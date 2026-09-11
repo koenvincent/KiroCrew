@@ -39,6 +39,7 @@ import os
 import shutil
 import stat
 import stat as _stat
+import tempfile
 from collections.abc import Iterable, Mapping
 from contextlib import suppress
 from dataclasses import dataclass
@@ -1955,13 +1956,114 @@ PUT_BACK_NAME_TAKEN = "name_taken"
 PUT_BACK_FAILED = "failed"
 
 
-def put_back_no_clobber(
-    src_parent_fd: int,
-    dst_dir_fd: int,
+def _stage_bytes_for_publish(
+    src: int, dst_parent: Path, dst_name: str, max_bytes: int | None
+) -> Path | None:
+    """Copy *src*'s bytes into a private fsynced temp beside the destination.
+
+    Returns the staged path, or ``None`` on any failure (the temp is removed).
+    This is the one descriptor-holding scope of the by-name branch: it asks no
+    name-based filesystem question, so the descriptor ratchet's split between
+    fd-space and name-space stays clean.
+    """
+    try:
+        stage_fd, stage_name = tempfile.mkstemp(
+            dir=os.fspath(dst_parent), prefix=dst_name + ".", suffix=".crew-gc"
+        )
+    except OSError:
+        return None
+    stage = Path(stage_name)
+    copied = 0
+    try:
+        while True:
+            read_size = 1 << 20
+            if max_bytes is not None:
+                read_size = min(read_size, max_bytes - copied + 1)
+            chunk = os.read(src, read_size)
+            if not chunk:
+                break
+            copied += len(chunk)
+            if max_bytes is not None and copied > max_bytes:
+                raise OverflowError("source exceeded max_bytes while copying")
+            while chunk:
+                chunk = chunk[os.write(stage_fd, chunk) :]
+        os.fsync(stage_fd)
+    except (OSError, OverflowError):
+        os.close(stage_fd)
+        with suppress(OSError):
+            stage.unlink()
+        return None
+    os.close(stage_fd)
+    return stage
+
+
+def _put_back_no_clobber_by_name(
+    src_parent: Path,
+    dst_parent: Path,
     src_name: str,
     dst_name: str,
     *,
     expect_ino: int,
+    max_bytes: int | None,
+) -> str | None:
+    """Portable no-dir-fd branch; source identity and publication stay no-clobber."""
+    src_path = src_parent / src_name
+    dst_path = dst_parent / dst_name
+    try:
+        if _stat.S_ISLNK(os.lstat(src_path).st_mode):
+            return PUT_BACK_FAILED
+        src = os.open(
+            src_path,
+            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0),
+        )
+    except OSError:
+        return PUT_BACK_FAILED
+    try:
+        opened = os.fstat(src)
+        if not _stat.S_ISREG(opened.st_mode) or opened.st_ino != expect_ino:
+            return PUT_BACK_FAILED
+        if max_bytes is not None and opened.st_size > max_bytes:
+            return PUT_BACK_FAILED
+        stage = _stage_bytes_for_publish(src, dst_parent, dst_name, max_bytes)
+        if stage is None:
+            return PUT_BACK_FAILED
+        try:
+            os.link(stage, dst_path)
+        except FileExistsError:
+            with suppress(OSError):
+                stage.unlink()
+            return PUT_BACK_NAME_TAKEN
+        except (OSError, NotImplementedError):
+            if os.name != "nt":
+                with suppress(OSError):
+                    stage.unlink()
+                return PUT_BACK_FAILED
+            try:
+                os.rename(stage, dst_path)
+            except FileExistsError:
+                with suppress(OSError):
+                    stage.unlink()
+                return PUT_BACK_NAME_TAKEN
+            except OSError:
+                with suppress(OSError):
+                    stage.unlink()
+                return PUT_BACK_FAILED
+            return None
+        with suppress(OSError):
+            stage.unlink()
+        return None
+    finally:
+        os.close(src)
+
+
+def put_back_no_clobber(
+    src_parent_fd: int | str | Path,
+    dst_dir_fd: int | str | Path,
+    src_name: str,
+    dst_name: str,
+    *,
+    expect_ino: int,
+    max_bytes: int | None = None,
 ) -> str | None:
     """Recreate *dst_name* inside *dst_dir_fd* from *src_name*, refusing to replace anything.
 
@@ -2006,9 +2108,28 @@ def put_back_no_clobber(
     supports, so a filesystem without hard links passes that probe and then refuses the
     call. A guard built on the probe is a guard that fails exactly where it matters.
 
+    ``src_parent_fd`` and ``dst_dir_fd`` are normally directory descriptors. When
+    directory descriptors are unavailable, pass their parent paths instead; the
+    fallback applies the same no-follow, inode, regular-file, staged-publish and
+    no-clobber checks by name. ``max_bytes`` optionally caps copy input (including
+    growth after ``fstat``); ``None`` preserves the existing uncapped behavior.
+
     Returns ``None`` when the name is back, :data:`PUT_BACK_NAME_TAKEN` when something else
     holds it (nothing was overwritten), or :data:`PUT_BACK_FAILED`.
     """
+    if max_bytes is not None and max_bytes < 0:
+        raise ValueError("max_bytes must be non-negative")
+    if not isinstance(src_parent_fd, int) and not isinstance(dst_dir_fd, int):
+        return _put_back_no_clobber_by_name(
+            Path(src_parent_fd),
+            Path(dst_dir_fd),
+            src_name,
+            dst_name,
+            expect_ino=expect_ino,
+            max_bytes=max_bytes,
+        )
+    if not isinstance(src_parent_fd, int) or not isinstance(dst_dir_fd, int):
+        return PUT_BACK_FAILED
     # O_NONBLOCK for the same reason `copy_file_pinned` carries it: O_NOFOLLOW refuses a
     # symbolic link and does NOT refuse a FIFO, so a named pipe at this name blocks the open
     # until a writer appears -- forever, with no timeout and no message. That is not a wrong
@@ -2027,6 +2148,8 @@ def put_back_no_clobber(
             # S_ISREG is checked as well as the inode because an inode number is reusable:
             # a FIFO created after the entry was unlinked can carry the number this call
             # recorded, and only the mode tells the two apart.
+            return PUT_BACK_FAILED
+        if max_bytes is not None and st.st_size > max_bytes:
             return PUT_BACK_FAILED
         linked = False
         try:
@@ -2076,13 +2199,20 @@ def put_back_no_clobber(
         try:
             # From the VERIFIED descriptor, not from the name again.
             os.lseek(src, 0, os.SEEK_SET)
+            copied = 0
             while True:
-                chunk = os.read(src, 1 << 20)
+                read_size = 1 << 20
+                if max_bytes is not None:
+                    read_size = min(read_size, max_bytes - copied + 1)
+                chunk = os.read(src, read_size)
                 if not chunk:
                     break
+                copied += len(chunk)
+                if max_bytes is not None and copied > max_bytes:
+                    raise OverflowError("source exceeded max_bytes while copying")
                 while chunk:
                     chunk = chunk[os.write(dst, chunk) :]
-        except OSError:
+        except (OSError, OverflowError):
             # A half-written file is worse than none: it would carry SOME of the content and
             # silently drop the rest, which reads as a smaller batch rather than as a failure.
             #
