@@ -20,6 +20,7 @@ whether a Slack session should skip memory writes.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import os
@@ -57,7 +58,12 @@ from kiro_crew.config.loader import (
     update_config_locked,
 )
 from kiro_crew.config.paths import kiro_agents_dir, peek_data_home
-from kiro_crew.constants import is_control_tag_tail, strip_control_comments
+from kiro_crew.constants import (
+    DENY_CAUSE_APPROVAL_TIMEOUT,
+    STEER_NOTICE_BOUND_SECS,
+    is_control_tag_tail,
+    strip_control_comments,
+)
 from kiro_crew.context import (
     ContextBuilder,
     build_cancelled_turn_preamble,
@@ -75,6 +81,7 @@ from kiro_crew.dashboard.chat_utils import (
     run_config_write,
 )
 from kiro_crew.dashboard.state import append_and_surface
+from kiro_crew.deny_notice import steer_refusal_notice
 from kiro_crew.executors import run_in_embed_pool
 from kiro_crew.history import ConversationLog, HistoryConsolidator
 from kiro_crew.hooks import (
@@ -237,6 +244,12 @@ _EDIT_INTERVAL = 1.0
 
 # Timeout for user to click approve/reject before auto-rejecting
 _APPROVAL_TIMEOUT = 120.0
+# Upper bound on the best-effort in-band deny notice steered into the running
+# turn before an expired approval prompt is rejected. The shared constant, so
+# this arm, the dashboard chat runner and the messaging TurnDriver cannot drift:
+# an unbounded await on a backpressured ACP stdin could stall the reject that
+# unblocks the turn. Module-level so a test can shorten it.
+_STEER_NOTICE_BOUND_SECS = STEER_NOTICE_BOUND_SECS
 
 # Slack Block Kit section text limit (3000 chars max); leave room for
 # markdown fences (``` ... ```) that wrap the tool input.
@@ -299,6 +312,10 @@ def _condense_thinking(mrkdwn: str, *, limit: int = _THINKING_PREVIEW_LIMIT) -> 
 # Pending approvals: keyed by f"{channel}:{approval_msg_ts}"
 # Module-level dict — safe because gateway runs in a single asyncio event loop.
 _pending_approvals: dict[str, _PendingApproval] = {}
+# Strong references to teardown-time orphan-reject tasks (the CancelledError
+# arm of _request_approval): asyncio holds tasks weakly, and these are created
+# exactly while the loop is unwinding.
+_orphan_rejects: "set[asyncio.Task[bool]]" = set()
 
 # ── Phase-aware reaction constants ──────────────────────────────────────
 
@@ -5349,19 +5366,36 @@ async def _maybe_auto_title_slack(
     )
 
 
-async def _reject_orphaned_tool(provider: LLMProvider, request_id: "str | int") -> None:
+async def _reject_orphaned_tool(provider: LLMProvider, request_id: "str | int") -> bool:
     """Reject a pending ACP permission request that we can no longer surface.
 
     Both the pre-approval stream-prep and the approval-prompt post happen BEFORE
     the permission is answered; if either raises, the ACP request would be left
     unanswered and the agent subprocess wedges forever (every later turn blocks
     behind it). Callers invoke this on failure, then re-raise. Swallows any
-    reject failure (best-effort) so the original error still propagates.
+    reject failure, and audit failure after a successful rejection, so the
+    original error still propagates.
     """
     try:
         await provider.reject_tool(request_id)
     except Exception:
         logger.warning("Failed to reject orphaned tool %s", request_id, exc_info=True)
+        return False
+    # The fallback arms re-raise past the normal permission audit, so record
+    # the denial here: a rejection that reached the wire but never reached the
+    # audit trail is a silent gap in a security control.
+    try:
+        sel().log_tool_invocation(
+            session_key="",
+            source="slack",
+            tool_name="",
+            outcome="rejected",
+            request_id=request_id,
+            metadata={"reason": "orphaned_fallback_reject"},
+        )
+    except Exception:
+        logger.warning("Failed to audit orphaned tool %s", request_id, exc_info=True)
+    return True
 
 
 class _LinkedApprovalEvent:
@@ -5587,11 +5621,78 @@ async def _request_approval(
     _pending_approvals[key] = pending
 
     try:
-        outcome = await asyncio.wait_for(pending.future, timeout=_APPROVAL_TIMEOUT)
+        # shield: on timeout, wait_for would otherwise CANCEL the future, and a
+        # click that claimed the entry just before the deadline could then
+        # never deliver its real outcome (its set_result guards on done()).
+        outcome = await asyncio.wait_for(asyncio.shield(pending.future), timeout=_APPROVAL_TIMEOUT)
     except asyncio.TimeoutError:
         outcome = _OUTCOME_REJECTED
-        await provider.reject_tool(event.request_id)
-        Stats().inc_tool_denial()
+        # Claim the decision BEFORE awaiting anything: while the entry stays
+        # registered, a Slack click landing inside the steer window would take
+        # the live-approval branch and answer the same permission request a
+        # second time. The pop's result says who won: a click that claimed the
+        # entry first is answering (or already answered) the request itself, so
+        # steering "expired unanswered" then would hand the model a false
+        # cause. The finally pop is idempotent, and a late click hits the
+        # already-resolved path.
+        claimed = _pending_approvals.pop(key, None) is not None
+        # Steer FIRST, reject SECOND: while the permission request is still
+        # unanswered the turn is provably in flight, so the notice is queued
+        # rather than dropped, and the model learns the denial was an expired
+        # prompt instead of concluding a human refused the call, matching the
+        # dashboard chat runner's host-decline arms. On Slack the driver stops
+        # rendering after a rejection, so this corrects the model-side
+        # transcript attribution only; the notice's continue-guidance has no
+        # Slack consumer. Best-effort: steer_refusal_notice (capability probe,
+        # redaction, build, bounded send -- the same helper the messaging
+        # TurnDriver uses) swallows every failure, so the reject below still
+        # runs; only cancellation escapes it, handled next.
+        try:
+            if claimed:
+                await steer_refusal_notice(
+                    provider,
+                    event.title,
+                    "the Slack approval prompt went unanswered for "
+                    f"{max(1, round(_APPROVAL_TIMEOUT))}s",
+                    cause=DENY_CAUSE_APPROVAL_TIMEOUT,
+                    bound_secs=_STEER_NOTICE_BOUND_SECS,
+                )
+        except asyncio.CancelledError:
+            # Teardown while steering must still answer the wire: a stranded
+            # session/request_permission blocks the subprocess forever and
+            # wedges every later turn behind it. Shield the reject so it is
+            # stepped even while this coroutine unwinds; _reject_orphaned_tool
+            # retrieves its exception so teardown stays quiet.
+            reject = asyncio.ensure_future(_reject_orphaned_tool(provider, event.request_id))
+            _orphan_rejects.add(reject)
+            reject.add_done_callback(_orphan_rejects.discard)
+            with contextlib.suppress(BaseException):
+                if await asyncio.shield(reject):
+                    Stats().inc_tool_denial()
+            raise
+        if claimed:
+            # Only the claim winner answers the wire. A lost claim means a
+            # click is answering (or answered) this request itself; a second
+            # answer would hit the ACP client's popped-options fallback, whose
+            # cancelled outcome cancels the WHOLE turn. The click's own wire
+            # failure cannot strand the request either: handle_interaction
+            # answers the wire itself when its approve/reject raises.
+            await provider.reject_tool(event.request_id)
+            Stats().inc_tool_denial()
+        else:
+            # A click beat the deadline and owns the answer. The future was
+            # shielded from the timeout's cancellation, so it still carries the
+            # click's REAL decision: await it until the click resolves it, and
+            # report THAT. No bound and no fabricated fallback: the click is the
+            # sole responder and every way it can end resolves this future --
+            # its approve/reject completes (set_result in handle_interaction),
+            # its write raises (handle_interaction self-answers the wire, then
+            # set_result), or the backend stops reading stdin for good, which
+            # the ACP client's tool-stall watchdog turns into a transport close
+            # that raises out of the parked write and lands on the same path.
+            # Returning "rejected" on a timer instead would close this stream
+            # over a tool the person approved and that still executes.
+            outcome = await asyncio.shield(pending.future)
     finally:
         _pending_approvals.pop(key, None)
 
@@ -5703,7 +5804,14 @@ async def handle_interaction(
             return _ACTION_TRUST
         return _ACTION_APPROVE if approved else _ACTION_REJECT
 
-    pending = _pending_approvals.get(key)
+    # Claim-before-await, symmetric with the timeout arm: popping here (not
+    # at the end) means a timeout firing while this click awaits the wire
+    # sees a lost claim and stays entirely off it — only the claim winner may
+    # answer, because a second answer to the same request id lands in the ACP
+    # client's popped-options cancelled-outcome fallback and cancels the whole
+    # turn. It also means the timeout arm's own pop cannot leave this path
+    # deleting a missing key.
+    pending = _pending_approvals.pop(key, None)
     if not pending:
         # Approval already resolved (approved/rejected/timed out).
         # For trust clicks, still set trust using the thread as session key.
@@ -5807,56 +5915,79 @@ async def handle_interaction(
             )
         return None
 
-    if action_id in (_ACTION_APPROVE, _ACTION_TRUST):
-        # Set trust state BEFORE approving (so subsequent tools auto-approve)
-        if action_id == _ACTION_TRUST:
-            if not is_allowed_user(user_id):
-                logger.error("Rejecting trust escalation from non-allowed user %s", user_id)
-                sel().log_api_access(
-                    caller=user_id,
-                    operation="slack.interactive.trust_denied",
-                    outcome="denied",
-                    source="slack",
-                    resources=pending.session_key or "",
-                    error="non-allowed user",
-                )
-                if not pending.future.done():
-                    pending.future.set_result(_OUTCOME_REJECTED)
-                del _pending_approvals[key]
-                return _ACTION_REJECT
-            elif pending.session_key:
-                add_trusted_session(pending.session_key, sessions)
-                logger.info("Trust mode ON for session %s", pending.session_key)
-            else:
-                logger.warning(
-                    "No session_key on pending approval %s; approving without trust", key
-                )
-        if pending.provider:
-            await pending.provider.approve_tool(pending.request_id)
+    # Everything below runs with the entry CLAIMED: the pop above means no
+    # later claimer exists, and _request_approval's lost-claim arm is awaiting
+    # ``pending.future`` unbounded on the promise that every way this click can
+    # end resolves it. The wire calls kept that promise through their own
+    # fallback arms, but the synchronous bookkeeping between the claim and
+    # ``set_result`` (trust grant, audit, stats) could raise and return with
+    # the wire unanswered and the future unresolved — parking that waiter
+    # permanently. One guard over the WHOLE claimed region keeps the promise
+    # on every exit; it subsumes the two per-wire-call fallback arms it
+    # replaces. approve_tool pops the recorded options before sending, so the
+    # guard's fallback reject can land as a cancelled outcome (ends the turn's
+    # remaining tool calls) — still strictly better than a wedged subprocess.
+    try:
+        if action_id in (_ACTION_APPROVE, _ACTION_TRUST):
+            # Set trust state BEFORE approving (so subsequent tools auto-approve)
+            if action_id == _ACTION_TRUST:
+                if not is_allowed_user(user_id):
+                    logger.error("Rejecting trust escalation from non-allowed user %s", user_id)
+                    sel().log_api_access(
+                        caller=user_id,
+                        operation="slack.interactive.trust_denied",
+                        outcome="denied",
+                        source="slack",
+                        resources=pending.session_key or "",
+                        error="non-allowed user",
+                    )
+                    if not pending.future.done():
+                        pending.future.set_result(_OUTCOME_REJECTED)
+                    return _ACTION_REJECT
+                elif pending.session_key:
+                    add_trusted_session(pending.session_key, sessions)
+                    logger.info("Trust mode ON for session %s", pending.session_key)
+                else:
+                    logger.warning(
+                        "No session_key on pending approval %s; approving without trust", key
+                    )
+            if pending.provider:
+                await pending.provider.approve_tool(pending.request_id)
+            if not pending.future.done():
+                pending.future.set_result(_OUTCOME_APPROVED)
+            Stats().inc_tool_approval()
+            sel().log_api_access(
+                caller=user_id,
+                operation="slack.interactive.approval",
+                outcome="allowed",
+                source="slack",
+                resources=action_id,
+            )
+        else:
+            if pending.provider:
+                await pending.provider.reject_tool(pending.request_id)
+            if not pending.future.done():
+                pending.future.set_result(_OUTCOME_REJECTED)
+            sel().log_api_access(
+                caller=user_id,
+                operation="slack.interactive.approval",
+                outcome="denied",
+                source="slack",
+                resources=action_id,
+            )
+    except BaseException:
+        # An unresolved future is the signal the exit was abnormal: both arms
+        # resolve it immediately after their wire call, so reaching here with
+        # it pending means the wire may be unanswered and the lost-claim
+        # waiter is still parked. Answer best-effort and release the waiter
+        # before propagating; _reject_orphaned_tool swallows its own failure,
+        # so the original error still surfaces.
         if not pending.future.done():
-            pending.future.set_result(_OUTCOME_APPROVED)
-        Stats().inc_tool_approval()
-        sel().log_api_access(
-            caller=user_id,
-            operation="slack.interactive.approval",
-            outcome="allowed",
-            source="slack",
-            resources=action_id,
-        )
-    else:
-        if pending.provider:
-            await pending.provider.reject_tool(pending.request_id)
-        if not pending.future.done():
+            if pending.provider:
+                await _reject_orphaned_tool(pending.provider, pending.request_id)
             pending.future.set_result(_OUTCOME_REJECTED)
-        sel().log_api_access(
-            caller=user_id,
-            operation="slack.interactive.approval",
-            outcome="denied",
-            source="slack",
-            resources=action_id,
-        )
+        raise
 
-    del _pending_approvals[key]
     return action_id
 
 
