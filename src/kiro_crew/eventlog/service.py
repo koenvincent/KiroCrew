@@ -73,6 +73,12 @@ def _redact_projection_value(value: object) -> object:
     return value
 
 
+#: Called after every successful append with ``(kind, id, event)``. The kind is
+#: passed even though this service only serves ``member``, so the hub it feeds
+#: stays kind-generic and a second kind's service is a registration rather than
+#: a second fan-out path.
+EventSink = Callable[[str, str, Event], None]
+
 #: The unit kind this service serves. A second kind registers alongside it
 #: rather than forking this module.
 #: Suffix that marks a member's legacy activity file as already folded. Its mere
@@ -378,6 +384,7 @@ class MemberEventLogService:
     def __init__(self, root: Path, broadcast: Broadcast | None = None) -> None:
         self._root = Path(root)
         self._broadcast = broadcast
+        self._event_sink: EventSink | None = None
         self._logs: dict[str, MemberLog] = {}
         self._slug_locks: dict[str, threading.Lock] = {}
         self._map_lock = threading.Lock()
@@ -391,6 +398,16 @@ class MemberEventLogService:
     # ---- wiring -----------------------------------------------------------
     def attach_broadcast(self, broadcast: Broadcast) -> None:
         self._broadcast = broadcast
+
+    def attach_event_sink(self, sink: "EventSink | None") -> None:
+        """Set the per-append sink that fans events to log subscribers.
+
+        Called once at dashboard startup. The sink runs INSIDE the per-slug lock,
+        on whatever thread appended, so an implementation must only ENQUEUE:
+        blocking or raising here stalls or breaks the append that is holding the
+        lock.
+        """
+        self._event_sink = sink
 
     @property
     def root(self) -> Path:
@@ -407,6 +424,11 @@ class MemberEventLogService:
     def broadcast(self) -> Broadcast | None:
         """The frame sink attached at dashboard startup, if any."""
         return self._broadcast
+
+    @property
+    def event_sink(self) -> "EventSink | None":
+        """The per-append fan-out sink attached at dashboard startup, if any."""
+        return self._event_sink
 
     def _on_change(self, slug: str, key: str, view: dict, seq: int) -> None:
         if key == types.PROJ_ROSTER:
@@ -774,9 +796,29 @@ class MemberEventLogService:
         return unit_ids(KIND_MEMBER)
 
     # ---- write ------------------------------------------------------------
-    def append(self, slug: str, type: str, data: dict) -> Event:
+    def append(
+        self,
+        slug: str,
+        type: str,
+        data: dict,
+        *,
+        still_granted: Callable[[], bool] | None = None,
+    ) -> Event:
+        """Append one event to a member's log.
+
+        ``still_granted`` is re-asked HERE, under the lock that writes, and exists
+        for the same reason the projection store's does: a route that checked a
+        contribution grant and then handed this work off across an ``await`` checked
+        an answer that can go stale before the row lands, so an app revoked while its
+        append is in flight had already passed that check. Asking under the write
+        lock is what makes the decision and the write one step. Callers with no grant
+        to re-ask -- the gateway's own observers, the migration -- pass nothing and
+        are unaffected.
+        """
         lock = self._slug_lock(slug)
         with lock:
+            if still_granted is not None and not still_granted():
+                raise PermissionError(f"the append grant for {slug!r} was revoked before the write")
             log = self._get_log(slug)
             if log is None:
                 raise FileNotFoundError(f"no member log for {slug!r}; call ensure() first")
@@ -865,6 +907,16 @@ class MemberEventLogService:
         # so replaying the range costs a cell nothing it has seen.
         self._fold_gap_locked(slug, log, below=event["seq"])
         self._registry.drive(slug, event)
+        sink = self._event_sink
+        if sink is not None:
+            try:
+                sink(UNIT_KIND, slug, event)
+            except Exception:
+                # The event is already durable and folded; a subscriber fan-out
+                # fault must not turn a committed append into a failed one. The
+                # subscriber detects the gap on its next seq check and heals with
+                # a catch-up read, which is the contract's own recovery path.
+                logger.debug("eventlog sink failed for %r/%r", slug, type, exc_info=True)
         return event
 
     # ---- read -------------------------------------------------------------
@@ -913,6 +965,22 @@ class MemberEventLogService:
                 return []
             return log.history(before, limit)
 
+    def events_after(self, slug: str, *, after: int = -1, limit: int = 200) -> list[Event]:
+        """Oldest-first page of events with ``seq > after`` (contribution §3).
+
+        The catch-up half of the delta channel: a subscriber that lost frames, or
+        one starting cold, folds this page in order and then streams. Returns an
+        empty list for a slug with no log rather than raising -- a caller asking
+        about a unit that does not exist has already been answered 404 by the
+        route's own existence check.
+        """
+        lock = self._slug_lock(slug)
+        with lock:
+            log = self._get_log(slug)
+            if log is None:
+                return []
+            return log.events_after(after, limit)
+
     def last_seq(self, slug: str) -> int:
         lock = self._slug_lock(slug)
         with lock:
@@ -959,6 +1027,11 @@ def get_service() -> MemberEventLogService:
         if _singleton is None or _singleton.root != root:
             previous = _singleton
             _singleton = MemberEventLogService(root, previous.broadcast if previous else None)
+            if previous is not None and previous.event_sink is not None:
+                # The hub is attached once at startup and is not rebound when the
+                # data home moves, so a rebuild that dropped the sink would leave
+                # every later append invisible to its subscribers.
+                _singleton.attach_event_sink(previous.event_sink)
         return _singleton
 
 
