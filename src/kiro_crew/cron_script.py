@@ -1475,23 +1475,182 @@ def _split_script_spec(script_path: str) -> tuple[str, str]:
     return script_path[:func_colon], script_path[func_colon + 1 :]
 
 
-def resolve_script_path(script_path: str) -> tuple[str, str]:
+def _trusted_script_bundle_roots() -> tuple[Path, ...]:
+    """Roots, besides ``crons/``, that legitimately hold a cron script.
+
+    An app ships its cron script inside its OWN tree, so a bundle script's
+    resolved path lands outside ``crons/`` by construction. Two kinds of root
+    provide bundles, matching the two sources
+    ``apps.bridges._registration_source`` reads a manifest from:
+
+    * the BUILTIN manifest sources, which is where a shipped builtin's bundle
+      lives, and which the bridge deliberately reads builtins from so a mutable
+      installed directory cannot borrow a builtin's name.
+    * ``<config_dir>/apps``, a third-party app's installed snapshot.
+
+    The builtin leg delegates to ``apps.execution._builtin_manifest_sources``,
+    the SAME function ``shipped_builtin_app_root`` walks to CHOOSE a builtin's
+    root, rather than assuming that root is under this package. It is not: that
+    function also returns the active edition's
+    ``apps_loader.manifest_sources()``, which can sit anywhere. One authority for
+    both ends is what keeps registration and fire time in agreement -- the
+    registrar is handed a builtin's chosen root as ``app_root``, and the
+    context-free consumers must recognise that same root, or a cron registers and
+    is then refused when it fires. The package directory stays as a fallback for a
+    composition where the platform seam is not available, which is how
+    ``_builtin_manifest_sources`` itself degrades.
+
+    Deliberately NOT delegated to ``skills._trusted_skill_roots``, which today
+    computes a similar set for app-shipped SKILLS. The sets overlap by
+    coincidence, not by rule: a skill is prose the scanner reads, a cron script
+    is code the launcher executes, and the two admit different things (a skill
+    root holds a directory tree with ``SKILL.md``, a script root holds a ``.py``
+    file). Sharing one helper would let a future change to which trees may
+    supply ``SKILL.md`` silently change which files are EXECUTABLE as crons, in
+    a module whose tests would not run.
+
+    Imports are function-local because ``cron_script`` is imported by
+    ``mcp_cron``, which ``apps.bridges`` imports back, so a module-level edge
+    into the apps package would close that cycle.
+    """
+    roots: list[Path] = []
+    try:
+        from kiro_crew.apps.execution import _builtin_manifest_sources
+
+        roots.extend(_builtin_manifest_sources())
+    except Exception:  # noqa: BLE001 — an unavailable seam must not stop resolution
+        pass
+    # Fallback and backstop: this package's own directory. Present even when the
+    # walk above succeeded, because a builtin's bundle under it must stay
+    # resolvable if the edition seam later stops reporting its source.
+    roots.append(Path(__file__).parent.resolve())
+    try:
+        from kiro_crew.apps.manager import apps_dir
+
+        roots.append(apps_dir().resolve())
+    except (OSError, ValueError, ImportError):  # an unresolvable home must not stop resolution
+        pass
+    # Order-preserving dedupe: _builtin_manifest_sources may already report this
+    # package's builtins dir, and a repeated root would be checked twice.
+    return tuple(dict.fromkeys(roots))
+
+
+def _bundle_relative_spec(module_part: str, app_root: Path) -> str:
+    """Rebase a bundle-RELATIVE script path onto ``app_root``; pass others through.
+
+    Pure path arithmetic. It touches no filesystem: no ``resolve()``, no
+    ``exists()``, no read. Resolution and canonical containment stay in
+    :func:`resolve_script_path`, which is deliberate -- keeping the join here
+    lets that function's ``resolve()`` line stay exactly as it has always been,
+    and keeps this step's only job legible.
+
+    An absolute spec is returned unchanged, so an app naming a full path is
+    judged by containment rather than silently re-rooted.
+
+    A ``..`` segment is refused LEXICALLY, before any join, in the same order and
+    for the same reason as ``apps.manifest._path_escapes_app_root``: the verdict
+    is then identical on every host, where deferring to ``resolve()`` would make
+    it host-dependent (on POSIX ``..\\evil.py`` is one odd filename that stays
+    inside the root; on Windows it escapes). Canonical containment in the caller
+    adds what no lexical check can see -- a link inside the root whose target
+    leaves it.
+    """
+    expanded = Path(os.path.expanduser(module_part))
+    if expanded.is_absolute():
+        return module_part
+    if ".." in expanded.parts:
+        raise PermissionError(f"Script path may not traverse upward: {module_part}")
+    return str(app_root / expanded)
+
+
+def resolve_script_path(
+    script_path: str,
+    *,
+    app_root: Path | None = None,
+    allow_bundle_roots: bool = False,
+) -> tuple[str, str]:
     """Validate and resolve a script path. Returns (file_path, func_name).
 
-    Scripts must be files under ``<config_dir>/crons/``.
-    Format: "<config_dir>/crons/file.py:function" or "/absolute/path.py:function"
+    Format: ``"<path>.py:function"``. Default behaviour is the OPERATOR
+    contract, byte for byte: a relative path resolves against the process CWD,
+    and the resolved file must sit under ``<config_dir>/crons/``. ``cron_add``,
+    the CLI and the vault-grant paths pass neither keyword, so nothing below
+    reaches them.
+
+    An app cron's script legitimately lives in the app's own bundle rather than
+    in ``crons/``, and the two keywords are how a caller says so. They are
+    separate because they answer different questions, and each opens one root.
+
+    ``app_root`` says "this spec belongs to THIS app", and is passed where a
+    manifest's own spec is vetted (``apps.bridges``, ``apps.cron_sdk``). It
+    becomes the base a RELATIVE spec resolves against, because ``"job.py:run"``
+    means "next to my manifest" and is the only spelling an app can write
+    without knowing its install location. With no base that resolved against
+    whatever directory the gateway process happened to start in, naming a file
+    that was never there. Containment is that ONE bundle, so app A cannot name a
+    script inside app B's tree.
+
+    ``allow_bundle_roots`` says "this spec was ALREADY vetted and persisted",
+    and is passed only by the consumers that re-resolve a stored ``job.script``
+    holding no app context: the fire-time governance gate, the launcher, and the
+    dashboard's script-source endpoint. Containment is the shared bundle roots,
+    because a stored absolute bundle path is all those callers have to go on. It
+    widens no authoring path: a freshly authored spec must still be under
+    ``crons/``, so ``cron_add`` cannot register a script inside a bundle.
+
+    A bundle root accepts ``.py`` files only, under either keyword. That is a
+    containment control rather than a style rule, and the surface it guards is
+    EXECUTION: the launcher puts the resolved file's directory on ``sys.path``,
+    imports the file as a module and calls ``func_name``, so whatever this
+    function returns is a path the gateway will run. A bundle holds more than
+    code -- ``.app_secret`` is the app's gateway credential (see
+    ``dashboard.token_auth``) and ``data/`` holds app state -- and nothing later
+    in the chain re-checks the suffix, so without it a manifest could name any
+    bundle file as an entry point and have the launcher try to execute it.
+    ``crons/`` keeps no such rule, because it exists only to hold scripts.
+
+    The dashboard's script-source endpoint is NOT part of that reasoning: its
+    read stays pinned to ``crons/``, so a bundle path is refused there with
+    ``script_read_refused`` whatever its suffix.
+
+    Unchanged on every path: a ``..``-bearing relative spec is refused
+    lexically before any join, so the verdict never depends on the host's path
+    grammar; ``.resolve()`` runs BEFORE containment, so a link pointing out of a
+    trusted root is rejected on its target rather than followed;
+    ``is_sensitive_path`` still vets the resolved path; and the body scan
+    (``mcp_cron._vet_script_file``) is a separate gate this function does not
+    speak for. Vault secret GRANTS stay narrower than all of it: their reader
+    (:func:`_read_script_body`) is pinned to ``crons/`` alone and the grant paths
+    pass neither keyword, so a bundle script can register and run but can never
+    be handed a secret.
     """
     module_part, func_name = _split_script_spec(script_path)
 
+    if app_root is not None:
+        module_part = _bundle_relative_spec(module_part, app_root)
     file_path = Path(os.path.expanduser(module_part)).resolve()
     if not file_path.exists():
         raise FileNotFoundError(f"Script file not found: {file_path}")
     if is_sensitive_path(str(file_path)):
         raise PermissionError(f"Script path blocked by security policy: {file_path}")
-    allowed_dir = (config_dir() / "crons").resolve()
-    if not file_path.is_relative_to(allowed_dir):
-        raise PermissionError(f"Script must be under {allowed_dir}, got: {file_path}")
-    return str(file_path), func_name
+    crons_dir = (config_dir() / "crons").resolve()
+    if app_root is None and file_path.is_relative_to(crons_dir):
+        return str(file_path), func_name
+    if app_root is not None:
+        bundle_roots: tuple[Path, ...] = (app_root.resolve(),)
+    elif allow_bundle_roots:
+        bundle_roots = _trusted_script_bundle_roots()
+    else:
+        bundle_roots = ()
+    for root in bundle_roots:
+        if not file_path.is_relative_to(root):
+            continue
+        if file_path.suffix.lower() != ".py":
+            raise PermissionError(f"App bundle script must be a .py file, got: {file_path}")
+        return str(file_path), func_name
+    admitted = bundle_roots if app_root is not None else (crons_dir, *bundle_roots)
+    roots_shown = ", ".join(str(r) for r in admitted)
+    raise PermissionError(f"Script must be under one of {roots_shown}, got: {file_path}")
 
 
 def _resolve_internal_secret(port: int) -> str:
@@ -1739,6 +1898,176 @@ def _publish_script_session_token(clean_env: dict[str, str], job_id: str) -> str
     return token
 
 
+def _app_secret_masks() -> tuple[str, ...] | None:
+    """Every installed app's ``.app_secret``, to hide from a cron script child.
+
+    ``.app_secret`` is a BEARER credential, not a marker:
+    ``dashboard.token_auth.validate_app_secret`` compares it and issues that app's
+    scoped token, so a subprocess that can read the file can act as the app. The
+    sandbox's own crew-home mask set (``sandbox._CREW_HIDDEN_LEAVES``) does not
+    cover these, and the ``cc`` profile a cron script runs under leaves them
+    readable, so masking is done here at the spawn that needs it.
+
+    Applied to EVERY script cron, not only a bundle one. A cron script gets its
+    gateway credential through ``_KIROCREW_SECRET_FILE`` and reaches tools via
+    ``ctx``, so none of them -- operator-authored under ``crons/`` or shipped in
+    an app bundle -- has a reason to read any app's secret, including its own
+    app's. Masking uniformly also avoids a rule that has to ask whose script this
+    is, which is the kind of condition that rots.
+
+    The CONTAINING TREE rather than one leaf per installed app. A mask is applied
+    to the paths named at spawn time and is never recomputed for a live child, so
+    an enumeration cannot name an app installed while a long-running script cron
+    is still executing: that app's ``.app_secret`` would stay readable for the
+    rest of the child's life. Masking the directory covers every app dir that
+    appears under it afterwards, because the mask is on the directory and not on
+    names read out of it.
+
+    The tree is CREATED when absent, which is what makes the sentence above true
+    on a home where no app has ever been installed. An earlier revision returned
+    no mask for an absent tree, reasoning that there was no directory to mask and
+    no secret to read. That reasoning is wrong in exactly the case this mask
+    exists for: it holds at spawn time and stops holding the moment the first
+    install lands mid-run, and the Linux launcher's mask loop is guarded on
+    ``isdir``, so a target that does not exist yet gets no bind over it and the
+    directory created later is plainly visible to the running child.
+    ``sandbox._materialize_maskable_dirs`` pre-creates its own mask targets for
+    this same reason and states it in the same terms; this is that shape applied
+    where a per-spawn mask is computed rather than to the crew home's fixed leaves.
+
+    A bundle cron's own script lives under this tree and the child must import
+    it, which is why the caller pairs this with a private WINDOW on the script's
+    own directory (:func:`_bundle_script_window`) instead of a second mask set.
+
+    Returns ``None`` -- distinct from an empty tuple -- when the mask cannot be
+    ESTABLISHED, and the caller REFUSES the spawn on it. Fail closed rather than
+    best effort, because the two states that reach it both mean the control was
+    requested and could not be built: a data home that cannot be resolved, and a
+    tree that cannot be created (notably a plain file squatting the name, which
+    ``mkdir`` reports as ``FileExistsError``). Running anyway would launch a child
+    that can read every app's bearer credential while nothing said so, which is
+    the exposure this function exists to prevent. There is deliberately no
+    remaining path that returns an empty mask.
+    """
+    try:
+        apps_root = (config_dir() / "apps").resolve()
+        # 0o700 only lands when this call creates it; exist_ok leaves an existing
+        # directory's mode alone. `.resolve()` above ran first, so a symlinked
+        # tree is masked at its TARGET rather than at the link.
+        apps_root.mkdir(mode=0o700, parents=True, exist_ok=True)
+    except OSError:
+        return None
+    return (str(apps_root),)
+
+
+def _bundle_script_window(file_path_str: str, apps_masks: tuple[str, ...]) -> tuple[str, ...]:
+    """The one directory a bundle cron keeps inside the masked ``apps/`` tree.
+
+    ``_app_secret_masks`` hides the whole installed-apps tree so an app installed
+    after spawn cannot leave an unmasked credential behind. A bundle cron's script
+    lives in that tree and the launcher puts its directory on ``sys.path`` to
+    import it, so that one directory is re-exposed as a private window:
+    ``sandbox._private_window_spellings`` admits only a PROPER descendant of a
+    hidden directory and never lifts the parent's mask, so every sibling app --
+    including one installed later -- stays hidden.
+
+    Returns empty for an operator cron under ``crons/``: its script is not in the
+    tree, so it needs no window and the tree stays wholly masked.
+
+    Residual, deliberate: an app whose script sits at its bundle ROOT (the
+    ``"job.py:run"`` spelling, next to the manifest) gets a window at that root,
+    so its OWN ``.app_secret`` is inside the window and readable. That grants the
+    app nothing -- the script IS that app's code and the secret only buys that
+    same app's scoped token, which its ``ctx`` already holds -- whereas a FOREIGN
+    app's secret stays masked in every layout, which is the escalation that
+    matters. A script one directory deeper keeps its own secret masked too, for
+    free, because the window then sits below the root the secret lives in. That
+    deeper layout is also the one whose durable ``data/`` falls OUTSIDE this
+    window, which is what :func:`_bundle_data_window` exists to re-expose.
+    """
+    if not apps_masks:
+        return ()
+    try:
+        script_dir = Path(file_path_str).resolve().parent
+    except OSError:
+        return ()
+    for mask in apps_masks:
+        root = mask.rstrip(os.sep)
+        if str(script_dir).startswith(root + os.sep):
+            return (str(script_dir),)
+    return ()
+
+
+def _bundle_data_window(
+    file_path_str: str, apps_masks: tuple[str, ...], script_window: tuple[str, ...]
+) -> tuple[str, ...]:
+    """The owning app's durable ``data/`` directory, when the mask would swallow it.
+
+    ``_app_secret_masks`` hides the whole installed-apps tree, and
+    ``apps.manager.app_data_dir`` resolves to ``apps/<name>/data`` INSIDE that
+    tree. :func:`_bundle_script_window` re-exposes only the script's own
+    directory, so the two spellings an app may use for its script are not
+    equivalent: a script at the bundle ROOT gets a window that already contains
+    ``data/``, while the nested ``crons/job.py`` spelling gets a window beside it,
+    leaving every ``app_data_dir`` write to land in the masked mount and vanish at
+    exit. Silent, unrecoverable, and worse for the layout the sibling docstring
+    recommends -- so the data directory is windowed in its own right.
+
+    The owner is taken from the SCRIPT PATH, never from ``job_id``. The path was
+    already canonically contained by :func:`resolve_script_path` against this very
+    root, so the first component below it is the app the script physically belongs
+    to, and no manifest can name another app's directory there. ``job_id`` is
+    ``"<app>/<cron>"`` and would read the same way in the ordinary case, but it is
+    assembled from manifest-supplied text, and a window is read-WRITE: pointing it
+    at a name a manifest chose would hand one app write access to another's state.
+
+    Delegates the path to ``app_data_dir`` rather than re-spelling
+    ``apps/<name>/data`` here, so the window cannot drift from the directory apps
+    actually write to. That call also creates the directory, which is what the
+    window needs -- there must be something to re-expose, and an app's first write
+    would otherwise create it inside the mask and lose it. Creating that app's own
+    data directory is what building its context already does.
+
+    Returns empty when the window would be redundant (the bundle-root layout,
+    where the script window already contains ``data/``; a window nested inside
+    another is not asked of the backend), when the script is not inside the masked
+    tree at all (an operator cron under ``crons/``, or a builtin whose bundle ships
+    in the package), and when the path arithmetic or the import fails -- matching
+    ``_app_secret_masks``, where a spawn is never lost to an unreadable directory.
+
+    A builtin whose bundle ships in the package is a MEASURED gap rather than a
+    covered case: its script sits outside this tree, so no owner can be read from
+    the path, while ``app_data_dir`` still points inside the mask. No builtin
+    declares a ``script`` cron today -- ``ops_mission_control`` is the only builtin
+    declaring crons at all, and all four of its crons are ``message`` crons -- so
+    nothing reaches it. Closing it needs the registrar to thread the app's own name
+    down to here, which is a wider change than this one.
+    """
+    if not apps_masks:
+        return ()
+    try:
+        from kiro_crew.apps.manager import app_data_dir, apps_dir
+
+        root = apps_dir().resolve()
+        rel = Path(file_path_str).resolve().relative_to(root)
+        # A path with no app component below the root belongs to no app, so there is
+        # no owner to read. Guarded rather than left to the OSError arm because
+        # ``app_data_dir`` CREATES what it is handed: for an EXISTING file the mkdir
+        # fails beneath it anyway, but `resolve_script_path` only proved the file
+        # existed a moment ago, and for a path deleted since then the mkdir would
+        # SUCCEED and a spawn would silently create ``apps/<filename>/data``.
+        if len(rel.parts) < 2:
+            return ()
+        data_dir = app_data_dir(rel.parts[0]).resolve()
+    except (OSError, ValueError, ImportError):
+        return ()
+    for window in script_window:
+        opened = window.rstrip(os.sep)
+        if str(data_dir) == opened or str(data_dir).startswith(opened + os.sep):
+            return ()
+    return (str(data_dir),)
+
+
 def run_script_sandboxed(
     script_path: str,
     job_id: str,
@@ -1778,7 +2107,9 @@ def run_script_sandboxed(
     (one approved body) or read them as data.
     """
 
-    file_path_str, func_name = resolve_script_path(script_path)
+    # A PERSISTED spec (see resolve_script_path): an app cron's stored path
+    # points into its bundle, which no authoring path may name.
+    file_path_str, func_name = resolve_script_path(script_path, allow_bundle_roots=True)
 
     import_dir_str = os.path.dirname(file_path_str)
     resolved_secret_env: dict[str, str] = {}
@@ -1977,17 +2308,54 @@ def run_script_sandboxed(
         # STRICT sandbox profile (credential stores and every crew-internal
         # dir hidden), keeping the child's reachable surface as small as the
         # sandbox can make it. Ungranted scripts keep their normal view.
+        # Every app's `.app_secret` is hidden from EVERY script cron by masking
+        # the whole installed-apps tree (see `_app_secret_masks`): it is a bearer
+        # credential the gateway exchanges for that app's scoped token, and the
+        # `cc` profile below leaves it readable. A granted script additionally
+        # loses the live crons dir and its own parent.
+        secret_masks = _app_secret_masks()
+        if secret_masks is None:
+            # A control was requested and could not be established, so refuse
+            # rather than degrade -- the same posture as the unsandboxed-exec
+            # refusal below. Running on would hand the child every installed
+            # app's bearer credential with nothing recording that the mask was
+            # skipped.
+            return {
+                "status": "error",
+                "error": "❌ cannot establish the app-credential mask under the crew "
+                "data home; refusing to run the script unmasked. Check that "
+                "<data home>/apps is a directory the gateway can create and write.",
+            }
+        # A granted run takes NO window. Its verified body travels over stdin so
+        # the child never reads the script file, and the block above deliberately
+        # hides the script's own parent to close the mutable-sibling import route;
+        # re-exposing that directory as a window would reopen precisely that
+        # route, so for a granted run the apps tree stays wholly masked.
+        script_window = (
+            () if stdin_payload is not None else _bundle_script_window(file_path_str, secret_masks)
+        )
+        # The owning app's durable `data/` sits in the masked tree as well, and the
+        # script window only covers it in the bundle-root layout. A granted run is
+        # excluded for the same reason and can never need it: `_read_script_body`
+        # requires the body's descriptor to resolve inside `crons/`, so a granted
+        # script is never a bundle script and has no app data dir.
+        data_window = (
+            ()
+            if stdin_payload is not None
+            else _bundle_data_window(file_path_str, secret_masks, script_window)
+        )
         if stdin_payload is not None:
             hidden = tuple(
                 dict.fromkeys(
                     (
                         str(config_dir() / "crons"),
                         str(Path(file_path_str).resolve().parent),
+                        *secret_masks,
                     )
                 )
             )
         else:
-            hidden = ()
+            hidden = secret_masks
         # Same tier as ``run_command_sandboxed`` below: a script body is
         # agent-written, so it is the HIGHER-capability cron surface, and it
         # ran the WIDER profile — ``standard`` leaves ~/.aws/credentials, the
@@ -2006,7 +2374,10 @@ def run_script_sandboxed(
         # secret instead of exposing a store.
         sandbox_mode = "strict" if stdin_payload is not None else "cc"
         sandboxed_argv, sandbox_cleanup = wrap_argv(
-            argv, mode=sandbox_mode, extra_hidden_dirs=hidden
+            argv,
+            mode=sandbox_mode,
+            extra_hidden_dirs=hidden,
+            extra_private_dirs=script_window + data_window,
         )
         if stdin_payload is not None and sandboxed_argv == argv:
             # On a host with no OS sandbox backend, the unsandboxed-exec
