@@ -1002,6 +1002,7 @@ async def create_session(
     title: str = "",
     agent: str = "",
     folder_id: str = "",
+    caller_fenced: bool | None = None,
 ) -> dict[str, Any]:
     """Open a new session in the caller's workspace, persisted at birth.
 
@@ -1039,6 +1040,14 @@ async def create_session(
     every caller class the move path's app-ownership rule exists to stop is
     already refused above it -- an app-scoped caller cannot create a session at
     all (`app_scoped_caller`).
+
+    ``caller_fenced`` is the ownership-fence verdict the HTTP gate already settled
+    on the caller's VERIFIED scope, carried in for the same reason
+    ``authorize_target`` takes ``precomputed_ownership_fenced``: the inline
+    predicate re-derives member status from the MUTABLE config record, and this
+    coroutine suspends many times before it is consulted. ``None`` means "not
+    settled", and the fence is then evaluated inline. It is read by the
+    private-store authorization below and nothing else.
     """
     caller_key = caller_slot_key(state, caller_session_key)
     if not caller_key:
@@ -1239,6 +1248,62 @@ async def create_session(
         raise SessionControlError(
             "selected execution context is unavailable", code="memory_unavailable"
         ) from None
+
+    # ONE authorization for the child's PRIVATE binding, at the single point where
+    # every branch above has already produced its final route. A per-branch check
+    # is not equivalent: the selected-member branch, the inherited-agent branch
+    # and the caller-agent fallback all reach a member store, so a check on any
+    # one of them leaves the others open.
+    #
+    # A private member store is reachable on exactly two authorities:
+    #
+    # * the store is the caller's OWN, read from its protected execution record --
+    #   the same-store worker that is a private caller's own model. The record is
+    #   the only admissible input: `slot.agent` and `slot.memory_store` are
+    #   metadata a later write can change, and the SELECTION itself is a
+    #   caller-supplied string, so deriving authority from either lets the request
+    #   authorize itself by naming a member's agent.
+    # * the caller is the owner's own dashboard session, which is what "not
+    #   ownership-fenced" means. That is a shipped capability: an owner reopening
+    #   member conversations and dispatching member workers. It is preserved here.
+    #
+    # Refused, therefore, is every population `_caller_is_ownership_fenced`
+    # already treats as untrusted for the sessions it may reach: a cron slot, a
+    # member's DM slot naming a PEER member's agent, and anything either of them
+    # created -- the fenced caller's unfenced deputy the fence exists to catch.
+    # An app-token caller never arrives (`_require_internal` refuses it) and an
+    # app-scoped one cannot create at all, so the fence is the whole population.
+    #
+    # Fail-closed in both directions. An unbound caller has no own-store
+    # admission, so it needs the unfenced one. A fence verdict is only ever read
+    # as a REFUSAL here, so the mutable-record window the carried verdict exists
+    # to close can widen nothing: a record that stops saying "member" between the
+    # gate and this line turns a refusal into an admission the owner already has,
+    # never the reverse.
+    if child_execution.member_id is not None and not (
+        caller_execution is not None
+        and caller_execution.member_id is not None
+        and caller_execution.store == child_execution.store
+    ):
+        # Off-loop: the inline predicate reads the config record. Only reached
+        # when the carried verdict is absent, and only for a private selection,
+        # so an ordinary create pays nothing.
+        fenced = (
+            caller_fenced
+            if caller_fenced is not None
+            else await asyncio.to_thread(_caller_is_ownership_fenced, state, caller_key)
+        )
+        if fenced:
+            # The delegation refusal, in the words and under the code this surface
+            # already uses for it, so a caller sees one refusal for the whole
+            # class. Deliberately says nothing about the store, the member, or why
+            # this caller is fenced: a refusal must not confirm which member owns
+            # the agent the caller guessed at.
+            raise SessionControlError(
+                "cannot verify delegation within the caller's memory assignment",
+                code="memory_delegation_denied",
+                status=403,
+            )
 
     # SlotOrigin.USER, not SYSTEM: the visibility semantics must match an
     # ordinary session, because the point of creating it here is that the user

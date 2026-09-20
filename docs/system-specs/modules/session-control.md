@@ -261,7 +261,7 @@ that is out of bounds is visible after the fact even though nothing happened.
 | Caller's own session is no longer open | 403 | Nothing to attribute the operation to |
 | Caller changed workspace while a creation was in flight | 403 | Creation resolves the workspace's project directory off-loop, so it suspends between authorizing the caller and allocating the slot. Both decisions that read the caller's workspace -- the memory boundary the child inherits, and whether the answering agent is bound to that workspace -- are invalidated by a move, and re-deciding the binding here is not available: it needs a config load, which must not run on the event loop |
 | Named agent does not resolve to a configured one | 403 | The resolver falls back to the default agent, which passes the workspace check because it is the caller's own default -- so no boundary is crossed, but the created session would store and advertise a name that is not what answers. `ResolvedBindings.requested_resolved` states that contract for callers that store the requested name. Refused rather than rewritten to the effective agent: nothing exists yet, so a corrected name costs one retry, whereas an existing slot keeps its stored name verbatim so a momentarily stale resolution cannot permanently rebind it |
-| Private caller selects another memory store, or its protected identity is unreadable | 403 | `memory_delegation_denied`; creation checks the canonical caller identity with `require_memory_delegation` before slot allocation or protected child binding. Same-store workers remain allowed; Global callers retain member assignment |
+| Caller may not bind a child to the selected member's private store | 403 | `memory_delegation_denied`; one check, on the route every branch of agent resolution has already produced, before slot allocation. Two admissions: the store is the caller's OWN (from its protected execution record), or the caller is not ownership-fenced. Same-store workers remain allowed; Global callers retain member assignment. See "A created worker receives one execution identity" |
 | Caller changes history key, agent or memory store during creation | 400 | `caller_memory_changed`; the live caller must still match the identity checked before awaited preparation |
 | Target is the caller | 403 | A session controlling itself has no exit |
 | Target is unattended (`cron-*`, `workflow-*`) | 403 | A `workflow-<run_id>` slot is display-only and a cron's turns are driven by a schedule. Not exempted for a cron CALLER: a cron may create and drive its own children, never another job's tab |
@@ -363,10 +363,44 @@ delegation rules. Template and project choices do not select memory. The child's
 execution record is published before slot metadata, broadcast or provider startup.
 Publication failure retracts an idle empty child and reports the actual failure.
 
-Member scope is not a ban on cross-member delegation. The existing session-control
-switches, creator ownership fence, application scope and approval policy remain
-independent. Memory identity failure is explicit and never substitutes Global.
+Member scope is not itself the thing that bounds cross-member delegation — the
+authorization below is. The existing session-control switches, creator ownership
+fence, application scope and approval policy remain independent. Memory identity
+failure is explicit and never substitutes Global.
 Incognito and temporary children inherit the stricter retention mode.
+
+#### Who may bind a child to a private store
+
+Selecting an agent is a caller-supplied string, so it cannot itself authorize the
+private V2 store that agent names. `create_session` therefore authorizes the
+child's private binding ONCE, at the single point where every branch of agent
+resolution has produced its final route, and before the slot is allocated. Placing
+it per branch is what left the surface open: the explicit member selection, the
+inherited caller execution and the caller-agent fallback all reach a member store,
+so a check on one of them leaves the others.
+
+A private member store is reachable on two authorities and no others:
+
+- the store is the caller's OWN, read from its protected execution record — the
+  same-store worker. The record is the only admissible input, because `slot.agent`
+  and `slot.memory_store` are metadata a later write can change;
+- the caller is not ownership-fenced, which is the owner's own dashboard session.
+  This keeps the shipped capability: an owner reopening member conversations and
+  dispatching member workers.
+
+Everything `_caller_is_ownership_fenced` already treats as untrusted is refused
+with `memory_delegation_denied` (403): a cron slot, a member DM slot naming a PEER
+member's agent, and anything either of them created — the fenced caller's unfenced
+deputy. An app-token caller never reaches the route (`internal_secret_required`)
+and an app-scoped one cannot create at all. The refusal names neither the store nor
+the member, so it cannot confirm a guessed agent name.
+
+The verdict is the one the HTTP gate settled on the caller's verified scope,
+carried in as `caller_fenced` exactly as the other routes carry
+`precomputed_ownership_fenced`; absent, it is evaluated inline. It is only ever
+read as a REFUSAL, so a config record that stops saying "member" between admission
+and this check can turn a refusal into an admission the owner already holds, never
+the reverse.
 
 A session with native provider context cannot change members in place. An unused
 chat may select a member only with selection revision checks covering prewarming,
@@ -442,9 +476,10 @@ fence above reads the slot; a fold that builds the tree of sessions reads the cr
 #### A member-created worker can itself dispatch — the nested-conductor design
 
 Case (b) keys member identity on the STORE, and `create_session` binds a member's
-child to that member's own V2 store at birth (`_pin_private_agent_assignment`, the
-private-binding path above). So a worker the member spawned is ALSO on a member
-store, which means `_member_caller` case (b) is true for it too: with
+child to that member's own V2 store at birth (the execution record published in
+`_persist_birth`, admitted by the own-store authority above). So a worker the member
+spawned is ALSO on a member store, which means `_member_caller` case (b) is true for
+it too: with
 `agent.member_dispatch` on, a member-created worker passes the HTTP gate and
 `_member_bypass` and can `session_create` its own children — grandchildren of the
 original member — without the operator's global `session_control` switch. This is
