@@ -62,7 +62,7 @@ legacy metadata do not override a canonical execution.
 | `messaging/renderer.py` | **Layer 2b** — `Renderer` ABC, `OutputEvent`, output-kind constants + `OUTPUT_KINDS`, `chunk_text` helper, `session_provenance_tag` (stable callback affinity without exposing session keys), `apply_options_cap`/`cap_choices`/`format_overflow` (`max_buttons` enforcement), `split_options_trailer` (the ONE `[OPTIONS:]` parse — see below), and `render_options_as_text` — the whole-trailer path for a channel with no widget, which reaches the same cap with zero slots so every choice becomes a numbered line. Also `credential_redaction_notice(count)` — the one sentence a channel sends when credential redaction rewrote text it already delivered, so the reader learns a pasted command will not run. Shared so the wording cannot fork per channel and each spelling need its own audit for leaked bytes; it carries only the count, never secret bytes, and is plain text with no markup or emoji because one string ships to platforms that render different dialects (or none). `redaction_notice(cred_count, url_count)` is the by-kind superset every channel delivery surface now posts through: it delegates to `credential_redaction_notice` byte-for-byte when `url_count` is zero, and otherwise names the suspicious-URL rewrite (`security.EXFILTRATION_REDACTION_TAG_PREFIX`, counted by prefix because the tag interpolates the domain) with the URL remedy — re-check the link against a trusted source — because telling a reader whose URL was rewritten to "supply the secret" names a remedy that cannot help them. Zero/zero is a `ValueError`, never an empty message |
 | `messaging/approval.py` | Two channel-neutral approval styles behind one INTERACTIVE `decider`, both deny-by-default on timeout and keyed `session_key`+`request_id`. **Typed reply** (`TEXT_APPROVAL_TIMEOUT_S`, the verdict vocabulary, `TextReplyApprovalDecider`) for a `max_buttons=0` channel, with Trust recorded as the session's own approval policy rather than a second trust store. **Widget awaiter** (`PendingApprovals` + `SessionApprovalDecider`) for a press whose correlation id and per-prompt nonce travel a round trip this module cannot see (a Webex Adaptive Card over the device websocket); a typed answer has no nonce, a press has no free text |
 | `messaging/driver.py` `deny_all_tools` | Rejects EVERY permission request ahead of every approve path. The approval ladder cannot express "this sender is not the operator" on its own: the PreToolUse hook may answer `auto_approve` and the Trust/YOLO predicates approve and short-circuit, both BEFORE the ladder is consulted, so setting the mode to `interactive` without a decider is not sufficient. Defaults False |
-| `messaging/display_safety.py` | `strip_ansi` / `canonicalize_display` / `redact_for_display` — credential redaction against the form a platform RENDERS, not the bytes sent. Hoisted out of `slack/format.py` when the shared overflow sink began writing choice text into the parsed body on every widget channel |
+| `messaging/display_safety.py` | `strip_ansi` / `canonicalize_display` / `redact_for_display` — credential redaction against the form a platform RENDERS, not the bytes sent. Hoisted out of `slack/format.py` when the shared overflow sink began writing choice text into the parsed body on every widget channel. Plus `joins_to_a_credential` / `safe_split_offset` / `safe_resume_offset`, the other half of the same contract: a message cap that CUTS the text can sever a key the reader's client rejoins, so a caller asks these where the cut may fall — `safe_split_offset` when both pieces are being created now, `safe_resume_offset` when one side is already on screen and cannot be rewritten |
 | `messaging/markup.py` | `strip_thinking_tags` / `flatten_pipe_tables` / `flatten_mermaid_body`: Markdown reductions for a surface that renders none of the source form (a `<thinking>` block, a pipe table needing a monospace grid, a `mermaid` fence needing an image). Emits Markdown, never a channel dialect, so each channel's own inline converter finishes the job. Stdlib-only leaf |
 | `messaging/split.py` | `split_markdown_safe` — the shared fence-safe markdown splitter (stdlib-only, pure). Prefix-stable so streaming callers can send sealed chunks and keep only the last as a live buffer. `split_markdown_bytes` wraps it for a byte-capped platform, measuring the produced chunks and shrinking the character budget until they fit, with the `chunk_utf8_bytes` primitive as the floor. Also exports `iter_fence_spans`, the same fence machine viewed as character spans over a whole message |
 | `messaging/outbound_files.py` | `extract_local_refs` (+ `extract_local_refs_off_loop`) — pulls local markdown image references out of an outbound reply into `OutboundFile` payloads carrying the validated bytes, with `Rejection` reasons for everything refused. Also `iter_local_refs` / `hide_local_refs`, the text-only scan a streaming channel uses to keep the markup off live frames. Channel-neutral; the upload stays per-transport |
@@ -3050,6 +3050,68 @@ sealing frame, the overflow pushes and the late head recovery all carry the iden
 string. Identity today (`table_mode="off"`), which is why the ordering is pinned by a
 test that fakes a length-changing transform: the two orderings are indistinguishable
 until the policy changes, and then the failure is silent.
+
+**The CUT is chosen against what the reader sees, not against raw characters.**
+The cap is applied to the raw answer while the reader sees the canonical rendering
+of each bubble, so a credential the model split with markup could be severed by it:
+each bubble is scrubbed alone and matches nothing, and the client renders the markup
+away and joins the halves on screen. `_push` therefore fills a bubble up to
+`safe_cut_offset` rather than up to the cap. The predicate is derived from the
+transforms that decide it (`redact_for_display`, then `canonicalize_display`), which
+is the point: #11196 spent six review rounds on a search window built from a
+hand-written character class, and each round's fix seeded the next round's finding.
+Moving the boundary back costs nothing, because text withheld from one bubble is text
+the next one carries. `on_done` still redacts the whole remainder BEFORE splitting
+it, so within that final message every credential is already one marker when a cut
+lands.
+
+BOTH readings of a boundary are scanned, because neither contains the other.
+Canonicalising the concatenation is the wider reading for a run of delimiters, which
+concatenation can only extend; canonicalising each side and then joining is wider
+wherever canonicalising DROPS text, which is what a link does to its target — a cut
+inside a link's URL completes the link only in the concatenation, where the URL then
+collapses to the label and the key disappears from the scan, while on screen each
+half is an unfinished link whose URL text stays visible.
+
+**A continuation bubble's own start is a seam, and it is re-decided on every frame.**
+A rotation is irreversible: the sealed bubble can never be rewritten, so where it
+ends and where the replacement begins sit side by side on the reader's screen for
+good. `_roll_if_sealed` picks that offset from what the old bubble delivered, and at
+that moment the answer usually ends exactly there — nothing is severed, so there is
+no boundary to check. Text arriving AFTERWARDS is what severs it. So `_reseam` runs
+on every streaming frame and on the seal, re-deciding the seam against the answer as
+it stands; moving it back re-sends text the sealed bubble already showed, and that
+wider slice is then scanned as one string, which is what catches the key. A visible
+repeat is the only remedy left once the bubble above cannot be edited, and it is the
+failure this path already prefers to a silent hole.
+
+**The seam is graded against what the reader ALREADY HAS.** A candidate cannot be
+judged as a partition of the answer, because the head of that partition shrinks with
+the candidate while the screen above keeps everything it was shown. So
+`_roll_if_sealed` records the furthest sealed edge, never letting it regress, and
+`_reseam` asks `safe_resume_offset` with the answer up to that edge as a fixed head,
+moving only where the tail resumes. **Delivered reasoning is part of that head**, and
+is the one case where the answer edge is empty while the screen is not: WeCom shows
+reasoning only while the answer buffer is empty, so a bubble rotating in that window
+seals visible text at answer offset zero, and a head taken from the answer alone would
+be empty exactly there. `_push` records what each reasoning frame delivered — the
+redacted form, without the `<think>` wrapper the client renders away — and
+`_roll_if_sealed` folds it into the frozen head, so a credential whose head ends the
+reasoning and whose tail opens the answer is the pair the grading sees.
+The whole screen, not the bubble directly above:
+a fragment two bubbles back is still visible and can still supply a credential's
+first piece, so a seam graded against one bubble's span misses a key split three
+ways. Grading the screen as one string stays faithful by induction — every seam is
+graded this way, so no credential spans what is already shown, so redacting that head
+removes nothing and the trailing characters a new tail would join survive intact. The
+difference is reachable, not theoretical: an answer can carry a key's tail earlier
+than the seam and the key's head right at it, written as markup so the head is wide
+in raw characters and narrow once rendered. A partition check then accepts a
+moved-back offset — its own head no longer ends in the key's head — while the bubbles
+still read as the key. When no sampled resume point is safe, including the start of
+the answer, the seam goes to the answer's end and the frame delivers nothing: a tail
+that is not shown cannot join what is above it, and what is above can no longer be
+edited.
 
 **Reply length is denominated in BYTES.** `stream.content` and
 `markdown.content` are capped at 20480 UTF-8 bytes, so the transport declares

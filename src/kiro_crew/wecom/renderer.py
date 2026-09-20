@@ -28,7 +28,13 @@ import logging
 import time
 from typing import TYPE_CHECKING, Any
 
-from kiro_crew.messaging.renderer import Renderer, format_overflow, split_options_trailer
+from kiro_crew.messaging.display_safety import safe_resume_offset, safe_split_offset
+from kiro_crew.messaging.renderer import (
+    Renderer,
+    _default_redactor,
+    format_overflow,
+    split_options_trailer,
+)
 from kiro_crew.messaging.split import split_markdown_safe
 from kiro_crew.messaging.transport import TransportCapabilities
 from kiro_crew.wecom.client import WECOM_SAFE_REPLY_CHARS, new_stream_id
@@ -146,6 +152,23 @@ class WeComRenderer(Renderer):
         # rolling to a fresh bubble the continuation must send only what comes
         # after this offset — otherwise the reader sees the whole answer twice.
         self._carried = 0
+        # How far the reader's screen already reaches: the furthest edge any sealed
+        # bubble delivered to. It only grows, while the seam moves BACK, so it cannot
+        # be read off `_carried`. `_reseam` grades every later seam against the answer
+        # up to here, which is what keeps a fragment several bubbles back in view.
+        # Zero while no bubble has been sealed, which is when `_reseam` no-ops.
+        self._frozen_end = 0
+        # Reasoning a sealed bubble is still SHOWING. The answer edge above cannot
+        # stand in for it: reasoning renders only while the answer is empty, so a
+        # bubble that rotates during that window freezes visible text while leaving
+        # the answer edge at zero. Its trailing characters sit directly above the
+        # continuation's first ones, so they belong in the head every later seam is
+        # graded against.
+        self._frozen_reasoning = ""
+        # Reasoning already delivered by THIS bubble, in the redacted form the
+        # reader sees, so a rotation freezes what is on screen rather than the raw
+        # chunks.
+        self._sent_reasoning = ""
         # Absolute answer lengths carried by the last two frames put on the wire.
         # Two, not one, because a refusal is only observed on a LATER push, so the
         # newest frame is the one that may have been rejected — see
@@ -253,6 +276,10 @@ class WeComRenderer(Renderer):
         # disappeared. Whether anything is actually POSTED is decided below, by the
         # remainder, so a roll that leaves nothing to say costs no message.
         self._roll_if_sealed()
+        # A live bubble is not rotated, so ``_roll_if_sealed`` above may have left an
+        # earlier rotation's seam in place while the answer grew past it. The final
+        # frame reads the answer from that seam, so it is re-decided here too.
+        self._reseam(answer)
         remainder = answer[self._carried :]
         if not answer:
             # Routed through _send_final_chunk like any other seal, so a refusal is
@@ -531,11 +558,10 @@ class WeComRenderer(Renderer):
         substitution cannot shift ``_carried`` / ``_sent_abs``.
 
         This closes a credential that lies WITHIN one slice. A credential the cap
-        severs ACROSS two slices is not closed here: each half is scrubbed alone,
-        neither matches, and the reader's client rejoins them. That is unchanged
-        from the pre-existing behaviour -- the cap has always cut in raw
-        coordinates while the reader sees the canonical form -- and closing it
-        needs the cut itself chosen in canonical space, which is its own change.
+        would sever ACROSS two slices is closed by the cut itself: ``_push`` picks
+        the boundary with ``safe_cut_offset`` and ``_roll_if_sealed`` re-decides it
+        against the whole answer before a rotation makes it permanent, so no reader
+        is ever shown two halves that rejoin.
         """
         converted = self.render_tables_for_target(body, final=final)
         cap = self.capabilities.max_message_chars
@@ -584,7 +610,29 @@ class WeComRenderer(Renderer):
         # ``stream_had_rejection`` answers "was everything written here accepted",
         # so the conservative resume is driven by evidence rather than assumed.
         unconfirmed = sealed or self._client.stream_had_rejection(self._stream_id)
-        self._carried = self._prev_sent_abs if unconfirmed else self._sent_abs
+        resume = self._prev_sent_abs if unconfirmed else self._sent_abs
+        # A rotation is the moment a boundary becomes IRREVERSIBLE: the sealed bubble
+        # can never be rewritten, so what it shows and what the fresh bubble shows sit
+        # side by side on the reader's screen for good. The offset above was chosen
+        # against the answer as it stood when the last frame went out, so the seam it
+        # names is decided -- and re-decided on every later read -- by ``_reseam``,
+        # which is where the reasoning for moving it back lives.
+        answer = self.text()
+        # Everything the reader ALREADY HAS is what a later seam must be graded
+        # against, so record the furthest sealed edge and never let it regress. A
+        # fragment two bubbles back still sits on the screen and can still supply a
+        # credential's first piece, so grading only the bubble directly above misses
+        # it. `_carried` cannot stand in for this edge either: the seam moves BACK
+        # while the screen only grows.
+        self._frozen_end = max(self._frozen_end, min(resume, len(answer)))
+        # Reasoning the sealed bubble is still showing counts as screen too, and it
+        # is the ONLY thing on screen when a bubble rotates before any answer text
+        # arrives -- there the answer edge stays at zero, so without this the seam
+        # below would be graded against nothing.
+        self._frozen_reasoning += self._sent_reasoning
+        self._sent_reasoning = ""
+        self._carried = min(resume, len(answer))
+        self._reseam(answer)
         # Both offsets belong to the bubble being ABANDONED, and a delivery it
         # accepted says nothing about the replacement. Carrying them forward is how
         # a SECOND refusal loses text: 846605 means the req_id is unroutable, so it
@@ -602,6 +650,81 @@ class WeComRenderer(Renderer):
             "sealed by the platform" if sealed else "approaching the stream lifetime",
         )
 
+    def safe_cut_offset(self, text: str, limit: int) -> int:
+        """Where to cut *text* for a ``limit``-sized bubble without severing a key.
+
+        Paired with :meth:`redact_for_target` deliberately: that method scrubs one
+        outgoing piece, and a piece is only safe if the CUT that produced it did not
+        split a credential the reader's client will rejoin across the two bubbles.
+
+        Local to this renderer rather than on the shared :class:`Renderer`: WeCom is
+        the only channel that caps a slice through this path today, and a base-class
+        method inherited by channels that never call it would read as a guarantee
+        those channels do not have. The primitive it delegates to is shared, so a
+        second channel needing the same boundary calls :func:`safe_split_offset`
+        itself, and lifting this method up is the right move once one does.
+        """
+        return safe_split_offset(text, limit, _default_redactor)
+
+    def _reseam(self, answer: str) -> None:
+        """Re-decide where a continuation bubble starts, against *answer* as it is.
+
+        ``_carried`` is only non-zero on a bubble that CONTINUES a sealed one, and
+        then it is a seam on the reader's screen: the bubble above ends exactly
+        where this one begins, and it can never be rewritten.
+
+        :meth:`_roll_if_sealed` chose that seam against the answer as it stood at
+        rotation, and at that moment the answer usually ended right there -- so
+        nothing was severed and there was no boundary to check. Text arriving
+        AFTERWARDS is what severs it: the frozen bubble is left showing a
+        credential's first half, this bubble opens with the second, and each is
+        clean when scanned on its own. Nothing rescans the frozen one.
+
+        So the seam is re-decided every time the answer is about to be read,
+        against its current length. Moving it back re-sends text the sealed bubble
+        already showed, and that wider slice is then scanned as ONE string, which
+        is what catches the key. A visible repeat is the only remedy left once the
+        bubble above cannot be edited, and it is the failure this path already
+        prefers to a silent hole.
+
+        The candidate is graded against EVERYTHING already on the reader's screen --
+        ``answer`` up to the furthest sealed edge -- and not against
+        ``answer[:candidate]``. Those differ the moment the seam moves back, and only
+        the first is on the screen: an answer carrying a key's tail earlier than the
+        seam and the key's head right at it passes a partition check at the moved-back
+        offset while the bubbles still read as the key. The screen is taken whole, not
+        one bubble at a time, because a fragment two bubbles back is still visible and
+        can still supply a credential's first piece.
+
+        Grading the screen as ONE string is faithful by induction: every seam is
+        graded this way, so no credential spans what is already shown, so redacting
+        that head removes nothing from it and its trailing characters -- the ones a
+        new tail would join -- survive the scan intact.
+
+        The guard is the frozen head's EXISTENCE, not ``_carried``. Zero is a legal
+        answer from the search -- the seam can move back to the answer's start -- and
+        gating on ``_carried`` would let that answer switch the check off for the rest
+        of this bubble, exactly when a later markup completion could still reassemble
+        a key across the boundary.
+
+        The head also carries the reasoning a sealed bubble is still showing, which is
+        the only case where the frozen ANSWER edge is empty but the screen is not:
+        reasoning renders only while the answer is empty, so a bubble rotating in that
+        window freezes visible text at answer offset zero. Its last characters sit
+        directly above the continuation's first ones, so a credential whose head ends
+        the reasoning and whose tail opens the answer is exactly the pair this grading
+        must see. Nothing is frozen before the first rotation, and an empty head
+        completes nothing, so skipping there is right.
+        """
+        frozen = self._frozen_reasoning + answer[: self._frozen_end]
+        if frozen:
+            self._carried = safe_resume_offset(
+                frozen,
+                answer,
+                self._carried,
+                _default_redactor,
+            )
+
     async def _push(self, *, force: bool) -> None:
         if not self._stream_ok:
             return
@@ -614,6 +737,7 @@ class WeComRenderer(Renderer):
         # the full accumulated length while sending a capped frame is how a later
         # rotation came to resume past text that was never delivered.
         answer = self.text()
+        self._reseam(answer)
         body = answer[self._carried :]
         if not body and self._reasoning:
             # Reasoning shows only while the answer is still empty; once real text
@@ -635,6 +759,12 @@ class WeComRenderer(Renderer):
             # is guarded against, on the same renderer.
             reasoning = "".join(self._reasoning)
             reasoning = self.redact_for_target(reasoning)
+            # What a rotation freezes is what the bubble SHOWS, so the redacted form
+            # is recorded rather than the raw chunks. Each frame replaces the bubble
+            # with its full text, so this is an assignment, not an append. The
+            # ``<think>`` wrapper is left out: it is markup the reader never sees,
+            # and a later seam is graded on the text it joins.
+            self._sent_reasoning = reasoning
             reasoning = f"<think>{reasoning}</think>"
             self._stream_ok = await self._client.send_stream(
                 self._req_id, self._stream_id, reasoning, finish=False
@@ -643,13 +773,16 @@ class WeComRenderer(Renderer):
             return
         footer = f"🔧 正在运行：{self._tool}…" if self._tool else ""
         cap = self.capabilities.max_message_chars
-        if cap > 0 and footer:
+        if cap > 0:
             # The footer is transient decoration; the answer is the payload, so
             # the budget is spent on the answer and the footer only rides along
             # when it fits beside it.
-            body = body[: max(0, cap - len(footer) - 2)]
-        elif cap > 0:
-            body = body[:cap]
+            room = max(0, cap - len(footer) - 2) if footer else cap
+            # Cut where the READER cannot rejoin a key across the boundary, not at
+            # whatever raw character the budget happens to land on. The remainder is
+            # not lost: nothing after this offset has been delivered, so the next
+            # frame of this bubble carries it, and a rotation resumes exactly here.
+            body = body[: self.safe_cut_offset(body, room)]
         # Progress is recorded from the RAW slice, before any table conversion: the
         # offsets index ``text()``, and a converted string has a different length.
         sent_abs = self._carried + len(body)
@@ -663,4 +796,9 @@ class WeComRenderer(Renderer):
         )
         if self._stream_ok:
             self._prev_sent_abs, self._sent_abs = self._sent_abs, sent_abs
+            # This frame REPLACED the bubble, so any reasoning it was showing has
+            # left the screen and must not be frozen by a later rotation. Dropping
+            # it only on a confirmed send is what keeps the record honest: a refused
+            # frame leaves the reasoning visible.
+            self._sent_reasoning = ""
         self._last_send = now
