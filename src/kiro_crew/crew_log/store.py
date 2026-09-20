@@ -574,6 +574,21 @@ def unit_header_slot(kind: str, unit_id: str) -> "str | None":
     return slot if isinstance(slot, str) and slot else None
 
 
+def unprovable_session_units() -> int:
+    """How many session-kind units under the root have a header that cannot be proved.
+
+    A slot-keyed fold reaches its units through their headers, so a unit this
+    cannot read is a unit no fold will see; a caller that must know its fold was
+    complete asks this first.
+    """
+    try:
+        root = _checked_crew_log_root(KIND_SESSION)
+        names = sorted(child.name for child in root.iterdir())
+    except (CrewLogError, OSError):
+        return 0
+    return sum(1 for name in names if _proved_header(root / name) is None)
+
+
 #: The cached slot map, the root identity it was built from, and the children that
 #: scan could NOT prove. Replaced WHOLE, so a reader loads one reference and sees
 #: either the old triple or the new one; two threads racing rebuild it twice, which
@@ -626,16 +641,27 @@ def session_units_for_slot(slot: str) -> "tuple[str, ...]":
     """
     if not slot:
         return ()
+    return session_units_by_slot().get(slot, ())
+
+
+def session_units_by_slot() -> "dict[str, tuple[str, ...]]":
+    """Every session crew log with a provable slot-naming header, grouped by slot.
+
+    The index :func:`session_units_for_slot` looks one slot up in; a caller that
+    must look ACROSS slots (a rebuild searching every other slot's units for entries
+    naming its board) reads the whole map once instead of scanning per slot. Same
+    order within a slot, same cache, same treatment of unprovable children.
+    """
     global _slot_index
     try:
         root = _checked_crew_log_root(KIND_SESSION)
         names = sorted(child.name for child in root.iterdir())
     except (CrewLogError, OSError):
-        return ()
+        return {}
     fingerprint = _slot_root_fingerprint(root, names)
     cached = _slot_index
     if cached is not None and cached[0] == fingerprint and not _any_now_provable(root, cached[2]):
-        return cached[1].get(slot, ())
+        return cached[1]
     rows: "dict[str, list[tuple[int, str]]]" = {}
     unproven: list[str] = []
     for name in names:
@@ -667,7 +693,7 @@ def session_units_for_slot(slot: str) -> "tuple[str, ...]":
         rows.setdefault(unit_slot, []).append((order, unit_id))
     by_slot = {key: tuple(unit for _order, unit in sorted(found)) for key, found in rows.items()}
     _slot_index = (fingerprint, by_slot, tuple(unproven))
-    return by_slot.get(slot, ())
+    return by_slot
 
 
 def _any_now_provable(root: Path, unproven: "tuple[str, ...]") -> bool:

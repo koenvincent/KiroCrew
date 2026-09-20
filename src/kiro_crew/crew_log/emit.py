@@ -3154,7 +3154,12 @@ def _entry_line_fits(entry_type: str, data: dict[str, Any], *, src: str) -> bool
         "data": data,
     }
     try:
-        line = _crew_log().schema.serialize(envelope)
+        # The schema module by its own import: the package front exports names,
+        # not submodules, so reaching it as an attribute worked only after some
+        # earlier import had loaded it.
+        from kiro_crew.crew_log import schema as crew_log_schema
+
+        line = crew_log_schema.serialize(envelope)
     except _crew_log().CrewLogError:
         # Not serializable at all. The append will refuse it for the same reason,
         # with the code that names it, so this reports "does not fit" rather than
@@ -4388,6 +4393,62 @@ def ledger_entry_fits(data: dict[str, Any]) -> bool:
     consumes the budget.
     """
     return _entry_line_fits("ledger/recorded", data, src=_SRC_GATEWAY)
+
+
+def work_entry_fits(data: dict[str, Any]) -> bool:
+    """Whether a ``work/recorded`` entry carrying *data* fits one log line.
+
+    The work ledger asks this BEFORE its own store commits, with the widest
+    payload the commit can produce, so a mutation whose record could not be
+    written is refused whole and no cache byte is touched: the store's caps
+    refuse and never truncate, and this keeps that rule for the one bound the
+    store cannot see, the line limit.
+    """
+    return _entry_line_fits("work/recorded", data, src=_SRC_GATEWAY)
+
+
+def on_work_recorded(session_id: str, data: dict[str, Any], *, timeout: float = 5.0) -> bool:
+    """One work-board mutation, appended to the ACTING session's log, acknowledged.
+
+    *data* is the ``work/recorded`` payload the work ledger already validated
+    against its own caps and against the declared type. Unlike the other
+    emitters this one WAITS: it returns ``True`` once the writer has appended the
+    entry, and ``False`` when the append was refused, permanently dropped, or
+    not started within *timeout* seconds. ``False`` is final: an entry the
+    waiter gave up on is abandoned and will not land later even if the writer
+    retries the job, so the caller's answer and the record cannot diverge. An
+    append the writer had already STARTED is waited to completion, however long
+    the store takes: its outcome is then reported truthfully rather than guessed.
+    The work ledger is a projection of these entries, so its routes report
+    success only on ``True``.
+    """
+    if not session_id or not enabled():
+        return False
+    landed = threading.Event()
+    gate = threading.Lock()
+    outcome = {"ok": False, "abandoned": False}
+
+    def _job() -> None:
+        with gate:
+            # A waiter that gave up has abandoned the entry: it must not land
+            # later, or a write the caller was told failed would come back on
+            # the next rebuild. Under the gate the two outcomes cannot cross.
+            if outcome["abandoned"]:
+                return
+            log = _handle(session_id)
+            if log is None:
+                return
+            log.append("work/recorded", data, src=_SRC_GATEWAY)
+            outcome["ok"] = True
+
+    _submit(_job, "appending work/recorded", session_id, after=landed.set)
+    if landed.wait(timeout):
+        return outcome["ok"]
+    with gate:
+        if outcome["ok"]:
+            return True
+        outcome["abandoned"] = True
+    return False
 
 
 def on_session_closed(session_id: str, reason: str) -> None:

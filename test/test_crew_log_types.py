@@ -146,6 +146,19 @@ CANONICAL: dict[str, dict] = {
         "event": "folded the ledger over the crew log",
         "event_kind": "phase",
     },
+    "work/recorded": {
+        "slot": "dashboard:3",
+        "actor": "worker",
+        "by": "dashboard:9",
+        "action": "report",
+        "item_id": "it_0badc0de",
+        "status": "progress",
+        "summary": "scoped tests green, opening the PR next",
+        "artifacts": {"branch": "feat/x", "pr": "123"},
+        "pr": 123,
+        "event": "progress: scoped tests green",
+        "event_kind": "report",
+    },
 }
 
 
@@ -166,7 +179,7 @@ def test_every_type_written_today_is_declared_and_nothing_else_is():
     # The registry declares the types that HAVE a writer. A type nothing writes
     # would declare a shape no site produces, and the first emitter to land would
     # have to satisfy a contract written without it.
-    assert len(SESSION_ENTRY_TYPES) == 22
+    assert len(SESSION_ENTRY_TYPES) == 23
     # Nine types the vocabulary owns that nothing writes, and six more whose
     # emitters are not wired on this base. Declaring either kind would state a
     # shape no writer produces, and the first emitter to land would have to satisfy
@@ -224,6 +237,15 @@ def test_only_a_vocabulary_the_writer_clamps_is_enforced():
         ("turn/started", "actor"),
         ("turn/refused", "actor"),
         ("ledger/recorded", "event_kind"),
+        # The work ledger clamps every one of these before it builds the entry:
+        # the vocabularies are declared beside the type and the writer imports
+        # them, so the closed enum and the writer's refusal are one set.
+        ("work/recorded", "actor"),
+        ("work/recorded", "action"),
+        ("work/recorded", "state"),
+        ("work/recorded", "verdict"),
+        ("work/recorded", "status"),
+        ("work/recorded", "event_kind"),
     }
     emitted = set(_types_with_a_producing_site())
     assert {spec_type for spec_type, _ in closed} <= emitted

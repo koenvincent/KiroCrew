@@ -971,10 +971,38 @@ def test_acceptance_must_be_json_serialisable():
 
 def test_an_oversized_acceptance_is_refused(monkeypatch):
     wl.ensure_conductor(CONDUCTOR)
-    monkeypatch.setattr(wl, "MAX_RECORD_BYTES", 200)
+    # Above the header's own size (the header must still read back), below the blob's.
+    monkeypatch.setattr(wl, "MAX_RECORD_BYTES", 300)
     with pytest.raises(wl.WorkLedgerError) as caught:
         wl.apply_conductor_action(CONDUCTOR, "create", title="t", acceptance={"blob": "x" * 400})
     assert caught.value.code == wl.CODE_FIELD_TOO_LONG
+
+
+def test_a_record_lands_at_the_size_the_ceiling_measured(monkeypatch):
+    """The whole-file writer pins ``newline`` so the stored bytes are the measured bytes.
+
+    :func:`_write_item_locked` and :func:`_read_json_record` both reason in the
+    ``\\n`` form ``_serialize`` produced. With the default newline translation
+    Windows writes ``\\r\\n``, one byte per line more, so a record measured just
+    under ``MAX_RECORD_BYTES`` would land over it and read back as absent. POSIX
+    cannot observe that growth, so the contract is pinned at the writer's boundary.
+    """
+    calls: list[dict] = []
+    real = wl.atomic_write
+
+    def recorder(path, content, **kwargs):
+        calls.append({"path": Path(path), "content": content, "newline": kwargs.get("newline")})
+        real(path, content, **kwargs)
+
+    monkeypatch.setattr(wl, "atomic_write", recorder)
+    wl.ensure_conductor(CONDUCTOR)
+    _new_item(acceptance={"kind": "manual"})
+    records = [c for c in calls if c["path"].suffix == ".json"]
+    assert records, "no whole-file record was written"
+    for call in records:
+        assert call["newline"] == "\n", call["path"].name
+        assert "\r" not in call["content"]
+        assert call["path"].read_bytes() == call["content"].encode("utf-8")
 
 
 def test_acceptance_is_stored_verbatim_and_never_interpreted():
