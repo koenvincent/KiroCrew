@@ -68,6 +68,7 @@ minutes; handlers use generous timeouts).
 
 from __future__ import annotations
 
+import contextlib
 import datetime as dt
 import errno
 import hashlib
@@ -126,6 +127,25 @@ KIND_SESSIONS = "sessions"
 #: constant reaches the uploader on both paths, so it cannot go unread.
 _PUSH_TIMEOUT_SECS = 3600
 
+#: Wall clock allowed for the authorization that runs inside the state lock: the
+#: STS identity check is bounded by ``deploy.engine._checked``'s own 30s default,
+#: and this leaves the same again for the local consent and app-enabled reads
+#: that follow it.
+_AUTHORIZE_TIMEOUT_SECS = 60
+
+#: How long a contender waits for the state file's sidecar lock. The Layer B
+#: upload gate holds it across that authorization and the archive PUT, so the
+#: wait must outlast their sum. ``platform_compat``'s default ceiling is
+#: ``_LOCK_TIMEOUT_SECS`` (300s), sized for a sub-second read plus an atomic
+#: rename, and ``file_lock`` requires any caller that can hold the lock longer to
+#: override it -- otherwise the ceiling refuses a contender while this holder is
+#: still working rather than because it is stuck. That refusal is not cosmetic:
+#: it arrives as the ``OSError`` :func:`_record_run` absorbs, which keeps the run
+#: in memory only, so a short-lived process that exits first loses it and leaves
+#: the nightly loop due and re-uploading. Derived from the bounds it must cover
+#: so the two cannot drift apart.
+_STATE_LOCK_TIMEOUT_SECS = float(_PUSH_TIMEOUT_SECS + _AUTHORIZE_TIMEOUT_SECS)
+
 
 #: Backup state, holding the ``nightly`` bit that AUTHORIZES the unattended
 #: upload loop. ``security._CREW_SECRET_LEAVES`` carries the matching
@@ -136,6 +156,13 @@ _PUSH_TIMEOUT_SECS = 3600
 #: there. A test pins the two together, because moving this file out of that
 #: directory would silently un-protect it.
 STATE_DIR_LEAF = f"apps/{APP_NAME}/data"
+
+#: Per-account key in the state document holding the operator's Layer B decision
+#: for the sessions archive. Named here rather than spelled inline because the
+#: reader, the writer and the test that pins the default all have to agree on it,
+#: and a typo in any one of them would read as "not permitted" -- a silent OFF is
+#: the failure this constant exists to make impossible.
+SESSIONS_LAYER_B_KEY = "sessionsIncludeLayerB"
 
 
 def _state_path() -> Path:
@@ -254,6 +281,88 @@ def _read_state_for_update() -> dict[str, Any]:
     return data if isinstance(data, dict) else {}
 
 
+@contextlib.contextmanager
+def _state_lock():
+    """Hold the state file's sidecar lock.
+
+    Extracted so a reader that must not be overtaken by a writer can hold the
+    SAME lock the writer takes, rather than a second lock over the same
+    invariant -- two locks guarding one document drift, and whichever is checked
+    first wins. :func:`_locked_state_update` is its holder; the Layer B upload
+    gate in :func:`run_sessions_backup` takes only this lock's FILE half via
+    :func:`_upload_lock`, deliberately without ``_run_lock``, so an hour-long PUT
+    does not stall the ``_run_lock`` status read.
+
+    A THIRD site takes the same sidecar file lock without coming through here:
+    :func:`_delete_under_the_retention_gate` composes it with
+    :data:`_RETENTION_GATE` rather than ``_run_lock``, deliberately, so that a
+    purge does not stall the status read. It keeps ``file_lock``'s default
+    ceiling, so a sweep contending with an upload that holds this lock is
+    REFUSED rather than parked. That is the direction to fail in: the sweep
+    deletes nothing, audits as failed and the next run retries, whereas raising
+    its ceiling would hold ``_RETENTION_GATE`` for the length of an upload and
+    park :func:`set_retention_keep` -- an operator's own write -- behind it.
+
+    Reentrant per thread only as far as ``_run_lock`` is: the file lock is taken
+    on a fresh descriptor each time, so a nested acquisition inside one thread
+    would deadlock on it. Neither holder nests.
+
+    The ceiling is ``_STATE_LOCK_TIMEOUT_SECS`` rather than ``file_lock``'s
+    default, because the upload gate holds this lock across a PUT allowed an
+    hour. A ceiling shorter than the holder's real work would refuse a contender
+    that is merely waiting, and that refusal reaches :func:`_record_run` as an
+    ``OSError`` which keeps a completed upload's record in memory alone.
+    """
+    lock_path = _state_path().with_suffix(".lock")
+    _state_path().parent.mkdir(parents=True, exist_ok=True)
+    with _run_lock, open_lock_file(lock_path) as fd:
+        with file_lock(fd, exclusive=True, required=True, timeout=_STATE_LOCK_TIMEOUT_SECS):
+            yield
+
+
+@contextlib.contextmanager
+def _upload_lock():
+    """Hold ONLY the state file's sidecar lock across the Layer B upload gate.
+
+    Same sidecar file lock as :func:`_state_lock`, and deliberately NOT
+    ``_run_lock`` -- the exact shape :func:`_delete_under_the_retention_gate`
+    composes for the same reason. ``_run_lock`` also serializes
+    :func:`last_runs`, and the dashboard's backup-status read goes through it,
+    so holding it across a PUT allowed ``_PUSH_TIMEOUT_SECS`` would block every
+    account's status surface for the length of one account's upload. The status
+    read must not be overtaken by a writer, but it is not this upload's writer:
+    the invariant the upload owns is that a consent withdrawal cannot interleave
+    between its recheck and the PUT, and that is a cross-process AND cross-thread
+    ordering against the SETTER, not against the reader.
+
+    The setter (:func:`set_sessions_layer_b` -> :func:`_locked_state_update` ->
+    :func:`_state_lock`) takes this same sidecar file lock EXCLUSIVELY. The file
+    lock is per-descriptor, so an exclusive hold here blocks the setter's
+    exclusive hold and vice versa, in this process and in a second install
+    writing the same state. That is what makes a revocation land wholly before
+    this block or wholly after it. The file lock alone carries that ordering, so
+    omitting ``_run_lock`` here costs the guarantee nothing and leaves the status
+    reader free.
+
+    The ceiling is ``_STATE_LOCK_TIMEOUT_SECS`` for the reason :func:`_state_lock`
+    documents: this gate holds the lock across the authorization and a PUT
+    allowed an hour, and ``file_lock``'s default would refuse a contender that is
+    merely waiting, a refusal :func:`_record_run` absorbs by keeping a completed
+    upload's record in memory alone.
+
+    Reentrant only as far as the file lock is -- taken on a fresh descriptor each
+    time, so a nested acquisition inside one thread would deadlock. The upload
+    gate does not nest, and nothing it reaches (:func:`_authorize_upload`,
+    :func:`sessions_layer_b_enabled`, :func:`_refuse_upload`) re-enters it;
+    :func:`_record_run` runs after the block has released.
+    """
+    lock_path = _state_path().with_suffix(".lock")
+    _state_path().parent.mkdir(parents=True, exist_ok=True)
+    with open_lock_file(lock_path) as fd:
+        with file_lock(fd, exclusive=True, required=True, timeout=_STATE_LOCK_TIMEOUT_SECS):
+            yield
+
+
 def _locked_state_update(mutate) -> Any:
     """Read-modify-write the state file under the sidecar lock.
 
@@ -266,32 +375,29 @@ def _locked_state_update(mutate) -> Any:
     :func:`_read_state_for_update` for why that is not collapsed to an empty
     document here.
     """
-    lock_path = _state_path().with_suffix(".lock")
-    _state_path().parent.mkdir(parents=True, exist_ok=True)
-    with _run_lock, open_lock_file(lock_path) as fd:
-        with file_lock(fd, exclusive=True, required=True):
-            state = _read_state_for_update()
-            pending, uploads = _merge_pending(state)
-            result = mutate(state)
-            write_state(state)
-            for account, kind, record in pending:
-                _forget_unpersisted(account, kind, record)
-            with _unpersisted_lock:
-                for key, fingerprints in uploads.items():
-                    held = _unpersisted_uploads.get(key, {})
-                    held_versions = _unpersisted_versions.get(key, {})
-                    for name, fingerprint in fingerprints.items():
-                        if held.get(name) == fingerprint:
-                            held.pop(name, None)
-                            # The version is cleared with the fingerprint it arrived
-                            # with, never on its own: the persisted state now carries
-                            # both, so keeping either would be a second copy that can
-                            # go stale.
-                            held_versions.pop(name, None)
-                    if not held:
-                        _unpersisted_uploads.pop(key, None)
-                    if not held_versions:
-                        _unpersisted_versions.pop(key, None)
+    with _state_lock():
+        state = _read_state_for_update()
+        pending, uploads = _merge_pending(state)
+        result = mutate(state)
+        write_state(state)
+        for account, kind, record in pending:
+            _forget_unpersisted(account, kind, record)
+        with _unpersisted_lock:
+            for key, fingerprints in uploads.items():
+                held = _unpersisted_uploads.get(key, {})
+                held_versions = _unpersisted_versions.get(key, {})
+                for name, fingerprint in fingerprints.items():
+                    if held.get(name) == fingerprint:
+                        held.pop(name, None)
+                        # The version is cleared with the fingerprint it arrived
+                        # with, never on its own: the persisted state now carries
+                        # both, so keeping either would be a second copy that can
+                        # go stale.
+                        held_versions.pop(name, None)
+                if not held:
+                    _unpersisted_uploads.pop(key, None)
+                if not held_versions:
+                    _unpersisted_versions.pop(key, None)
     return result
 
 
@@ -1202,12 +1308,22 @@ def _record_run(
     size: int,
     fingerprint: str = "",
     version: str = "",
+    *,
     tree: str = "",
     uploaded: bool = True,
+    layer_b: bool | None = None,
 ) -> dict[str, Any]:
     with _run_lock:
         recorded = _record_run_locked(
-            account, kind, key, size, fingerprint, version, tree=tree, uploaded=uploaded
+            account,
+            kind,
+            key,
+            size,
+            fingerprint,
+            version,
+            tree=tree,
+            uploaded=uploaded,
+            layer_b=layer_b,
         )
     assert recorded is not None
     return recorded
@@ -1224,6 +1340,7 @@ def _record_run_locked(
     tree: str = "",
     uploaded: bool = True,
     expected: object = _UNCONDITIONAL_RUN_WRITE,
+    layer_b: bool | None = None,
 ) -> Optional[dict[str, Any]]:
     global _run_sequence
     _run_sequence += 1
@@ -1257,6 +1374,22 @@ def _record_run_locked(
         # READ fails, because `mutate` never runs then.
         "at": dt.datetime.now(dt.timezone.utc).isoformat(timespec="microseconds"),
     }
+    # Which layers the archive actually holds, stated rather than inferred from an
+    # absent key -- the same reason the file export sets ``layer_b_skipped``. It is
+    # a RECORD for whoever inspects the run, not an input to anything:
+    # ``restore_download`` does not read it, and two archives with the same
+    # stamped name are otherwise indistinguishable, so without this field nobody
+    # can tell whether a given archive can resume a session at full fidelity or
+    # only replay its transcript. ``None`` for a kind where the question does not
+    # arise (the snapshot), so its records keep their shape.
+    #
+    # The caller passes what it ARCHIVED, never what it was permitted to archive.
+    # A permitted run can still add no Layer B file -- see
+    # :func:`run_sessions_backup` -- and this record is written once, so a value
+    # taken from the permission would state a fidelity the object does not hold
+    # and nothing afterwards would correct it.
+    if layer_b is not None:
+        record["layer_b"] = bool(layer_b)
 
     def mutate(state: dict[str, Any]) -> Optional[dict[str, Any]]:
         entry = _account_state(state, account)
@@ -2881,27 +3014,164 @@ def _add_tree(tar: tarfile.TarFile, root: Path, arc_prefix: str) -> int:
         os.close(root_fd)
 
 
+#: The operator's standing permission for the sessions archive to carry Layer B --
+#: the byte-exact, unredacted kiro-cli context window (``<sid>.json`` +
+#: ``<sid>.jsonl`` under :func:`kiro_sessions_dir`). Default OFF, so an archive
+#: carries the crew transcript half only unless the operator has chosen otherwise.
+#:
+#: Why a gate here at all. Layer B is strictly more sensitive than the transcript
+#: it accompanies: the transcript is what was DISPLAYED, with display-time
+#: redaction applied, while Layer B is what the model actually held, unredacted.
+#: It also cannot be redacted on the way out -- the thinking blocks inside it
+#: carry a provider signature over their own content, so rewriting one invalidates
+#: the conversation -- which leaves exactly two choices, byte-exact or absent.
+#: ``dashboard.export_include_layer_b`` puts the same choice in the operator's
+#: hands for the file-export path, but this permission is deliberately NOT a
+#: ``config.json`` key like that one.
+#:
+#: WHY NOT ``config.json``. That file is writable by any auto-approved agent
+#: shell, so a permission stored there is one a prompt-injected agent can grant
+#: itself: edit the key, wait for the owner to run a sessions backup, and the
+#: unredacted context uploads with no consent -- an outcome nothing can recall,
+#: because an object already in a bucket cannot be un-sent. An authorization
+#: whose subject can write it is not an authorization. The repo's own
+#: ``CredentialPolicy.exempt_exact_hosts`` docstring states the rule: such a
+#: value is "NEVER sourced from ``config.json``". So this one lives in the app's
+#: state document, ``backup.json``, which sits inside the already-fenced
+#: :data:`STATE_DIR_LEAF` directory on the read+write keystone floor
+#: (``security._CREW_SECRET_LEAVES``) -- the same placement, and for the same
+#: reason, as the ``nightly`` bit beside it, which authorizes unattended PAID
+#: uploads. An agent can write no path in that directory, and the only writer is
+#: the owner-gated ``POST /backup/{account}/layer-b`` handler, which opens the
+#: file directly rather than through the agent tool gate, so the operator's
+#: toggle still works.
+#:
+#: PER ACCOUNT, like ``nightly`` and unlike the export key, because the risk this
+#: permission prices is the destination: the archive lands in one account's
+#: bucket, so granting it for that bucket must not grant it for another the
+#: operator adds later.
+#:
+#: Default OFF rather than ON, even though the destination is the operator's own
+#: bucket, because the bucket is not provably a single operator's: this app
+#: supports several installs writing one drive and says so
+#: (:data:`ORIGIN_UNVERIFIED` exists because "anyone who can write to the bucket
+#: can write to a name"), so a co-writer can reach an archive here. Being wrong
+#: in the OFF direction costs a restore its full-fidelity resume until the
+#: operator flips one toggle, and the run record states that it happened. Being
+#: wrong in the ON direction puts unredacted context somewhere it cannot be
+#: recalled from. Only one of those is recoverable.
+#:
+#: An unreadable state file or a non-boolean value reads as OFF, for the reason
+#: :func:`nightly_enabled` gives for the same posture: a document this function
+#: cannot understand must not widen what leaves the machine, and a backup that
+#: still runs without Layer B is better than one that fails.
+def sessions_layer_b_enabled(account: str) -> bool:
+    """Whether the operator has enabled Layer B for *account*'s sessions archive.
+
+    Default False; enable through the owner-gated
+    ``POST /api/apps/aws-control/backup/{account}/layer-b``.
+    """
+    raw = _account_view(account).get(SESSIONS_LAYER_B_KEY, False)
+    return raw if isinstance(raw, bool) else False
+
+
+def set_sessions_layer_b(account: str, enabled: bool) -> None:
+    """Record the operator's Layer B decision for *account*.
+
+    Raises ``OSError`` when the existing state could not be read, exactly as
+    :func:`set_nightly` does: a permission the caller believes it stored and the
+    next read contradicts is worse than a loud failure.
+    """
+
+    def mutate(state: dict[str, Any]) -> None:
+        _account_state(state, account)[SESSIONS_LAYER_B_KEY] = bool(enabled)
+
+    _locked_state_update(mutate)
+
+
+def _audit_layer_b_decision(account: str, layer_b: bool, *, caller: str) -> None:
+    """Record which way the Layer B decision went, at the point it is made.
+
+    The permission decides whether unredacted model context leaves the machine,
+    so an incident review asking "was Layer B in the archive that went out on
+    Tuesday" needs an answer that does not depend on the run record still being
+    on disk. Every other access decision in this module reaches the SEL through
+    :func:`_refuse_upload`, but that helper only fires on a REFUSAL -- so the
+    ALLOW direction, which is the one that ships the bytes, was the only decision
+    here leaving no event at all.
+
+    ``successful`` for both directions, because the decision itself succeeded
+    either way; which way it went is in ``resources``. Filing a withhold as
+    ``denied`` would put a configuration the operator chose in the same bucket as
+    a refused upload and devalue every real denial in the log.
+
+    Same event shape, caller threading and best-effort posture as
+    :func:`_refuse_upload`: ``caller`` is passed in so an unattended nightly run
+    is not recorded against the dashboard owner, and a failed audit must never be
+    what stops a backup.
+    """
+    try:
+        sel().log_api_access(
+            caller=caller,
+            operation="aws_control.backup_layer_b_decision",
+            outcome="successful",
+            source="aws-control",
+            resources=f"account={account} layer_b={'allowed' if layer_b else 'withheld'}"[:200],
+        )
+    except Exception:
+        logger.debug("aws-control Layer B decision audit failed", exc_info=True)
+
+
 def run_sessions_backup(
     account: str, profile: str, region: str, bucket: str, *, caller: str
 ) -> dict[str, Any]:
-    """Tar both session halves and push. Returns the run record.
+    """Tar the session halves the operator permits, and push. Returns the run record.
 
     Refuses outright on a platform that cannot pin the traversal to descriptors.
     The session directories are agent-writable and this archive is uploaded
     unattended, so a name-based walk would trade an unrecoverable outcome
     (credentials reached by a junction swapped in after the check) for a
     convenience. See :func:`_add_tree`.
+
+    The crew half (the display transcript) always rides. The kiro-cli half --
+    Layer B, the unredacted model context -- rides only on the operator's
+    standing permission (:func:`sessions_layer_b_enabled`), and the run record
+    says which way it went, so which layers an archive holds is readable from the
+    record instead of being a guess.
+
+    Raises ``RuntimeError`` when that permission is revoked while the archive is
+    being built: the bytes are discarded unuploaded and unrecorded rather than
+    shipped under a permission the operator has withdrawn.
     """
     if not _CAN_PIN_TRAVERSAL:
         raise RuntimeError(_NO_PINNING_REASON)
     identity = install_identity()
     crew_sessions = data_home() / SESSIONS_DIR_NAME
     cli_sessions = kiro_sessions_dir()
+    # Read ONCE, before the archive is opened, so a write landing mid-build cannot
+    # make the tar carry Layer B under one half of the build and omit it under the
+    # other. The record is taken from what was actually added, not from this
+    # answer, so the two cannot disagree about what is inside the archive -- which
+    # is the reading a restore would otherwise trust. A withdrawal landing in that
+    # window is caught before the upload instead, by refusing -- see the recheck
+    # below, which adds no second answer for the record to disagree with.
+    layer_b = sessions_layer_b_enabled(account)
+    _audit_layer_b_decision(account, layer_b, caller=caller)
     with tempfile.TemporaryDirectory(prefix="kc-backup-") as tmp:
         archive = Path(tmp) / f"sessions-{_stamp()}.tar.gz"
         with tarfile.open(archive, "w:gz") as tar:
             count = _add_tree(tar, crew_sessions, "crew")
-            count += _add_tree(tar, cli_sessions, "cli")
+            # Counted separately because the RECORD below must describe the
+            # archive, not the permission. A permitted run whose kiro-cli
+            # directory is absent or empty -- an ordinary state on a fresh or
+            # CLI-idle install -- adds nothing, and the crew half alone keeps
+            # `count` past the guard, so recording the permission would file a
+            # crew-only archive as carrying Layer B. Nothing corrects that
+            # afterwards: a run record is written once, and a later run with real
+            # kiro-cli files records only itself. A restore reading it would go
+            # looking for a fidelity the object does not hold.
+            layer_b_files = _add_tree(tar, cli_sessions, "cli") if layer_b else 0
+            count += layer_b_files
         if count == 0:
             raise RuntimeError("no session files to archive")
         # `volatile_root=False`: this archive's roots are `crew` and `cli`, which are
@@ -2929,22 +3199,84 @@ def run_sessions_backup(
                 account,
             )
         key = f"{KIND_SUBPATHS[KIND_SESSIONS]}/{identity['id']}/{archive.name}"
-        # The gate sits IMMEDIATELY before the archive PUT with nothing in
-        # between -- no other network call, no second upload -- so the decision
-        # that authorizes these bytes cannot go stale before they leave. The
-        # label's own PUT takes its own authorization inside `_publish_label`,
-        # which is why it can safely run afterwards.
-        _authorize_upload(account, profile, region, caller=caller, payload_kind=KIND_SESSIONS)
-        version = storage.put_file(
-            profile,
-            region,
-            bucket,
-            "backup",
-            key,
-            str(archive),
-            account=account,
-            timeout=_PUSH_TIMEOUT_SECS,
-        )
+        # A WITHDRAWAL landing during the build must not ship. The permission is
+        # read once at the top so one answer decides the whole tar, and that
+        # invariant is deliberate -- but it leaves a window: enabled at the
+        # read, withdrawn while the tar is written, and these bytes upload under a
+        # permission the operator has withdrawn. Re-reading and REFUSING closes it
+        # without breaking the invariant, because nothing is uploaded and nothing
+        # is recorded, so there is no record to disagree with anything. Rebuilding
+        # without Layer B instead would be the torn state the read-once rule
+        # exists to prevent.
+        #
+        # Taken BEFORE `_authorize_upload`, so the whole decision-to-upload span is
+        # one critical section. Acquiring it after authorization put a blocking
+        # wait between the consent check and `put_file`: a concurrent account's
+        # backup can hold this lock across its own upload, and consent withdrawn
+        # during that wait was never re-read, because the recheck below covers
+        # Layer B only. `_authorize_upload` states the invariant this restores --
+        # no check is separated from the upload by another blocking call.
+        #
+        # `_upload_lock`, not `_state_lock`: the sidecar FILE lock alone, without
+        # `_run_lock`. The setter (`set_sessions_layer_b` -> `_locked_state_update`
+        # -> `_state_lock`) takes this same file lock exclusively, so an exclusive
+        # hold here still orders a revocation wholly before or wholly after this
+        # block, in this process and in a second install writing the same state --
+        # the guarantee this gate exists for is untouched. `_run_lock` ALSO
+        # serializes `last_runs`, which the dashboard's backup-status read goes
+        # through, so holding it across a PUT allowed `_PUSH_TIMEOUT_SECS` would
+        # stall every account's status surface for one account's upload -- which is
+        # why this block does not take it. Same shape, and same reason, as
+        # `_delete_under_the_retention_gate`: it composes the sidecar file lock with
+        # a dedicated gate rather than `_run_lock`, so a purge does not stall the
+        # status read either.
+        #
+        # Nothing inside the block re-enters this lock: `_authorize_upload` reaches
+        # only `aws_consent`, `is_app_enabled`, an STS call and `_refuse_upload`,
+        # and the run record is written after the block. `_record_run` takes
+        # `_run_lock`, which this block does not hold, so it cannot deadlock and
+        # -- because the status read shares only `_run_lock` -- it runs
+        # concurrently with the upload. The retention sweep takes the same FILE
+        # lock under `_RETENTION_GATE`, but it runs after this block has released,
+        # not inside it.
+        #
+        # The cost is that a same-account revocation and the nightly loop wait for
+        # the in-flight upload, bounded by `_PUSH_TIMEOUT_SECS`. A revocation that
+        # appears slow is the price of one that cannot be overtaken, and the
+        # exposure it prevents has no recovery. `_record_run` and every status read
+        # do not wait: they take only `_run_lock`, which this block does not hold.
+        with _upload_lock():
+            # The live checks: the connection still points at this account, the app
+            # is still enabled, and consent still stands. Inside the lock so none of
+            # them can go stale between here and the upload.
+            _authorize_upload(account, profile, region, caller=caller, payload_kind=KIND_SESSIONS)
+            # Only the withdrawn direction refuses. A grant landing mid-build leaves
+            # an archive without Layer B, which is the withholding default and needs
+            # no refusal -- the next run picks the grant up.
+            #
+            # Through `_refuse_upload` rather than a bare raise, so the refusal lands
+            # in the SEL beside every other refused upload. A withdrawn permission is
+            # exactly the denial an incident review looks for, and one refusal path
+            # that leaves no record would make the audited ones look complete. It
+            # takes no state lock itself, so it is safe to reach from in here.
+            if layer_b and not sessions_layer_b_enabled(account):
+                _refuse_upload(
+                    account,
+                    "the Layer B permission was withdrawn while this archive was being"
+                    " built, so it was not uploaded; start the backup again to store"
+                    " the transcript half",
+                    caller=caller,
+                )
+            version = storage.put_file(
+                profile,
+                region,
+                bucket,
+                "backup",
+                key,
+                str(archive),
+                account=account,
+                timeout=_PUSH_TIMEOUT_SECS,
+            )
         record = _record_run(
             account,
             KIND_SESSIONS,
@@ -2953,6 +3285,7 @@ def run_sessions_backup(
             _body_fingerprint(archive),
             version,
             tree=tree,
+            layer_b=layer_b_files > 0,
         )
         # After the archive and after the ledger write, and with its own
         # authorization: a caption must never delay or endanger the payload.
