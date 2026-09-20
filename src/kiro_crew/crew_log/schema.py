@@ -121,6 +121,11 @@ TYPE_OWNERSHIP: dict[str, frozenset[str]] = {
             # entries, so this domain is what makes the session ledger a
             # projection of the crew log rather than a second document beside it.
             "ledger",
+            # The Issue Radar crew ledger. ``issue_radar_crew_record`` appends one
+            # ``radar/recorded`` entry per call into the crew's own session log and
+            # every reader folds those entries, which is what makes that ledger a
+            # projection of the crew log rather than a store of its own.
+            "radar",
             "write",
         }
     ),

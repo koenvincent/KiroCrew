@@ -603,7 +603,7 @@ def _slot_root_fingerprint(root: Path, names: "list[str]") -> "tuple[Any, ...]":
     return (str(root), stat.st_dev, stat.st_ino, stat.st_mtime_ns, tuple(names))
 
 
-def session_units_for_slot(slot: str) -> "tuple[str, ...]":
+def session_units_for_slot(slot: str, *, strict: bool = False) -> "tuple[str, ...]":
     """Every session crew log whose HEADER names *slot*, oldest unit first.
 
     The slot-keyed read path. A slot owns one ACP session id AT A TIME rather than
@@ -631,6 +631,12 @@ def session_units_for_slot(slot: str) -> "tuple[str, ...]":
         root = _checked_crew_log_root(KIND_SESSION)
         names = sorted(child.name for child in root.iterdir())
     except (CrewLogError, OSError):
+        # No store, or one that could not be scanned. A read takes the empty listing;
+        # a caller that would VALIDATE against the listing passes ``strict`` and gets
+        # the failure instead, because an empty listing taken for a scan that failed
+        # would let it validate against a record that is not there.
+        if strict:
+            raise
         return ()
     fingerprint = _slot_root_fingerprint(root, names)
     cached = _slot_index
