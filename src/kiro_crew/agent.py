@@ -1308,6 +1308,40 @@ def managed_mcp_spec_entry(name: str) -> dict[str, Any] | None:
         return None
     if not _mcp_server_emission_eligible(name, spec):
         return None
+    return _resolve_managed_mcp_entry(name, spec)
+
+
+def managed_mcp_granted_entry(name: str) -> dict[str, Any] | None:
+    """The entry a spec that already GRANTS *name* is expected to carry.
+
+    :func:`managed_mcp_spec_entry` answers "would a fresh build emit this?", and
+    so says ``None`` for every ``opt_in`` server -- correct for a writer, because
+    an assignable set is granted by a spec and never minted. This answers a
+    different question for a reader that has ALREADY found the grant in a spec:
+    what command and args must that entry name to be Crew's own process? Two
+    readers ask it, and both hand out the session's identity on the answer --
+    :func:`kiro_crew.acp.session_mcp.kiro_control_plane_servers` re-emits the
+    element with the session token on the kiro backend, and gatewayd's
+    control-plane check decides which pooled backend receives the per-frame
+    token. Every managed server reads the session's tool policy through
+    ``mcp_shared`` and therefore needs that attestation; an opt-in one that was
+    granted but never handed identity comes up present-but-unusable, refusing
+    every call as ``identity_unattested``.
+
+    ``opt_in`` does not disqualify here; a closed ``spec_gate`` still does, and
+    an unmanaged name is still ``None``. Same resolution and the same
+    never-raises contract as :func:`managed_mcp_spec_entry`.
+    """
+    spec = _MANAGED_MCP_SERVERS.get(name)
+    if not isinstance(spec, dict):
+        return None
+    if not _mcp_spec_gate_open(name, spec):
+        return None
+    return _resolve_managed_mcp_entry(name, spec)
+
+
+def _resolve_managed_mcp_entry(name: str, spec: dict[str, Any]) -> dict[str, Any] | None:
+    """Resolve *spec*'s invocation into a kiro-spec ``mcpServers`` entry, or ``None``."""
     try:
         if "invocation_fn" in spec:
             cmd, args = spec["invocation_fn"]()

@@ -1517,10 +1517,61 @@ def test_the_token_is_attached_per_backend_never_to_the_base_caller() -> None:
 
 def test_control_plane_set_mirrors_session_mcp() -> None:
     """gatewayd names the set itself so the daemon does not import
-    ``kiro_crew.agent`` at boot; this pin is what stops the two copies drifting."""
-    from kiro_crew.acp.session_mcp import CONTROL_PLANE_SERVERS
+    ``kiro_crew.agent`` at boot; this pin is what stops the two copies drifting.
+    The set is every managed Crew server, not only the two always-on control
+    planes: an opt-in server routed through the pool needs the per-frame token
+    as much as ``kirocrew-core`` does, or its every call refuses as
+    ``identity_unattested``."""
+    from kiro_crew.acp.session_mcp import CONTROL_PLANE_SERVERS, IDENTITY_BOUND_SERVERS
+    from kiro_crew.mcp_cleanup import OPT_IN_BIN_MCP_SERVERS
 
-    assert gw.CONTROL_PLANE_BACKENDS == frozenset(CONTROL_PLANE_SERVERS)
+    assert gw.CONTROL_PLANE_BACKENDS == frozenset(IDENTITY_BOUND_SERVERS)
+    assert frozenset(CONTROL_PLANE_SERVERS) < gw.CONTROL_PLANE_BACKENDS
+    assert frozenset(OPT_IN_BIN_MCP_SERVERS) <= gw.CONTROL_PLANE_BACKENDS
+
+
+class TestGrantedOptInBackend:
+    """An opt-in Crew server (``kirocrew-dashboard``) reaches the pool only because
+    a spec granted it. Its identity is decided the same way as the control
+    plane's -- binary and args against the managed invocation -- but the writer's
+    resolver refuses to answer for an opt-in name by design, so the check must
+    read the GRANTED form or every routed dashboard backend is denied the token."""
+
+    @pytest.fixture
+    def launcher(self, tmp_path: Path) -> Path:
+        path = tmp_path / "kirocrew"
+        path.write_text("#!/bin/sh\n")
+        return path
+
+    def test_the_real_granted_entry_is_recognised_as_ours(self) -> None:
+        """No patching: whatever this install resolves for ``kirocrew-dashboard``
+        must be recognised, or the widened set hands over nothing."""
+        from kiro_crew.agent import managed_mcp_granted_entry, managed_mcp_spec_entry
+
+        assert managed_mcp_spec_entry("kirocrew-dashboard") is None, "opt-in: never minted"
+        entry = managed_mcp_granted_entry("kirocrew-dashboard")
+        assert entry is not None and entry["args"] == ["mcp-dashboard"]
+        assert gw._spawns_own_control_plane(
+            "kirocrew-dashboard", entry["command"], entry["args"], env={}
+        )
+
+    def test_a_foreign_binary_under_the_opt_in_name_is_denied(
+        self, launcher: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import kiro_crew.agent as agent_mod
+
+        monkeypatch.setattr(
+            agent_mod,
+            "managed_mcp_granted_entry",
+            lambda name: {"command": str(launcher), "args": ["mcp-dashboard"]},
+        )
+        other = tmp_path / "evil"
+        other.write_text("#!/bin/sh\n")
+        assert not gw._spawns_own_control_plane("kirocrew-dashboard", str(other), ["mcp-dashboard"])
+        assert not gw._spawns_own_control_plane("kirocrew-dashboard", str(launcher), ["mcp-core"])
+        assert gw._spawns_own_control_plane(
+            "kirocrew-dashboard", str(launcher), ["mcp-dashboard"], env={}
+        )
 
 
 class TestSpawnsOwnControlPlane:
@@ -1536,7 +1587,7 @@ class TestSpawnsOwnControlPlane:
 
         monkeypatch.setattr(
             agent_mod,
-            "managed_mcp_spec_entry",
+            "managed_mcp_granted_entry",
             lambda name: dict(entry) if name == "kirocrew-core" else None,
         )
         return entry
@@ -1605,7 +1656,7 @@ class TestSpawnsOwnControlPlane:
             caplog.clear()
             import kiro_crew.agent as agent_mod
 
-            monkeypatch.setattr(agent_mod, "managed_mcp_spec_entry", lambda name: None)
+            monkeypatch.setattr(agent_mod, "managed_mcp_granted_entry", lambda name: None)
             assert not gw._spawns_own_control_plane(
                 "kirocrew-core", managed["command"], ["mcp-core"]
             )
@@ -1620,7 +1671,7 @@ class TestSpawnsOwnControlPlane:
     ) -> None:
         import kiro_crew.agent as agent_mod
 
-        monkeypatch.setattr(agent_mod, "managed_mcp_spec_entry", lambda name: None)
+        monkeypatch.setattr(agent_mod, "managed_mcp_granted_entry", lambda name: None)
         assert not gw._spawns_own_control_plane("kirocrew-core", managed["command"], ["mcp-core"])
 
     def test_the_real_managed_entry_matches_itself(self) -> None:
@@ -1785,7 +1836,7 @@ class TestModuleFormShadowing:
 
         monkeypatch.setattr(
             agent_mod,
-            "managed_mcp_spec_entry",
+            "managed_mcp_granted_entry",
             lambda name: dict(entry) if name == "kirocrew-cron" else None,
         )
         return entry
@@ -2001,11 +2052,11 @@ class TestModuleFormShadowing:
         entry = {"command": sys.executable, "args": ["-P", "-s", "-m", "kiro_crew", self.SUB]}
         import kiro_crew.agent as agent_mod
 
-        monkeypatch.setattr(agent_mod, "managed_mcp_spec_entry", lambda name: dict(entry))
+        monkeypatch.setattr(agent_mod, "managed_mcp_granted_entry", lambda name: dict(entry))
         (tmp_path / "kiro_crew").mkdir()
         (tmp_path / "kiro_crew" / "__init__.py").write_text("")
         assert not self._ours(entry, env={}, work_dir=tmp_path)
         assert not self._ours(entry, env={"PYTHONPATH": str(tmp_path)}, work_dir=tmp_path)
         isolated = {"command": sys.executable, "args": ["-I", "-m", "kiro_crew", self.SUB]}
-        monkeypatch.setattr(agent_mod, "managed_mcp_spec_entry", lambda name: dict(isolated))
+        monkeypatch.setattr(agent_mod, "managed_mcp_granted_entry", lambda name: dict(isolated))
         assert not self._ours(isolated, env={"PYTHONPATH": str(tmp_path)}, work_dir=tmp_path)

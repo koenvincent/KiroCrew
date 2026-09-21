@@ -406,7 +406,7 @@ async def test_kiro_unpooled_control_plane_receives_session_token(cfg, monkeypat
     monkeypatch.setattr(session_mcp, "_agent_spec_for", lambda *a, **k: spec)
     monkeypatch.setattr(session_mcp, "_global_settings", lambda **kwargs: {})
     monkeypatch.setattr(session_mcp, "_registry_mode", lambda: False)
-    monkeypatch.setattr(session_mcp, "managed_mcp_spec_entry", lambda name: entry)
+    monkeypatch.setattr(session_mcp, "managed_mcp_granted_entry", lambda name: entry)
     monkeypatch.setattr(session_handle, "_MCP_DRAIN_NO_REPORT_CEILING", 0)
     runtime, _, _ = _make_runtime()
     runtime._can_load_session = True
@@ -441,7 +441,7 @@ async def test_projected_skill_search_receives_the_shared_sessions_identity(cfg,
     monkeypatch.setattr(session_mcp, "_agent_spec_for", lambda *a, **k: {"tools": []})
     monkeypatch.setattr(session_mcp, "_global_settings", lambda **kw: {})
     monkeypatch.setattr(session_mcp, "_registry_mode", lambda: False)
-    monkeypatch.setattr(session_mcp, "managed_mcp_spec_entry", lambda name: entry)
+    monkeypatch.setattr(session_mcp, "managed_mcp_granted_entry", lambda name: entry)
     runtime, _, _ = _make_runtime()
     runtime._native_skill_projection = NativeSkillProjection(
         {"custom": "alias"}, {"custom": spec}, search_agents={"custom"}
@@ -485,7 +485,7 @@ def test_kiro_identity_projection_preserves_native_restrictions(tmp_path, monkey
     monkeypatch.setattr(session_mcp, "_agent_spec_for", lambda *a, **k: spec)
     monkeypatch.setattr(session_mcp, "_global_settings", lambda **kwargs: settings)
     monkeypatch.setattr(session_mcp, "_registry_mode", lambda: restriction == "registry")
-    monkeypatch.setattr(session_mcp, "managed_mcp_spec_entry", lambda name: managed)
+    monkeypatch.setattr(session_mcp, "managed_mcp_granted_entry", lambda name: managed)
     assert (
         session_mcp.kiro_control_plane_servers(
             "kirocrew",
@@ -494,6 +494,114 @@ def test_kiro_identity_projection_preserves_native_restrictions(tmp_path, monkey
         )
         == []
     )
+
+
+@pytest.mark.parametrize("server", ["kirocrew-dashboard", "kirocrew-work", "kirocrew-crew-log"])
+def test_kiro_identity_projection_covers_a_granted_opt_in_server(tmp_path, monkeypatch, server):
+    """The reported defect: a spec that grants ``@kirocrew-dashboard`` on the kiro
+    backend mounted the server straight from the spec, with no session-valued
+    environment, so its every ``tools/call`` refused as ``identity_unattested``.
+    The identity projection must re-emit the granted opt-in element exactly as it
+    does the control plane's, so the token attach that follows reaches it."""
+    from kiro_crew.acp import session_mcp
+
+    sub = {"kirocrew-dashboard": "mcp-dashboard", "kirocrew-work": "mcp-work"}.get(
+        server, "mcp-crew-log"
+    )
+    managed = {"command": "test-crew", "args": [sub]}
+    spec = {
+        "tools": ["@kirocrew-core", f"@{server}"],
+        "mcpServers": {
+            "kirocrew-core": {"command": "test-crew", "args": ["mcp-core"]},
+            server: dict(managed),
+        },
+    }
+    monkeypatch.setattr(session_mcp, "_agent_spec_for", lambda *a, **k: spec)
+    monkeypatch.setattr(session_mcp, "_global_settings", lambda **kwargs: {})
+    monkeypatch.setattr(session_mcp, "_registry_mode", lambda: False)
+    monkeypatch.setattr(
+        session_mcp,
+        "managed_mcp_granted_entry",
+        lambda name: dict(spec["mcpServers"][name]) if name in spec["mcpServers"] else None,
+    )
+    elements = session_mcp.kiro_control_plane_servers("kirocrew", work_dir=tmp_path)
+    names = [e["name"] for e in elements]
+    assert names == ["kirocrew-core", server], names
+    granted = next(e for e in elements if e["name"] == server)
+    assert granted["command"] == "test-crew" and granted["args"] == [sub]
+
+
+def test_kiro_identity_projection_leaves_an_ungranted_opt_in_server_out(tmp_path, monkeypatch):
+    """Widening the set must not widen the GRANT: a spec whose ``tools`` does not
+    name the opt-in server gets no element for it, exactly as kiro-cli mounts
+    nothing the allowlist does not reference."""
+    from kiro_crew.acp import session_mcp
+
+    spec = {
+        "tools": ["@kirocrew-core"],
+        "mcpServers": {
+            "kirocrew-core": {"command": "test-crew", "args": ["mcp-core"]},
+            "kirocrew-dashboard": {"command": "test-crew", "args": ["mcp-dashboard"]},
+        },
+    }
+    monkeypatch.setattr(session_mcp, "_agent_spec_for", lambda *a, **k: spec)
+    monkeypatch.setattr(session_mcp, "_global_settings", lambda **kwargs: {})
+    monkeypatch.setattr(session_mcp, "_registry_mode", lambda: False)
+    monkeypatch.setattr(
+        session_mcp,
+        "managed_mcp_granted_entry",
+        lambda name: dict(spec["mcpServers"][name]) if name in spec["mcpServers"] else None,
+    )
+    elements = session_mcp.kiro_control_plane_servers("kirocrew", work_dir=tmp_path)
+    assert [e["name"] for e in elements] == ["kirocrew-core"]
+
+
+def test_identity_bound_set_is_every_managed_server():
+    """Derived, not enumerated: a managed server added later is identity-bound by
+    construction, the two always-on control planes are a strict subset, and they
+    LEAD in their own order -- a session granting only those two emits exactly the
+    elements, in exactly the order, it emitted before the set widened."""
+    from kiro_crew.acp.session_mcp import CONTROL_PLANE_SERVERS, IDENTITY_BOUND_SERVERS
+    from kiro_crew.mcp_cleanup import KIROCREW_BIN_MCP_SERVERS
+
+    assert set(IDENTITY_BOUND_SERVERS) == set(KIROCREW_BIN_MCP_SERVERS)
+    assert len(IDENTITY_BOUND_SERVERS) == len(set(IDENTITY_BOUND_SERVERS))
+    assert IDENTITY_BOUND_SERVERS[: len(CONTROL_PLANE_SERVERS)] == CONTROL_PLANE_SERVERS
+
+
+class TestManagedMcpGrantedEntry:
+    """``managed_mcp_granted_entry`` answers for a GRANTED opt-in server where the
+    writer's ``managed_mcp_spec_entry`` refuses by design; both still refuse an
+    unmanaged name, and the closed spec gate still wins for the gated server."""
+
+    def test_opt_in_servers_resolve_only_through_the_granted_form(self):
+        from kiro_crew.agent import managed_mcp_granted_entry, managed_mcp_spec_entry
+        from kiro_crew.mcp_cleanup import OPT_IN_BIN_MCP_SERVERS
+
+        for name in OPT_IN_BIN_MCP_SERVERS:
+            assert managed_mcp_spec_entry(name) is None
+            entry = managed_mcp_granted_entry(name)
+            assert entry is not None and entry["command"], name
+            assert entry["args"] == [name.replace("kirocrew-", "mcp-")]
+
+    def test_the_two_forms_agree_on_the_control_plane(self):
+        from kiro_crew.acp.session_mcp import CONTROL_PLANE_SERVERS
+        from kiro_crew.agent import managed_mcp_granted_entry, managed_mcp_spec_entry
+
+        for name in CONTROL_PLANE_SERVERS:
+            assert managed_mcp_granted_entry(name) == managed_mcp_spec_entry(name)
+
+    def test_an_unmanaged_name_is_none(self):
+        from kiro_crew.agent import managed_mcp_granted_entry
+
+        assert managed_mcp_granted_entry("echo-mcp") is None
+
+    def test_a_closed_spec_gate_still_withholds(self, monkeypatch):
+        from kiro_crew import agent
+
+        monkeypatch.setattr(agent, "_mcp_spec_gate_open", lambda name, spec: False)
+        assert agent.managed_mcp_granted_entry("kirocrew-computer") is None
+        assert agent.managed_mcp_granted_entry("kirocrew-dashboard") is None
 
 
 @pytest.mark.parametrize("scope", ["global", "project"])
@@ -531,7 +639,7 @@ def test_kiro_identity_projection_fails_closed_on_settings_errors(
     monkeypatch.setattr(agent, "_KIRO_MCP_JSON", global_path)
     monkeypatch.setattr(session_mcp, "_agent_spec_for", lambda *a, **k: spec)
     monkeypatch.setattr(session_mcp, "_registry_mode", lambda: False)
-    monkeypatch.setattr(session_mcp, "managed_mcp_spec_entry", lambda name: managed)
+    monkeypatch.setattr(session_mcp, "managed_mcp_granted_entry", lambda name: managed)
     if failure == "refused":
         monkeypatch.setattr(hooks, "validate_file_path", lambda raw: None)
     elif failure == "oversized":
@@ -593,7 +701,7 @@ def test_the_control_plane_element_env_matches_the_spec_writing_consumer(tmp_pat
     monkeypatch.setattr(session_mcp, "_agent_spec_for", lambda *a, **k: spec)
     monkeypatch.setattr(session_mcp, "_global_settings", lambda **kwargs: {})
     monkeypatch.setattr(session_mcp, "_registry_mode", lambda: False)
-    monkeypatch.setattr(session_mcp, "managed_mcp_spec_entry", lambda name: dict(managed))
+    monkeypatch.setattr(session_mcp, "managed_mcp_granted_entry", lambda name: dict(managed))
 
     elements = session_mcp.kiro_control_plane_servers("an-agent", work_dir=None)
 

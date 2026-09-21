@@ -66,6 +66,7 @@ from kiro_crew.executors import (
 from kiro_crew.mcp_caller import CallerContext
 from kiro_crew.mcp_caller import _parent_pid as _ppid_fn
 from kiro_crew.mcp_caller import new_tenant_nonce
+from kiro_crew.mcp_cleanup import KIROCREW_BIN_MCP_SERVERS
 from kiro_crew.mcp_gateway import credwatch, hazards, socketsec, tool_surface, transport
 from kiro_crew.mcp_gateway.admission import (
     DEFAULT_CAPACITY,
@@ -147,12 +148,19 @@ from kiro_crew.sel import SecurityEventLog
 
 logger = logging.getLogger(__name__)
 
-#: Kiro Crew's own pooled control planes: the only backends handed the
-#: per-session token, because only they post back to the gateway for the
-#: session they act on behalf of. Mirrors ``acp.session_mcp.CONTROL_PLANE_SERVERS``
-#: rather than importing it (that module pulls ``kiro_crew.agent`` onto the
-#: daemon's boot path); a ratchet test pins the two equal.
-CONTROL_PLANE_BACKENDS = frozenset({"kirocrew-core", "kirocrew-cron"})
+#: Kiro Crew's own pooled backends handed the per-session token: every managed
+#: Crew server, because each reads the session's tool policy through
+#: ``mcp_shared`` and posts back to the gateway for the session it acts on
+#: behalf of, and the gateway reads a declared session key only behind that
+#: attestation. Not only the two always-on control planes: an opt-in server
+#: (``kirocrew-dashboard``) that is routed here but denied the token comes up
+#: present-but-unusable, refusing every call as ``identity_unattested``. Read
+#: from :mod:`kiro_crew.mcp_cleanup`, a leaf that imports nothing heavier than
+#: ``config.paths`` (``kiro_crew.agent`` stays off the daemon's boot path); a
+#: ratchet test pins it equal to ``acp.session_mcp.IDENTITY_BOUND_SERVERS``.
+#: The name is only a CLAIM until :func:`_spawns_own_control_plane` verifies the
+#: spawned binary and args against the managed invocation.
+CONTROL_PLANE_BACKENDS = frozenset(KIROCREW_BIN_MCP_SERVERS)
 
 # Python treats its environment namespace as an extensible interpreter control
 # surface. A prefix rule fails closed when a later Python release adds another
@@ -208,10 +216,12 @@ def _spawns_own_control_plane(
     if server_name not in CONTROL_PLANE_BACKENDS:
         return False
     # Lazy: ``kiro_crew.agent`` is not on the daemon's boot path and this runs
-    # once per spawn, not per call.
-    from kiro_crew.agent import managed_mcp_spec_entry
+    # once per spawn, not per call. The GRANTED form: an opt-in server reaches
+    # this pool only because some spec granted it, and ``managed_mcp_spec_entry``
+    # would answer ``None`` for it by design (a writer never mints a grant).
+    from kiro_crew.agent import managed_mcp_granted_entry
 
-    expected = managed_mcp_spec_entry(server_name)
+    expected = managed_mcp_granted_entry(server_name)
     if not expected:
         return _deny_control_plane(server_name, "no managed spec entry resolves for this name")
     expected_command = str(expected.get("command") or "")
@@ -250,7 +260,7 @@ def _deny_control_plane(server_name: str, reason: str) -> bool:
     """Record why a reserved-name backend gets no session token; always False."""
     logger.warning(
         "mcp-gateway: backend %r spawned under a control-plane name but is denied the "
-        "session token: %s; its kirocrew-core/kirocrew-cron tools will answer 403",
+        "session token: %s; its tools will answer 403",
         server_name,
         reason,
     )
