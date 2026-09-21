@@ -35,6 +35,8 @@ Missing history must never silently turn a private topic into Global memory.
 | `src/kiro_crew/config/prompt-orchestrator.md` | The orchestrator prompt that names `select_crew` and the delegation rule |
 | `src/kiro_crew/dashboard/handlers/agents.py` | Crew CRUD on `/api/agents`, and the roster row serializer |
 | `src/kiro_crew/dashboard/handlers/agent_catalog.py` | Read-only `/api/agents/catalog` execution choices, with separate member and template namespaces |
+| `src/kiro_crew/dashboard/handlers/agent_templates.py` | The Agent templates tab's roster (`/api/agents/templates`), create, delete with reference guard, and the read-only rule the detail PATCH applies to definition edits |
+| `website/src/pages/overview/AgentTemplatesTab.tsx` | The **Agent templates** tab of `CapabilitiesPage`: list by origin, edit the shared definition, create, delete, chat-with / enroll |
 | `src/kiro_crew/dashboard/handlers/members.py` | `/api/members` roster, thread get-or-create, rules, activity |
 | `website/src/pages/KiroCrewAgentsPage.tsx` | The Crews UI, mounted as the **Crews** tab of `CapabilitiesPage` (Agent Capabilities) |
 | `website/src/components/crew/crewEditorSections.ts` | The crew editor's pane registry, including the Routing pane that edits `triggers` |
@@ -90,6 +92,81 @@ projection exposes it, so a same-name member and template are distinct sessions.
 member DM thread's pin covers the namespace too: the same name picked as a template
 is refused like any other re-bind (`409 member_thread_agent_pinned`).
 Request and error contract: [learn-cron-dashboard](learn-cron-dashboard.md) → Chat.
+
+## Agent templates tab
+
+The Template pane inside a crew editor edits that crew's PRIVATE copy of a
+template (blueprint semantics, below). The **Agent templates** tab under Agent
+Capabilities is the other half: it manages the shared templates themselves,
+the files under `~/.kiro/agents/` a chat or a crewmate runs.
+
+`GET /api/agents/templates` returns every global discovery row with two
+additions. `read_only` is `null` for a template the user owns, or names why it
+cannot be edited or deleted here: `package` (the package rewrites the file on
+its next install), `runtime` (`OWNED_KIRO_AGENT_FILES`, refreshed by the
+runtime), `markdown` (a JSON round-trip would lose fields), `private_copy`
+(it belongs to one crew's pane, where reset and publish keep its lineage
+straight). `used_by` lists what still points at the template — each crew whose
+`kiro_agent` resolves it, the default agent, each schedule whose `agent_id`
+names it, each chat folder whose `default_agent` pins it (what every new
+session filed there starts on), each webhook token whose `agent` pins it (its
+calls are refused once the agent is gone), each private copy forked from it —
+and is the same list the delete guard evaluates, so the tab shows before a
+delete what a refusal would say. The folder pins are snapshotted from the
+dashboard's folder store on the event loop (`state.read_folders`) before the
+roster is built in the discovery executor. An open chat slot that picked the
+template (`agent_kind: "template"`) is deliberately NOT a reference: a slot is
+a conversation on screen, not a configuration that redirects future work, and
+a guard whose answer depended on which tabs are open in which window could not
+be reasoned about from the roster — the decision and its consequence are
+stated in the module docstring of `handlers/agent_templates.py`.
+
+The delete guard serializes with the stores it can: the config lock (held for
+the whole handler) covers crew bindings, the default agent and the fork
+sidecar, whose writers hold it too; the final reference check runs INSIDE the
+folder store's lock (`state.read_folders`) together with the unlink, so a
+folder pinned between the check and the unlink is impossible — the pin waits
+for the lock and then finds the template gone, which the folder editor already
+reports as an orphan. Schedules and webhook tokens are read at check time;
+their writers hold neither lock.
+
+The tab groups rows as Mine / Private copies / From packages / Built-in
+(`lib/templateSource.ts`), lets an owned template's description, model,
+prompt, tools and auto-approved tools be edited as one draft saved through the
+detail PATCH (the definition keys are refused on a read-only spec, `409
+template_read_only`; each tool entry is capped at `MAX_TEMPLATE_TOOL_CHARS`),
+and edits skills through the same `AgentSkillsEditor` the crew pane uses.
+Skills save on their own and are NOT part of the draft: the editor invalidates
+the `['agent-templates']` prefix, which the detail query shares, so the editor
+reseeds from a refetch only while the draft is clean — a dirty draft is never
+overwritten by a background refetch. The read-only rule for a PATCH is decided
+from the targeted FILE (its name and declared `name`, classified the way
+discovery classifies a row, plus the fork sidecar), never by looking the
+declared name up in the deduplicated roster: `atlas.json` beside
+`SomePkg-atlas.json` keeps only the package twin there, and a lookup would let
+the package file through as if it were the plain one. Resources and MCP
+servers are shown read-only: skills are a computed view over `resources`, and
+an MCP server is a capability grant with its own admission path. Auto-approval
+marks are advisory: the governance sanitizer still withholds an entry the
+ceiling may speak to. A read-only template's banner carries the reason once
+and **Duplicate to edit** beside it; creating (`POST /api/agents/templates`,
+blank or a lineage-free copy of any installed template) refuses a name an
+installed spec or a crew binding already resolves, and answers `409
+ambiguous_template_name` when two files declare the name. The detail header
+holds two controls — **Chat with this template** and an overflow menu (enroll,
+duplicate, delete); **Chat with this template** creates a slot with
+`agent_kind: "template"` (its title says it is a one-off chat that creates
+nothing, or, while the draft is dirty, why it is disabled); **Enroll as
+crewmate** is the ordinary `POST /api/agents` with the template as
+`kiro_agent`, and its menu row says what it starts (a crewmate with its own
+memory, nothing running). The unsaved-changes bar names how many crewmates a
+save affects and that saving needs no restart while the page header's **Apply
+& Restart** only relaunches sessions already running. A rejected detail read
+renders its `ErrorNotice` ahead of the loading state (the draft stays null on a
+rejection, so a draft-gated loading branch would mask the error); MCP server
+rows render only string-valued `url` / `command` / `type` fields, since a spec
+is a hand-editable file. The skills editor carries its own heading, so the tab
+adds none over it. Nothing on this tab enrols a member as a side effect.
 
 ## Owner-reviewed capability inheritance
 
@@ -514,6 +591,8 @@ name, and it resolves an empty crew too so the concrete template stays inside
 | Test | What it holds |
 |---|---|
 | `test/test_agent_execution_catalog.py` | Read-only catalog, same-name member/template choices, requesting-project isolation, private-template exclusion and explicit discovery failure |
+| `test/test_agent_templates_endpoint.py` | Templates roster marks editability and references (crews, default, schedules, chat-folder pins, webhook pins, private copies); create writes a minimal runnable spec or a lineage-free copy and refuses taken, bound, reserved, ambiguous and malformed names; delete refuses read-only and referenced templates (listing the references), reads folder pins inside the store lock rather than from a snapshot, and removes an unreferenced one; the detail PATCH writes the definition keys on an owned template, refuses them on a package one, classifies the targeted file rather than its name, and validates their shape |
+| `website/src/test/AgentTemplatesTab.test.tsx` | Grouping by origin, the two-control action row with its overflow menu (enroll hint, Delete vs Duplicate-to-edit by editability), the definition save through the detail PATCH, the dirty-draft guard on row switch and on a background refetch, a rejected detail read rendering its error rather than Loading, string-only MCP fields from a hand-edited spec, one Skills heading, the referenced-delete dialog (including a chat-folder row), blank vs `from` create, and chat-with in the template namespace |
 | `test/test_chat_agent_kind.py` | `agent_kind` on slot create and switch: template picks skip the member store pin, an unresolvable stated kind is `409 agent_choice_unavailable` refused before any slot is minted, an unknown kind is `400 invalid_agent_kind`, a member thread refuses the same-name template kind, the slot projection carries the committed kind |
 | `test/test_open_slots_persistence.py` (`test_restore_carries_the_agent_selection_namespace`) | A template-picked slot restores as a template pick; an unknown persisted kind reads as name-only |
 | `test/test_select_crew.py` | Roster excludes the default crew and every triggerless crew, carries `default_agent` plus guidance; a named crew returns its bindings; an unknown name returns `error` plus `available`; the schema accepts spaces and dots in a crew name |

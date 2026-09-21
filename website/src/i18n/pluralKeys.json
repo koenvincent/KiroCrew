@@ -199,5 +199,12 @@
   "pages.webhooksPage.switched_off_credentials_kept",
   "pages.worldsPage.agent",
   "pages.worldsPage.slot",
-  "utils.toolCallTitle.and_more"
+  "utils.toolCallTitle.and_more",
+  "pages.overview.agentTemplatesTab.cannot_delete_body",
+  "pages.overview.agentTemplatesTab.runs_as_crewmates",
+  "pages.overview.agentTemplatesTab.schedules_count",
+  "pages.overview.agentTemplatesTab.private_copies_count",
+  "pages.overview.agentTemplatesTab.crewmates_count",
+  "pages.overview.agentTemplatesTab.affects_crewmates",
+  "pages.overview.agentTemplatesTab.chars_count"
 ]

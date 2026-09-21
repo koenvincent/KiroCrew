@@ -930,6 +930,9 @@ _EXPECTED_CALL_SITE_LABELS: dict[str, list[tuple[str, str]]] = {
         ("steering_resources", "unknown"),
     ],
     "kiro_crew/cron_script.py": [("cron_resolve_mcp_server", "cron")],
+    # The templates tab's read-only rule for a definition PATCH reads the spec
+    # file the PATCH targets, so it labels itself as that PATCH.
+    "kiro_crew/dashboard/handlers/agent_templates.py": [("api_agent_detail", "dashboard")],
     "kiro_crew/dashboard/handlers/agents.py": [
         ("api_agent_detail", "dashboard"),
         ("api_agent_detail", "dashboard"),
