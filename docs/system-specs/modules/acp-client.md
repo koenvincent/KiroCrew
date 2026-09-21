@@ -54,7 +54,13 @@ This overlay also affects standalone native custom agents in that workspace.
 The [Kiro CLI 2.10 release notes](https://kiro.dev/changelog/cli/2-10/)
 document this setting and agent-config hot reload. No documented per-invocation
 settings channel was found; changing `KIRO_HOME` would also relocate native
-identity and session state, so it is not used for this overlay.
+identity and session state, so it is not used for this overlay. Every in-product
+workspace `cli.json` writer—projection, effort, Tool Search, and the built-in
+review pool—takes the same verified `.kirocrew-cli-settings.lock` sidecar and
+reads the file only after acquiring it. Projection holds that lock from the
+fresh read through alias publication and settings commit, so a concurrent writer
+cannot be replaced by a stale pre-enumeration snapshot. Lock identity changes or
+a two-second acquisition timeout fail closed without writing the settings file.
 Crew records the original local inheritance key's presence and value in
 `kirocrew.skillDiscovery.previousInheritance`. Rollback restores that snapshot
 only while the native key still equals Crew's asserted `true`, removes Crew's
@@ -62,8 +68,49 @@ overlay markers and preserves unrelated settings and a native key that the
 operator changed or removed. Older overlays use their recorded local/global
 source and boolean preference for restoration. Stop projected sessions before
 rollback so another active Crew process cannot reassert the shared overlay.
-Aliases remain on disk: automatic pruning cannot safely identify obsolete views
-owned by other workspaces or still used by active native processes.
+Inactive aliases owned by the same Crew data home are pruned only when the
+recorded work directory or authored source proves that the pair cannot be
+regenerated. Projected agent JSON contains only fields accepted by Kiro's strict
+schema; lifecycle ownership lives in the non-spec
+`.kirocrew-skill-projection-metadata` directory. Each sidecar records the alias's
+exact byte digest, so a stale or replaced sidecar cannot authorize deletion of a
+different spec. Review-head aliases that carried lifecycle fields in-spec are
+recognized only as a migration fallback and are replaced by clean specs on their
+next projection. On Windows, untrusted metadata paths must resolve to a classified
+local volume with no linked ancestor or linked leaf before any existence probe;
+remote, unclassifiable, or linked paths retain the alias without triggering a
+network lookup. Each live projection publishes one bounded lease in the non-spec
+`.kirocrew-skill-projection-leases` directory as TWO files: a `.json` record
+naming its aliases, which is never locked, and a `.hold` sidecar that carries the
+lock for the projection object's lifetime and is never read. The split is
+required, not stylistic: Windows file locks are MANDATORY, so a lock on byte 0 of
+the record makes a reader's parse fail with a lock violation from any other
+handle, including one in the same process. Pruning always runs while the current
+projection holds its own lease, so a single-file lease turned every liveness
+probe into the uncertainty answer and reclaimed nothing on Windows while passing
+on POSIX, where locks are advisory. Finalization releases the lock and removes
+both identity-verified sidecars. Pruning reads each record without any lock and
+tests its `.hold` with a non-blocking exclusive acquisition: a held lease keeps
+every alias it names, while an unlocked one is crash/finalizer residue and both
+files are identity-checked and reclaimed. An unreadable, malformed, linked,
+replaced, or otherwise uncertain lease keeps the alias. OS lock release makes a
+crashed process's lease stale without trusting a PID.
+
+Alias publication and pruning share one cross-process lock sidecar in the native
+agents directory, with a two-second acquisition ceiling instead of the platform
+lock's general five-minute ceiling. A sidecar that is a symlink or junction,
+changes identity while opened or acquired, or is otherwise unverifiable is
+treated as lock failure. Removal revalidates the candidate's identity, bytes,
+digest-bound ownership sidecar, and source staleness under that lock immediately before
+unlinking it. POSIX uses descriptor-relative identity-checked deletion; Windows
+uses the same global publisher lock plus a final no-link identity check before
+its by-name unlink. An unknown platform without either contract retains the
+stale alias. A changed, unreadable, oversized, or otherwise uncertain candidate
+remains on disk. If the lock cannot be opened or acquired, preparation retains
+every alias and the current settings file byte-for-byte, then falls back to the
+authored native agent rather than risking a stale-snapshot overwrite or blocking
+startup. Active, foreign-home, unmarked, malformed, unreadable, oversized or
+otherwise uncertain alias files remain on disk.
 
 Windows runtime teardown records the reaped return code after the owned-handle
 drain, before dropping the process reference, just as POSIX teardown does. The

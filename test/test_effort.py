@@ -5,6 +5,8 @@ from __future__ import annotations
 
 import json
 import logging
+from contextlib import contextmanager
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -18,6 +20,7 @@ from kiro_crew.effort import (
     model_supports_effort,
     resolve_effort_for_model,
 )
+from kiro_crew.providers import acp as acp_provider
 from kiro_crew.providers.acp import (
     _clear_cli_overlay_effort,
     _read_cli_overlay,
@@ -201,6 +204,58 @@ class TestCliOverlay:
     def test_clear_missing_file_noop(self, tmp_path):
         _clear_cli_overlay_effort(tmp_path, "claude-opus-4.7")  # must not raise
         assert _read_cli_overlay(tmp_path) == {}
+
+    def test_clear_reports_success_only_when_the_file_stops_naming_the_model(self, tmp_path):
+        # The postcondition is about the FILE, so an absent file and an absent
+        # entry are both successes -- there is nothing left to re-seed from.
+        assert _clear_cli_overlay_effort(tmp_path, "claude-opus-4.7") is True
+        _write_cli_overlay(tmp_path, "claude-opus-4.7", "max")
+        assert _clear_cli_overlay_effort(tmp_path, "claude-opus-4.7") is True
+        assert _read_cli_overlay(tmp_path) == {}
+
+    def test_clear_separates_a_malformed_file_from_a_failed_read(self, tmp_path, monkeypatch):
+        # Two very different facts share one code path. A malformed file names no
+        # effort for anyone and `_read_cli_overlay` reads it as {} too, so the
+        # postcondition already holds. A read that fails while the file EXISTS
+        # and the lock is held is transient IO, and the level may still be on
+        # disk -- reporting a clear there is the silent stale reload this return
+        # value exists to prevent.
+        settings_dir = tmp_path / ".kiro" / "settings"
+        settings_dir.mkdir(parents=True)
+        (settings_dir / "cli.json").write_text("{ not json", encoding="utf-8")
+        assert _clear_cli_overlay_effort(tmp_path, "claude-opus-4.7") is True
+
+        _write_cli_overlay(tmp_path, "claude-opus-4.7", "max")
+        real_read_text = Path.read_text
+
+        def _flaky_read(self, *args, **kwargs):
+            if self.name == "cli.json":
+                raise OSError("sharing violation")
+            return real_read_text(self, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "read_text", _flaky_read)
+        assert _clear_cli_overlay_effort(tmp_path, "claude-opus-4.7") is False
+        monkeypatch.undo()
+        assert _read_cli_overlay(tmp_path) == {"claude-opus-4.7": "max"}
+
+    def test_clear_reports_failure_when_the_shared_settings_lock_is_busy(self, tmp_path, monkeypatch):
+        # The shared lock has a startup-bounded ceiling, and the native skill
+        # projection holds it from its settings read through every alias and
+        # ownership write to the settings commit, so losing it is a
+        # designed-for outcome rather than a freak event. The
+        # level stays on disk, and provider construction re-seeds from there --
+        # so answering True would promise a clear the next spawn undoes.
+        _write_cli_overlay(tmp_path, "claude-opus-4.7", "max")
+
+        @contextmanager
+        def _busy(_work_dir):
+            raise OSError("lock busy")
+            yield  # pragma: no cover - unreachable, keeps the generator shape
+
+        monkeypatch.setattr(acp_provider, "workspace_cli_settings_lock", _busy)
+        assert _clear_cli_overlay_effort(tmp_path, "claude-opus-4.7") is False
+        monkeypatch.undo()
+        assert _read_cli_overlay(tmp_path) == {"claude-opus-4.7": "max"}
 
     def test_gpt_write_uses_reasoning_key_and_roundtrips(self, tmp_path):
         # kiro-cli persists GPT effort under `reasoning`, not `output_config`;

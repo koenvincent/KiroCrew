@@ -89,6 +89,7 @@ from kiro_crew.providers.base import (
 )
 from kiro_crew.providers.cleanup import _is_safe_path
 from kiro_crew.recovery.ladder import InfraError
+from kiro_crew.workspace_cli_settings import workspace_cli_settings_lock
 
 logger = logging.getLogger(__name__)
 
@@ -108,40 +109,38 @@ def _write_cli_overlay(work_dir: Path, model: str, effort: str) -> None:
 
         {"chat.modelDefaults": {"<model>": {"<key>": {"effort": "<level>"}}}}
     """
-    settings_dir = work_dir / ".kiro" / "settings"
-    settings_dir.mkdir(parents=True, exist_ok=True)
-    cli_json = settings_dir / "cli.json"
-    try:
-        existing = json.loads(cli_json.read_text(encoding="utf-8")) if cli_json.exists() else {}
-    except (json.JSONDecodeError, OSError):
-        existing = {}
-    if not isinstance(existing, dict):
-        existing = {}
-    model_defaults = existing.get("chat.modelDefaults")
-    if not isinstance(model_defaults, dict):
-        model_defaults = {}
-    model_cfg = model_defaults.get(model)
-    if not isinstance(model_cfg, dict):
-        model_cfg = {}
-    key = effort_settings_key(model)
-    effort_cfg = model_cfg.get(key)
-    if not isinstance(effort_cfg, dict):
-        effort_cfg = {}
-    effort_cfg["effort"] = effort
-    model_cfg[key] = effort_cfg
-    # Recovery checks output_config first, so leaving effort under both family
-    # keys can resurrect a stale value after restart.
-    other_key = "reasoning" if key == "output_config" else "output_config"
-    other_effort_cfg = model_cfg.get(other_key)
-    if isinstance(other_effort_cfg, dict) and "effort" in other_effort_cfg:
-        other_effort_cfg.pop("effort")
-        if not other_effort_cfg:
-            model_cfg.pop(other_key, None)
-    model_defaults[model] = model_cfg
-    existing["chat.modelDefaults"] = model_defaults
-    atomic_write(
-        cli_json, json.dumps(existing, indent=2)
-    )  # atomic: readers never see a partial file
+    with workspace_cli_settings_lock(work_dir) as cli_json:
+        try:
+            existing = json.loads(cli_json.read_text(encoding="utf-8")) if cli_json.exists() else {}
+        except (json.JSONDecodeError, OSError):
+            existing = {}
+        if not isinstance(existing, dict):
+            existing = {}
+        model_defaults = existing.get("chat.modelDefaults")
+        if not isinstance(model_defaults, dict):
+            model_defaults = {}
+        model_cfg = model_defaults.get(model)
+        if not isinstance(model_cfg, dict):
+            model_cfg = {}
+        key = effort_settings_key(model)
+        effort_cfg = model_cfg.get(key)
+        if not isinstance(effort_cfg, dict):
+            effort_cfg = {}
+        effort_cfg["effort"] = effort
+        model_cfg[key] = effort_cfg
+        # Recovery checks output_config first, so leaving effort under both family
+        # keys can resurrect a stale value after restart.
+        other_key = "reasoning" if key == "output_config" else "output_config"
+        other_effort_cfg = model_cfg.get(other_key)
+        if isinstance(other_effort_cfg, dict) and "effort" in other_effort_cfg:
+            other_effort_cfg.pop("effort")
+            if not other_effort_cfg:
+                model_cfg.pop(other_key, None)
+        model_defaults[model] = model_cfg
+        existing["chat.modelDefaults"] = model_defaults
+        atomic_write(
+            cli_json, json.dumps(existing, indent=2)
+        )  # atomic: readers never see a partial file
 
 
 # The thresholds and their clamps live in ``agent_sdk.tool_search`` so the
@@ -194,64 +193,84 @@ def _write_tool_search_overlay(
     (e.g. ``"chat.modelDefaults"``), so the Tool Search keys are written flat to
     match.
     """
-    settings_dir = work_dir / ".kiro" / "settings"
-    settings_dir.mkdir(parents=True, exist_ok=True)
-    cli_json = settings_dir / "cli.json"
-    try:
-        existing = json.loads(cli_json.read_text(encoding="utf-8")) if cli_json.exists() else {}
-    except (json.JSONDecodeError, OSError):
-        existing = {}
-    if not isinstance(existing, dict):
-        existing = {}
-    existing["toolSearch.enabled"] = bool(enabled)
-    if enabled:
-        existing["toolSearch.minPct"] = _clamp_min_pct(min_pct)
-        existing["toolSearch.minTokens"] = _clamp_min_tokens(min_tokens)
-    else:
-        # Drop the thresholds when disabling so nothing is left behind that
-        # would take effect if a later build flips the global default on.
-        existing.pop("toolSearch.minPct", None)
-        existing.pop("toolSearch.minTokens", None)
-    atomic_write(
-        cli_json, json.dumps(existing, indent=2)
-    )  # atomic: readers never see a partial file
+    with workspace_cli_settings_lock(work_dir) as cli_json:
+        try:
+            existing = json.loads(cli_json.read_text(encoding="utf-8")) if cli_json.exists() else {}
+        except (json.JSONDecodeError, OSError):
+            existing = {}
+        if not isinstance(existing, dict):
+            existing = {}
+        existing["toolSearch.enabled"] = bool(enabled)
+        if enabled:
+            existing["toolSearch.minPct"] = _clamp_min_pct(min_pct)
+            existing["toolSearch.minTokens"] = _clamp_min_tokens(min_tokens)
+        else:
+            # Drop the thresholds when disabling so nothing is left behind that
+            # would take effect if a later build flips the global default on.
+            existing.pop("toolSearch.minPct", None)
+            existing.pop("toolSearch.minTokens", None)
+        atomic_write(
+            cli_json, json.dumps(existing, indent=2)
+        )  # atomic: readers never see a partial file
 
 
-def _clear_cli_overlay_effort(work_dir: Path, model: str) -> None:
+def _clear_cli_overlay_effort(work_dir: Path, model: str) -> bool:
     """Remove the effort entry for *model* from the workspace cli.json overlay.
 
     Merge-safe: leaves other models' settings intact and drops now-empty
     containers. No-op when the file or entry is absent.
+
+    Returns whether the overlay holds no effort for *model* once this returns.
+    False means the shared settings lock could not be taken inside its
+    startup-bounded ceiling, so the file STILL holds the level: a caller that
+    reports a clear on that answer is wrong twice over, because construction
+    re-seeds ``_effort_per_model`` from this file (see ``_read_cli_overlay``), so
+    the very respawn a clear asks for re-applies the level it just cleared. Every
+    other exit is a success: an absent file, an absent entry and a removed entry
+    all satisfy the postcondition.
     """
-    cli_json = work_dir / ".kiro" / "settings" / "cli.json"
-    if not cli_json.exists():
-        return
     try:
-        data = json.loads(cli_json.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError):
-        return
-    if not isinstance(data, dict):
-        return
-    model_defaults = data.get("chat.modelDefaults")
-    if not isinstance(model_defaults, dict):
-        return
-    model_cfg = model_defaults.get(model)
-    if isinstance(model_cfg, dict):
-        # Clear whichever sub-key holds effort. Sweep both known shapes so a
-        # model whose family key changed (or an overlay written by an older
-        # build) is fully cleaned up, not just the current-family key.
-        for key in ("output_config", "reasoning"):
-            effort_cfg = model_cfg.get(key)
-            if isinstance(effort_cfg, dict):
-                effort_cfg.pop("effort", None)
-                if not effort_cfg:
-                    model_cfg.pop(key, None)
-        if not model_cfg:
-            model_defaults.pop(model, None)
-    try:
-        atomic_write(cli_json, json.dumps(data, indent=2))  # atomic
+        with workspace_cli_settings_lock(work_dir) as cli_json:
+            if not cli_json.exists():
+                return True
+            try:
+                data = json.loads(cli_json.read_text(encoding="utf-8"))
+            except json.JSONDecodeError:
+                # A malformed file names no effort for any model, and
+                # ``_read_cli_overlay`` reads it as ``{}`` too, so a respawn
+                # re-seeds nothing. The postcondition already holds.
+                return True
+            except OSError:
+                # The file EXISTS and this call holds the lock, so a read that
+                # fails here is transient IO (a Windows sharing violation, say),
+                # NOT an absent entry: the level may well still be on disk.
+                # Reporting success would be the silent stale reload this
+                # function's own return value exists to prevent.
+                logger.debug("ACP effort overlay read failed", exc_info=True)
+                return False
+            if not isinstance(data, dict):
+                return True
+            model_defaults = data.get("chat.modelDefaults")
+            if not isinstance(model_defaults, dict):
+                return True
+            model_cfg = model_defaults.get(model)
+            if isinstance(model_cfg, dict):
+                # Clear whichever sub-key holds effort. Sweep both known shapes so a
+                # model whose family key changed (or an overlay written by an older
+                # build) is fully cleaned up, not just the current-family key.
+                for key in ("output_config", "reasoning"):
+                    effort_cfg = model_cfg.get(key)
+                    if isinstance(effort_cfg, dict):
+                        effort_cfg.pop("effort", None)
+                        if not effort_cfg:
+                            model_cfg.pop(key, None)
+                if not model_cfg:
+                    model_defaults.pop(model, None)
+            atomic_write(cli_json, json.dumps(data, indent=2))  # atomic
     except OSError:
         logger.debug("ACP effort overlay clear failed", exc_info=True)
+        return False
+    return True
 
 
 def _read_cli_overlay(work_dir: Path) -> dict[str, str]:
@@ -1589,7 +1608,17 @@ class AcpProvider(LLMProvider):
             if _prev is None:
                 self._effort_per_model.pop(model, None)
                 if self._client.backend in ACP_BACKENDS_KIRO_SLASH_COMMANDS:
-                    _clear_cli_overlay_effort(self._client._work_dir, model)
+                    if not _clear_cli_overlay_effort(self._client._work_dir, model):
+                        # The overlay keeps a level the live push never applied,
+                        # and construction re-seeds from it, so the next spawn
+                        # adopts a level this rollback reports as undone.
+                        self._effort_per_model[model] = level
+                        logger.warning(
+                            "ACP effort rollback left the overlay set (model=%s effort=%s): "
+                            "the workspace overlay lock was busy, so a respawn adopts it",
+                            model,
+                            level,
+                        )
             else:
                 self._effort_per_model[model] = _prev
                 self._apply_effort_overlay()
@@ -1630,7 +1659,7 @@ class AcpProvider(LLMProvider):
         model = self._client._model
         if not model_supports_effort(model):
             return False
-        self._effort_per_model.pop(model, None)
+        cleared = self._effort_per_model.pop(model, None)
         if self._client.backend not in ACP_BACKENDS_KIRO_SLASH_COMMANDS:
             # No live "reset to default" — caller must reset the session. Scoped
             # by membership so a harness that reads neither the overlay nor the
@@ -1650,7 +1679,22 @@ class AcpProvider(LLMProvider):
             return True
         # No default to push live — clear the overlay and let the caller reset
         # so kiro respawns at the model's built-in default.
-        _clear_cli_overlay_effort(self._client._work_dir, model)
+        if not _clear_cli_overlay_effort(self._client._work_dir, model):
+            # The file still names this model. Construction re-seeds
+            # _effort_per_model from it, so the reset this False asks for would
+            # re-apply the level just cleared. Put the entry back so Crew's own
+            # view equals the file a respawn will read, and say so: reporting a
+            # clear the file does not hold is what makes the level's return
+            # silent.
+            if cleared is not None:
+                self._effort_per_model[model] = cleared
+            logger.warning(
+                "ACP effort NOT cleared (model=%s): the workspace overlay lock was "
+                "busy, so the file still holds it and a respawn re-applies it; "
+                "clear again once the concurrent writer finishes",
+                model,
+            )
+            return False
         logger.info("ACP effort cleared (kiro); session reset needed for built-in default")
         return False
 

@@ -660,6 +660,20 @@ class TestEffortControl:
         provider._client.send_command.assert_not_awaited()
 
     @pytest.mark.asyncio
+    async def test_kiro_clear_effort_keeps_the_entry_when_the_overlay_lock_is_busy(self):
+        # The overlay still names the model, and provider construction re-seeds
+        # _effort_per_model from that file, so the session reset this False asks
+        # for re-applies the level. Dropping the entry anyway would make Crew's
+        # own view disagree with the file and hide that from the next clear.
+        provider = self._effort_provider(backend="", model="claude-opus-4.7")
+        provider._effort_per_model = {"claude-opus-4.7": "high"}
+        with patch("kiro_crew.providers.acp._clear_cli_overlay_effort", return_value=False):
+            ok = await provider.clear_effort()
+        assert ok is False
+        assert provider._effort_per_model["claude-opus-4.7"] == "high"
+        provider._client.send_command.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_claude_clear_effort_returns_false_for_reset(self):
         # claude-agent-acp has no "reset to default" config value, so clearing
         # must return False to trigger a session reset; it must NOT push.
