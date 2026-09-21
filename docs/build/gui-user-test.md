@@ -145,8 +145,8 @@ answered from any run page without opening the YAML.
 - `user_story` is one sentence of at most 300 characters, in the user's voice: `As a
   <who>, I want <what>, so that <why>`, or a plain use case when the persona adds
   nothing. Say what the user is trying to achieve, not which control they press --
-  that is what `steps` are for. The shipped scenarios all start with `As a`, and the
-  unit tests hold them to it.
+  that is what `steps` are for. The shipped scenarios all start with `As a` or `As an`
+  (the article follows the persona's noun), and the unit tests hold them to it.
 - `docs_url` is optional: an `https://` URL or a repo path under `docs/` ending in
   `.md` (an anchor is allowed). It becomes the **Docs** link in `features.md`.
 
@@ -170,6 +170,16 @@ on demand (below) before merging.
 `boot.sh` seeds one home per run from `GUI_SEED` (default `rich`) with `GUI_MEMBERS`
 (default `nova-sky`); a scenario's `preconditions.seed` / `members` document what it
 needs and must agree with that boot, because the target is booted once per run.
+
+Because one seed serves every scenario, a surface that needs content gets it from the
+`rich` fixture itself rather than from a second seed: `rich` ships the three saved
+artifacts of the `artifacts-library` fixture (`release-checklist`, a widget on its
+second version; `pagination-design`, markdown; `queue-badge`, svg) so the Artifacts
+scenario reads a populated library, and the one crew on the Agents tab is the member
+`boot.sh` adds. Surfaces the seed cannot populate deterministically are read in their
+empty state instead -- the MCP Servers table (no `mcp.json` in the seeded home or the
+isolated agent home) -- or through content the gateway itself installs at boot, such as
+the packaged built-in skills the Skills tab lists.
 
 The home is a `mktemp` directory, so no scenario can spell its path. Where a flow needs
 the tester to TYPE a path -- the Knowledge "Add Source > Local Folder" form, whose
