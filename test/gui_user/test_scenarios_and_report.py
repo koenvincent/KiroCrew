@@ -25,13 +25,18 @@ KNOWLEDGE_NOTES_DIR = (
 SHIPPED_SMOKE = {
     "apps-discover-enable-research-lab",
     "auth-sign-in-card-signed-out",
+    "chat-activity-side-panel-toggle",
+    "chat-session-title",
+    "chat-sessions-page",
     "chat-switch-seeded-sessions",
+    "chat-turn-stats-footer",
     "schedule-list-calendar-executions-views",
     "search-everywhere-jump-to-setting",
     "sessions-new-chat",
     "settings-search-jump-to-theme",
     "settings-theme-toggle",
     "sidebar-folders-and-older-sessions",
+    "sidebar-rail-collapse-expand",
 }
 SHIPPED = SHIPPED_SMOKE | {
     "knowledge-add-folder-source-and-scan",
@@ -49,12 +54,14 @@ class TestShippedScenarios:
         smoke = scenarios.select(scenarios.load_all(SCENARIOS_DIR), tier="smoke")
         assert {s.name for s in smoke} == SHIPPED_SMOKE
         # A smoke scenario is a core path in a handful of actions; the tier's bill is
-        # bounded by the scenarios' own limits, which the nightly tier then inherits.
+        # the sum of the scenarios' own limits, which the nightly tier then inherits.
+        # The totals are pinned, not bounded, so a new smoke scenario moves them on
+        # purpose and the cost note in docs/build/gui-user-test.md is re-read with them.
         for s in smoke:
             assert len(s.steps) <= 5, s.name
             assert s.max_steps <= 14, s.name
-        assert sum(s.max_steps for s in smoke) <= 120
-        assert sum(s.max_seconds for s in smoke) <= 3000
+        assert sum(s.max_steps for s in smoke) == 150
+        assert sum(s.max_seconds for s in smoke) == 3960
 
     def test_nightly_includes_smoke(self) -> None:
         nightly = scenarios.select(scenarios.load_all(SCENARIOS_DIR), tier="nightly")
@@ -107,8 +114,18 @@ class TestShippedScenarios:
     def test_shipped_scenarios_group_by_feature(self) -> None:
         groups = scenarios.by_feature(scenarios.load_all(SCENARIOS_DIR))
         assert {slug: [s.name for s in g] for slug, g in groups.items()} == {
-            "chat": ["chat-switch-seeded-sessions", "sessions-new-chat"],
-            "sidebar": ["sidebar-folders-and-older-sessions"],
+            "chat": [
+                "chat-session-title",
+                "chat-switch-seeded-sessions",
+                "chat-turn-stats-footer",
+                "sessions-new-chat",
+            ],
+            "side-panel": ["chat-activity-side-panel-toggle"],
+            "sidebar": [
+                "chat-sessions-page",
+                "sidebar-folders-and-older-sessions",
+                "sidebar-rail-collapse-expand",
+            ],
             "search": ["search-everywhere-jump-to-setting"],
             "members": ["members-dm-hello", "members-private-memory-keeps-thread"],
             "knowledge": ["knowledge-add-folder-source-and-scan"],
@@ -120,6 +137,7 @@ class TestShippedScenarios:
         # FEATURES order, not alphabetical: chat is the product's primary surface.
         assert list(groups) == [
             "chat",
+            "side-panel",
             "sidebar",
             "search",
             "members",
@@ -474,7 +492,7 @@ class TestReport:
         md = report.render_features(catalog, _summary(), run_url="https://x/run")
         assert md.startswith("# GUI user-test feature catalog\n")
         assert (
-            f"_9 of {len(scenarios.FEATURES)} features covered · 12 scenarios (9 smoke / 3 nightly)._"
+            f"_10 of {len(scenarios.FEATURES)} features covered · 17 scenarios (14 smoke / 3 nightly)._"
             in md
         )
         assert (
