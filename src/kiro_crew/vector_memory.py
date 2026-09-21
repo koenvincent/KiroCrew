@@ -6170,13 +6170,18 @@ class VectorMemoryStore:
         Args:
             query_text: Request to rank against. Empty keeps recency order for
                 explicit recall, never as filler in background admission.
-            background: Preserve all eligible in-scope rules, without query ranking
-                or ordinary-budget truncation. Extraction source does not establish
-                optionality.
-            cap: Character budget for explicit recall. 0 means unbounded.
-            hard_cap: Model-safety ceiling used only for background admission.
-                Content at or below it is byte-identical; overflow keeps the
-                highest-ranked complete lessons.
+            background: Preserve all eligible in-scope rules, without query
+                ranking beyond a lexical pass. Admission targets the ordinary
+                lessons budget ``cap`` bounded by the ``hard_cap`` safety
+                ceiling. Extraction source does not establish optionality.
+            cap: Character budget. In explicit recall it is the sole limit; in
+                background admission it is the ordinary target, capped by
+                ``hard_cap``. 0 means no ordinary budget (unbounded, or the
+                ``hard_cap`` ceiling alone when one is given).
+            hard_cap: Model-safety ceiling for background admission, the upper
+                bound the effective budget is never allowed to exceed. Content
+                at or below the effective budget is byte-identical; overflow
+                keeps the highest-ranked complete lessons.
             project_dir: The session's active project, used only by the
                 ``repo_scope`` gate. Omitting it withholds every scoped lesson.
         """
@@ -6230,11 +6235,21 @@ class VectorMemoryStore:
                 return context
 
             full = render_background(kept)
-            if not hard_cap or len(full) <= hard_cap:
+            # Background admission targets the ordinary lessons budget ``cap``
+            # and keeps ``hard_cap`` only as the model-safety upper bound it is
+            # named as. The effective ceiling is the smaller of the two. A
+            # ``cap`` of 0 means "no ordinary budget", so the ceiling is
+            # ``hard_cap`` alone; when both are 0 the block is unbounded, which
+            # preserves the meaning of every existing caller.
+            if cap and hard_cap:
+                effective = min(cap, hard_cap)
+            else:
+                effective = cap or hard_cap
+            if not effective or len(full) <= effective:
                 return full
             # Longest relevance-ordered prefix that fits, with room reserved for
             # the omission notice at its widest; one pass over the rows.
-            budget = hard_cap - len(render_background([], len(kept)))
+            budget = effective - len(render_background([], len(kept)))
             fitted: list[tuple[dict, str]] = []
             for entry in kept:
                 line = len(entry[1]) + 3
