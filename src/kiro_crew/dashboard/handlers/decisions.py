@@ -2,6 +2,8 @@
 
 ``GET  /api/decisions/consent``   the keystone plus the endpoint config names now
 ``PUT  /api/decisions/consent``   ``{"enabled": bool}`` -> writes it, bound to that endpoint
+                                 plus the ``tool_args`` / ``compaction`` egress scopes,
+                                 each preserved when its field is omitted
 ``POST /api/decisions/feedback``  a person's verdict on one turn -> one appended log row
 
 Consent is bound to a destination: enabling records the provider endpoint the
@@ -175,6 +177,12 @@ def _payload(state: dict, *, denied: bool) -> dict:
         # guessing from ``enabled``: a record written before this scope existed reads
         # false here, which is what the card must draw for it.
         "tool_args": consent.consented_tool_args(state),
+        # Whether the owner consented to sending a WHOLE SLOT TRANSCRIPT, the scope
+        # ``compaction.keep`` needs. Reported for the reason ``tool_args`` is: the
+        # card draws the switch in the state actually recorded, and a record written
+        # before this scope existed reads false here rather than inheriting either of
+        # the narrower yeses.
+        "compaction": consent.consented_compaction(state),
     }
 
 
@@ -220,6 +228,14 @@ async def api_decisions_consent_put(request: web.Request) -> web.Response:
     switch flip cannot grant or erase it by omission. Absent on a keystone that never
     had it reads as false, which is what keeps a consent given before this scope
     existed meaning only what its owner reviewed.
+
+    ``compaction`` records the same thing for a WHOLE SLOT TRANSCRIPT -- the
+    conversation text and every tool-call input in it -- which is what
+    ``compaction.keep`` sends and neither of the other two scopes covers. It behaves
+    identically: absent preserves, disabling clears, a non-boolean is a ``400``, and
+    absent on a keystone that never had it reads as false. It is a field of its own
+    rather than a wider reading of ``tool_args`` because the owner reviewed that one
+    as the arguments of the one call about to run.
 
     ``history_budget_chars`` records the prior-conversation CEILING the owner
     reviewed, and it is here for the same reason ``endpoint`` is: the value in force
@@ -310,6 +326,22 @@ async def api_decisions_consent_put(request: web.Request) -> web.Response:
             status=400,
         )
 
+    # The third scope, on exactly the terms of the one above: absent is the
+    # ``KEEP_COMPACTION`` sentinel resolved inside the writer's own lock, a truthy
+    # stand-in is a 400 rather than a silent yes, and disabling clears it. A separate
+    # field and not a wider reading of ``tool_args``, because the two were reviewed as
+    # different things -- the arguments of one call, versus everything this session has
+    # run.
+    compaction = (
+        body.get("compaction", consent.KEEP_COMPACTION) if isinstance(body, dict) else False
+    )
+    if compaction is not consent.KEEP_COMPACTION and not isinstance(compaction, bool):
+        await _audit(request, operation=OP_CONSENT_PUT, outcome="denied", error="invalid_body")
+        return web.json_response(
+            {"error": '"compaction" must be true or false', "code": _CODE_INVALID_BODY},
+            status=400,
+        )
+
     # Bound to the endpoint the owner REVIEWED, checked against the one the
     # config names now. Equal: consent is for the address on screen, and the one
     # the gate will hold the config to afterwards. Different: the config moved
@@ -367,6 +399,7 @@ async def api_decisions_consent_put(request: web.Request) -> web.Response:
             endpoint=endpoint,
             history_budget_chars=budget,
             tool_args=tool_args,
+            compaction=compaction,
         )
     except consent.ConsentCorruptError as exc:
         await _audit(request, operation=OP_CONSENT_PUT, outcome="error", error="corrupt")
@@ -385,7 +418,8 @@ async def api_decisions_consent_put(request: web.Request) -> web.Response:
         resources=(
             f"decisions_consent.json endpoint={endpoint} "
             f"history_budget_chars={consent.consented_history_budget(state)} "
-            f"tool_args={consent.consented_tool_args(state)}"
+            f"tool_args={consent.consented_tool_args(state)} "
+            f"compaction={consent.consented_compaction(state)}"
         ),
     )
     return web.json_response(_payload(state, denied=withdrawn))

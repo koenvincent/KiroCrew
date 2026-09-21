@@ -138,6 +138,27 @@ _REDACTION_SINKS: tuple[tuple[str, str, str], ...] = (
         "turn is sent -- private reasoning is excluded at the read.",
     ),
     (
+        "Compaction scoring sent to the decision judge",
+        "decisions/points/compaction_keep.py",
+        "A whole slot transcript sent to the third-party judge that scores, in the "
+        "SHADOW, which of a session's tool calls an automatic compaction should have "
+        "kept: the conversation text and every tool-call INPUT in it. Tool OUTPUT "
+        "never leaves the machine at any fitting stage -- each result is replaced by "
+        "its own character count (`result_placeholder`), which is the widest single "
+        "omission in this table and is what keeps the largest half of a transcript "
+        "local. Like the two points above it this module EMITS its redacted bytes "
+        "rather than refusing on a hit: a credential in a tool argument is ordinary, "
+        "and refusing would mean the measurement never runs on the transcripts most "
+        "worth measuring. Both scanners run, credential-then-URL, over each field in "
+        "FULL, and the stage's clip is taken AFTER them -- a cut placed first can "
+        "halve a secret into a fragment neither pattern matches; a scanner that "
+        "fails yields the empty string rather than the input, and the gate's own "
+        "scan still refuses the whole request for a spelling this pass missed. "
+        "Authorized by a THIRD keystone scope (`consent.STATE_KEY_COMPACTION`), "
+        "because neither the message excerpt the main switch records nor the "
+        "single-call `tool_args` scope describes it.",
+    ),
+    (
         "Member capability editor responses",
         "agent_capabilities.py",
         "Owner-facing capability rows, Parent-change previews and impact summaries. "

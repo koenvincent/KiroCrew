@@ -5,6 +5,12 @@ importing ``kiro_crew.session``.  Session allocation and teardown still own the
 registry, its lock, and the exact-identity ``_recycling`` marker; compaction
 borrows those seams without becoming a second session manager.
 
+One observation rides this boundary and decides nothing: ``_compact_session``
+starts the ``compaction.keep`` shadow measurement
+(``decisions/points/compaction_keep.py``) as an unawaited background task before it
+picks an arm, so a consented install learns which tool calls an oracle would have
+kept while the compaction itself runs byte-identically.
+
 Calls between formerly patchable ``SessionManager`` methods go back through
 the owner.  Besides preserving the public/private monkeypatch surface during
 the extraction, that keeps one authoritative place for lifecycle operations
@@ -497,9 +503,54 @@ class CompactionCoordinator:
         task.add_done_callback(owner._background_tasks.discard)
         return None
 
+    def _shadow_score_compaction(self, key: str) -> None:
+        """Start the ``compaction.keep`` shadow measurement. Never raises, never waits.
+
+        Placed at the top of :meth:`_compact_session` because that method is the ONE
+        funnel both AUTOMATIC entry points reach -- the per-turn threshold trigger
+        (``check_context_usage`` -> ``_trigger_compaction``) and the awaited
+        between-turn one (``compact_if_needed``) -- and it is reached BEFORE the
+        Claude arm, before ``_recycle_unmanaged`` and before ``_compact_in_place``.
+        So every backend is covered and the measurement observes the transcript as it
+        stands when the compaction was decided, not after it ran.
+
+        A MANUAL ``/compact`` is excluded by construction, not by a flag: the
+        dashboard dispatches that command as an ordinary turn through
+        ``provider.stream_command("/compact")`` and never calls this method, so there
+        is no manual path for the point to sit on.
+
+        FIRE AND FORGET, and that is the contract the point's own docstring states:
+        the task is created and never awaited, so the compaction proceeds on its own
+        coroutine and nothing here can delay it, fail it or change its outcome. The
+        worst case is a missing observation.
+
+        Imported inside the function and guarded as a whole: the decisions package is
+        an optional subsystem that is off until the owner consents (and this module is
+        on the gateway boot path), so its import graph is paid only by a compaction
+        that actually fires, and a broken point file cannot cost a session its
+        compaction.
+        """
+        try:
+            from kiro_crew.decisions.points.compaction_keep import score_compaction
+
+            task = asyncio.create_task(score_compaction(key))
+            # Tracked on the owner's set, the same place ``_trigger_compaction`` parks
+            # its own background task: an untracked task can be garbage-collected
+            # mid-await, which turns a shadow measurement into a warning nobody can
+            # act on.
+            self._owner._background_tasks.add(task)
+            task.add_done_callback(self._owner._background_tasks.discard)
+        except Exception:
+            self._deps.logger.debug(
+                "Session %s compaction left unmeasured by the decision seam", key, exc_info=True
+            )
+
     async def _compact_session(self, key: str, pct: float) -> str:
         """Run the backend-specific in-place compaction policy."""
         owner = self._owner
+        # Before the first branch, so the observation covers every backend; not
+        # awaited, so it cannot sit between the trigger and the compaction.
+        self._shadow_score_compaction(key)
         try:
             session = owner._sessions.get(key)
             if session and self._deps.is_claude_backend(session.provider):

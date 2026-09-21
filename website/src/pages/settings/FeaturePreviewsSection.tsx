@@ -9,7 +9,7 @@ import { SettingsSection, SettingsCard, SettingsToggle } from '../../components/
 import { FeaturePreviewIntroButton, type FeaturePreviewIntro } from '../../components/FeaturePreviewIntroDialog'
 import { usePreviewFlag } from '../../hooks/usePreviewFlag'
 import { PREVIEW_CREW, PREVIEW_INSTANCE_SESSIONS, PREVIEW_REMOTE_CREW_CHAT, PREVIEW_WEBHOOKS, setPreviewFlag } from '../../utils/previewFlags'
-import { DECISIONS_LIVE_POINT, readDecisions } from './decisionsPreview'
+import { DECISIONS_COMPACTION_POINT, DECISIONS_LIVE_POINT, readDecisions } from './decisionsPreview'
 import { fmtPercent } from '../../i18n/format'
 import { i18nT } from '../../i18n/t'
 
@@ -224,6 +224,15 @@ function DecisionsPreviewCard() {
       api.saveDecisionsConsent(true, view.configuredEndpoint, value),
     onSettled: () => qc.invalidateQueries({ queryKey: ['decisionsConsent'] }),
   })
+  // The whole-transcript scope, on the same terms as the one above and with its own
+  // pending state, so the three switches disable independently. `tool_args` is passed
+  // as `undefined` deliberately: an omitted field PRESERVES the recorded scope, so
+  // acting on this switch cannot grant or erase the narrower one beside it.
+  const compactionMut = useMutation({
+    mutationFn: (value: boolean) =>
+      api.saveDecisionsConsent(true, view.configuredEndpoint, undefined, value),
+    onSettled: () => qc.invalidateQueries({ queryKey: ['decisionsConsent'] }),
+  })
   // "Old gateway" and "could not read the settings" are different facts and must
   // not share a sentence: the first is a state the user fixes by updating, the
   // second by retrying. An older gateway answers the consent GET with 404, which
@@ -294,6 +303,25 @@ function DecisionsPreviewCard() {
           disabled={loading || readFailed || !view.supported || mut.isPending || scopeMut.isPending}
         />
       )}
+      {/* The whole-transcript scope. A THIRD switch rather than a wider reading of
+          either of the two above, for the reason the second one exists: this sends the
+          conversation and every tool-call input the session has accumulated, which is
+          the largest category by far and was reviewed by nobody who only turned on the
+          other two. Drawn only while the main switch is on, and it starts off even for
+          an owner who already granted tool arguments. What it buys is a MEASUREMENT --
+          the compaction itself is unchanged whatever Jev answers -- which is why the
+          description says so rather than promising a better compaction. */}
+      {view.enabled && (
+        <SettingsToggle
+          label={i18nT('pages.developer.featurePreviewsTab.decisions_compaction')}
+          description={i18nT('pages.developer.featurePreviewsTab.decisions_compaction_desc')}
+          checked={view.compaction}
+          onChange={v => compactionMut.mutate(v)}
+          disabled={
+            loading || readFailed || !view.supported || mut.isPending || compactionMut.isPending
+          }
+        />
+      )}
       {/* WHERE the messages go, as a fact beside the switch: consent is given for
           an address, and the gate holds the config to that address afterwards.
           Mono and untranslated -- it is a URL the reader may want to compare
@@ -362,6 +390,22 @@ function DecisionsPreviewCard() {
               </span>
             </span>
           </div>
+          {/* The compaction point, on the same one-row shape. Drawn only while its own
+              scope is granted: without it the point is inert, and a row naming a check
+              that cannot run reads as a feature that is on. */}
+          {view.compaction && (
+            <div className="flex items-center justify-between gap-3 text-[12px] mt-1">
+              <span className="text-text">
+                {i18nT('pages.developer.featurePreviewsTab.decisions_point_compaction_keep')}
+              </span>
+              <span className="text-muted">
+                {i18nT('pages.developer.featurePreviewsTab.decisions_point_logged_as')}{' '}
+                <span className="font-mono" title={DECISIONS_COMPACTION_POINT}>
+                  {DECISIONS_COMPACTION_POINT}
+                </span>
+              </span>
+            </div>
+          )}
           {/* The share is printed in both switch states, as "while this is on":
               the shipped default is 100, and a reader must see "all of your
               sessions" BEFORE consenting, not discover it afterwards. Only a

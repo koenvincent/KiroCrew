@@ -52,12 +52,22 @@ const consentOf = (enabled: boolean, overrides: Partial<DecisionsConsentData> = 
   // a keystone recorded before the scope existed reads as, and it is the state the
   // overwhelming majority of consented installs are in.
   tool_args: false,
+  // The whole-transcript egress scope, false by default for the same reason: it is
+  // what a keystone recorded before the scope existed reads as, and no narrower yes
+  // grants it.
+  compaction: false,
   ...overrides,
 })
 
 /** The tool-argument consent switch. Only drawn while the main switch is on. */
 const toolArgsSwitch = () =>
   screen.getByRole('switch', { name: 'Also send tool-call arguments so Jev can flag risky calls' })
+
+/** The whole-transcript consent switch. Only drawn while the main switch is on. */
+const compactionSwitch = () =>
+  screen.getByRole('switch', {
+    name: 'Also send the conversation and tool-call inputs so Jev can score compaction',
+  })
 
 /**
  * Stub all three reads: the governance answer that decides whether the card is
@@ -568,5 +578,96 @@ describe('Decisions (Jev) preview card', () => {
       })
       expect(decisionsSwitch().getAttribute('aria-disabled')).not.toBe('true')
     })
+  })
+})
+
+describe('the whole-transcript consent scope', () => {
+  it('is not drawn while the main switch is off', () => {
+    stubGateway({ enabled: false })
+    renderSection()
+    expect(
+      screen.queryByRole('switch', {
+        name: 'Also send the conversation and tool-call inputs so Jev can score compaction',
+      }),
+    ).toBeNull()
+  })
+
+  it('draws OFF for a consent recorded before the scope existed', async () => {
+    // The whole point of a third leaf: an owner who consented to sending, and even to
+    // tool arguments, has not consented to a whole transcript.
+    stubGateway(consentOf(true, { tool_args: true }))
+    renderSection()
+    await waitFor(() => {
+      expect(toolArgsSwitch().getAttribute('aria-checked')).toBe('true')
+      expect(compactionSwitch().getAttribute('aria-checked')).toBe('false')
+    })
+  })
+
+  it('draws ON when the keystone recorded it', async () => {
+    stubGateway(consentOf(true, { compaction: true }))
+    renderSection()
+    await waitFor(() => {
+      expect(compactionSwitch().getAttribute('aria-checked')).toBe('true')
+    })
+  })
+
+  it('grants the scope through the same consent route, with no new endpoint', async () => {
+    stubGateway({ enabled: true })
+    const save = vi.spyOn(api, 'saveDecisionsConsent').mockResolvedValue(
+      consentOf(true, { compaction: true }),
+    )
+    renderSection()
+    await waitFor(() => {
+      expect(compactionSwitch()).toBeInTheDocument()
+    })
+    compactionSwitch().click()
+    await waitFor(() => {
+      // `undefined` in the tool-argument slot is deliberate: an OMITTED field
+      // preserves the recorded scope, so acting on this switch cannot grant or erase
+      // the narrower one beside it.
+      expect(save).toHaveBeenCalledWith(true, ENDPOINT, undefined, true)
+    })
+  })
+
+  it('revokes it with an explicit false rather than by omission', async () => {
+    stubGateway(consentOf(true, { compaction: true }))
+    const save = vi.spyOn(api, 'saveDecisionsConsent').mockResolvedValue(consentOf(true))
+    renderSection()
+    await waitFor(() => {
+      expect(compactionSwitch().getAttribute('aria-checked')).toBe('true')
+    })
+    compactionSwitch().click()
+    await waitFor(() => {
+      expect(save).toHaveBeenCalledWith(true, ENDPOINT, undefined, false)
+    })
+  })
+
+  it('names the point only while the scope is granted', async () => {
+    stubGateway(consentOf(true, { compaction: true }))
+    renderSection()
+    await waitFor(() => {
+      expect(screen.getByTitle('compaction.keep')).toBeInTheDocument()
+    })
+    cleanup()
+    stubGateway(consentOf(true))
+    renderSection()
+    await waitFor(() => {
+      expect(screen.getByTitle('skills.select')).toBeInTheDocument()
+    })
+    expect(screen.queryByTitle('compaction.keep')).toBeNull()
+  })
+
+  it('says the compaction itself is unchanged', async () => {
+    // A switch that read as "better compaction" would be a promise this build does
+    // not keep: nothing is applied, and the answer is a line on a notice.
+    stubGateway({ enabled: true })
+    renderSection()
+    await waitFor(() => {
+      expect(compactionSwitch()).toBeInTheDocument()
+    })
+    const rendered = document.body.textContent ?? ''
+    expect(rendered).toContain('It is a measurement')
+    expect(rendered).toContain('Tool OUTPUT is never sent')
+    expect(rendered).toContain('Passwords and keys are replaced')
   })
 })
