@@ -17,7 +17,7 @@ platform could support it.
 | Adds emoji reactions | ✅ | ✅ | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ | ✅ | ❌ |
 | Accepts a file you send | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ | ✅ | ❌ |
 | Sends a file back to you | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ | ❌ | ❌ | ✅ | ❌ |
-| Native widget (buttons, cards) | ✅ | ❌ | ✅ | ✅ | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ |
+| Native card (Block Kit, Adaptive Card) | ✅ | ❌ | ✅ | ✅ | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ |
 | Threads a conversation | ✅ | ✅ | ✅ | ❌ | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ |
 | Renders markdown tables natively | ❌ | ❌ | ✅ | ❌ | ❌ | ❌ | ✅ | ❌ | ❌ | ❌ |
 | Reply length before splitting | 3900 chars | 1900 chars | 4000 chars | 16000 chars | 1750 chars (7000 bytes) | 5120 chars (20480 bytes) | 4000 chars | 4000 chars | 4096 chars | 4000 chars |
@@ -39,9 +39,10 @@ present. Above the cap, the remainder degrades to a numbered list in the message
 body rather than being dropped. A channel showing `0` renders no widget at all:
 every choice arrives as a numbered line, and you answer by typing the number.
 
-**Native widget** gates whether a channel builds a platform card for a tool
-approval or a choice list. Discord streams and threads well but declares no rich
-widget, so its approvals are text.
+**Native card** gates whether a channel builds a platform card (Block Kit, an
+Adaptive Card) for a tool approval or a choice list. It is not the same question
+as buttons: Discord shows ❌ here and still renders Approve/Deny buttons and
+tappable `[OPTIONS:]` rows, which is what its `25` in the row below means.
 
 **Dashboard link is two-way** means connecting the channel from the dashboard
 marks the binding as an inbound target, so your reply in the channel continues
