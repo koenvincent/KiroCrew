@@ -21,6 +21,19 @@ that worker thread, never on the event loop that serves the gateway. Only the
 ``decide`` await is submitted to the loop, and the caller waits for a bounded
 budget. Same shape, same reason, as ``points/skills_select.py``.
 
+A SECOND consent, because this is a new category
+-----------------------------------------------
+A recalled memory is not the text the main switch describes. That consent is
+recorded against a message excerpt -- text the owner just typed -- and skill
+descriptions, which this build shipped. A recalled memory is text the AGENT wrote
+down turns or days ago, about work the owner was not reviewing when they flipped
+the switch. So the keystone records a scope of its own, ``memory_text``
+(``consent.consented_memory_text``), default FALSE, and ``gate.POINT_EGRESS_SCOPES``
+refuses this point without it -- which means an install consented before the scope
+existed is INERT here rather than retroactively signed up. The refusal arrives as
+``core.is_enabled`` answering False, so it costs no redaction and writes no row,
+exactly like an unsampled turn: the three cheap refusals touch no disk by design.
+
 Everything is a REFUSAL back to the baseline
 --------------------------------------------
 :func:`kept_memories` returns ``None`` for "inject exactly the similarity top-k"
@@ -126,15 +139,23 @@ def kept_memories(
     Runs on the CALLER's thread, which in production is an executor worker. The
     order below is the contract:
 
-    1. this is not an owner dashboard turn — refuse, before anything else. The
-       receipt for this decision rides a dashboard reply, and the egress is
-       memory text, so a cron, a sub-agent, an integration and a channel turn are
-       never asked about;
+    1. this session has no live DASHBOARD SURFACE — refuse, before anything else.
+       The receipt for this decision rides a reply someone is looking at, and the
+       egress is memory text, so a turn with nobody watching is never asked about:
+       a cron, a sub-agent, an integration, and any session whose tab is closed.
+       A CHANNEL-born session with its dashboard tab open DOES qualify — the
+       publisher contributes each open slot's own key, channel keys included --
+       and that is the intended reading rather than an accident: the owner is
+       reading that conversation in the dashboard and the strip will reach them
+       there;
     2. no usable loop, or this thread is running one — refuse. Waiting on a
        future from the loop's own thread would deadlock the loop;
     3. there are no candidates — refuse. An empty block is what both arms
        produce, so there is nothing to decide;
-    4. the point is not enabled for this session — refuse, before any redaction;
+    4. the point is not enabled for this session — refuse, before any redaction.
+       That covers the ``memory_text`` consent scope as well as the switch and the
+       sampling bucket, because the gate funnels all three through one keystone
+       read;
     5. screen and redact the candidate rows on THIS thread;
     6. submit one round to *loop* and wait ONCE for the whole turn's budget;
     7. record both arms and publish the outcome, still on THIS thread.
@@ -232,16 +253,17 @@ async def keep_decision(
     deadline is one whose answer the caller has already stopped waiting for.
 
     *candidates* are WIRE rows -- ``{key, snippet}`` as :func:`screen_candidates`
-    produces them -- not store rows. The two shapes are deliberately different
-    names for the identifier (``id`` in the store, ``key`` on the wire) so a row
-    that skipped the screen cannot reach the request by looking close enough; this
-    function re-checks the wire shape with :func:`wire_rows`, which is idempotent,
-    rather than screening again.
+    produces them -- not store rows, and they arrive already capped, key-screened
+    and redacted. The two shapes use different names for the identifier (``id`` in
+    the store, ``key`` on the wire), which is what keeps a store row from reaching
+    the request by looking close enough: it would carry no ``key`` and be sent as a
+    blank one. Nothing is re-screened here; :func:`screen_candidates` is the one
+    bound, on the one path that reaches this.
 
     *trace* is filled with what the caller needs for the outcome row (the turn id,
     the menu size, the excerpt cost, the mean keep probability).
     """
-    rows = wire_rows(candidates)
+    rows = list(candidates)
     if not rows:
         return None
     turn = turn_id or uuid.uuid4().hex[:16]
@@ -358,29 +380,6 @@ def screen_candidates(candidates: Sequence[Mapping[str, Any]]) -> list[dict[str,
             continue
         seen.add(key)
         rows.append({"key": key, "snippet": scrubbed(candidate.get("text", ""), MAX_SNIPPET_CHARS)})
-    return rows
-
-
-def wire_rows(candidates: Sequence[Mapping[str, str]]) -> list[dict[str, str]]:
-    """The already-screened rows that are still admissible, as the request sends them.
-
-    Idempotent, and NOT a second screen: it re-checks the wire shape
-    (``{key, snippet}``, a key inside :data:`MAX_KEY_CHARS`) and re-applies the
-    candidate cap, so a caller handing over a list it built itself gets the same
-    bounds as one that came from :func:`screen_candidates`. It does not redact,
-    because the snippets it receives are already redacted and running the
-    redactors twice would cost every sampled turn a second pass over the same text.
-    """
-    rows: list[dict[str, str]] = []
-    seen: set[str] = set()
-    for candidate in list(candidates)[:MAX_CANDIDATES]:
-        if not isinstance(candidate, Mapping):
-            continue
-        key = candidate.get("key", "")
-        if not isinstance(key, str) or not key or len(key) > MAX_KEY_CHARS or key in seen:
-            continue
-        seen.add(key)
-        rows.append({"key": key, "snippet": str(candidate.get("snippet", ""))})
     return rows
 
 

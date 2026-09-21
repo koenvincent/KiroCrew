@@ -91,6 +91,13 @@ export interface DecisionsView {
    * rather than a value it guessed.
    */
   toolArgs: boolean
+  /**
+   * Whether the owner consented to sending the text of recalled memories — the
+   * `memory.recall` scope. Read on the same fail-closed terms as `toolArgs`: only a
+   * literal `true` counts, so an older gateway and a keystone written before this
+   * scope existed both read false, and the card draws the switch off for them.
+   */
+  memoryText: boolean
 }
 
 const UNSUPPORTED: DecisionsView = {
@@ -100,6 +107,7 @@ const UNSUPPORTED: DecisionsView = {
   endpointMoved: false,
   bucket: null,
   toolArgs: false,
+  memoryText: false,
 }
 
 function asRecord(value: unknown): Record<string, unknown> | null {
@@ -147,6 +155,7 @@ export function readConsent(body: unknown): Omit<DecisionsView, 'bucket'> {
       configuredEndpoint: '',
       endpointMoved: false,
       toolArgs: false,
+      memoryText: false,
     }
   }
   const enabled = root.enabled === true
@@ -159,7 +168,8 @@ export function readConsent(body: unknown): Omit<DecisionsView, 'bucket'> {
   // category of conversation content leaves the machine, so a truthy stand-in is
   // not a deliberate yes. An older gateway omits it entirely and reads as off.
   const toolArgs = root.tool_args === true
-  return { supported: true, enabled, configuredEndpoint, endpointMoved, toolArgs }
+  const memoryText = root.memory_text === true
+  return { supported: true, enabled, configuredEndpoint, endpointMoved, toolArgs, memoryText }
 }
 
 /** Combine the two reads into the card's one view. */

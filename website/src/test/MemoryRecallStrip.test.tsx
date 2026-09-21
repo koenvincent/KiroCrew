@@ -248,6 +248,22 @@ describe('the expanded body', () => {
     expect(screen.getByTestId('memory-recall-strip-error')).toBeInTheDocument()
   })
 
+  it('offers the agent hand-off on that failure', () => {
+    // The strip holds no draft input and the failure names the judge rather than
+    // the reply, so there is something for an agent to pick up and nothing to lose.
+    render(<MemoryRecallStrip record={readMemoryRecallRecord({ ...WIRE, error: 'timeout' })!} />)
+    fireEvent.click(screen.getByTestId('memory-recall-strip-toggle'))
+    expect(screen.getByRole('button', { name: /ask the agent/i })).toBeInTheDocument()
+  })
+
+  it('draws no hand-off when the decision did not fail', () => {
+    // The notice renders nothing without a message, so the hand-off must not be a
+    // button sitting under every healthy strip.
+    render(<MemoryRecallStrip record={record} />)
+    fireEvent.click(screen.getByTestId('memory-recall-strip-toggle'))
+    expect(screen.queryByRole('button', { name: /ask the agent/i })).toBeNull()
+  })
+
   it('exposes the toggle state to assistive technology', () => {
     render(<MemoryRecallStrip record={record} />)
     const toggle = screen.getByTestId('memory-recall-strip-toggle')

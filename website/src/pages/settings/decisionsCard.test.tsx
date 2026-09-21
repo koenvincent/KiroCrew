@@ -56,6 +56,9 @@ const consentOf = (enabled: boolean, overrides: Partial<DecisionsConsentData> = 
 })
 
 /** The tool-argument consent switch. Only drawn while the main switch is on. */
+const memoryTextSwitch = () =>
+  screen.getByRole('switch', { name: /snippets of recalled memories/i })
+
 const toolArgsSwitch = () =>
   screen.getByRole('switch', { name: 'Also send tool-call arguments so Jev can flag risky calls' })
 
@@ -442,7 +445,7 @@ describe('Decisions (Jev) preview card', () => {
       await waitFor(() => {
         // `enabled: true` rides along because the scope is only meaningful while the
         // seam is on, and the reviewed address because consent binds to it.
-        expect(save).toHaveBeenCalledWith(true, ENDPOINT, true)
+        expect(save).toHaveBeenCalledWith(true, ENDPOINT, { toolArgs: true })
       })
     })
 
@@ -457,7 +460,7 @@ describe('Decisions (Jev) preview card', () => {
       })
       toolArgsSwitch().click()
       await waitFor(() => {
-        expect(save).toHaveBeenCalledWith(true, ENDPOINT, false)
+        expect(save).toHaveBeenCalledWith(true, ENDPOINT, { toolArgs: false })
       })
     })
 
@@ -568,5 +571,102 @@ describe('Decisions (Jev) preview card', () => {
       })
       expect(decisionsSwitch().getAttribute('aria-disabled')).not.toBe('true')
     })
+  })
+})
+
+describe('the recalled-memory scope switch', () => {
+  it('is not offered while the main switch is off', async () => {
+    // Off, nothing is sent at all, so a second egress control would describe a
+    // state that cannot happen.
+    stubGateway({ enabled: false })
+    renderSection()
+    await waitFor(() => {
+      expect(decisionsSwitch()).toBeInTheDocument()
+    })
+    expect(screen.queryByRole('switch', { name: /snippets of recalled memories/i })).toBeNull()
+  })
+
+  it('appears unchecked once consent is on, for a keystone that never recorded it', async () => {
+    // The state every install consented before this scope existed is in: sending is
+    // allowed, recalled-memory text is not, and the card must draw exactly that
+    // rather than inferring the scope from the main switch.
+    stubGateway({ enabled: true })
+    renderSection()
+    await waitFor(() => {
+      expect(memoryTextSwitch()).toBeInTheDocument()
+    })
+    expect(memoryTextSwitch().getAttribute('aria-checked')).toBe('false')
+  })
+
+  it('reflects a recorded scope', async () => {
+    stubGateway(consentOf(true, { memory_text: true }))
+    renderSection()
+    await waitFor(() => {
+      expect(memoryTextSwitch().getAttribute('aria-checked')).toBe('true')
+    })
+  })
+
+  it('is not granted by the tool-argument scope', async () => {
+    // Two independent decisions. A card that read one switch off the other would
+    // show a consent the owner never gave.
+    stubGateway(consentOf(true, { tool_args: true }))
+    renderSection()
+    await waitFor(() => {
+      expect(toolArgsSwitch().getAttribute('aria-checked')).toBe('true')
+    })
+    expect(memoryTextSwitch().getAttribute('aria-checked')).toBe('false')
+  })
+
+  it('grants the scope through the same consent route, naming only itself', async () => {
+    stubGateway({ enabled: true })
+    const save = vi.spyOn(api, 'saveDecisionsConsent').mockResolvedValue(
+      consentOf(true, { memory_text: true }),
+    )
+    renderSection()
+    await waitFor(() => {
+      expect(memoryTextSwitch()).toBeInTheDocument()
+    })
+    memoryTextSwitch().click()
+    await waitFor(() => {
+      // ONLY its own scope: naming the other would let this click grant or erase a
+      // scope the owner did not touch, which the route's omission rule exists for.
+      expect(save).toHaveBeenCalledWith(true, ENDPOINT, { memoryText: true })
+    })
+  })
+
+  it('revokes it with an explicit false rather than by omission', async () => {
+    stubGateway(consentOf(true, { memory_text: true }))
+    const save = vi.spyOn(api, 'saveDecisionsConsent').mockResolvedValue(consentOf(true))
+    renderSection()
+    await waitFor(() => {
+      expect(memoryTextSwitch().getAttribute('aria-checked')).toBe('true')
+    })
+    memoryTextSwitch().click()
+    await waitFor(() => {
+      expect(save).toHaveBeenCalledWith(true, ENDPOINT, { memoryText: false })
+    })
+  })
+
+  it('states what the extra data is, and what the decision can do with it', async () => {
+    stubGateway({ enabled: true })
+    renderSection()
+    await waitFor(() => {
+      expect(memoryTextSwitch()).toBeInTheDocument()
+    })
+    const body = document.body.textContent ?? ''
+    expect(body).toContain('first 200 characters')
+    expect(body).toContain('It can only remove them')
+    expect(body).toContain('Passwords and keys are replaced')
+  })
+
+  it('names recalled-memory snippets in the egress note, above either switch', async () => {
+    // The note is what a reader consents to, and it is drawn whether or not the
+    // scope switches are. Naming only messages and skills would understate it.
+    stubGateway({ enabled: false })
+    renderSection()
+    await waitFor(() => {
+      expect(screen.getByText(/leave this machine/i)).toBeInTheDocument()
+    })
+    expect(screen.getByText(/snippets of the memories recalled/i)).toBeInTheDocument()
   })
 })

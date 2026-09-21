@@ -3420,15 +3420,22 @@ class ContextBuilder:
         """The ``memory.recall`` keep hook for this turn, or ``None``.
 
         ``None`` -- inject every memory similarity recalled, which is what this
-        method returns for every turn that is not an OWNER DASHBOARD one. That
+        method returns for every session with no live DASHBOARD SURFACE. That
         restriction is this call site's, not the seam's, and it is about egress
         plus audience: the request carries snippets of the member's own recalled
-        memories, and the receipt for the decision rides a dashboard reply
-        (`decisions/outcomes.py` hands it to `chat_runner`). A cron turn, a
-        sub-agent, a channel and an integration have no such reply, so asking on
-        their behalf would send memory text for a decision nobody is shown.
-        `has_dashboard_surface` is the same predicate the rest of this module uses
-        to mean "a person is looking at this session".
+        memories, and the receipt for the decision rides a reply someone is
+        looking at (`decisions/outcomes.py` hands it to `chat_runner`). A cron
+        turn, a sub-agent, an integration and any session whose tab is closed have
+        no such reader, so asking on their behalf would send memory text for a
+        decision nobody is shown.
+
+        `has_dashboard_surface` is observed state, not a prefix test, and that is
+        the point: it answers "is this session displayed in an open tab". A
+        CHANNEL-born session with its tab open therefore qualifies, because
+        `chat_utils._sync_dashboard_slots` publishes every open slot's own key and
+        a channel-born slot contributes its channel key. That is the intended
+        reading rather than a leak through the gate -- the owner is reading that
+        conversation in the dashboard, so the audience the receipt needs is there.
 
         Also ``None`` without a query: with no message there is nothing to judge
         relevance against, and `get_episodic_context` is not reached either.

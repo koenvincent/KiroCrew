@@ -221,7 +221,16 @@ function DecisionsPreviewCard() {
   // two switches disable independently rather than one freezing the other.
   const scopeMut = useMutation({
     mutationFn: (value: boolean) =>
-      api.saveDecisionsConsent(true, view.configuredEndpoint, value),
+      api.saveDecisionsConsent(true, view.configuredEndpoint, { toolArgs: value }),
+    onSettled: () => qc.invalidateQueries({ queryKey: ['decisionsConsent'] }),
+  })
+  // The recalled-memory scope, on the same terms and with its own pending state for
+  // the same reason. A SECOND scope rather than a wider reading of the first: an
+  // owner may want risky tool calls flagged without the contents of their memory
+  // store leaving the machine, and only two fields can record that.
+  const memoryScopeMut = useMutation({
+    mutationFn: (value: boolean) =>
+      api.saveDecisionsConsent(true, view.configuredEndpoint, { memoryText: value }),
     onSettled: () => qc.invalidateQueries({ queryKey: ['decisionsConsent'] }),
   })
   // "Old gateway" and "could not read the settings" are different facts and must
@@ -292,6 +301,22 @@ function DecisionsPreviewCard() {
           checked={view.toolArgs}
           onChange={v => scopeMut.mutate(v)}
           disabled={loading || readFailed || !view.supported || mut.isPending || scopeMut.isPending}
+        />
+      )}
+      {/* The recalled-memory scope. Same shape, same reason, same drawn-only-while-on
+          rule as the switch above: it widens what leaves the machine, so it is a
+          consent on the keystone rather than a config value, and a consent recorded
+          before it existed reads false here so an owner who never saw this switch has
+          not granted it. */}
+      {view.enabled && (
+        <SettingsToggle
+          label={i18nT('pages.developer.featurePreviewsTab.decisions_memory_text')}
+          description={i18nT('pages.developer.featurePreviewsTab.decisions_memory_text_desc')}
+          checked={view.memoryText}
+          onChange={v => memoryScopeMut.mutate(v)}
+          disabled={
+            loading || readFailed || !view.supported || mut.isPending || memoryScopeMut.isPending
+          }
         />
       )}
       {/* WHERE the messages go, as a fact beside the switch: consent is given for

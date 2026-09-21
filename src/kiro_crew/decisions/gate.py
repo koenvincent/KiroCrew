@@ -42,7 +42,7 @@ import math
 import re
 import time
 from hashlib import sha256
-from typing import Any
+from typing import Any, NamedTuple
 
 from kiro_crew import credential_patterns as _cred
 from kiro_crew.config.sections import (
@@ -61,15 +61,57 @@ logger = logging.getLogger(__name__)
 #: and keeping it here keeps the config loader off a hot path's import graph.
 DECISION_POINT_NAMES = ("skills.select", "tool.risk", "message.steer", "memory.recall")
 
-#: Points whose request carries TOOL-CALL ARGUMENTS, and which therefore need the
-#: keystone's ``tool_args`` scope on top of consent itself
-#: (``consent.consented_tool_args``). A point is in here because of what it SENDS,
-#: not what it decides: consent is recorded against the text the owner reviewed, so
-#: a record written before that scope existed authorizes the message excerpt and the
-#: candidate descriptions and nothing wider. Absent scope refuses the point
-#: outright, which is what makes an already-consented install inert for it rather
-#: than retroactively signed up.
-POINTS_NEEDING_TOOL_ARGS = frozenset({"tool.risk"})
+
+class EgressScope(NamedTuple):
+    """One keystone scope a point needs on top of consent itself.
+
+    ``reader`` is the NAME of the :mod:`~kiro_crew.decisions.consent` function that
+    answers for this scope, not the function object, and :meth:`consented` resolves it
+    at call time. Late binding for the reason every other consent read in this module
+    is late-bound: a captured reference is a second handle on the same function that a
+    test patching the module cannot reach, and it would make the map the one place in
+    the seam where "what consent says" is fixed at import. It reads the scope off an
+    ALREADY-LOADED keystone state, so adding a scope costs no second file read --
+    ``_consented_for`` does the one read and hands it in.
+
+    ``sends`` and ``switch`` are the two phrases the once-per-point warning needs --
+    what the point would send, and which control grants it -- because an owner whose
+    feature does nothing has to be told which switch is missing, not merely that one
+    is.
+    """
+
+    reader: str
+    sends: str
+    switch: str
+
+    def consented(self, state: dict) -> bool:
+        """Whether *state* records this scope. Raises only if the reader does."""
+        return bool(getattr(_consent, self.reader)(state))
+
+
+#: The scope each point needs BEYOND consent itself, keyed by point name. A point is
+#: in here because of what it SENDS, not what it decides: consent is recorded against
+#: the text the owner reviewed, so a record written before a scope existed authorizes
+#: the message excerpt and the candidate descriptions and nothing wider. An absent
+#: scope refuses the point outright, which is what makes an already-consented install
+#: inert for it rather than retroactively signed up. A point absent from this map
+#: needs no scope and pays nothing for the mechanism.
+#:
+#: A MAP rather than one set per scope: the two entries differ only in which keystone
+#: leaf answers for them, so a second set would be a second copy of one refusal path
+#: -- and the third would be a third.
+POINT_EGRESS_SCOPES: "dict[str, EgressScope]" = {
+    "tool.risk": EgressScope(
+        reader="consented_tool_args",
+        sends="tool-call arguments",
+        switch="the tool-argument switch",
+    ),
+    "memory.recall": EgressScope(
+        reader="consented_memory_text",
+        sends="the text of recalled memories",
+        switch="the recalled-memory switch",
+    ),
+}
 
 #: The model id sent when the config leaves ``provider.model`` empty -- the same
 #: fallback ``impl_jev`` applies, so the id the scrub clears is the id sent.
@@ -242,8 +284,8 @@ def _consented_for(
     an auditor needs recorded.
 
     *point* names the caller's decision point, so a point in
-    :data:`POINTS_NEEDING_TOOL_ARGS` can be refused on a keystone that consents to
-    sending but not to sending TOOL ARGUMENTS. Checked here rather than in
+    :data:`POINT_EGRESS_SCOPES` can be refused on a keystone that consents to
+    sending but not to sending THAT CATEGORY. Checked here rather than in
     :func:`_sampled` because the state this needs is the one read this function
     already did -- ``_sampled`` is deliberately IO-free -- so the scope costs no
     second keystone read, and because this is the documented chokepoint every
@@ -253,7 +295,7 @@ def _consented_for(
     state = _consent.load_state()
     endpoint = configured_endpoint(config)
     if _consent.permits(endpoint, state):
-        if not _tool_args_scoped(point, state):
+        if not _egress_scope_ok(point, state):
             return False
         return not _capability_denied(session_key)
     if _consent.is_enabled(state) and endpoint not in _unconsented_warned:
@@ -270,34 +312,40 @@ def _consented_for(
 _unscoped_warned: set[str] = set()
 
 
-def _tool_args_scoped(point: str | None, state: dict) -> bool:
-    """Whether *point*'s tool-argument egress is consented to. Never raises.
+def _egress_scope_ok(point: str | None, state: dict) -> bool:
+    """Whether *point*'s extra egress scope is consented to. Never raises.
 
-    ``True`` for every point that does not send tool arguments, so
-    ``skills.select`` is untouched by this and pays nothing for it.
+    ``True`` for every point absent from :data:`POINT_EGRESS_SCOPES`, so
+    ``skills.select`` and ``message.steer`` are untouched by this and pay nothing for
+    it.
 
     A missing scope is said out loud ONCE per point, at WARNING, for the reason the
     endpoint mismatch beside it is: an owner who consented before this scope existed
     sees the feature do nothing, and "you consented to sending, but not to sending
-    this" is the one fact that tells that apart from a broken build.
+    this" is the one fact that tells that apart from a broken build. The message
+    names the category AND the switch, because a warning that says only "a scope is
+    missing" leaves the owner with nothing to click.
     """
-    if point is None or point not in POINTS_NEEDING_TOOL_ARGS:
+    scope = POINT_EGRESS_SCOPES.get(point or "")
+    if scope is None:
         return True
     try:
-        if _consent.consented_tool_args(state):
+        if scope.consented(state):
             return True
     except Exception:
         # An unreadable scope is an unconsented scope: this decides whether a new
         # category of conversation content leaves the machine.
-        logger.debug("decisions: tool-argument scope unreadable; refusing %s", point)
+        logger.debug("decisions: egress scope unreadable; refusing %s", point)
         return False
     if point not in _unscoped_warned:
-        _unscoped_warned.add(point)
+        _unscoped_warned.add(point or "")
         logger.warning(
-            "decisions: %s needs consent to send tool-call arguments, which this "
-            "machine has not given; turn on the tool-argument switch in Settings to "
-            "enable it. Nothing is sent for this point until then",
+            "decisions: %s needs consent to send %s, which this machine has not "
+            "given; turn on %s in Settings to enable it. Nothing is sent for this "
+            "point until then",
             point,
+            scope.sends,
+            scope.switch,
         )
     return False
 

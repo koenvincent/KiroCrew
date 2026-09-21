@@ -128,9 +128,11 @@ With the Decisions switch on, Jev looks at that shortlist and says which entries
 
 Keeping none of them is a valid answer, not a failure: the prompt then carries no remembered-conversation block, which is also what a conversation with no close matches looks like.
 
-It happens only in a chat you have open in the dashboard. A scheduled job, a sub-agent, a Slack thread and an app request are never decided for, because the question sends parts of your own remembered notes and because the receipt for the decision appears on a reply you are looking at -- and those have no such reply.
+It happens only in a chat you have open in the dashboard. A scheduled job, a sub-agent, an app request and any conversation whose tab is closed are never decided for, because the question sends parts of your own remembered notes and because the receipt appears on a reply you are looking at -- and those have no such reply. A conversation that started in Slack or another channel counts while you have its tab open in the dashboard: you are reading it there, so the receipt reaches you.
 
 What leaves the machine for one of these questions is your message (up to 2000 characters) and, for each of at most twenty shortlisted memories, its id and the first 200 characters of its text. Credentials and data-collecting URLs are replaced in that text BEFORE it is shortened, so a shortened snippet cannot end in half a key. The remembered entries are already the earlier conversation, so this question sends no separate conversation history at all, whatever `history_budget_chars` says.
+
+Waiting for Jev cannot hold up the start of a conversation for long. The request gets the same budget as the other decisions -- `timeout_ms`, 1000 milliseconds by default -- and the wait is capped at ten seconds whatever that value says. When the time is up, every close match goes in as before.
 
 The reply carries a one-line receipt: how many memories were close matches, how many Jev kept, how sure it was on average, how long it took, and the prompt characters the smaller set saved -- `memory · similarity: 6 · Jev kept: 3 (0.81, 210 ms) · saved 2.1K chars`. Open it to see which entries were on the shortlist and which survived, with a thumbs pair for each side, so you can say the plain closest-match list was the better one.
 

@@ -6636,7 +6636,7 @@
         "crew_members_desc": "The Crew Members page: every agent you have, each with its own thread. Still being built, so it is not offered until you turn this on.",
         "decisions": "Decisions (Jev)",
         "decisions_desc": "Jev is a small, fast decision model. With this on, {{productName}} asks Jev which one of your skills fits the message you just sent — or that none does — and uses Jev's pick for the share of your sessions shown under the switch; the rest keep the word-matching rule this build ships with. If Jev is slow, unreachable or answers with nothing usable, that message falls back to the same rule, so a decision never holds up your reply. Each call is also recorded in a log on the machine that runs {{productName}}, for diagnostics. This switch is saved on the machine that runs {{productName}}, not in this browser, so it applies on every device you open it from.",
-        "decisions_egress": "While this is on, the text of your messages and the names and descriptions of your skills leave this machine. They are sent over the internet to Jev, the decision service this {{productName}} is set up to use. Nothing is sent while this is off.",
+        "decisions_egress": "While this is on, the text of your messages and the names and descriptions of your skills leave this machine. They are sent over the internet to Jev, the decision service this {{productName}} is set up to use. Two further categories each need their own switch below and stay off until you turn one on: the name and arguments of your tool calls, and short snippets of the memories recalled for your message. Nothing is sent while this is off.",
         "decisions_backend_required": "The {{productName}} running this dashboard is older than this feature, so there is nothing to turn on yet. Update {{productName}} first, from Settings › Releases.",
         "decisions_sent_to": "Sent to",
         "decisions_endpoint_moved": "You agreed to send to a different address than the one in the settings now, so nothing is being sent. Turn this off and on again to agree to the new address.",
@@ -6648,7 +6648,9 @@
         "decisions_config_unavailable": "Could not read the settings, so this switch is not offered. Reload to try again.",
         "decisions_save_failed": "Could not save this setting. The switch is showing the saved value again.",
         "decisions_tool_args": "Also send tool-call arguments so Jev can flag risky calls",
-        "decisions_tool_args_desc": "In a session that approves its own tool calls, this also sends the name and arguments of each call to Jev, which then puts a note on the ones it thinks are worth a look. Passwords and keys are replaced before anything is sent. It changes nothing about which tool calls are allowed. Off until you turn it on, even if the switch above is already on."
+        "decisions_tool_args_desc": "In a session that approves its own tool calls, this also sends the name and arguments of each call to Jev, which then puts a note on the ones it thinks are worth a look. Passwords and keys are replaced before anything is sent. It changes nothing about which tool calls are allowed. Off until you turn it on, even if the switch above is already on.",
+        "decisions_memory_text": "Also send snippets of recalled memories so Jev can drop the ones that do not help",
+        "decisions_memory_text_desc": "When a conversation starts, the memories closest in wording to your message go into the prompt. This also sends each one's id and the first 200 characters of its text to Jev, which then says which ones to keep. It can only remove them — never add one, never reorder them — and if it is slow or unreachable they all go in as before. Passwords and keys are replaced before anything is sent. Off until you turn it on, even if the switch above is already on."
       },
       "kiroSignInCard": {
         "title": "Kiro sign-in",

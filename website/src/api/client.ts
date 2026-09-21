@@ -430,6 +430,13 @@ export interface DecisionsConsentData {
    * consent recorded before this existed authorizes only what its owner reviewed.
    */
   tool_args?: boolean
+  /**
+   * Whether the owner consented to sending THE TEXT OF RECALLED MEMORIES — the extra
+   * egress category `memory.recall` needs. Absent reads as not consented, on the same
+   * terms as `tool_args`: a recalled memory is text the agent wrote down in an earlier
+   * conversation, so consent recorded against a message excerpt cannot stand for it.
+   */
+  memory_text?: boolean
 }
 
 /** Which side of a logged decision a reader's verdict is about. */
@@ -4935,13 +4942,24 @@ export const api = {
   getDecisionsConsent: () => get('/api/decisions/consent').then(j) as Promise<DecisionsConsentData>,
   // Enabling echoes the endpoint the card showed: the gateway binds consent to
   // that address and answers 409 if config.json moved it since the read.
-  // `toolArgs` is OMITTED when the caller does not pass one, and that omission is
-  // meaningful: the gateway preserves the recorded scope for an absent field, so
-  // an ordinary switch flip can neither grant nor erase it. Pass a boolean only
-  // when the owner acted on the tool-argument switch itself.
-  saveDecisionsConsent: (enabled: boolean, endpoint?: string, toolArgs?: boolean) =>
+  // Each `scopes` member is OMITTED when the caller does not pass it, and that
+  // omission is meaningful: the gateway preserves a recorded scope for an absent
+  // field, so an ordinary switch flip can neither grant nor erase one. Pass a
+  // boolean only for the scope switch the owner actually acted on — which is also
+  // why this is a named object rather than positional booleans, where granting the
+  // second scope would have to spell the first as a bare `undefined`.
+  saveDecisionsConsent: (
+    enabled: boolean,
+    endpoint?: string,
+    scopes?: { toolArgs?: boolean; memoryText?: boolean },
+  ) =>
     put('/api/decisions/consent', enabled
-      ? (toolArgs === undefined ? { enabled, endpoint } : { enabled, endpoint, tool_args: toolArgs })
+      ? {
+        enabled,
+        endpoint,
+        ...(scopes?.toolArgs === undefined ? {} : { tool_args: scopes.toolArgs }),
+        ...(scopes?.memoryText === undefined ? {} : { memory_text: scopes.memoryText }),
+      }
       : { enabled }).then(j) as Promise<DecisionsConsentData>,
   // One reader's verdict on one side of one decision, from the transcript's
   // decision strip. `verdict: null` takes an answer back, which is why the field

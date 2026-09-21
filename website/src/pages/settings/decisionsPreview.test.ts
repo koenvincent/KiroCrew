@@ -29,6 +29,7 @@ const OFF = {
   // The tool-argument egress scope reads FALSE for an unreadable body, on the same
   // fail-closed terms as `enabled`: a body nobody could parse grants nothing.
   toolArgs: false,
+  memoryText: false,
 }
 
 describe('readConsent', () => {
@@ -48,6 +49,8 @@ describe('readConsent', () => {
         // Consent to SEND is not consent to send tool arguments: a body that does
         // not mention the scope grants none of it.
         toolArgs: false,
+        memoryText: false,
+  memoryText: false,
       })
     for (const sloppy of [false, 'true', 1, null]) {
       expect(readConsent({ enabled: sloppy, configured_endpoint: ENDPOINT, permits: false }).enabled).toBe(false)
@@ -60,8 +63,13 @@ describe('readConsent', () => {
     // omits it entirely, which must read as off rather than as unknown.
     const base = { enabled: true, configured_endpoint: ENDPOINT, permits: true }
     expect(readConsent({ ...base, tool_args: true }).toolArgs).toBe(true)
+    expect(readConsent({ ...base, memory_text: true }).memoryText).toBe(true)
+    // Independent fields: one granted must not read as the other.
+    expect(readConsent({ ...base, tool_args: true }).memoryText).toBe(false)
+    expect(readConsent({ ...base, memory_text: true }).toolArgs).toBe(false)
     for (const sloppy of [undefined, false, 'true', 1, 0, null, [], {}]) {
       expect(readConsent({ ...base, tool_args: sloppy }).toolArgs).toBe(false)
+      expect(readConsent({ ...base, memory_text: sloppy }).memoryText).toBe(false)
     }
   })
 
@@ -118,6 +126,8 @@ describe('readDecisions', () => {
         endpointMoved: false,
         bucket: 25,
         toolArgs: false,
+        memoryText: false,
+  memoryText: false,
       })
     expect(readDecisions(off, { decisions: { bucket: 100 } }).bucket).toBe(100)
     expect(readDecisions(off, undefined).bucket).toBeNull()

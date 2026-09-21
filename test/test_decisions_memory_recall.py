@@ -22,7 +22,7 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from kiro_crew.decisions import gate
+from kiro_crew.decisions import consent, gate
 from kiro_crew.decisions import log as _log
 from kiro_crew.decisions import outcomes as _outcomes
 from kiro_crew.decisions.points import memory_recall as mr
@@ -395,14 +395,19 @@ class TestTheGateOwnsRefusals:
         """
         assert mr.POINT in gate.DECISION_POINT_NAMES
 
-    def test_the_point_sends_no_tool_arguments_so_it_needs_no_second_scope(self):
-        """The ``tool_args`` consent scope is for tool-call arguments.
+    def test_the_point_needs_the_recalled_memory_scope_and_not_the_tool_one(self):
+        """Its scope is ``memory_text``, and it is the memory reader that answers.
 
-        This point sends memory snippets and a message excerpt, which is the
-        category the first consent covers, so adding it to the scope set would make
-        an already-consented install inert for no egress it performs.
+        Held against the gate's own map rather than the point's constants: the two
+        live in different modules and only the gate's copy is consulted. An entry
+        naming the TOOL reader would let a tool-argument consent stand for memory
+        text, which is the exact widening the scope exists to prevent.
         """
-        assert mr.POINT not in gate.POINTS_NEEDING_TOOL_ARGS
+        scope = gate.POINT_EGRESS_SCOPES[mr.POINT]
+        assert scope.reader == "consented_memory_text"
+        assert getattr(consent, scope.reader) is consent.consented_memory_text
+        assert scope.reader != "consented_tool_args"
+        assert "recalled memories" in scope.sends
 
     @pytest.mark.asyncio
     async def test_a_credential_in_a_snippet_refuses_the_whole_request(self, home, monkeypatch):

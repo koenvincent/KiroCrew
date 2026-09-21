@@ -864,6 +864,13 @@
       "description": "Client ID, client secret and redirect URI for a provider that needs a registered OAuth app"
     },
     {
+      "id": "developer.also-send-snippets-of-recalled-memories-so-jev-can-drop-the-ones-that-do-not-help",
+      "label": "Also send snippets of recalled memories so Jev can drop the ones that do not help",
+      "tab": "developer",
+      "route": "/settings/developer?highlight=developer.also-send-snippets-of-recalled-memories-so-jev-can-drop-the-ones-that-do-not-help",
+      "description": "When a conversation starts, the memories closest in wording to your message go into the prompt. This also sends each one's id and the first 200 characters of its text to Jev, which then says which ones to keep. It can only remove them — never add one, never reorder them — and if it is slow or unreachable they all go in as before. Passwords and keys are replaced before anything is sent. Off until you turn it on, even if the switch above is already on."
+    },
+    {
       "id": "developer.also-send-tool-call-arguments-so-jev-can-flag-risky-calls",
       "label": "Also send tool-call arguments so Jev can flag risky calls",
       "tab": "developer",

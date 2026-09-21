@@ -175,6 +175,11 @@ def _payload(state: dict, *, denied: bool) -> dict:
         # guessing from ``enabled``: a record written before this scope existed reads
         # false here, which is what the card must draw for it.
         "tool_args": consent.consented_tool_args(state),
+        # Whether the owner consented to sending the TEXT OF RECALLED MEMORIES, on
+        # the same terms and reported for the same reason: a record written before
+        # this scope existed reads false here, which is what the card must draw for
+        # it rather than inferring the scope from ``enabled``.
+        "memory_text": consent.consented_memory_text(state),
     }
 
 
@@ -220,6 +225,12 @@ async def api_decisions_consent_put(request: web.Request) -> web.Response:
     switch flip cannot grant or erase it by omission. Absent on a keystone that never
     had it reads as false, which is what keeps a consent given before this scope
     existed meaning only what its owner reviewed.
+
+    ``memory_text`` records the same answer for the TEXT OF RECALLED MEMORIES, the
+    category ``memory.recall`` needs, on identical terms. Two independent fields
+    because they are two independent decisions: an owner may want risky tool calls
+    flagged without the contents of their memory store leaving the machine, and
+    either order of those answers has to be recordable.
 
     ``history_budget_chars`` records the prior-conversation CEILING the owner
     reviewed, and it is here for the same reason ``endpoint`` is: the value in force
@@ -310,6 +321,20 @@ async def api_decisions_consent_put(request: web.Request) -> web.Response:
             status=400,
         )
 
+    # The recalled-memory scope, read and validated on exactly the terms above: the
+    # sentinel is handed on rather than resolved here so the writer resolves it from
+    # the same read its write is based on, and a truthy stand-in is a 400 rather than
+    # a silent yes about a new egress category.
+    memory_text = (
+        body.get("memory_text", consent.KEEP_MEMORY_TEXT) if isinstance(body, dict) else False
+    )
+    if memory_text is not consent.KEEP_MEMORY_TEXT and not isinstance(memory_text, bool):
+        await _audit(request, operation=OP_CONSENT_PUT, outcome="denied", error="invalid_body")
+        return web.json_response(
+            {"error": '"memory_text" must be true or false', "code": _CODE_INVALID_BODY},
+            status=400,
+        )
+
     # Bound to the endpoint the owner REVIEWED, checked against the one the
     # config names now. Equal: consent is for the address on screen, and the one
     # the gate will hold the config to afterwards. Different: the config moved
@@ -367,6 +392,7 @@ async def api_decisions_consent_put(request: web.Request) -> web.Response:
             endpoint=endpoint,
             history_budget_chars=budget,
             tool_args=tool_args,
+            memory_text=memory_text,
         )
     except consent.ConsentCorruptError as exc:
         await _audit(request, operation=OP_CONSENT_PUT, outcome="error", error="corrupt")
@@ -385,7 +411,8 @@ async def api_decisions_consent_put(request: web.Request) -> web.Response:
         resources=(
             f"decisions_consent.json endpoint={endpoint} "
             f"history_budget_chars={consent.consented_history_budget(state)} "
-            f"tool_args={consent.consented_tool_args(state)}"
+            f"tool_args={consent.consented_tool_args(state)} "
+            f"memory_text={consent.consented_memory_text(state)}"
         ),
     )
     return web.json_response(_payload(state, denied=withdrawn))

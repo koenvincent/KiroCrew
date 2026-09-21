@@ -600,26 +600,34 @@ class TestPointName:
     def test_every_shipped_name_is_admitted(self, install_impl, monkeypatch):
         """Each shipped point, given the egress scope its own request needs.
 
-        ``tool.risk`` carries tool-call arguments, so consent alone does not admit
-        it -- the keystone's ``tool_args`` scope does, and this test grants it rather
-        than dropping the point from the loop, because "every shipped name" is the
-        claim and a loop that skipped one would stop making it.
+        Two points carry a category consent alone does not cover -- ``tool.risk``
+        sends tool-call arguments and ``memory.recall`` sends recalled-memory text --
+        so every reader in ``POINT_EGRESS_SCOPES`` is granted here rather than the
+        points being dropped from the loop, because "every shipped name" is the claim
+        and a loop that skipped one would stop making it.
+
+        Granted through the MAP rather than by naming the two readers: a point added
+        with a third scope is then admitted by this loop automatically, so the test
+        keeps asserting what it says instead of silently narrowing to two.
         """
         install_impl(_RecordingOracle())
-        monkeypatch.setattr(consent_mod, "consented_tool_args", lambda *_a, **_kw: True)
+        for scope in gate_mod.POINT_EGRESS_SCOPES.values():
+            monkeypatch.setattr(consent_mod, scope.reader, lambda *_a, **_kw: True)
         for name in DECISION_POINT_NAMES:
             assert is_enabled(name, config=_config()) is True
 
-    def test_the_annotating_point_is_refused_without_its_egress_scope(self, install_impl):
-        """Consent to SEND is not consent to send tool arguments.
+    def test_the_scoped_points_are_refused_without_their_egress_scope(self, install_impl):
+        """Consent to SEND is not consent to send a wider category.
 
         The keystone this suite writes consents to the endpoint and records no scope,
-        which is the state every install consented before the scope existed is in.
-        ``skills.select`` is unaffected; ``tool.risk`` is inert.
+        which is the state every install consented before the scopes existed is in.
+        The unscoped points are unaffected; every scoped one is inert.
         """
         install_impl(_RecordingOracle())
         assert is_enabled("skills.select", config=_config()) is True
-        assert is_enabled("tool.risk", config=_config()) is False
+        assert is_enabled("message.steer", config=_config()) is True
+        for name in gate_mod.POINT_EGRESS_SCOPES:
+            assert is_enabled(name, config=_config()) is False, name
 
 
 # ---------------------------------------------------------------------------

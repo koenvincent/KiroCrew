@@ -146,12 +146,19 @@ class TestTheSwitchOffChangesNothing:
         )
 
 
-class TestTheHookIsOnlyBuiltForAnOwnerDashboardTurn:
+class TestTheHookNeedsALiveDashboardSurface:
     """The restriction is the CALL SITE's, so it is asserted at the call site.
 
-    A cron turn, a sub-agent and a channel turn have no dashboard reply for the
-    receipt to ride, and the request carries snippets of the member's own recalled
-    memories -- so the hook is not built for them at all and nothing is sent.
+    A cron turn, a sub-agent, an integration and any session whose tab is closed
+    have no reader for the receipt to reach, and the request carries snippets of the
+    member's own recalled memories -- so the hook is not built for them at all and
+    nothing is sent.
+
+    `has_dashboard_surface` is OBSERVED state, so the parametrised keys below are
+    refused because nothing published them, NOT because of how they are spelled --
+    which is why one of them is a channel key that IS accepted once published. That
+    is the intended reading of the gate: the owner is reading that conversation in
+    the dashboard.
     """
 
     def _builder(self, monkeypatch, surfaced: set[str]):
@@ -163,9 +170,20 @@ class TestTheHookIsOnlyBuiltForAnOwnerDashboardTurn:
         assert builder._episodic_keep_hook("chat-1", "a message") is not None
 
     @pytest.mark.parametrize("key", ["cron:nightly", "subagent:abc", "slack:C1", "_bg"])
-    def test_a_non_dashboard_session_gets_no_hook(self, monkeypatch, key):
+    def test_an_unsurfaced_session_gets_no_hook(self, monkeypatch, key):
         builder = self._builder(monkeypatch, {"chat-1"})
         assert builder._episodic_keep_hook(key, "a message") is None
+
+    def test_a_channel_session_with_an_open_tab_gets_one(self, monkeypatch):
+        """The gate reads the PUBLISHED set, not the key's prefix.
+
+        `chat_utils._sync_dashboard_slots` publishes each open slot's own key and a
+        channel-born slot contributes its channel key, so this is the state a Slack
+        conversation with its dashboard tab open is really in. Asserted so the
+        documented behaviour and the code cannot drift into two claims.
+        """
+        builder = self._builder(monkeypatch, {"slack:C1"})
+        assert builder._episodic_keep_hook("slack:C1", "a message") is not None
 
     def test_no_session_key_gets_no_hook(self, monkeypatch):
         builder = self._builder(monkeypatch, {"chat-1"})

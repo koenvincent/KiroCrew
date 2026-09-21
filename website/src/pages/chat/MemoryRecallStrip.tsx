@@ -182,13 +182,16 @@ const MemoryRecallStrip = memo(function MemoryRecallStrip({
           {latency !== null && (
             <Detail label={i18nT('pages.chat.decisionStrip.latency_label')} value={latency} />
           )}
-          {/* No `askAgent`, for the draft reason the thumbs' notice states: the
-              failure is a decision the gateway already fell back from, so there
-              is nothing for an agent to pick up. */}
+          {/* Hand-off ON: this strip holds no draft input, the host composer's
+              draft is persisted per slot, and the failure category here is one an
+              agent can actually act on — a timeout or a provider error names the
+              judge, not the reply. An in-chat hand-off opens a fresh slot without
+              navigating away, so there is nothing to lose. */}
           <ErrorNotice
             message={record.error}
             title={i18nT('pages.chat.decisionStrip.error_title')}
             variant="inline"
+            askAgent
             testId="memory-recall-strip-error"
           />
           <div className="flex items-center gap-1.5 min-w-0 pt-0.5">
