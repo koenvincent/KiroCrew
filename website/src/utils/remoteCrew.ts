@@ -13,3 +13,8 @@ export const WARM_SET_CAP_AUTO_CEILING = 10
 /** Provisioner id of the built-in EC2 launcher. Mirrors
  *  BUILTIN_PROVISIONER_ID in src/kiro_crew/platform/interfaces.py. */
 export const BUILTIN_PROVISIONER_ID = 'aws_ec2'
+
+/** Provisioner id of the Fargate lane. Mirrors FARGATE_PROVISIONER_ID in
+ *  src/kiro_crew/platform/defaults.py. A launch on this lane records the
+ *  task's ARN where the EC2 lane records an instance id. */
+export const FARGATE_PROVISIONER_ID = 'aws_fargate'
