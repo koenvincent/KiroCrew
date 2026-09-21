@@ -30,6 +30,7 @@
  * (which is global through the inbox, see voiceTranscriptInbox).
  */
 import { useCallback, useEffect, useId, useRef, useState, useSyncExternalStore } from 'react'
+import { i18nT } from '../../i18n/t'
 import { useQuery } from '@tanstack/react-query'
 import { api } from '../../api/client'
 import { providerLabel } from '../../lib/sttProviders'
@@ -91,7 +92,7 @@ export interface ComposerVoiceHost {
   pendingCaretRef?: React.MutableRefObject<number | null>
 }
 
-export type SttConfig = { streaming?: boolean; enabled?: boolean; dictation_panel?: boolean; available?: boolean; provider?: string }
+export type SttConfig = { streaming?: boolean; enabled?: boolean; dictation_panel?: boolean; available?: boolean; provider?: string; polish?: boolean }
 
 export function useComposerVoice(host: ComposerVoiceHost) {
   const { sessionId, inputRef, setInput } = host
@@ -109,6 +110,17 @@ export function useComposerVoice(host: ComposerVoiceHost) {
   })
   const sttStreaming = !!sttCfg?.streaming
   const sttEnabled = !!sttCfg?.enabled
+  // Whether a finished transcript is handed to a fast model for punctuation and
+  // spacing. Read here rather than inside the replacement so the request is never
+  // even attempted with the switch off (the server refuses it with 403 anyway —
+  // the switch is the consent — but asking would be a pointless round-trip and a
+  // pointless 403 in the log).
+  const sttPolish = !!sttCfg?.polish
+  // Read through a ref inside the delivery callback: `applyVoiceText` is memoized
+  // and a live config value in its deps would rebuild it (and every hook that
+  // depends on it) on each config refetch, for a flag only read at delivery time.
+  const sttPolishRef = useRef(sttPolish)
+  sttPolishRef.current = sttPolish
   // The backend probes for the provider's binary and reports `available`.
   // Default true so a not-yet-loaded config doesn't flash the modal; the
   // separate sttConfigLoaded guard already covers the pre-load case.
@@ -245,6 +257,64 @@ export function useComposerVoice(host: ComposerVoiceHost) {
   // composer was never focused).
   const spliceDictation = useCallback((base: string, text: string): { value: string; caret: number } =>
     spliceDictationText(base, text, frozenCaretRef.current ?? voiceCaretRef.current), [voiceCaretRef])
+  /**
+   * Replace a just-delivered transcript with a tidied version of itself, a moment
+   * after the fact.
+   *
+   * Asynchronous by construction: the recogniser's own text is already in the
+   * composer and already sendable before this is called, so the model round-trip
+   * never stands between the user and their words. If it fails, times out, or the
+   * model declines, the composer simply keeps what it has.
+   *
+   * Only ever rewrites the span it wrote itself, and only while that span is still
+   * exactly as it left it. `written` is the whole composer value at the moment of
+   * delivery; if the live value has moved on at all -- the user typed, sent,
+   * switched slot, or another utterance landed -- the replacement is dropped rather
+   * than reconciled. Guessing at a merge here would delete text the user authored
+   * after they stopped talking, which is worse than not polishing at all.
+   *
+   * Deliberately does NOT auto-submit and does NOT touch `lastDictationAnchorRef`:
+   * this is a correction to a finished transcript, not a new dictation, and the
+   * live-region bookkeeping belongs to the capture that produced it.
+   */
+  /**
+   * A cleanup failure the user can see and dismiss.
+   *
+   * Kept SEPARATE from `useVoiceInput`'s own `error` and merged only at the
+   * boundary, so a feature-local failure does not need a setter on a hook several
+   * composers share. Both travel the same dismissible channel, which is what makes
+   * this safe to surface: the transcript is already in the composer, so the notice
+   * reports a correction that did not happen rather than words that were lost.
+   */
+  const [polishError, setPolishError] = useState<string | null>(null)
+
+  const polishDictation = useCallback((raw: string, written: string, end: number) => {
+    const start = end - raw.length
+    // The span invariant, checked rather than assumed: `spliceDictationText` owns
+    // where the transcript landed, and if its separator handling ever changes this
+    // offset arithmetic would silently rewrite the wrong characters. A mismatch
+    // means skip, never "rewrite anyway".
+    if (start < 0 || written.slice(start, end) !== raw) return
+    void api.sttPolish(raw)
+      .then(res => {
+        if (!res?.changed || !res.text || res.text === raw) return
+        // Byte-identical or nothing. See the doc comment: this is the whole
+        // protection for text the user typed after the transcript landed.
+        if (inputRef.current !== written) return
+        const next = written.slice(0, start) + res.text + written.slice(end)
+        if (next === written) return
+        setInput(next)
+        voicePendingCaretRef.current = start + res.text.length
+      })
+      // Surfaced, not swallowed. The earlier reasoning -- "the transcript is already
+      // there, so a failed polish is a non-event" -- is wrong about whose
+      // expectation is in play: the user turned this on, so silence tells them it
+      // worked. A dismissible notice is the honest signal, and because the words are
+      // already delivered it costs them nothing to ignore.
+      .catch(() => {
+        setPolishError(i18nT('hooks.useVoiceInput.polish_failed'))
+      })
+  }, [inputRef, setInput, voicePendingCaretRef])
   // Deliver a finished transcript to the slot that INITIATED the recording,
   // using the session id useVoiceInput snapshotted at record-start (falling back
   // to this host's session for the ordinary same-slot case). Same-slot splices
@@ -311,7 +381,11 @@ export function useComposerVoice(host: ComposerVoiceHost) {
     lastDictationValueRef.current = null
     postStopEditedRef.current = false
     frozenCaretRef.current = null
-  }, [isComposerFor, spliceDictation, rebaseFrozenCaret, inputRef, setInput, voicePendingCaretRef])
+    // After the write, never before it: the transcript must be in the composer and
+    // sendable first. Covers both origins, because both streaming finals and batch
+    // results reach the composer through this one branch.
+    if (sttPolishRef.current) polishDictation(text, spliced.value, spliced.caret)
+  }, [isComposerFor, spliceDictation, rebaseFrozenCaret, inputRef, setInput, voicePendingCaretRef, polishDictation])
   // Capture can end from a manual release or from the readiness-buffer ceiling.
   // Both release the composer for typing while the same socket still sends finals.
   const protectStoppedDictation = useCallback(() => {
@@ -717,9 +791,18 @@ export function useComposerVoice(host: ComposerVoiceHost) {
     }
   }, [])
 
+  /** Clears both halves, so one dismissal means what the user thinks it means. */
+  const clearVoiceError = useCallback(() => {
+    setPolishError(null)
+    voice.clearError()
+  }, [voice])
+
   return {
     voice,
     voiceOwned,
+    /** A cleanup pass that failed, merged into the capture's error at the boundary. */
+    polishError,
+    clearVoiceError,
     voiceCaretRef,
     voicePendingCaretRef,
     startVoice,
@@ -750,7 +833,7 @@ export type ComposerVoice = ReturnType<typeof useComposerVoice>
  * drift this slice exists to close.
  */
 export function composerVoiceInputProps(cv: ComposerVoice) {
-  const { voice, voiceOwned } = cv
+  const { voice, voiceOwned, polishError, clearVoiceError } = cv
   return {
     voiceRecording: voiceOwned && voice.recording,
     voiceTranscribing: voiceOwned && voice.transcribing,
@@ -765,13 +848,15 @@ export function composerVoiceInputProps(cv: ComposerVoice) {
     voiceBusyElsewhereSession: cv.micBusyElsewhereSession,
     /* A held dictation just landed here: the composer shows a brief cue. */
     voiceHeldLanded: cv.heldLanded,
-    voiceError: voice.error,
+    // The capture's own error wins: a microphone that never recorded outranks a
+    // cleanup pass that did not run.
+    voiceError: voice.error ?? polishError,
     voiceLevel: voiceOwned ? voice.level : 0,
     voiceDeviceLabel: voiceOwned ? voice.deviceLabel : '',
     voiceDeviceId: voiceOwned ? voice.deviceId : '',
     onSelectVoiceDevice: voice.switchDevice,
     voiceDeviceSwitchIsLive: voiceOwned && voice.deviceSwitchIsLive,
-    onClearVoiceError: voice.clearError,
+    onClearVoiceError: clearVoiceError,
     voiceDictationPanel: cv.sttDictationPanel,
     voiceStreaming: voice.streamEnabled,
     voiceSampleRef: voice.sampleRef,

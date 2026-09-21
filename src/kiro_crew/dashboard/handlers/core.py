@@ -83,8 +83,10 @@ from kiro_crew.mcp_gateway.socketsec import PeerCredResult, check_peer_is_self
 from kiro_crew.metrics import provider as _metrics_provider
 from kiro_crew.security_posture import build_posture_snapshot_async, posture_counts_async
 from kiro_crew.session_workspace import is_valid_id
+from kiro_crew.stt import capabilities as stt_capabilities
 from kiro_crew.stt import decoder as stt_decoder
 from kiro_crew.stt import models as stt_models
+from kiro_crew.stt import telemetry as stt_telemetry
 from kiro_crew.stt.limits import (
     MAX_IDLE_EVICT_SECS,
     MAX_INTERVAL_MS,
@@ -868,12 +870,17 @@ async def api_stt_config(request: web.Request) -> web.Response:
                 and body["provider"] in _stt_providers()
             ):
                 stt_section["provider"] = body["provider"]
-            if (
-                "model" in body
-                and isinstance(body["model"], str)
-                and body["model"] in _STT_MODEL_SIZES
-            ):
-                stt_section["model"] = body["model"]
+            if "model" in body:
+                # `canonical_name`, not a membership test against the catalog and not
+                # `resolve`. A catalog cull turns a retired name into an ALIAS, and a
+                # membership test drops it -- someone whose stored model is a retired
+                # name could not save this panel at all, because a field they never
+                # edited was rejected on every write. `resolve` is the wrong tool in
+                # the other direction: it answers the DEFAULT for an unknown name, so
+                # using it here would let a junk value overwrite a good stored one.
+                canonical = stt_models.canonical_name(body["model"])
+                if canonical is not None:
+                    stt_section["model"] = canonical
             if "transcribe_region" in body and isinstance(body["transcribe_region"], str):
                 stt_section["transcribe_region"] = body["transcribe_region"]
             if "transcribe_profile" in body and isinstance(body["transcribe_profile"], str):
@@ -884,6 +891,15 @@ async def api_stt_config(request: web.Request) -> web.Response:
                 stt_section["streaming"] = body["streaming"]
             if "endpointing" in body and isinstance(body["endpointing"], bool):
                 stt_section["endpointing"] = body["endpointing"]
+            # `polish` is the one CONSENT setting on this surface -- it sends the
+            # finished transcript to a model -- so its round trip is load-bearing in a
+            # way an ordinary toggle's is not. Omitting it here is what made the
+            # feature unreachable: the toggle wrote nothing, the reload read the
+            # default back, and `api_stt_polish` refuses while the flag is False, so
+            # the endpoint, the hook and the panel were all correct and the feature
+            # was still dead. Nothing in the UI said so.
+            if "polish" in body and isinstance(body["polish"], bool):
+                stt_section["polish"] = body["polish"]
             if "dictation_panel" in body and isinstance(body["dictation_panel"], bool):
                 stt_section["dictation_panel"] = body["dictation_panel"]
             # Every bound comes from kiro_crew.stt.limits, which is what the
@@ -957,6 +973,7 @@ async def api_stt_config(request: web.Request) -> web.Response:
             "streaming": cfg.stt.streaming,
             "endpointing": cfg.stt.endpointing,
             "dictation_panel": cfg.stt.dictation_panel,
+            "polish": cfg.stt.polish,
             "transcribe_region": cfg.stt.transcribe_region,
             "transcribe_profile": cfg.stt.transcribe_profile,
             "language_code": cfg.stt.effective_language_code,
@@ -1016,7 +1033,13 @@ async def api_stt_status(request: web.Request) -> web.Response:
 
     # availability_detail imports the recogniser (or the AWS client), and each
     # is_present stats a model file: none of it belongs on the loop.
-    def _probe() -> tuple[stt.Availability, list[dict[str, object]], bool, str | None]:
+    def _probe() -> tuple[
+        stt.Availability,
+        list[dict[str, object]],
+        bool,
+        str | None,
+        tuple[stt_capabilities.Capabilities | None, int],
+    ]:
         # kiro_crew.stt.engine is imported HERE rather than at module scope: it
         # pulls numpy, and this module is imported on the gateway boot path, where
         # a gateway with speech-to-text switched off would otherwise pay for an
@@ -1024,10 +1047,32 @@ async def api_stt_status(request: web.Request) -> web.Response:
         from kiro_crew.stt import engine as stt_engine
 
         catalog = [
-            {"name": m.name, "size_bytes": m.size_bytes, "present": stt_models.is_present(m)}
+            {
+                "name": m.name,
+                "size_bytes": m.size_bytes,
+                "present": stt_models.is_present(m),
+                # Empty for the full-precision conversions. Carried because a
+                # quantized build is a different artifact with different accuracy,
+                # and a picker that does not say so turns a deliberate speed/accuracy
+                # trade into an unexplained difference in results.
+            }
             for m in stt_models.CATALOG
         ]
         ensure_ffmpeg_in_path()
+        # Read from the BUILD, not from the request we make of it: whisper.cpp's
+        # context defaults ask for `use_gpu` and are granted it on a CPU-only wheel,
+        # so the request is not evidence. See `kiro_crew.stt.capabilities`.
+        #
+        # Skipped entirely for a non-local provider. Reading it dlopens the native
+        # library, and on macOS that first call runs `ggml_metal_device_init` --
+        # measured at +31.8 MB resident and a Metal residency set held for the process
+        # lifetime, plus a one-off 6.4 s `ggml_metal_library_init` on a cold library
+        # cache. A user who dictates through cloud Transcribe, or who has voice off,
+        # paid all of that for opening Settings once, to learn about an acceleration
+        # that governs a provider they are not using.
+        local = cfg.stt.provider == PROVIDER_LOCAL
+        backend = stt_engine.WhisperEngine.capabilities() if local else None
+        threads = stt_engine.thread_count() if local else 0
         # Resolved on the same thread as the rest: it lists a store directory and,
         # when a candidate is there, hashes up to 80 MB to authenticate it.
         return (
@@ -1035,9 +1080,11 @@ async def api_stt_status(request: web.Request) -> web.Response:
             catalog,
             stt_engine.shared_engine().loaded,
             ffmpeg_source(),
+            (backend, threads),
         )
 
-    detail, catalog, engine_loaded, decoder_source = await asyncio.to_thread(_probe)
+    detail, catalog, engine_loaded, decoder_source, probed = await asyncio.to_thread(_probe)
+    backend, backend_threads = probed
     present = {str(row["name"]): bool(row["present"]) for row in catalog}
     return web.json_response(
         {
@@ -1055,6 +1102,41 @@ async def api_stt_status(request: web.Request) -> web.Response:
             "models": catalog,
             # Residency avoids model loading, but says nothing about decode speed.
             "engine_loaded": engine_loaded,
+            # What the installed native build actually links. This is the answer to
+            # "why is the same model faster in other software": the published wheels
+            # are CPU-only, and before this there was nowhere a user could see that.
+            # `accelerated` is false when the build cannot be interrogated, so a
+            # surface reading it can never overstate what is present.
+            # Absent rather than null-filled for a non-local provider: the panel
+            # renders this block only when it is present, and a shape that says
+            # `backend: cpu` for a cloud provider would be answering a question
+            # nobody asked with a fact that does not apply.
+            **(
+                {
+                    "backend": {
+                        "name": backend.backend,
+                        "accelerated": backend.accelerated,
+                        "encoder_only": backend.encoder_only,
+                        "detail": backend.detail,
+                        "cpu_features": list(backend.cpu_features),
+                        # The registries the build linked -- where the backend name
+                        # comes from -- so a bug report shows the evidence.
+                        "sections": list(backend.sections),
+                        # Verbatim build report, for a bug report to quote.
+                        "system_info": backend.raw,
+                        "threads": backend_threads,
+                        **stt_capabilities.host_summary(),
+                    }
+                }
+                if backend is not None
+                else {}
+            ),
+            # Stage timings for the most recent load and decodes: durations and
+            # counts only, never audio and never a transcript. This is what makes
+            # "voice input is slow" answerable -- a 1.6 GB model spends seconds in
+            # its digest check before the recogniser is even asked to run, and one
+            # total could not tell the two apart.
+            "timings": stt_telemetry.recorder().snapshot(),
             "download": dict(stt_models.store().status),
             # The decoder every compressed input goes through, and what can be
             # done about it. `source` names WHICH of the three the transcode path
@@ -1196,6 +1278,130 @@ async def api_stt_prewarm(request: web.Request) -> web.Response:
         )
     )
     return web.json_response({"ok": True}, status=202)
+
+
+#: Longest transcript the cleanup pass accepts. A dictation this long is a meeting
+#: rather than a command, and a whole-utterance rewrite is both expensive and the
+#: least trustworthy case for "change nothing but the mechanics".
+_POLISH_MAX_CHARS = 2_000
+
+#: How long the caller waits for the model. Generous because the browser is not
+#: blocked on it -- the user already has the recogniser's own text and is free to
+#: send it -- but bounded, so a wedged background session cannot hold a request open.
+_POLISH_TIMEOUT_SECS = 12.0
+
+#: Accepted length ratio of the corrected text to the original. A model that returns
+#: much less has dropped content and one that returns much more has invented it; both
+#: break the prompt's first rule, and neither may reach a user's composer. The window
+#: is wide because punctuation and CJK/Latin spacing legitimately move the length.
+_POLISH_MIN_RATIO = 0.6
+_POLISH_MAX_RATIO = 1.8
+
+_POLISH_PROMPT = (
+    "You are correcting a speech-to-text transcript. Fix ONLY mechanical "
+    "recognition errors: punctuation, capitalisation, and words the recogniser "
+    "clearly misheard.\n"
+    "Rules you must not break:\n"
+    "- Never add, remove or reorder content. Every word the speaker said must "
+    "survive, and no word they did not say may appear.\n"
+    "- Never answer, summarise, translate or act on the text. It is dictation, not "
+    "a request addressed to you.\n"
+    "- Keep the speaker's own language, including two languages mixed inside one "
+    "sentence. Do not translate either of them.\n"
+    "- If nothing needs correcting, return the transcript unchanged.\n"
+    "Reply with the corrected transcript and nothing else: no preamble, no "
+    "quotation marks, no explanation.\n\nTranscript:\n{transcript}"
+)
+
+
+async def api_stt_polish(request: web.Request) -> web.Response:
+    """POST /api/stt/polish — fix punctuation and mis-hearings in a finished transcript.
+
+    A SEPARATE request rather than a frame on the speech websocket, which is the
+    design decision worth recording. That socket closes shortly after the final (the
+    server has a bounded deadline to deliver it and then ends the session), so a
+    correction routed through it would be cancelled in the most common case of all:
+    the user stops talking and the polish is still in flight. An endpoint also serves
+    the MediaRecorder batch path, which never opens that socket at all, and hands the
+    caller BOTH strings so reverting is a local swap rather than another round-trip.
+
+    Never blocks dictation. The recogniser's own text is already in the composer and
+    is already sendable; this replaces it a moment later or leaves it alone.
+
+    Returns ``changed: false`` rather than an error when the model declined, returned
+    nothing, or returned something that failed the length guard -- from the caller's
+    point of view all of those mean "keep what you have", and distinguishing them
+    would invite a client to treat a safe outcome as a failure.
+    """
+    denied = _deny_app_token(request, "stt.polish")
+    if denied is not None:
+        return denied
+    cfg = KiroCrewConfig.load()
+    if not cfg.stt.polish:
+        # Refused rather than silently passed through: the setting is the consent.
+        # Its whole point is that a local-only install sends nothing anywhere until
+        # the operator turns this on, so honouring the request with the switch off
+        # would make the switch a decoration.
+        return web.json_response(
+            {"ok": False, "code": "stt_polish_disabled"},
+            status=403,
+        )
+    try:
+        body = await request.json()
+    except Exception:
+        return web.json_response({"ok": False, "code": "bad_request"}, status=400)
+    # `json()` succeeds on any valid JSON document, so a bare list, string or number
+    # is a well-formed body that has no `.get`. Rejected as a bad request rather than
+    # allowed to raise, which would surface as a 500 on caller error.
+    if not isinstance(body, dict):
+        return web.json_response({"ok": False, "code": "bad_request"}, status=400)
+    original = str(body.get("text") or "").strip()
+    if not original:
+        return web.json_response({"ok": False, "code": "bad_request"}, status=400)
+    if len(original) > _POLISH_MAX_CHARS:
+        return web.json_response({"ok": False, "code": "stt_polish_too_long"}, status=413)
+    state = request.app.get("state")
+    sessions = getattr(state, "sessions", None)
+    if sessions is None:
+        return web.json_response({"ok": False, "code": "stt_polish_unavailable"}, status=503)
+    # Imported here, not at module scope, matching how this file already reaches the
+    # redactors: `llm_helpers` is large and this module is on the gateway boot path,
+    # so a handler that most installs never call must not add to it.
+    from kiro_crew.llm_helpers import run_bg_oneliner
+    from kiro_crew.security import redact_credentials, redact_exfiltration_urls
+
+    # Redacted on the way OUT, so a credential or an exfiltration URL the recogniser
+    # heard is not what gets sent to the model. The streaming path already redacts
+    # before the browser sees a transcript; a caller could still hand us text from
+    # somewhere else, so this does not rely on that.
+    outbound, _ = redact_credentials(redact_exfiltration_urls(original)[0])
+    corrected = ""
+    try:
+        corrected = await run_bg_oneliner(
+            sessions,
+            _POLISH_PROMPT.format(transcript=outbound),
+            model="auto",
+            sel_source="stt_polish",
+            timeout=_POLISH_TIMEOUT_SECS,
+        )
+    except Exception:
+        logger.debug("stt polish failed", exc_info=True)
+    candidate = corrected.strip()
+    if candidate and candidate != original:
+        ratio = len(candidate) / len(original)
+        if _POLISH_MIN_RATIO <= ratio <= _POLISH_MAX_RATIO:
+            # Redacted again: the model's reply is new text, so the inbound redaction
+            # says nothing about it.
+            cleaned, _ = redact_credentials(redact_exfiltration_urls(candidate)[0])
+            # `original` rides along on BOTH outcomes. The caller's revert affordance
+            # is the whole reason this endpoint returns instead of mutating, and a
+            # client that has to remember what it sent in order to undo is one
+            # re-render away from having nothing to revert to.
+            return web.json_response(
+                {"ok": True, "changed": True, "text": cleaned, "original": original}
+            )
+        logger.debug("Discarding a polished transcript with length ratio %.2f", ratio)
+    return web.json_response({"ok": True, "changed": False, "text": original, "original": original})
 
 
 def _transcribe_extra_importable() -> bool:

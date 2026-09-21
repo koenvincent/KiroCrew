@@ -1899,7 +1899,6 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "id": "voice.auto-submit-when-i-finish-speaking",
     "label": "Auto-submit when I finish speaking",
     "labelKey": "pages.settings.sttSettings.endpointing",
-    "description": "Use a fast model to detect when you've finished a complete request and send it automatically. Streaming providers only.",
     "tab": "voice",
     "type": "toggle",
     "occurrence": 1,
@@ -1945,7 +1944,6 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "id": "voice.dictation-panel",
     "label": "Dictation panel",
     "labelKey": "pages.settings.sttSettings.dictation_panel",
-    "description": "Show an animated panel while recording instead of the thin status bar. Falls back to the bar when the browser lacks WebGL2 or your system requests reduced motion.",
     "tab": "voice",
     "type": "toggle",
     "occurrence": 1
@@ -1954,7 +1952,6 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "id": "voice.enabled",
     "label": "Enabled",
     "labelKey": "pages.settings.sttSettings.enabled",
-    "description": "Transcribe voice into the message box when you click the mic",
     "tab": "voice",
     "type": "toggle",
     "occurrence": 1
@@ -1986,20 +1983,9 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "configKey": "stt.language_code"
   },
   {
-    "id": "voice.live-transcript-refresh-ms",
-    "label": "Live transcript refresh (ms)",
-    "labelKey": "pages.settings.sttSettings.partial_interval_ms",
-    "description": "How often the transcript is redrawn while you speak. Lower feels more immediate and costs more processing.",
-    "tab": "voice",
-    "type": "stepper",
-    "occurrence": 1,
-    "configKey": "stt.partial_interval_ms"
-  },
-  {
     "id": "voice.microphone",
     "label": "Microphone",
     "labelKey": "pages.settings.sttSettings.microphone",
-    "description": "Input device used to capture your voice",
     "tab": "voice",
     "type": "select",
     "occurrence": 1
@@ -2008,21 +1994,10 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "id": "voice.model",
     "label": "Model",
     "labelKey": "pages.settings.sttSettings.model",
-    "description": "Models download on demand. Select one and click Download now; the desktop app already includes every other runtime dependency.",
     "tab": "voice",
     "type": "select",
     "occurrence": 1,
     "configKey": "stt.model"
-  },
-  {
-    "id": "voice.pause-that-ends-a-phrase-ms",
-    "label": "Pause that ends a phrase (ms)",
-    "labelKey": "pages.settings.sttSettings.silence_ms",
-    "description": "How much silence commits what you just said. Lower reacts sooner; higher tolerates thinking pauses.",
-    "tab": "voice",
-    "type": "stepper",
-    "occurrence": 1,
-    "configKey": "stt.silence_ms"
   },
   {
     "id": "voice.piper-binary",
@@ -2101,7 +2076,6 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "id": "voice.streaming",
     "label": "Streaming",
     "labelKey": "pages.settings.sttSettings.streaming",
-    "description": "Show the transcript in the input box as you speak, instead of only when you stop.",
     "tab": "voice",
     "type": "toggle",
     "occurrence": 1,
@@ -2115,6 +2089,16 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "tab": "voice",
     "type": "stepper",
     "occurrence": 1
+  },
+  {
+    "id": "voice.tidy-up-transcripts-with-ai",
+    "label": "Tidy up transcripts with AI",
+    "labelKey": "pages.settings.sttSettings.polish",
+    "description": "Sends the finished text, never the audio, to a fast model that fixes punctuation. The original is kept.",
+    "tab": "voice",
+    "type": "toggle",
+    "occurrence": 1,
+    "configKey": "stt.polish"
   },
   {
     "id": "voice.voice",

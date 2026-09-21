@@ -749,13 +749,49 @@ class TestSttConfigEndpoint:
         assert "turbo" not in core_mod._STT_MODEL_SIZES
         async with TestClient(TestServer(_stt_app())) as client:
             assert (await client.put("/api/config/stt", json={"model": "small"})).status == 200
-            refused = await client.put("/api/config/stt", json={"model": "turbo"})
+            # An ALIAS is accepted and canonicalised. It has to be: a catalog cull
+            # turns a retired name into an alias, and refusing those meant someone
+            # whose stored model was retired could not save this panel at all --
+            # a field they never edited was rejected on every write.
+            aliased = await client.put("/api/config/stt", json={"model": "turbo"})
+            assert (await aliased.json())["model"] == "large-v3-turbo"
+            # A name that resolves to NOTHING leaves the stored value alone. The
+            # distinction matters: answering the default here would let one junk
+            # request replace a model the user deliberately chose.
+            refused = await client.put("/api/config/stt", json={"model": "no-such-model"})
             assert refused.status == 200
-            assert (await refused.json())["model"] == "small"
-            accepted = await client.put("/api/config/stt", json={"model": "large-v3-turbo"})
-            assert (await accepted.json())["model"] == "large-v3-turbo"
+            assert (await refused.json())["model"] == "large-v3-turbo"
+            accepted = await client.put("/api/config/stt", json={"model": "tiny"})
+            assert (await accepted.json())["model"] == "tiny"
         stt = json.loads(seeded_config.read_text(encoding="utf-8"))["stt"]
-        assert stt["model"] == "large-v3-turbo"
+        assert stt["model"] == "tiny"
+
+    @pytest.mark.asyncio
+    async def test_put_round_trips_the_cleanup_consent(self, seeded_config) -> None:
+        """The whole feature hangs off this round trip, and it was broken.
+
+        `polish` sends the finished transcript to a model, so it is the one CONSENT
+        setting on this surface. The PUT branch never read it and the GET response
+        never returned it, so the toggle wrote nothing and a reload read the default
+        back -- and because `api_stt_polish` refuses while the flag is False, the
+        endpoint, the hook and the panel were each correct while the feature was
+        dead. Nothing in the UI said so, which is why this asserts the value on
+        DISK rather than only the response.
+        """
+        async with TestClient(TestServer(_stt_app())) as client:
+            assert (await (await client.get("/api/config/stt")).json())["polish"] is False
+            enabled = await client.put("/api/config/stt", json={"polish": True})
+            assert enabled.status == 200
+            assert (await enabled.json())["polish"] is True
+            assert json.loads(seeded_config.read_text(encoding="utf-8"))["stt"]["polish"] is True
+            # And back off again -- a consent setting that cannot be withdrawn is
+            # worse than one that cannot be given.
+            disabled = await client.put("/api/config/stt", json={"polish": False})
+            assert (await disabled.json())["polish"] is False
+            assert json.loads(seeded_config.read_text(encoding="utf-8"))["stt"]["polish"] is False
+            # A non-bool is ignored rather than coerced: "on" must not read as consent.
+            await client.put("/api/config/stt", json={"polish": "yes"})
+            assert json.loads(seeded_config.read_text(encoding="utf-8"))["stt"]["polish"] is False
 
     @pytest.mark.asyncio
     async def test_put_persists_the_millisecond_knobs_at_their_floors(self, seeded_config) -> None:

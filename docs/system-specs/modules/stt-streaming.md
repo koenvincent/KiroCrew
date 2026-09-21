@@ -396,6 +396,165 @@ releases weights after a quiet spell to bound resident memory. Decodes run on
 mutates the context, so two concurrent decodes on one context corrupt each other,
 and a superseded partial aborts rather than queueing.
 
+**Boot prewarm.** `dashboard.server._stt_startup_prewarm` loads and warms the model
+in the background a few seconds after boot, so the first dictation of a gateway's
+life does not pay the cold start. Triggering only on the browser's pointer-down is
+too late: the digest verification and the native load sit in front of the first
+utterance's own decode, so a user who says a short phrase and stops is still waiting
+on them after they have finished speaking. It is registered beside the idle sweep and
+cancelled with it at shutdown.
+
+It removes the hash and the load, NOT the decode, which happens either way. Measured
+on a 32-core aarch64 CPU build (11 s clip, time from "ready to decode" to "transcript
+in hand"): `base` 1.36 s -> 0.66 s, `small` 4.39 s -> 2.44 s, `large-v3-turbo`
+15.47 s -> 13.59 s. The saving is dominated by the digest check, which scales with
+model size and page-cache state -- the same 1.6 GB model hashed in 1.14 s warm and
+5.48 s cold -- so several seconds is the upper bound on a cold host. The first
+decode's graph allocation is negligible on a CPU build (30-40 ms, the gap between the
+first and second decode after a load). On macOS it is not: a reviewer measured
+`ggml_metal_library_init` at 6.364 s on a host whose Metal library cache was cold, and
+0.018 s on every run after, because the OS caches the compiled library. Boot prewarm
+covers that once-per-machine cost, which makes it worth more on a Mac than the aarch64
+figures suggest rather than less.
+
+**UI evidence lives off this branch.** The screenshots and the walkthrough recording
+are on `assets/stt-perf-evidence`, not in the PR. `.gitignore` already records
+`temp-screenshots/` as never-committed, and force-adding binaries past it puts them in
+this repository's history forever for the sake of one review. A separate branch also
+makes the PR body's URLs stable: pinned to a review branch's SHA they broke on every
+force-push, which cost a body rewrite each time.
+
+**Retired weights are not reclaimed.** The cull maps `tiny`, `base-q5_1`, `small` and
+`small-q5_0` onto surviving rows, so no stored configuration falls back to the default
+-- but the FILES stay. A user who had `ggml-tiny.bin` or `ggml-small.bin` holds 148 MB
+to 488 MB that no catalog row references, so nothing lists it and nothing reclaims it,
+and their next dictation on the aliased row starts a fresh download. Neither the store
+nor the panel accounts for that today; it is a known gap rather than a solved one.
+
+Four restraints, each with a test, because a task on every boot has more ways to do
+harm than good:
+
+- It NEVER downloads. Only an already-present model is warmed (`is_present` is
+  checked first), so a gateway cannot spend a user's bandwidth on 1.6 GB because it
+  restarted. The first-run download stays an explicit `POST /api/stt/prepare`.
+- It does not run when `stt.enabled` is false or the provider is not `local`, and in
+  those cases it does not even IMPORT the recognizer -- that import pulls numpy and
+  the native binding, measured at 169 ms.
+- It does not block boot and does not run on the event loop: the delay plus
+  `asyncio.to_thread` for the import, exactly as the idle sweep does it.
+- It does not run when the host is short on memory: `platform_compat.host_available_mib`
+  must report at least twice the model's size, and a reading of 0 (the platform could
+  not answer) is treated as "do not speculate". `large-v3-turbo` measured 1861 MB
+  resident on a reviewer's Mac, and a desktop install restarts the gateway with the
+  app -- so without this an 8 GB machine pays that per launch for `idle_evict_secs`
+  whether or not its owner dictates. The pointer-down prewarm still covers the case.
+- It cannot fail the gateway. Every reason it gives up -- no model, no recognizer, a
+  load that timed out -- is a state the gateway is expected to run in, so its
+  done-callback consumes the exception rather than re-raising the way the sweep's
+  deliberately does.
+
+It also passes `stt.idle_evict_secs` and `stt.timeout_secs` when it first reaches
+`shared_engine`, because that function is a process singleton whose bounds are set by
+its first caller; booting without them would leave the module defaults in force.
+
+**The section label is the backend name.** Easy to get backwards, and getting it
+backwards inverts the answer on two of the three shipped platforms. Upstream builds
+`whisper_print_system_info()` by walking the ggml backend registry and printing each
+registry's NAME as a section label, then that registry's own features as `KEY = VALUE`
+pairs. So `VITISAI`, `COREML` and `OPENVINO` are the only genuine backend flags; CUDA,
+Vulkan, Metal, ROCm, SYCL and BLAS appear only as labels, and CUDA's own flags are
+`ARCHS` / `USE_GRAPHS`. There is no `CUDA = 1` token in any build's output.
+
+The first version of `stt/capabilities.py` flattened the labels away as noise, which
+made `detect()` report every Mac (`MTL :`) and every CUDA or Vulkan build as CPU-only
+-- the exact failure this module exists to prevent, in the unsafe direction, on the
+platforms where acceleration matters most. Two reviewers caught it on real hardware,
+one measuring `large-v3-turbo` at RTF 0.070 over Metal on a machine the panel was
+warning could not keep up with speech. The fixtures were the reason the suite stayed
+green: they synthesized `CUDA = 1` and `METAL = 1` tokens inside the `CPU :` section, a
+shape no build emits, so they pinned the assumption rather than the format. Every
+fixture is now a verbatim capture, and one test asserts those tokens are ABSENT so a
+future fixture cannot drift back.
+
+Apple is the reason label matching is a table of accepted spellings: its Metal registry
+shortens to `MTL`, and its BLAS appears as the CPU-registry feature `ACCELERATE` rather
+than a `BLAS :` section.
+
+A caveat the module cannot fix: this string is COMPILE-TIME information. Which backend a
+load actually uses is stated only by the loader's own `using <name> backend` lines,
+reachable through `whisper_log_set` during a load. What is reported is therefore "what
+was linked", not "what ran".
+
+**Which acceleration is actually present.** `stt.capabilities` answers this by
+parsing `whisper_print_system_info()`, which is produced BY the compiled artifact
+and lists the backends linked into it. Nothing else is evidence:
+`whisper_context_default_params()` returns `use_gpu=True` and `flash_attn=True` on
+a CPU-only wheel (measured on the packaged `pywhispercpp` for linux-aarch64), so
+those fields report the request rather than the grant. The published wheels are
+described upstream as CPU-only builds, with CUDA, Vulkan, CoreML and OpenBLAS each
+requiring a different source build, so "has a GPU, uses the GPU" is a common false
+inference rather than an edge case. A build that cannot be interrogated reports
+`unknown` and `accelerated: false`: the module never guesses, because a guess here
+tells a user to stop expecting a speedup they are not getting.
+
+**There is deliberately no `stt.local_backend` key.** One was built and then removed
+before merge, and the reason is worth keeping: its only reader was the status echo
+that reported whether it had been honoured. No load path consulted it, so naming
+`cuda` on a CPU-only build changed nothing except the sentence the panel printed
+about the value the user had just set. A config key is honoured forever once it
+ships, and a 14-value one whose entire effect is a note about itself is surface with
+no function -- the same objection that retired the adaptive partial-cadence budget in
+this change. `detect()` and the badge stay, because reporting the backend the build
+actually links is the fix; asking for one was never the fix.
+
+Installing acceleration is a packaging problem (the published wheel links none), and
+a config key cannot solve it. If backend selection ever becomes real it needs a
+loader that acts on it, which is a different change.
+
+**Decode cost is a fixed floor plus a small marginal term.** whisper.cpp pads every
+decode into a fixed analysis window, so the cost of a decode is dominated by a
+constant rather than by the length of the audio. Measured with `base` on a 32-core
+aarch64 CPU build: 0.5 s of audio in 0.82 s, 2 s in 0.86 s, 8 s in 1.29 s, 11 s in
+1.65 s -- about 0.78 s fixed plus 0.08 s per audio-second. Two consequences that
+matter for anyone tuning this path:
+
+- The real-time factor of one model on one host spans 1.64 to 0.15 depending only
+  on how much audio it was handed, so RTF is a reporting figure and cannot be used
+  as a multiplier to project a decode's cost. The previous decode's absolute wall
+  time is the honest predictor.
+- `stt.partial_interval_ms`'s 400 ms default is below that floor, so on a CPU build
+  the cadence is bounded by inference rather than by the setting. The interval is
+  measured from the END of a decode, which bounds the queue but not the share of the
+  machine cosmetic work takes.
+
+**The Voice panel's shape follows from that.** Two duration pickers were retired from
+Settings -> Voice as a consequence of the paragraph above, not as a matter of taste:
+`stt.partial_interval_ms` asked a user to choose a cadence the recogniser cannot
+honour on any CPU build, and `stt.silence_ms` asked them to tell 700 ms from 750 ms by
+feel. Both keys are still read from `config.json`, so an operator who has measured
+their own pauses loses nothing; only the pickers are gone, because a dial nobody can
+aim is worse than no dial. What a user actually reaches for when dictation cuts them
+off is `stt.endpointing`, which is the behaviour those milliseconds were tuning.
+
+The panel now keeps six decisions on its surface (enabled, microphone, provider,
+model, language, transcript polish) and puts everything else behind a disclosure,
+with the key binding behind a second one inside it. The acceleration rides on the
+Status row rather than in a section of its own, and the decode-thread count and the
+last decode's cost sit in the tip beside it: they answer "why is it slow", which is a
+question a user goes looking for, so they do not need permanent space.
+`test/SttSettings.surface.test.tsx` pins that shape, because a regression here does
+not throw -- it quietly puts a knob back on the surface.
+
+**Where the streaming time actually goes.** Measured streaming an 11 s clip in real
+time through the full session on the same host: with `base`, 7 partials costing
+4.1 s and 5 phrase commits costing 2.9 s, against a 1.65 s final -- cosmetic and
+phrase-commit inference together are roughly 4x the cost of the text the user keeps.
+With `large-v3-turbo` the same clip costs 40 s of partials and 68 s of phrase
+commits, and the session finishes ~138 s behind real time. Phrase commits, whose
+text is RETAINED and which are therefore not cosmetic, are the larger share in both
+cases. Any future attempt to reduce streaming cost should start there rather than at
+the partial cadence.
+
 `stt.engine`'s docstring carries the two properties that make this safe inside
 the gateway process: whisper.cpp releases the GIL for the duration of a decode,
 and it writes nothing to stdout with `print_progress=False` and
@@ -405,17 +564,113 @@ stderr is not quiet, so no test may assert it empty.
 
 `redirect_whispercpp_logs_to` stays at its `False` default. Its binding governs stderr rather than the log callback, and `None` redirects process-wide fd 2 during model loading, silencing unrelated threads while leaving stdout behavior unchanged.
 
+## Tidying a finished transcript
+
+`stt.polish` (default **false**) hands a FINISHED transcript to a fast model for
+punctuation and spacing. It is off by default because it is the one part of the local
+provider that sends anything off the machine: the TEXT leaves, the audio never does.
+The switch is the consent, so `POST /api/stt/polish` refuses with 403
+`stt_polish_disabled` when it is off rather than quietly passing the transcript
+through -- a setting that is honoured only sometimes is a decoration.
+
+Why it is an endpoint and not a frame on the speech websocket, which is the design
+decision worth recording: that socket closes shortly after the final (the server has
+a bounded deadline to deliver it and then ends the session), so a correction routed
+through it would be cancelled in the most common case of all -- the user stops talking
+and the correction is still in flight. An endpoint also serves the MediaRecorder batch
+path, which never opens that socket, and it can hand the caller BOTH strings so
+reverting is a local swap rather than another round-trip.
+
+It reuses `llm_helpers.run_bg_oneliner` with `model="auto"`, the same seam
+`stt.endpointing` already uses, so this adds a second consumer of an existing boundary
+rather than a new one. The prompt forbids adding, removing, reordering and
+**translating** -- the last because code-switched speech is the least accurate input
+the recogniser has (CER 0.436 on `base`) and therefore the input a model is most
+tempted to "fix" by rendering it in one language.
+
+Four properties, each with a test:
+
+- **Never blocks dictation.** The recogniser's own text is in the composer and is
+  already sendable before the request goes out. The correction replaces it a moment
+  later or does not arrive at all.
+- **Never invents or drops words.** A reply outside 0.6-1.8x the original's length is
+  discarded and the original returned. The response therefore reports
+  `changed: false` for a decline, a timeout, an empty reply and a reply that failed
+  that guard alike: from the caller's side all four mean "keep what you have", and
+  distinguishing them would invite a client to treat a safe outcome as a failure.
+- **Redacted both ways.** Credentials and exfiltration URLs are stripped from the text
+  before it is sent, and again from the model's reply, which is new text the outbound
+  pass says nothing about.
+- **Never overwrites the user.** `useComposerVoice.polishDictation` rewrites only the
+  span it wrote itself, and only while the composer value is still byte-identical to
+  what the delivery left. If the user typed, sent, or another utterance landed, the
+  replacement is dropped rather than merged -- guessing at a merge there deletes text
+  the user authored after they stopped talking, which is worse than not polishing.
+  It never auto-submits.
+
 ## Model download
 
-`stt.models` holds the catalog: name, byte size and a sha256 digest per entry.
+`stt.models` holds the catalog: name, byte size and a sha256 digest per entry. The
+rows are `tiny`, `base`, `small` and `large-v3-turbo`, unchanged by this work.
+
+**A quantized catalog was built here and then withdrawn before merge.** The
+measurements stand and are worth keeping, because they are why the idea was
+attractive: on a CPU build `base-q8_0` decodes an 11 s clip in 0.40 s against `base`'s
+0.62 s for a byte-identical transcript at 45% of the download, and over 60 clips in ten
+language buckets `tiny` was dominated outright by it (Portuguese 0.826 against 0.409,
+Italian 0.761 against 0.477).
+
+It was withdrawn for two reasons, both of which outrank the measurements:
+
+- **It is a product-shape change, and this was not the change to make it in.** Removing
+  `tiny` and full-precision `small` alters what a user can download and run. That needs
+  its own decision with its own record; measurements in a pull-request description are a
+  proposal, not an accepted one. Making local dictation honest about its speed never
+  required changing which models exist.
+- **The speed premise is platform-local.** Every figure above was measured on a CPU
+  build. On Metal a reviewer measured full-precision `small` decoding 5.5 s of audio in
+  195 ms (RTF 0.036), where the 2.6x download `small-q5_1` saves buys nothing while
+  `small`'s accuracy advantage over it (Chinese CER 0.349 against 0.413) still applies.
+  A cull justified by CPU speed would be wrong for every accelerated user.
+
+A retired row would also have stranded its weights: `ggml-tiny.bin` and
+`ggml-small.bin` stay on disk with no catalog row referencing them, so nothing lists
+them and nothing reclaims them. Any future cull has to answer that first.
+
+**`large-v3-turbo` is slower than real time on a CPU build** (RTF 1.24, so 11 s of
+speech costs 13.6 s) and is kept, because measured per language it is the best model
+available by a wide margin for exactly the users who need one: German 0.063 against
+`small`'s 0.180, Italian 0.114 against 0.239, Portuguese 0.113 against 0.139, and
+code-switched Mandarin-English 0.282, the best reading any model produced on that
+bucket. Its cost is made VISIBLE instead, which is this change's actual subject:
+`GET /api/stt/status` reports the backend and the measured real-time factor.
+
+`PUT /api/config/stt` resolves the model field through `models.canonical_name` rather
+than testing membership of the catalog: a membership test rejects an alias, so
+someone whose stored model was retired could not save the panel at all -- a field
+they never edited was refused on every write. `canonical_name` is deliberately not
+`resolve`: an unrecognised name returns `None` and leaves the stored value alone,
+where `resolve` would answer the default and let one junk request replace a model the
+user deliberately chose.
+
 Four endpoints expose it, all four refused to an app token by `_deny_app_token`
 because they start a download and warm a resident model inside the gateway, which
 is operator setup rather than something an app earns by naming a path (the
 transcription surfaces are deliberately open to an app token):
 
 - `GET /api/stt/status`: the availability code and prose, the resolved model with
-  `model_present` and its size, whether a model is resident right now, and the
-  live transfer state. Separate from `GET /api/config/stt`, which serves settings.
+  `model_present`, its size and its quantization, whether a model is resident right
+  now, and the live transfer state. Separate from `GET /api/config/stt`, which
+  serves settings. It also carries `backend: {name, accelerated, encoder_only,
+  detail, cpu_features, system_info, requested, honoured, threads, os, arch,
+  python}` -- read from the build, with `accelerated: false` whenever it cannot be
+  interrogated -- and `timings`, the most recent load episode split into
+  `hash_ms` / `load_ms` / `first_decode_ms` plus recent per-decode costs. `timings`
+  holds durations, counts and the model name only: never audio, never a transcript,
+  no paths and no host identity, so it is safe to quote in a bug report. Splitting
+  the load episode is what makes a cold start legible -- a 1.6 GB model spends
+  seconds in its digest verification before the recognizer is asked to do anything,
+  and one total cannot tell that apart from a slow model.
   It also carries `ffmpeg: {present, source, auto_fetch, os, arch, download}`.
   `source` is `bundled` | `system` | `store` | `null` and names WHICH decoder the
   transcode path would run, because each one is repaired differently — reinstall
