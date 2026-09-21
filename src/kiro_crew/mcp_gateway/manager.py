@@ -32,7 +32,7 @@ from typing import Any, Optional
 from kiro_crew import platform_compat
 from kiro_crew.code_fingerprint import code_fingerprint, warm_code_fingerprint
 from kiro_crew.config.paths import config_dir
-from kiro_crew.env import resolve_krb5_ccname
+from kiro_crew.env import augmented_path, resolve_krb5_ccname
 from kiro_crew.mcp_gateway import transport
 from kiro_crew.mcp_gateway.pool import READ_BUFFER_LIMIT_BYTES
 from kiro_crew.mcp_gateway.shutdown_budget import TOTAL_SHUTDOWN_BUDGET_SECS
@@ -673,14 +673,25 @@ class GatewayManager:
         # long-lived background daemon's forked children inherit a usable
         # ticket for any credential-gated MCP server.
         resolve_krb5_ccname(env)
-        # A background daemon can inherit a minimal PATH (e.g. under
-        # systemd-user), so prepend the user-local bin dir where MCP
-        # server launchers are commonly installed.
-        local_bin = str(Path.home() / ".local" / "bin")
-        existing_path = env.get("PATH", "")
-        extra_dirs = [p for p in (local_bin,) if p and p not in existing_path.split(os.pathsep)]
-        if extra_dirs:
-            env["PATH"] = os.pathsep.join([*extra_dirs, existing_path]) if existing_path else os.pathsep.join(extra_dirs)
+        # A background daemon can inherit a minimal PATH (e.g. launched from
+        # Electron or under systemd-user), so extend it with the well-known MCP
+        # launcher dirs. This MUST be ``augmented_path`` -- the same helper the
+        # kiro-cli spawn path uses -- and not a hand-picked subset: gatewayd
+        # spawns backend launchers that are themselves thin wrappers exec'ing a
+        # BARE tool name -- a one-line ``#!/bin/sh`` script whose whole body is
+        # ``exec <tool> <subcommand> <server>`` -- so a PATH missing the dir
+        # that holds that tool makes ``/bin/sh`` fail the exec and the backend
+        # exits rc=127, which the session sees only as "backend gone". An
+        # absolute-path command is unaffected, which is why such a gap shows up
+        # on a handful of servers rather than all of them.
+        #
+        # Off the loop, like the other blocking calls in this method: on a cold
+        # cache ``augmented_path`` globs every version-manager root for Node bin
+        # dirs (``_node_all_bin_dirs``, whose own docstring calls repeating that
+        # glob a GIL-contention risk). Measured 5ms warm-cache against 35 such
+        # dirs, but it is filesystem work with no ceiling on a slow or remote
+        # home, and this method already offloads a single chmod.
+        env["PATH"] = await asyncio.to_thread(augmented_path, env.get("PATH", ""))
         argv = platform_compat.isolated_python_argv(
             "-m", _GATEWAYD_MODULE,
             "--socket", str(self._spec.socket_path),
