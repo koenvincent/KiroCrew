@@ -139,6 +139,20 @@ class PullRequestFacts:
     unresolved_review_threads: int
     review_threads_complete: bool
     checks_complete: bool = True
+    #: A stable digest over the comment bodies of the unresolved, non-outdated
+    #: review threads, or "" when there are none. Provider-specific: only the
+    #: GitHub adapter reads thread bodies today, so every other provider leaves
+    #: it empty and its canonical never carries the key. It is the ONE signal a
+    #: thread COUNT cannot express -- a bot rewrites a finding in place, so the
+    #: count is unchanged while the text flips -- which is why it is a digest
+    #: rather than a number.
+    review_thread_body_digest: str = ""
+    #: A stable digest over the pull request's PR-level (issue) comment bodies,
+    #: or "" when there are none. Provider-specific: only the GitHub adapter reads
+    #: them today. This is the surface a review bot's verdict comment actually
+    #: lives on -- created_at frozen at PR open, body rewritten in place -- so it
+    #: is the digest that catches the four bot verdicts a thread digest cannot see.
+    pr_comment_body_digest: str = ""
 
     def __post_init__(self) -> None:
         if self.kind not in PULL_REQUEST_MONITOR_KINDS:
@@ -171,6 +185,10 @@ class PullRequestFacts:
             raise ValueError("review_threads_complete must be a boolean")
         if not isinstance(self.checks_complete, bool):
             raise ValueError("checks_complete must be a boolean")
+        if not isinstance(self.review_thread_body_digest, str):
+            raise ValueError("review_thread_body_digest must be a string")
+        if not isinstance(self.pr_comment_body_digest, str):
+            raise ValueError("pr_comment_body_digest must be a string")
 
 
 @dataclass(frozen=True)
@@ -273,7 +291,7 @@ def canonical_pull_request_facts(facts: PullRequestFacts) -> dict[str, object]:
         blocking_review = "unknown"
     else:
         blocking_review = "none"
-    return {
+    canonical: dict[str, object] = {
         "blocking_review": blocking_review,
         "checks": checks,
         "checks_complete": not overflow,
@@ -287,6 +305,22 @@ def canonical_pull_request_facts(facts: PullRequestFacts) -> dict[str, object]:
         "target": facts.target,
         "unresolved_review_threads": facts.unresolved_review_threads,
     }
+    # Present ONLY when there is a digest to carry, so a subject with no
+    # unresolved review-thread bodies keeps the exact canonical shape every
+    # provider shared before this field existed -- a hard requirement, because
+    # the shape is pinned by full-dict equality tests and hashed into the
+    # fingerprint. It is deliberately NOT in ``PULL_REQUEST_OBSERVATION_FIELDS``:
+    # that list drives the public projection, which fail-closes on an absent
+    # field and would inject an always-present key into the projected
+    # observation. This is a per-condition wake signal that
+    # ``pull_request_conditions`` reads, not a projected public fact.
+    if facts.review_thread_body_digest:
+        canonical["review_thread_body_digest"] = facts.review_thread_body_digest
+    # The PR-level comment digest follows the same conditional-presence rule and
+    # is likewise absent from PULL_REQUEST_OBSERVATION_FIELDS, for the same reason.
+    if facts.pr_comment_body_digest:
+        canonical["pr_comment_body_digest"] = facts.pr_comment_body_digest
+    return canonical
 
 
 def actionable_fingerprint_facts(canonical: Mapping[str, object]) -> dict[str, object]:
@@ -415,6 +449,51 @@ def pull_request_conditions(canonical: Mapping[str, object]) -> tuple[MonitorCon
                 severity=MonitorSeverity.WAKE,
                 brief="the branch is behind its target",
                 resets_on=MonitorResetsOn.REVISION,
+            )
+        )
+    body_digest = canonical.get("review_thread_body_digest")
+    if (
+        canonical.get("review_threads_complete") is True
+        and isinstance(body_digest, str)
+        and body_digest
+    ):
+        # The digest is inside the KEY, not only the brief: the engine dedupes
+        # per condition key, so a stable key with a changing brief would be
+        # masked and never wake again. A bot rewrites a review comment IN PLACE
+        # -- created_at does not move -- so a count or a newest-timestamp probe
+        # cannot see it, only a digest over the bodies can. NEVER, not REVISION:
+        # a review comment belongs to the conversation, not to the commit, so a
+        # force-push must not replay it (the same reasoning as the two review
+        # conditions above). Gated on ``review_threads_complete`` because a
+        # digest built from an INCOMPLETE thread list flips every time a page
+        # fails or is rate-limited, which would wake the session forever on no
+        # real change -- worse than not having the signal at all.
+        conditions.append(
+            MonitorCondition(
+                key=f"review_thread_bodies:{body_digest}",
+                severity=MonitorSeverity.WAKE,
+                brief="review thread comments changed",
+                resets_on=MonitorResetsOn.NEVER,
+            )
+        )
+    comment_digest = canonical.get("pr_comment_body_digest")
+    if isinstance(comment_digest, str) and comment_digest:
+        # A SEPARATE key from the thread digest, never merged: a change on either
+        # surface must be distinguishable, and one shared key would make a thread
+        # edit and a PR-level comment edit collide. Same WAKE / NEVER reasoning as
+        # the thread digest -- a comment belongs to the conversation, not the
+        # commit. Fail-closed lives in the provider: it emits "" (so this key is
+        # absent) on an incomplete comment read, so an empty/absent digest is the
+        # incomplete-read signal and no condition is emitted. There is no separate
+        # ``pr_comments_complete`` canonical field because an always-present key
+        # would break the pinned full-canonical shape and the public projection,
+        # and PR-level comment completeness has no bearing on readiness anyway.
+        conditions.append(
+            MonitorCondition(
+                key=f"review_comment_bodies:{comment_digest}",
+                severity=MonitorSeverity.WAKE,
+                brief="pull request comments changed",
+                resets_on=MonitorResetsOn.NEVER,
             )
         )
     # Deduplicate by key while keeping order: a provider is free to report two

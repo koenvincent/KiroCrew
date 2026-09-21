@@ -231,6 +231,37 @@ def _threads(
     return _envelope(_threads_node(nodes, has_next=has_next, cursor=cursor))
 
 
+def _comment_node(
+    bodies: Sequence[object] | None = None,
+    *,
+    has_next: bool = False,
+    cursor: str | None = None,
+) -> dict[str, object]:
+    """One subject's PR-level (issue) comment read node.
+
+    A string in ``bodies`` becomes a ``{"body": ...}`` comment; a non-string is
+    passed through so a malformed-node test can supply its own shape.
+    """
+    source = list(bodies) if bodies is not None else []
+    nodes = [{"body": body} if isinstance(body, str) else body for body in source]
+    return {
+        "comments": {
+            "pageInfo": {"hasNextPage": has_next, "endCursor": cursor},
+            "nodes": nodes,
+        }
+    }
+
+
+def _comments(
+    bodies: Sequence[object] | None = None,
+    *,
+    has_next: bool = False,
+    cursor: str | None = None,
+) -> dict[str, object]:
+    """One subject's PR-level comment read, as a whole response."""
+    return _envelope(_comment_node(bodies, has_next=has_next, cursor=cursor))
+
+
 def _alias_error(
     index: int, *, type_name: str = "NOT_FOUND", message: str = ""
 ) -> dict[str, object]:
@@ -297,7 +328,10 @@ def _batched_reads(*payloads: Mapping[str, object]) -> list[dict[str, object]]:
     return responses
 
 
-def _provider(*payloads: dict[str, object]) -> tuple[GitHubPullRequestProvider, _FakeRunner]:
+def _provider(
+    *payloads: dict[str, object],
+    pr_comments: dict[str, object] | list[dict[str, object]] | None = None,
+) -> tuple[GitHubPullRequestProvider, _FakeRunner]:
     """Wire a provider to canned responses.
 
     A payload in the fixtures' flat vocabulary (``_primary()``) is expanded into
@@ -305,6 +339,10 @@ def _provider(*payloads: dict[str, object]) -> tuple[GitHubPullRequestProvider, 
     which is how a test supplies its own review-thread pages or an error envelope.
     A live subject with no supplemental response of its own gets the default one,
     so a test that only cares about primary facts does not have to write it.
+
+    The PR-level comment read always follows the thread read, so a live subject
+    gets a comment response too: the ``pr_comments`` override when a test cares
+    about it, else a default empty page (digest "", so no condition).
     """
     expanded: list[dict[str, object]] = []
     supplemental_supplied = False
@@ -319,6 +357,13 @@ def _provider(*payloads: dict[str, object]) -> tuple[GitHubPullRequestProvider, 
             expanded.append(deepcopy(payload))
     if live and not supplemental_supplied:
         expanded.append(_envelope(_threads_node()))
+    if live:
+        if pr_comments is None:
+            expanded.append(_comments())
+        elif isinstance(pr_comments, list):
+            expanded.extend(deepcopy(page) for page in pr_comments)
+        else:
+            expanded.append(deepcopy(pr_comments))
     runner = _FakeRunner(expanded)
     return (
         GitHubPullRequestProvider(
@@ -1767,7 +1812,7 @@ def test_review_threads_paginate_and_fold_order_independently() -> None:
     assert first.canonical["unresolved_review_threads"] == 1
     assert first.canonical["review_threads_complete"] is True
     assert first.observation.fingerprint == second.observation.fingerprint
-    assert len(first_runner.calls) == 4
+    assert len(first_runner.calls) == 5
     assert "c0=cursor-1" in first_runner.calls[3][0]
 
 
@@ -1807,7 +1852,7 @@ def test_review_thread_page_cap_is_pending_instead_of_success() -> None:
     assert result.observation.status is MonitorObservationStatus.PENDING
     assert result.observation.reason_code == "review_threads_incomplete"
     assert result.observation.supplemental_provider_error is None
-    assert len(runner.calls) == 12
+    assert len(runner.calls) == 13
 
 
 def test_review_thread_missing_next_cursor_is_pending_instead_of_success() -> None:
@@ -1822,7 +1867,7 @@ def test_review_thread_missing_next_cursor_is_pending_instead_of_success() -> No
     assert result.canonical["review_threads_complete"] is False
     assert result.observation.status is MonitorObservationStatus.PENDING
     assert result.observation.reason_code == "review_threads_incomplete"
-    assert len(runner.calls) == 3
+    assert len(runner.calls) == 4
 
 
 def test_review_thread_graphql_errors_make_partial_data_pending() -> None:
@@ -1949,7 +1994,7 @@ def test_review_thread_request_failure_preserves_primary_failed_check() -> None:
     )
     provider = GitHubPullRequestProvider(
         resolver=lambda: "/trusted/bin/gh",
-        runner=lambda *_args, **_kwargs: next(results),
+        runner=lambda *_args, **_kwargs: next(results, _completed(_comments())),
     )
 
     result = _probe_one(provider)
@@ -1983,7 +2028,7 @@ def test_raised_check_timeout_preserves_primary_review_blocker() -> None:
     )
 
     def runner(argv: Sequence[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
-        step = next(steps)
+        step = next(steps, _completed(_comments()))
         if isinstance(step, BaseException):
             raise step
         assert isinstance(step, subprocess.CompletedProcess)
@@ -2016,7 +2061,7 @@ def test_raised_review_setup_error_preserves_primary_review_blocker() -> None:
     )
 
     def runner(argv: Sequence[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
-        step = next(steps)
+        step = next(steps, _completed(_comments()))
         if isinstance(step, BaseException):
             raise step
         assert isinstance(step, subprocess.CompletedProcess)
@@ -2061,7 +2106,7 @@ def test_later_review_thread_request_failure_preserves_observed_blocker() -> Non
     )
     provider = GitHubPullRequestProvider(
         resolver=lambda: "/trusted/bin/gh",
-        runner=lambda *_args, **_kwargs: next(results),
+        runner=lambda *_args, **_kwargs: next(results, _completed(_comments())),
     )
 
     result = _probe_one(provider)
@@ -2585,6 +2630,15 @@ class _CompletedRunner:
 
     def __call__(self, argv: Sequence[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
         self.calls.append(list(argv))
+        if any("comments(first:" in str(arg) for arg in argv):
+            # The PR-level comment read is always issued after the thread read;
+            # a hand-built runner that does not enumerate a response for it gets a
+            # default empty page (digest ""), mirroring how _provider supplies one.
+            # Uniquely identified by comments(first: -- the thread read selects
+            # comments(last: and the rollup selects contexts(first:.
+            return subprocess.CompletedProcess(
+                list(argv), 0, stdout=json.dumps(_comments()), stderr=""
+            )
         return self._results.pop(0)
 
 
@@ -2617,7 +2671,9 @@ def test_probe_isolates_checks_from_the_primary_field_set() -> None:
     that failure -- which is why the two reads are separate requests.
     """
     core, rollup = _core_and_rollup()
-    runner = _CompletedRunner([_completed(core), _completed(rollup), _completed(_threads())])
+    runner = _CompletedRunner(
+        [_completed(core), _completed(rollup), _completed(_threads()), _completed(_comments())]
+    )
     provider = GitHubPullRequestProvider(resolver=lambda: "/trusted/bin/gh", runner=runner)
 
     result = _probe_one(provider)
@@ -2635,7 +2691,9 @@ def test_probe_isolates_checks_from_the_primary_field_set() -> None:
 def test_null_check_rollup_is_an_empty_complete_check_set() -> None:
     core = _envelope(_pr_node(_primary()))
     rollup = _envelope(_rollup_node(_primary(statusCheckRollup=None)))
-    runner = _CompletedRunner([_completed(core), _completed(rollup), _completed(_threads())])
+    runner = _CompletedRunner(
+        [_completed(core), _completed(rollup), _completed(_threads()), _completed(_comments())]
+    )
     provider = GitHubPullRequestProvider(resolver=lambda: "/trusted/bin/gh", runner=runner)
 
     result = _probe_one(provider)
@@ -2727,7 +2785,7 @@ def test_repeated_review_thread_cursor_is_incomplete_instead_of_looping() -> Non
 
     assert result.canonical["review_threads_complete"] is False
     assert result.observation.reason_code == "review_threads_incomplete"
-    assert len(runner.calls) == 4
+    assert len(runner.calls) == 5
 
 
 def test_check_identity_and_bucket_sizes_are_bounded_before_persistence() -> None:
@@ -2740,7 +2798,9 @@ def test_check_identity_and_bucket_sizes_are_bounded_before_persistence() -> Non
             for index in range(101)
         ]
     )
-    runner = _CompletedRunner([_completed(core), _completed(rollup), _completed(_threads())])
+    runner = _CompletedRunner(
+        [_completed(core), _completed(rollup), _completed(_threads()), _completed(_comments())]
+    )
     provider = GitHubPullRequestProvider(resolver=lambda: "/trusted/bin/gh", runner=runner)
 
     result = _probe_one(provider)
@@ -2767,7 +2827,9 @@ def test_status_context_failure_outranks_duplicate_success_and_stale_is_nonblock
             _check_run(conclusion="STALE"),
         ]
     )
-    runner = _CompletedRunner([_completed(core), _completed(rollup), _completed(_threads())])
+    runner = _CompletedRunner(
+        [_completed(core), _completed(rollup), _completed(_threads()), _completed(_comments())]
+    )
     provider = GitHubPullRequestProvider(resolver=lambda: "/trusted/bin/gh", runner=runner)
 
     result = _probe_one(provider)
@@ -2818,7 +2880,9 @@ def test_draft_state_prevents_failed_checks_from_requesting_a_turn() -> None:
         isDraft=True,
         statusCheckRollup=[_check_run(conclusion="FAILURE")],
     )
-    runner = _CompletedRunner([_completed(core), _completed(rollup), _completed(_threads())])
+    runner = _CompletedRunner(
+        [_completed(core), _completed(rollup), _completed(_threads()), _completed(_comments())]
+    )
     provider = GitHubPullRequestProvider(resolver=lambda: "/trusted/bin/gh", runner=runner)
 
     result = _probe_one(provider)
@@ -3068,8 +3132,12 @@ class TestBatchedReads:
         # so it cannot consume an alias the survivors' evidence is read from.
         assert runner.calls[1][4].count("repository(") == 4
 
-    def test_a_tick_costs_three_requests_whatever_the_subject_count_is(self) -> None:
-        """Ten subjects were thirty invocations before this; the count is the point."""
+    def test_a_tick_costs_four_requests_whatever_the_subject_count_is(self) -> None:
+        """Ten subjects were thirty invocations before this; the count is the point.
+
+        Four documents now: the primary read, the check rollup, the review-thread
+        read and the PR-level comment read, each batched over every subject.
+        """
         payloads = [_primary(number=number) for number in range(1, 11)]
         runner = _CompletedRunner([_completed(payload) for payload in _batched_reads(*payloads)])
         provider = GitHubPullRequestProvider(resolver=lambda: "/trusted/bin/gh", runner=runner)
@@ -3078,7 +3146,7 @@ class TestBatchedReads:
 
         assert len(results) == 10
         assert all(result.observation.provider_error is None for result in results.values())
-        assert len(runner.calls) == 3
+        assert len(runner.calls) == 4
         assert all(call[1] == "api" and call[2] == "graphql" for call in runner.calls)
 
     def test_every_subject_gets_its_own_alias_and_bound_variables(self) -> None:
@@ -3132,7 +3200,7 @@ class TestBatchedReads:
             )
         )
 
-        assert len(runner.calls) == 3
+        assert len(runner.calls) == 4
         assert all(result.observation.provider_error is None for result in results.values())
         assert runner.calls[0][5:11] == ["-f", "o0=owner", "-f", "r0=first", "-F", "n0=1"]
         assert runner.calls[0][11:] == ["-f", "o1=other", "-f", "r1=second", "-F", "n1=2"]
@@ -3155,9 +3223,9 @@ class TestBatchedReads:
 
         assert len(results) == count
         assert all(result.observation.provider_error is None for result in results.values())
-        assert len(runner.calls) == 6
+        assert len(runner.calls) == 8
         assert runner.calls[0][4].count("repository(") == _MAX_SUBJECTS_PER_QUERY
-        assert runner.calls[3][4].count("repository(") == 1
+        assert runner.calls[4][4].count("repository(") == 1
 
     def test_an_error_naming_no_subject_is_charged_to_all_of_them(self) -> None:
         """A document-level failure means none of them was read.
@@ -3217,7 +3285,7 @@ class TestBatchedReads:
         assert paginated.canonical["review_threads_complete"] is True
         assert settled.canonical["unresolved_review_threads"] == 0
         assert settled.canonical["review_threads_complete"] is True
-        assert len(runner.calls) == 4
+        assert len(runner.calls) == 5
         assert "c0=cursor-1" in runner.calls[3]
         assert runner.calls[3][4].count("repository(") == 1
 
@@ -3233,7 +3301,7 @@ class TestBatchedReads:
         assert merged.observation.status is MonitorObservationStatus.SUCCESS
         assert merged.observation.reason_code == "pull_request_merged"
         assert results["https://github.com/owner/repo/pull/2"].observation.provider_error is None
-        assert len(runner.calls) == 3
+        assert len(runner.calls) == 4
         assert runner.calls[0][4].count("repository(") == 2
         assert runner.calls[1][4].count("repository(") == 1
         assert runner.calls[2][4].count("repository(") == 1
@@ -3440,7 +3508,9 @@ class TestPluralProbeBoundary:
         caller that built the request.
         """
         core, rollup = _core_and_rollup()
-        runner = _CompletedRunner([_completed(core), _completed(rollup), _completed(_threads())])
+        runner = _CompletedRunner(
+            [_completed(core), _completed(rollup), _completed(_threads()), _completed(_comments())]
+        )
         provider = GitHubPullRequestProvider(resolver=lambda: "/trusted/bin/gh", runner=runner)
         url = "https://github.com/owner/repo/pull/123"
 
@@ -3522,7 +3592,9 @@ class TestPluralProbeBoundary:
     def test_the_github_result_is_an_implementation_of_the_shared_result(self) -> None:
         """So a caller typed to the shared record can hold this kind's result."""
         core, rollup = _core_and_rollup()
-        runner = _CompletedRunner([_completed(core), _completed(rollup), _completed(_threads())])
+        runner = _CompletedRunner(
+            [_completed(core), _completed(rollup), _completed(_threads()), _completed(_comments())]
+        )
         provider = GitHubPullRequestProvider(resolver=lambda: "/trusted/bin/gh", runner=runner)
 
         result = _probe_one(provider)
@@ -4000,7 +4072,7 @@ class TestRestFallbackOnRateLimit:
         checks = result.canonical["checks"]
         assert isinstance(checks, Mapping)
         assert checks["failed"] == ["PR Readiness"]
-        assert runner.calls[3][2] == _REST_STATUS_PATH
+        assert runner.calls[4][2] == _REST_STATUS_PATH
 
     def test_a_rate_limited_thread_read_reports_incomplete_without_an_error(self) -> None:
         """The one signal REST cannot express, degraded rather than charged.
@@ -4008,8 +4080,10 @@ class TestRestFallbackOnRateLimit:
         Thread resolution has no REST projection, so a refused thread read is
         reported as an incomplete COUNT. Incompleteness already holds the subject
         at PENDING, which is what makes it safe to stop charging it: the watch
-        survives without ever being able to call the subject ready. No fourth
-        request is sent, because there is no endpoint to send it to.
+        survives without ever being able to call the subject ready. No REST
+        fallback request is sent for the thread read, because there is no
+        endpoint to send it to; the PR-comment read is a separate, always-issued
+        supplemental, so the tick still costs four requests.
         """
         runner = _CompletedRunner(
             [
@@ -4031,7 +4105,7 @@ class TestRestFallbackOnRateLimit:
         assert result.observation.reason_code == "review_threads_incomplete"
         assert result.canonical["review_threads_complete"] is False
         assert result.canonical["blocking_review"] == "unknown"
-        assert len(runner.calls) == 3
+        assert len(runner.calls) == 4
 
     @pytest.mark.asyncio
     async def test_consecutive_rate_limited_ticks_do_not_retire_the_watch(self) -> None:
@@ -4073,3 +4147,246 @@ class TestRestFallbackOnRateLimit:
         assert state.outcome is None
         assert state.outcome is not MonitorOutcome.BUDGET
         assert verdict.decision is not MonitorDecision.STOP_BLOCKED
+
+
+def _thread_with_bodies(
+    *bodies: str, resolved: bool = False, outdated: bool = False
+) -> dict[str, object]:
+    """A review-thread node carrying comment bodies, in the wire shape.
+
+    ``_threads_node`` adds ``isOutdated: False`` when absent, so a plain
+    unresolved thread stays counted; pass ``resolved`` or ``outdated`` to exclude
+    it from both the count and the digest.
+    """
+    return {
+        "isResolved": resolved,
+        "isOutdated": outdated,
+        "comments": {"nodes": [{"body": body} for body in bodies]},
+    }
+
+
+def _body_condition_key(result: object) -> str | None:
+    """The one review-thread-body condition key on a result, or None."""
+    keys = [
+        condition.key
+        for condition in result.observation.conditions
+        if condition.key.startswith("review_thread_bodies:")
+    ]
+    assert len(keys) <= 1, "at most one body-digest condition per subject"
+    return keys[0] if keys else None
+
+
+class TestReviewThreadBodyDigest:
+    """The probe digests unresolved thread bodies, so an in-place edit wakes.
+
+    The count and every typed wake field can be byte-identical across two ticks
+    while a bot rewrites its finding in place, so the digest inside the condition
+    key is the only thing that changes -- which is the whole reason the structured
+    monitor could not see an advisory comment before.
+    """
+
+    def test_an_in_place_comment_edit_changes_the_condition_key(self) -> None:
+        """The count is identical but the body flipped: only a body digest sees it."""
+        before, _ = _provider(_primary(), _threads([_thread_with_bodies("no blocking findings")]))
+        after, _ = _provider(_primary(), _threads([_thread_with_bodies("BLOCKING: leaked secret")]))
+        result_before = _probe_one(before)
+        result_after = _probe_one(after)
+
+        assert result_before.canonical["unresolved_review_threads"] == 1
+        assert result_after.canonical["unresolved_review_threads"] == 1
+        key_before = _body_condition_key(result_before)
+        key_after = _body_condition_key(result_after)
+        assert key_before is not None and key_after is not None
+        assert key_before != key_after
+
+    def test_resolved_and_outdated_threads_are_excluded_from_the_digest(self) -> None:
+        """The digest predicate is the count predicate: unresolved and not outdated."""
+        full, _ = _provider(
+            _primary(),
+            _threads(
+                [
+                    _thread_with_bodies("live finding"),
+                    _thread_with_bodies("resolved chatter", resolved=True),
+                    _thread_with_bodies("outdated note", outdated=True),
+                ]
+            ),
+        )
+        only_live, _ = _provider(_primary(), _threads([_thread_with_bodies("live finding")]))
+        result_full = _probe_one(full)
+        result_live = _probe_one(only_live)
+
+        assert result_full.canonical["unresolved_review_threads"] == 1
+        assert result_live.canonical["unresolved_review_threads"] == 1
+        assert _body_condition_key(result_full) is not None
+        assert _body_condition_key(result_full) == _body_condition_key(result_live)
+
+    def test_the_digest_is_independent_of_thread_page_order(self) -> None:
+        """Sorting the per-thread bodies before hashing makes page order irrelevant."""
+        first, _ = _provider(
+            _primary(),
+            _threads([_thread_with_bodies("alpha")], has_next=True, cursor="cursor-1"),
+            _threads([_thread_with_bodies("beta")], has_next=False),
+        )
+        second, _ = _provider(
+            _primary(),
+            _threads([_thread_with_bodies("beta")], has_next=True, cursor="cursor-2"),
+            _threads([_thread_with_bodies("alpha")], has_next=False),
+        )
+        result_first = _probe_one(first)
+        result_second = _probe_one(second)
+
+        assert _body_condition_key(result_first) is not None
+        assert _body_condition_key(result_first) == _body_condition_key(result_second)
+
+    def test_an_unresolved_thread_with_no_comment_body_emits_no_body_condition(self) -> None:
+        """A qualifying thread that carries no readable body contributes nothing."""
+        provider, _ = _provider(_primary(), _threads([_thread_with_bodies()]))
+        result = _probe_one(provider)
+
+        assert result.canonical["unresolved_review_threads"] == 1
+        assert result.canonical["review_threads_complete"] is True
+        assert "review_thread_body_digest" not in result.canonical
+        assert _body_condition_key(result) is None
+
+    def test_an_incomplete_thread_read_carries_no_digest_or_body_condition(self) -> None:
+        """The correctness trap at the provider: a capped read digests nothing, so
+        the monitor cannot wake forever on a page that keeps failing."""
+        pages = [
+            _threads(
+                [_thread_with_bodies(f"finding {page}")],
+                has_next=True,
+                cursor=f"cursor-{page}",
+            )
+            for page in range(1, 11)
+        ]
+        provider, runner = _provider(_primary(), *pages)
+        result = _probe_one(provider)
+
+        assert result.canonical["review_threads_complete"] is False
+        assert "review_thread_body_digest" not in result.canonical
+        assert _body_condition_key(result) is None
+        assert len(runner.calls) == 13
+
+
+def _comment_condition_key(result: object) -> str | None:
+    """The one PR-level-comment-body condition key on a result, or None."""
+    keys = [
+        condition.key
+        for condition in result.observation.conditions
+        if condition.key.startswith("review_comment_bodies:")
+    ]
+    assert len(keys) <= 1, "at most one comment-digest condition per subject"
+    return keys[0] if keys else None
+
+
+class TestPullRequestCommentDigest:
+    """The probe digests PR-level (issue) comment bodies, the surface the review
+    bot verdicts actually live on.
+
+    A verdict comment's created_at is frozen at PR open while its body is
+    rewritten in place, so a count or newest-timestamp probe cannot see it; only
+    a digest over the bodies can. The subject reaches ACTIONABLE by a failing
+    check here, so its conditions are carried and the comment digest rides
+    alongside -- exactly as the thread digest rides on an unresolved-thread
+    subject.
+    """
+
+    @staticmethod
+    def _failing() -> dict[str, object]:
+        return _primary(statusCheckRollup=[_check_run(conclusion="FAILURE")])
+
+    def test_an_in_place_comment_edit_changes_the_condition_key(self) -> None:
+        """The body flipped in place: only a digest over the bodies sees it."""
+        before, _ = _provider(
+            self._failing(), _threads(), pr_comments=_comments(["no blocking findings"])
+        )
+        after, _ = _provider(
+            self._failing(), _threads(), pr_comments=_comments(["blocking: found an issue"])
+        )
+        result_before = _probe_one(before)
+        result_after = _probe_one(after)
+
+        key_before = _comment_condition_key(result_before)
+        key_after = _comment_condition_key(result_after)
+        assert key_before is not None and key_after is not None
+        assert key_before != key_after
+
+    def test_every_comment_is_digested_not_bot_authored_only(self) -> None:
+        """A human editing a comment in place is as invisible to a count and as
+        load-bearing as a bot; the digest filters by no author."""
+        before, _ = _provider(self._failing(), _threads(), pr_comments=_comments(["please rebase"]))
+        after, _ = _provider(
+            self._failing(), _threads(), pr_comments=_comments(["please rebase and squash"])
+        )
+        result_before = _probe_one(before)
+        result_after = _probe_one(after)
+        assert _comment_condition_key(result_before) != _comment_condition_key(result_after)
+
+    def test_the_digest_is_independent_of_comment_page_order(self) -> None:
+        """Sorting the bodies before hashing makes the page order irrelevant."""
+        first, _ = _provider(
+            self._failing(),
+            _threads(),
+            pr_comments=[
+                _comments(["alpha"], has_next=True, cursor="cursor-1"),
+                _comments(["beta"], has_next=False),
+            ],
+        )
+        second, _ = _provider(
+            self._failing(),
+            _threads(),
+            pr_comments=[
+                _comments(["beta"], has_next=True, cursor="cursor-2"),
+                _comments(["alpha"], has_next=False),
+            ],
+        )
+        result_first = _probe_one(first)
+        result_second = _probe_one(second)
+        assert _comment_condition_key(result_first) is not None
+        assert _comment_condition_key(result_first) == _comment_condition_key(result_second)
+
+    def test_no_comments_emits_no_comment_condition(self) -> None:
+        provider, _ = _provider(self._failing(), _threads(), pr_comments=_comments())
+        result = _probe_one(provider)
+
+        assert result.observation.status is MonitorObservationStatus.ACTIONABLE
+        assert "pr_comment_body_digest" not in result.canonical
+        assert _comment_condition_key(result) is None
+
+    def test_an_incomplete_comment_read_carries_no_digest_or_condition(self) -> None:
+        """The correctness trap on the comment surface: a capped read digests
+        nothing, so a page that keeps failing cannot wake the owner forever."""
+        pages = [
+            _comments([f"comment {page}"], has_next=True, cursor=f"cursor-{page}")
+            for page in range(1, 11)
+        ]
+        provider, _ = _provider(self._failing(), _threads(), pr_comments=pages)
+        result = _probe_one(provider)
+
+        assert "pr_comment_body_digest" not in result.canonical
+        assert _comment_condition_key(result) is None
+
+    def test_the_thread_and_comment_surfaces_emit_distinct_independent_keys(self) -> None:
+        """A thread change and a comment change must be distinguishable, so the two
+        digests are never merged into one key, and a change on one surface does
+        not move the other's key."""
+        provider, _ = _provider(
+            _primary(),
+            _threads([_thread_with_bodies("thread finding")]),
+            pr_comments=_comments(["pr verdict"]),
+        )
+        result = _probe_one(provider)
+        thread_key = _body_condition_key(result)
+        comment_key = _comment_condition_key(result)
+        assert thread_key is not None and comment_key is not None
+        assert thread_key != comment_key
+
+        # Editing only the PR-level comment moves only the comment key.
+        edited, _ = _provider(
+            _primary(),
+            _threads([_thread_with_bodies("thread finding")]),
+            pr_comments=_comments(["pr verdict changed"]),
+        )
+        edited_result = _probe_one(edited)
+        assert _body_condition_key(edited_result) == thread_key
+        assert _comment_condition_key(edited_result) != comment_key

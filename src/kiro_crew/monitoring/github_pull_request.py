@@ -49,6 +49,33 @@ _HEAD_REVISION_RE = re.compile(r"^[0-9a-fA-F]{1,128}$")
 _PROBE_TIMEOUT_SECS = 30.0
 _REVIEW_THREAD_PAGE_SIZE = 100
 _REVIEW_THREAD_MAX_PAGES = 10
+# The most recent comments read from each unresolved review thread, digested so
+# an in-place bot edit (created_at unchanged) still wakes the owner. Bounded and
+# NOT itself paged, on purpose: GraphQL node cost is the product of the
+# connection sizes along a path, so reviewThreads(first:100) x comments(last:20)
+# is 2,000 comment nodes per subject per page, and a full 25-subject batch is
+# ~50,000 -- an order of magnitude under GitHub's 500,000-node ceiling, with room
+# left for the thread and rollup nodes counted beside it. Paging comments as well
+# would multiply that by the comment-page count for a signal that lives in a
+# thread's recent tail. ``last:`` rather than ``first:`` so a comment appended to
+# a long thread is always in the window, and 20 is generous enough that a typical
+# advisory or bot thread (a finding plus a few replies) is captured whole, so an
+# in-place edit of the finding is seen even when it is not the newest comment.
+_REVIEW_THREAD_COMMENT_PAGE_SIZE = 20
+# PR-level (issue) comments: the surface a review bot's verdict comment actually
+# lives on. The four verdicts that motivated this feature -- design-review,
+# codex-ai-review, first-principles-review, claude-ai-review -- post as PR-level
+# issue comments, NOT as review threads (measured: over 60 recently-updated open
+# PRs, 50 carry PR-level bot comments and ZERO carry an unresolved non-outdated
+# review thread). ``first:`` not ``last:``: a verdict comment is created once at
+# PR open and rewritten in place forever, so it is among the OLDEST, and
+# ``last:100`` would miss it precisely on a busy PR (measured max 309 comments).
+# Cost is a DIRECT connection, not the nested reviewThreads x comments product:
+# comments(first:100) across 25 subjects in one document is 2,500 nodes at cost 1
+# point, two orders under the 500,000-node ceiling. Paged with the same page-cap
+# shape as the thread read.
+_PR_COMMENT_PAGE_SIZE = 100
+_PR_COMMENT_MAX_PAGES = 10
 _MERGEABLE_SETTLED_STATES = frozenset({"CLEAN", "HAS_HOOKS", "UNSTABLE"})
 _MAX_PULL_REQUEST_NUMBER = 2_147_483_647
 # GitHub bounds one connection page at 100 nodes, so the row budget this adapter
@@ -77,12 +104,22 @@ commits(last:1){nodes{commit{oid statusCheckRollup{contexts(first:PAGE_SIZE,afte
   }
 }}}}}
 """.replace("PAGE_SIZE", str(_ROLLUP_PAGE_SIZE)).strip()
-_REVIEW_THREADS_SELECTION = """
+_REVIEW_THREADS_SELECTION = (
+    """
 reviewThreads(first:PAGE_SIZE,after:$CURSOR){
   pageInfo{hasNextPage endCursor}
-  nodes{isResolved isOutdated}
+  nodes{isResolved isOutdated comments(last:COMMENT_SIZE){nodes{body}}}
 }
-""".replace("PAGE_SIZE", str(_REVIEW_THREAD_PAGE_SIZE)).strip()
+""".replace("PAGE_SIZE", str(_REVIEW_THREAD_PAGE_SIZE))
+    .replace("COMMENT_SIZE", str(_REVIEW_THREAD_COMMENT_PAGE_SIZE))
+    .strip()
+)
+_PR_COMMENTS_SELECTION = """
+comments(first:PAGE_SIZE,after:$CURSOR){
+  pageInfo{hasNextPage endCursor}
+  nodes{body}
+}
+""".replace("PAGE_SIZE", str(_PR_COMMENT_PAGE_SIZE)).strip()
 # GitHub meters GraphQL in points and REST in requests, and the two budgets are
 # SEPARATE. An exhausted point budget therefore refuses every read above while
 # these two paths keep answering, which is the whole reason the fallback exists.
@@ -187,6 +224,15 @@ class GitHubPullRequestResponse:
     checks_complete: bool
     unresolved_review_threads: int
     review_threads_complete: bool
+    #: Digest over the unresolved, non-outdated review threads' comment bodies,
+    #: or "" when there are none or the thread read was incomplete. Set after the
+    #: supplemental thread read via ``replace``; the primary-only and REST paths
+    #: leave it empty because they read no threads.
+    review_thread_body_digest: str = ""
+    #: Digest over the PR-level (issue) comment bodies, or "" when there are none
+    #: or the comment read was incomplete. Set after the supplemental comment
+    #: read via ``replace``; the primary-only and REST paths leave it empty.
+    pr_comment_body_digest: str = ""
 
 
 GitHubPullRequestProbeResult = PullRequestProbeResult
@@ -368,6 +414,7 @@ class GitHubPullRequestProvider:
         graphql_live = [member for member in live if member.raw not in degraded]
         checks = self._checks(gh, host, graphql_live, heads)
         threads = self._review_threads(gh, host, graphql_live)
+        comments = self._pr_comments(gh, host, graphql_live)
         rest_checks = self._checks_rest(
             gh,
             host,
@@ -383,9 +430,10 @@ class GitHubPullRequestProvider:
                 check_rows, checks_complete, checks_error = rest_checks[member.raw]
             else:
                 check_rows, checks_complete, checks_error = checks[member.raw]
-            unresolved, threads_complete, threads_error = (
-                (0, False, None) if member.raw in degraded else threads[member.raw]
+            unresolved, body_digest, threads_complete, threads_error = (
+                (0, "", False, None) if member.raw in degraded else threads[member.raw]
             )
+            comment_digest = "" if member.raw in degraded else comments[member.raw]
             if threads_error is ProviderErrorKind.RATE_LIMITED:
                 # Thread resolution is the ONE signal REST cannot express, so a
                 # refused thread read is reported as an incomplete COUNT rather
@@ -399,6 +447,8 @@ class GitHubPullRequestProvider:
                 checks_complete=checks_complete,
                 unresolved_review_threads=unresolved,
                 review_threads_complete=threads_complete,
+                review_thread_body_digest=body_digest,
+                pr_comment_body_digest=comment_digest,
             )
             results[member.raw] = _build_result(
                 response,
@@ -726,9 +776,17 @@ class GitHubPullRequestProvider:
         gh: str,
         host: str,
         members: Sequence[_BatchSubject],
-    ) -> dict[str, tuple[int, bool, ProviderErrorKind | None]]:
-        """Count every subject's unresolved review threads in shared pages."""
+    ) -> dict[str, tuple[int, str, bool, ProviderErrorKind | None]]:
+        """Count each subject's unresolved threads and digest their comment bodies.
+
+        Returns ``(unresolved_count, body_digest, complete, error)`` per subject.
+        The digest is over the comment bodies of the unresolved, non-outdated
+        threads and is "" whenever the read was incomplete -- a digest built from
+        a partial thread list flips every time a page fails, which would wake the
+        owner forever on no real change, so an incomplete read carries no digest.
+        """
         unresolved: dict[str, int] = dict.fromkeys((m.raw for m in members), 0)
+        bodies: dict[str, list[list[str]]] = {member.raw: [] for member in members}
         complete: dict[str, bool] = dict.fromkeys((m.raw for m in members), True)
         errors: dict[str, ProviderErrorKind | None] = dict.fromkeys((m.raw for m in members), None)
         pending = list(members)
@@ -759,7 +817,9 @@ class GitHubPullRequestProvider:
                     complete[member.raw] = False
                     continue
                 try:
-                    counted, nodes_complete, has_next, cursor = _review_thread_page(node)
+                    counted, page_bodies, nodes_complete, has_next, cursor = _review_thread_page(
+                        node
+                    )
                 except (KeyError, TypeError, ValueError):
                     errors[member.raw] = round_errors.get(member.raw, ProviderErrorKind.TRANSIENT)
                     complete[member.raw] = False
@@ -768,8 +828,11 @@ class GitHubPullRequestProvider:
                 # error or a malformed sibling. An unresolved thread GitHub did
                 # return is a real blocker, and dropping the count because the page
                 # was partial would report the subject as having none; only the
-                # count's completeness is lost.
+                # count's completeness is lost. Bodies accumulate the same way, but
+                # they are only digested when the whole read completes, so a
+                # partial accumulation is discarded rather than trusted.
                 unresolved[member.raw] += counted
+                bodies[member.raw].extend(page_bodies)
                 if member.raw in round_errors:
                     errors[member.raw] = round_errors[member.raw]
                     complete[member.raw] = False
@@ -792,8 +855,89 @@ class GitHubPullRequestProvider:
             # The page cap was reached with more pages still advertised: the count
             # so far is real but incomplete, and that is not a provider failure.
             complete[member.raw] = False
+        result: dict[str, tuple[int, str, bool, ProviderErrorKind | None]] = {}
+        for member in members:
+            member_complete = complete[member.raw]
+            digest = _review_thread_body_digest(bodies[member.raw]) if member_complete else ""
+            result[member.raw] = (
+                unresolved[member.raw],
+                digest,
+                member_complete,
+                errors[member.raw],
+            )
+        return result
+
+    def _pr_comments(
+        self,
+        gh: str,
+        host: str,
+        members: Sequence[_BatchSubject],
+    ) -> dict[str, str]:
+        """Digest each subject's PR-level (issue) comment bodies in shared pages.
+
+        Mirrors :meth:`_review_threads` in paging shape -- page size 100, the same
+        page cap, cursor de-duplication and fail-closed handling -- but reports
+        ONLY a digest. PR-level comment completeness has no bearing on
+        review-readiness classification, so a refused, malformed or capped read is
+        never a provider error and never forces a retry: it simply yields "" and
+        emits no condition (fail-closed). The digest is over ALL comment bodies,
+        human and bot alike, because a human editing a comment in place is exactly
+        as invisible to a count and as load-bearing as a bot rewriting a verdict;
+        filtering by author would encode "only bots matter", which is false. Known
+        bounded cost: the tick after the owning session posts its own comment, the
+        digest moves once and wakes once, then dedupes.
+        """
+        bodies: dict[str, list[str]] = {member.raw: [] for member in members}
+        complete: dict[str, bool] = dict.fromkeys((m.raw for m in members), True)
+        pending = list(members)
+        cursors: dict[str, str] = {}
+        seen_cursors: dict[str, set[str]] = {member.raw: set() for member in members}
+        for _ in range(_PR_COMMENT_MAX_PAGES):
+            if not pending:
+                break
+            document, argv_tail = _batch_document(
+                pending,
+                _PR_COMMENTS_SELECTION,
+                cursors=cursors,
+            )
+            payload, _group_failure = self._graphql(gh, host, document, argv_tail)
+            if payload is None:
+                for member in pending:
+                    complete[member.raw] = False
+                break
+            round_errors = _subject_errors(payload, pending)
+            advancing: list[_BatchSubject] = []
+            for index, member in enumerate(pending):
+                node = _alias_pull_request(payload, index)
+                if node is None:
+                    complete[member.raw] = False
+                    continue
+                try:
+                    page_bodies, nodes_complete, has_next, cursor = _pr_comment_page(node)
+                except (KeyError, TypeError, ValueError):
+                    complete[member.raw] = False
+                    continue
+                bodies[member.raw].extend(page_bodies)
+                if member.raw in round_errors or not nodes_complete:
+                    complete[member.raw] = False
+                    continue
+                if not has_next or cursor is None:
+                    continue
+                if cursor in seen_cursors[member.raw]:
+                    complete[member.raw] = False
+                    continue
+                seen_cursors[member.raw].add(cursor)
+                cursors[member.raw] = cursor
+                advancing.append(member)
+            pending = advancing
+        for member in pending:
+            # The page cap was reached with more pages still advertised: an
+            # incomplete read, so no digest.
+            complete[member.raw] = False
         return {
-            member.raw: (unresolved[member.raw], complete[member.raw], errors[member.raw])
+            member.raw: (
+                _pr_comment_body_digest(bodies[member.raw]) if complete[member.raw] else ""
+            )
             for member in members
         }
 
@@ -1431,6 +1575,8 @@ def _build_result(
             checks_complete=response.checks_complete,
             unresolved_review_threads=response.unresolved_review_threads,
             review_threads_complete=response.review_threads_complete,
+            review_thread_body_digest=response.review_thread_body_digest,
+            pr_comment_body_digest=response.pr_comment_body_digest,
         ),
         previous_observation=previous_observation,
         response=response,
@@ -1538,8 +1684,66 @@ def _rollup_page(
     return [_flat_check_row(row) for row in rows], revision, total, has_next, cursor
 
 
-def _review_thread_page(node: Mapping[str, Any]) -> tuple[int, bool, bool, str | None]:
-    """Count one page's unresolved threads, ignoring outdated ones."""
+def _review_thread_comment_bodies(raw: object) -> tuple[list[str], bool]:
+    """One thread's comment bodies, and whether they were fully readable.
+
+    An ABSENT ``comments`` connection is not malformed -- it contributes no
+    bodies and does not mark the page incomplete, which keeps a thread whose
+    comments were simply not selected from poisoning the completeness signal. A
+    PRESENT connection whose shape is wrong, or a comment whose body is not a
+    string, marks the read incomplete so a digest built from it is not trusted.
+    """
+    if raw is None:
+        return [], True
+    if not isinstance(raw, Mapping):
+        return [], False
+    nodes = raw.get("nodes")
+    if not isinstance(nodes, list):
+        return [], False
+    collected: list[str] = []
+    complete = True
+    for comment in nodes:
+        if not isinstance(comment, Mapping) or not isinstance(comment.get("body"), str):
+            complete = False
+            continue
+        collected.append(comment["body"])
+    return collected, complete
+
+
+def _review_thread_body_digest(thread_bodies: list[list[str]]) -> str:
+    """A stable digest over the comment bodies of unresolved review threads.
+
+    Empty when there is nothing to say -- no qualifying thread carried a readable
+    body -- so a subject with only resolved, outdated, or comment-less threads
+    emits no body condition. Each thread's bodies are serialized in their own
+    (chronological) order, then the per-thread strings are SORTED before hashing,
+    so the digest does not depend on the page order threads arrived in.
+    ``json.dumps`` keeps a body that happens to contain the separator from
+    colliding with two shorter ones.
+    """
+    per_thread = [
+        json.dumps(one_thread, ensure_ascii=True, separators=(",", ":"))
+        for one_thread in thread_bodies
+        if one_thread
+    ]
+    if not per_thread:
+        return ""
+    per_thread.sort()
+    encoded = json.dumps(per_thread, ensure_ascii=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _review_thread_page(
+    node: Mapping[str, Any],
+) -> tuple[int, list[list[str]], bool, bool, str | None]:
+    """Count one page's unresolved threads and collect their comment bodies.
+
+    A thread is counted AND its comment bodies collected under the SAME predicate
+    -- unresolved and not outdated -- so the digest sees exactly the threads the
+    count does. A malformed thread, or a malformed comment inside a counted
+    thread, marks the page incomplete so the caller does not trust a digest built
+    from a partial read.
+    """
     threads = node["reviewThreads"]
     if not isinstance(threads, Mapping):
         raise ValueError("GitHub review threads are malformed")
@@ -1547,6 +1751,7 @@ def _review_thread_page(node: Mapping[str, Any]) -> tuple[int, bool, bool, str |
     if not isinstance(nodes, list):
         raise ValueError("GitHub review threads are malformed")
     unresolved = 0
+    bodies: list[list[str]] = []
     nodes_complete = True
     for thread in nodes:
         if (
@@ -1556,9 +1761,53 @@ def _review_thread_page(node: Mapping[str, Any]) -> tuple[int, bool, bool, str |
         ):
             nodes_complete = False
             continue
-        unresolved += int(not thread["isResolved"] and not thread["isOutdated"])
+        if thread["isResolved"] or thread["isOutdated"]:
+            continue
+        unresolved += 1
+        thread_bodies, comments_complete = _review_thread_comment_bodies(thread.get("comments"))
+        nodes_complete = nodes_complete and comments_complete
+        bodies.append(thread_bodies)
     has_next, cursor = _page_cursor(threads.get("pageInfo"))
-    return unresolved, nodes_complete, has_next, cursor
+    return unresolved, bodies, nodes_complete, has_next, cursor
+
+
+def _pr_comment_page(node: Mapping[str, Any]) -> tuple[list[str], bool, bool, str | None]:
+    """Read one page of a pull request's PR-level (issue) comment bodies.
+
+    A malformed comment marks the page incomplete so a digest built from a
+    partial read is not trusted, mirroring the thread page reader.
+    """
+    comments = node["comments"]
+    if not isinstance(comments, Mapping):
+        raise ValueError("GitHub pull request comments are malformed")
+    nodes = comments.get("nodes")
+    if not isinstance(nodes, list):
+        raise ValueError("GitHub pull request comments are malformed")
+    bodies: list[str] = []
+    nodes_complete = True
+    for comment in nodes:
+        if not isinstance(comment, Mapping) or not isinstance(comment.get("body"), str):
+            nodes_complete = False
+            continue
+        bodies.append(comment["body"])
+    has_next, cursor = _page_cursor(comments.get("pageInfo"))
+    return bodies, nodes_complete, has_next, cursor
+
+
+def _pr_comment_body_digest(bodies: list[str]) -> str:
+    """A stable digest over a pull request's PR-level comment bodies.
+
+    Empty when there are no non-empty bodies, so a pull request with no comments
+    emits no condition. Bodies are SORTED before hashing so the page order they
+    arrived in cannot move the digest, mirroring the thread digest.
+    ``json.dumps`` keeps a body that happens to contain the separator from
+    colliding with two shorter ones.
+    """
+    kept = sorted(body for body in bodies if body)
+    if not kept:
+        return ""
+    encoded = json.dumps(kept, ensure_ascii=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
 
 
 # ``gh`` stderr classification and the process-wide ``github:api`` cooldown are

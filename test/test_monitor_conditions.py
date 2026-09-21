@@ -558,3 +558,290 @@ class TestTheConditionCapHoldsEverythingABoundedProbeCanName:
         assert keys[0] != keys[1]
         for key in keys:
             assert len(key) <= MAX_MONITOR_CONDITION_KEY_CHARS
+
+
+_BODY = MonitorCondition(
+    key="review_thread_bodies:aaaa",
+    severity=MonitorSeverity.WAKE,
+    resets_on=MonitorResetsOn.NEVER,
+)
+_BODY_CHANGED = MonitorCondition(
+    key="review_thread_bodies:bbbb",
+    severity=MonitorSeverity.WAKE,
+    resets_on=MonitorResetsOn.NEVER,
+)
+
+
+class TestTheReviewThreadBodyCondition:
+    """A monitor wakes when a review thread's comment BODIES change.
+
+    Every typed field, the unresolved COUNT included, can be identical across two
+    ticks while a bot rewrites its finding in place -- created_at does not move --
+    so the only signal is a digest over the bodies, carried inside the condition
+    KEY so a changed digest is a new key the mask does not cover.
+    """
+
+    @staticmethod
+    def _body_keys(conditions: object) -> list[str]:
+        return [c.key for c in conditions if c.key.startswith("review_thread_bodies:")]
+
+    def test_a_complete_read_with_a_digest_emits_one_sticky_body_condition(self) -> None:
+        conditions = pull_request_conditions(
+            {
+                "checks": {"failed": []},
+                "review_threads_complete": True,
+                "unresolved_review_threads": 1,
+                "review_thread_body_digest": "deadbeef",
+            }
+        )
+        keyed = {c.key: c for c in conditions}
+        assert "review_thread_bodies:deadbeef" in keyed
+        condition = keyed["review_thread_bodies:deadbeef"]
+        assert condition.severity is MonitorSeverity.WAKE
+        # NEVER, like the other two review conditions: a review comment belongs to
+        # the conversation, not the commit, so a force-push must not replay it.
+        assert condition.resets_on is MonitorResetsOn.NEVER
+
+    def test_an_incomplete_thread_read_emits_no_body_condition(self) -> None:
+        """The correctness trap. A digest over a PARTIAL thread list flips on every
+        failed page, so an incomplete read must carry no body condition."""
+        incomplete = pull_request_conditions(
+            {
+                "checks": {"failed": []},
+                "review_threads_complete": False,
+                "unresolved_review_threads": 1,
+                "review_thread_body_digest": "deadbeef",
+            }
+        )
+        assert self._body_keys(incomplete) == []
+        # The differential: the SAME facts with a complete read DO emit it, so the
+        # suppression is the completeness gate and not something incidental.
+        complete = pull_request_conditions(
+            {
+                "checks": {"failed": []},
+                "review_threads_complete": True,
+                "unresolved_review_threads": 1,
+                "review_thread_body_digest": "deadbeef",
+            }
+        )
+        assert self._body_keys(complete) == ["review_thread_bodies:deadbeef"]
+
+    def test_the_adapter_carries_the_digest_only_when_non_empty(self) -> None:
+        """canonical keeps its pre-existing shape when there is no digest, which is
+        what leaves every full-canonical-equality test unchanged."""
+        without = build_pull_request_probe_result(_facts(unresolved_review_threads=1)).canonical
+        assert "review_thread_body_digest" not in without
+
+        with_digest = build_pull_request_probe_result(
+            _facts(unresolved_review_threads=1, review_thread_body_digest="c0ffee")
+        ).canonical
+        assert with_digest["review_thread_body_digest"] == "c0ffee"
+
+    def test_a_changed_body_digest_wakes(self) -> None:
+        state = _state()
+        assert _decide(state, _actionable(_BODY), now=0.0) is MonitorDecision.WAKE_ACTIONABLE
+        stamp_monitor_alerted(state, now=0.0)
+        # A DIFFERENT digest past the floor is a new key the mask does not cover.
+        changed = _actionable(_BODY_CHANGED, fingerprint="fp-2")
+        assert _decide(state, changed, now=_FLOOR * 1.1) is MonitorDecision.WAKE_ACTIONABLE
+
+    def test_an_unchanged_body_digest_does_not_wake_again(self) -> None:
+        """The differential for the test above: an identical digest inside the
+        re-alert interval is masked, so an in-place edit that produced no net
+        change tells the owner nothing new."""
+        state = _state()
+        assert _decide(state, _actionable(_BODY), now=0.0) is MonitorDecision.WAKE_ACTIONABLE
+        stamp_monitor_alerted(state, now=0.0)
+        assert _decide(state, _actionable(_BODY), now=1.0) is MonitorDecision.NO_CHANGE
+
+    def test_the_body_condition_survives_a_head_change(self) -> None:
+        """Sticky: a force-push does not answer a reviewer's comment, so its mask
+        is not cleared by a new head the way a failing check's is."""
+        state = _state()
+        assert _decide(state, _actionable(_BODY), now=0.0) is MonitorDecision.WAKE_ACTIONABLE
+        stamp_monitor_alerted(state, now=0.0)
+        pushed = _actionable(_BODY, fingerprint="fp-2", head_changed=True)
+        assert _decide(state, pushed, now=10.0) is MonitorDecision.NO_CHANGE
+        assert monitor_condition_dedupe_key(_BODY) in state.coalesce_alerted
+
+    def test_a_fully_loaded_subject_including_the_body_digest_loses_no_blocker(self) -> None:
+        """Every check the projection admits, all three review/mergeability fixed
+        conditions, AND the body digest survive the cap together -- which is why
+        MAX_MONITOR_FIXED_CONDITIONS had to rise to cover a fourth co-occurring
+        fixed key."""
+        failed = [f"check-{index}" for index in range(MAX_MONITOR_CHECK_IDENTITIES_PER_BUCKET)]
+        conditions = pull_request_conditions(
+            {
+                "checks": {"failed": failed},
+                "review_decision": "changes_requested",
+                "unresolved_review_threads": 3,
+                "mergeability": "conflicting",
+                "review_threads_complete": True,
+                "review_thread_body_digest": "feedface",
+            }
+        )
+        keys = [condition.key for condition in conditions]
+        assert len(keys) == len(failed) + 4
+        assert len(keys) == len(set(keys))
+        for fixed in (
+            "changes_requested",
+            "unresolved_threads",
+            "conflict",
+            "review_thread_bodies:feedface",
+        ):
+            assert fixed in keys
+        # The engine must accept everything the adapter can legitimately produce.
+        MonitorObservation(
+            "fp",
+            MonitorObservationStatus.ACTIONABLE,
+            conditions=conditions,
+        )
+
+
+_COMMENT = MonitorCondition(
+    key="review_comment_bodies:cccc",
+    severity=MonitorSeverity.WAKE,
+    resets_on=MonitorResetsOn.NEVER,
+)
+_COMMENT_CHANGED = MonitorCondition(
+    key="review_comment_bodies:dddd",
+    severity=MonitorSeverity.WAKE,
+    resets_on=MonitorResetsOn.NEVER,
+)
+
+
+class TestTheReviewCommentBodyCondition:
+    """A monitor also wakes when a PR-LEVEL comment body changes.
+
+    The review-bot verdicts (design-review, codex-ai-review, ...) post as
+    PR-level issue comments, not review threads, and a bot rewrites its verdict
+    IN PLACE, so this is the surface that carries the motivating signal. It is a
+    SEPARATE key from the thread digest, so a change on one surface is
+    distinguishable from a change on the other.
+    """
+
+    @staticmethod
+    def _comment_keys(conditions: object) -> list[str]:
+        return [c.key for c in conditions if c.key.startswith("review_comment_bodies:")]
+
+    def test_a_digest_emits_one_sticky_comment_condition(self) -> None:
+        conditions = pull_request_conditions(
+            {"checks": {"failed": []}, "pr_comment_body_digest": "beadfeed"}
+        )
+        keyed = {c.key: c for c in conditions}
+        assert "review_comment_bodies:beadfeed" in keyed
+        condition = keyed["review_comment_bodies:beadfeed"]
+        assert condition.severity is MonitorSeverity.WAKE
+        assert condition.resets_on is MonitorResetsOn.NEVER
+
+    def test_an_absent_or_empty_digest_emits_no_comment_condition(self) -> None:
+        """The fail-closed representation at the adapter: the provider emits "" on
+        an incomplete or empty read, and an absent or empty digest yields no
+        condition. The provider-side incomplete-read assertion lives in the
+        GitHub monitor tests."""
+        assert self._comment_keys(pull_request_conditions({"checks": {"failed": []}})) == []
+        assert (
+            self._comment_keys(
+                pull_request_conditions({"checks": {"failed": []}, "pr_comment_body_digest": ""})
+            )
+            == []
+        )
+
+    def test_the_adapter_carries_the_comment_digest_only_when_non_empty(self) -> None:
+        without = build_pull_request_probe_result(
+            _facts(checks=(PullRequestCheck("build", "failed"),))
+        ).canonical
+        assert "pr_comment_body_digest" not in without
+
+        with_digest = build_pull_request_probe_result(
+            _facts(
+                checks=(PullRequestCheck("build", "failed"),),
+                pr_comment_body_digest="c0ffee",
+            )
+        ).canonical
+        assert with_digest["pr_comment_body_digest"] == "c0ffee"
+
+    def test_a_changed_comment_digest_wakes(self) -> None:
+        state = _state()
+        assert _decide(state, _actionable(_COMMENT), now=0.0) is MonitorDecision.WAKE_ACTIONABLE
+        stamp_monitor_alerted(state, now=0.0)
+        changed = _actionable(_COMMENT_CHANGED, fingerprint="fp-2")
+        assert _decide(state, changed, now=_FLOOR * 1.1) is MonitorDecision.WAKE_ACTIONABLE
+
+    def test_an_unchanged_comment_digest_does_not_wake_again(self) -> None:
+        state = _state()
+        assert _decide(state, _actionable(_COMMENT), now=0.0) is MonitorDecision.WAKE_ACTIONABLE
+        stamp_monitor_alerted(state, now=0.0)
+        assert _decide(state, _actionable(_COMMENT), now=1.0) is MonitorDecision.NO_CHANGE
+
+    def test_the_comment_condition_survives_a_head_change(self) -> None:
+        """Sticky: a force-push does not answer a PR-level comment either."""
+        state = _state()
+        assert _decide(state, _actionable(_COMMENT), now=0.0) is MonitorDecision.WAKE_ACTIONABLE
+        stamp_monitor_alerted(state, now=0.0)
+        pushed = _actionable(_COMMENT, fingerprint="fp-2", head_changed=True)
+        assert _decide(state, pushed, now=10.0) is MonitorDecision.NO_CHANGE
+        assert monitor_condition_dedupe_key(_COMMENT) in state.coalesce_alerted
+
+    def test_the_two_surfaces_are_distinct_keys_and_independent(self) -> None:
+        """A thread change and a comment change must be distinguishable, so the two
+        digests are never merged; a change on one leaves the other's key intact."""
+        both = pull_request_conditions(
+            {
+                "checks": {"failed": []},
+                "unresolved_review_threads": 1,
+                "review_threads_complete": True,
+                "review_thread_body_digest": "aaaa",
+                "pr_comment_body_digest": "bbbb",
+            }
+        )
+        keys = {c.key for c in both}
+        assert "review_thread_bodies:aaaa" in keys
+        assert "review_comment_bodies:bbbb" in keys
+
+        comment_changed = pull_request_conditions(
+            {
+                "checks": {"failed": []},
+                "unresolved_review_threads": 1,
+                "review_threads_complete": True,
+                "review_thread_body_digest": "aaaa",
+                "pr_comment_body_digest": "cccc",
+            }
+        )
+        changed_keys = {c.key for c in comment_changed}
+        assert "review_thread_bodies:aaaa" in changed_keys
+        assert "review_comment_bodies:cccc" in changed_keys
+        assert "review_comment_bodies:bbbb" not in changed_keys
+
+    def test_a_fully_loaded_subject_with_both_digests_loses_no_blocker(self) -> None:
+        """Five fixed conditions co-occur (a review verdict, the unresolved-thread
+        count, one mergeability condition, and BOTH digests), plus every check the
+        projection admits; the cap, now six fixed, covers them."""
+        failed = [f"check-{index}" for index in range(MAX_MONITOR_CHECK_IDENTITIES_PER_BUCKET)]
+        conditions = pull_request_conditions(
+            {
+                "checks": {"failed": failed},
+                "review_decision": "changes_requested",
+                "unresolved_review_threads": 3,
+                "mergeability": "conflicting",
+                "review_threads_complete": True,
+                "review_thread_body_digest": "aaaa",
+                "pr_comment_body_digest": "bbbb",
+            }
+        )
+        keys = [condition.key for condition in conditions]
+        assert len(keys) == len(failed) + 5
+        assert len(keys) == len(set(keys))
+        for fixed in (
+            "changes_requested",
+            "unresolved_threads",
+            "conflict",
+            "review_thread_bodies:aaaa",
+            "review_comment_bodies:bbbb",
+        ):
+            assert fixed in keys
+        MonitorObservation(
+            "fp",
+            MonitorObservationStatus.ACTIONABLE,
+            conditions=conditions,
+        )
