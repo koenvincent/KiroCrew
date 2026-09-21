@@ -55,8 +55,9 @@ cap      = clamp( min(mem_term, cpu_term), 3, hard_cap )
 ```
 
 - **Memory term** — how many agents fit in available RAM after reserving a
-  buffer for the OS and other processes. `effective_available` is
-  `min(MemAvailable, cgroup headroom)` so a memory-capped container is respected.
+  buffer for the OS and other processes. The reading is `_available_memory_gb()`,
+  which on Linux is `min(MemAvailable, cgroup headroom)` so a memory-capped
+  container is respected.
 - **CPU term** — how many fit in the core budget, using a measured per-agent
   CPU cost (agents are mostly I/O-bound, so this is generous).
 - **`min(...)`** — the tighter of memory/CPU wins.
