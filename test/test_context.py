@@ -1560,7 +1560,7 @@ class TestMemoryGetContextQueryWiring:
         builder = self._builder(tmp_path)
         store = builder.get_memory_for(None)
         store._vector_store = SimpleNamespace(
-            get_episodic_context=lambda query_text, cap: "",
+            get_episodic_context=lambda query_text, cap, keep=None: "",
             get_semantic_context=lambda query_text, cap: "",
             get_preferences_context=lambda: "",
             get_lessons_context=lambda query_text, cap, project_dir=None, background=False, hard_cap=0: "",
@@ -1581,7 +1581,7 @@ class TestMemoryGetContextQueryWiring:
         builder = self._builder(tmp_path)
         store = builder.get_memory_for(None)
         store._vector_store = SimpleNamespace(
-            get_episodic_context=lambda query_text, cap: "",
+            get_episodic_context=lambda query_text, cap, keep=None: "",
             get_semantic_context=lambda query_text, cap: "",
             get_preferences_context=lambda: "",
             get_lessons_context=lambda query_text, cap, project_dir=None, background=False, hard_cap=0: "",
@@ -1626,7 +1626,7 @@ class TestMemoryGetContextQueryWiring:
         builder = self._builder(tmp_path)
         store = builder.get_memory_for(None)
         store._vector_store = SimpleNamespace(
-            get_episodic_context=lambda query_text, cap: "[EPISODIC-SENTINEL]",
+            get_episodic_context=lambda query_text, cap, keep=None: "[EPISODIC-SENTINEL]",
             get_semantic_context=lambda query_text, cap: "",
             get_preferences_context=lambda: "",
             get_lessons_context=lambda query_text, cap, project_dir=None, background=False, hard_cap=0: "",
@@ -1643,7 +1643,7 @@ class TestMemoryGetContextQueryWiring:
         builder = self._builder(tmp_path)
         store = builder.get_memory_for(None)
 
-        def _episodic(query_text, cap):
+        def _episodic(query_text, cap, keep=None):
             seen.append(query_text)
             return ""
 
@@ -1696,7 +1696,7 @@ class TestDurableModelVersionLessonContext:
         builder = self._builder(tmp_path)
         memory = builder.get_memory_for(None)
         memory._vector_store = SimpleNamespace(
-            get_episodic_context=lambda query_text, cap: "",
+            get_episodic_context=lambda query_text, cap, keep=None: "",
             get_semantic_context=lambda query_text, cap: "",
             get_preferences_context=lambda: "",
             get_lessons_context=lambda query_text, cap, project_dir=None, background=False, hard_cap=0: "",

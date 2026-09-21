@@ -175,7 +175,7 @@ class TestEpisodicMemoryGate:
         builder = _builder(tmp_path)
         store = builder.get_memory_for(None)
         store._vector_store = SimpleNamespace(
-            get_episodic_context=lambda query_text, cap: "[EPISODIC-SENTINEL]",
+            get_episodic_context=lambda query_text, cap, keep=None: "[EPISODIC-SENTINEL]",
             get_semantic_context=lambda query_text, cap: "",
             get_preferences_context=lambda: "[PREFERENCE-SENTINEL]",
             get_lessons_context=lambda query_text, cap, project_dir=None, background=False, hard_cap=0: "",

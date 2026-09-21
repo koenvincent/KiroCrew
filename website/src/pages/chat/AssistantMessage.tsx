@@ -15,7 +15,8 @@ import { applySearchHighlights, clearSearchHighlights } from '../../utils/domHig
 import { scrollCurrentMatchIntoView } from '../../utils/searchScroll'
 import FileChangeChips, { type FileChangeEntry } from '../../components/FileChangeChips'
 import DecisionStrip from './DecisionStrip'
-import { readDecisionStrip } from './decisionRecord'
+import { readDecisionStrip, readMemoryRecallRecord } from './decisionRecord'
+import MemoryRecallStrip from './MemoryRecallStrip'
 import type { FileChipStyle } from './ChatSettings'
 import { loadChatConfig } from './ChatSettings'
 import { useSmoothStream } from '../../hooks/useSmoothStream'
@@ -321,6 +322,10 @@ const AssistantMessage = memo(function AssistantMessage({ content, isStreaming, 
   // Validated here rather than at the host, so the strip mounts only for a row
   // that really carries one and the hosts stay a one-property read.
   const decisionRecord = useMemo(() => readDecisionStrip(decisionsStrip), [decisionsStrip])
+  // The second record this field can hold. Read separately rather than through one
+  // dispatcher: each reader validates its own shape and returns null for the
+  // other's, so at most one is non-null and neither has to know the other exists.
+  const memoryRecord = useMemo(() => readMemoryRecallRecord(decisionsStrip), [decisionsStrip])
   const turnStatsTitle = (() => {
     if (!turnStats) return undefined
     const elapsed = fmtTurnElapsed(turnStats.elapsed_ms)
@@ -543,6 +548,9 @@ const AssistantMessage = memo(function AssistantMessage({ content, isStreaming, 
         all, so there is no partial form to withhold. */}
     {decisionRecord && (
       <DecisionStrip record={decisionRecord} disclosureKey={messageTs ? `dstrip-${messageTs}` : undefined} />
+    )}
+    {memoryRecord && (
+      <MemoryRecallStrip record={memoryRecord} disclosureKey={messageTs ? `mstrip-${messageTs}` : undefined} />
     )}
     {fileChanges && fileChanges.length > 0 && !isStreaming && (
       /* Pass `onFileOpen` by IDENTITY — a `(p) => onFileOpen(p)` wrapper here is

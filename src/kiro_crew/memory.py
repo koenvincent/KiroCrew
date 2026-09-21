@@ -1215,6 +1215,7 @@ class MemoryStore:
         query: str = "",
         *,
         include_activity: bool = True,
+        episodic_keep: Callable[[list[dict]], list[dict] | None] | None = None,
     ) -> str:
         """Build memory context block with source citations for prompt injection.
 
@@ -1227,6 +1228,11 @@ class MemoryStore:
             query: User message for episodic memory retrieval (optional).
             include_activity: Explicit readers may include activity; startup passes
                 False to read complete preferences only, without history/search.
+            episodic_keep: Optional hook that may narrow the recalled episodes
+                before they are formatted, returning ``None`` to keep every one.
+                Passed straight to ``VectorMemoryStore.get_episodic_context``,
+                which owns every fallback; this method only carries it, so a
+                caller without one gets byte-identical output.
         """
         parts: list[str] = []
 
@@ -1277,7 +1283,7 @@ class MemoryStore:
             # Episodic memory (relevant past conversation fragments)
             if query and include_activity:
                 episodic_ctx = self._vector_store.get_episodic_context(
-                    query_text=query, cap=episodic_cap
+                    query_text=query, cap=episodic_cap, keep=episodic_keep
                 )
                 if episodic_ctx:
                     parts.append(episodic_ctx)

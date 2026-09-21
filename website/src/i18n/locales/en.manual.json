@@ -4288,7 +4288,22 @@
         "saved_tokens": "saved {{tokens}} tokens",
         "sent_history": "history {{chars}} chars",
         "sent_label": "Sent to Jev",
-        "sent_message": "message {{chars}} chars"
+        "sent_message": "message {{chars}} chars",
+        "point_memory_recall": "memory",
+        "memory_similarity": "similarity: {{count}}",
+        "memory_kept": "Jev kept: {{count}}",
+        "memory_saved_chars": "saved {{chars}} chars",
+        "memory_baseline_label": "Recalled by similarity",
+        "memory_jev_label": "Kept by Jev",
+        "memory_candidates_label": "Memories offered",
+        "memory_none": "no memories",
+        "memory_confidence_title": "Jev's average confidence that one memory was worth the prompt, from 0 to 1",
+        "memory_confidence_latency_title": "Jev's average confidence that one memory was worth the prompt, from 0 to 1, and how long the answer took",
+        "memory_rate_right_jev": "Jev kept the right memories",
+        "memory_rate_wrong_jev": "Jev kept the wrong memories",
+        "memory_rate_baseline": "Similarity",
+        "memory_rate_right_baseline": "Similarity recalled the right memories",
+        "memory_rate_wrong_baseline": "Similarity recalled the wrong memories"
       },
       "toolRiskBadge": {
         "annotation_title": "Jev looked at this call and flagged it. That changed nothing about whether the call was allowed: this session's own permission setting decided that, and the call may still have been refused.",

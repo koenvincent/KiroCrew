@@ -1266,6 +1266,55 @@ def open_member_database(
     return store
 
 
+#: Characters of one episode's text the injected block carries. Named because two
+#: readers need the same number: the block builder clips to it, and
+#: ``decisions/points/memory_recall.py`` measures a decision's saving against the
+#: same clip. A literal in one place and a different literal in the other would
+#: make the saving a number about a block nobody assembled.
+EPISODIC_BLOCK_TEXT_CHARS = 1500
+
+
+def _kept_episodes(
+    results: list[dict],
+    keep: Callable[[list[dict]], list[dict] | None] | None,
+) -> list[dict]:
+    """*results* narrowed by *keep*, or *results* unchanged.
+
+    Every unusable answer keeps the full similarity result, which is what this
+    module did before a hook existed: ``None`` (no decision), a raise, a
+    non-sequence, and a row the search did not produce. The last one matters most
+    -- a hook is allowed to REMOVE entries and nothing else, so an answer carrying
+    an unknown row is treated as unusable rather than injected, and an injected
+    block can never hold a memory this search did not rank.
+
+    Identity, not equality, is what membership is judged on: two distinct episodes
+    can hold equal dicts, and a membership test by value would let one answer
+    admit the other.
+    """
+    if keep is None:
+        return results
+    try:
+        narrowed = keep(list(results))
+    except Exception:
+        logger.debug("Episodic keep hook failed; injecting the similarity result")
+        return results
+    if narrowed is None:
+        return results
+    if not isinstance(narrowed, list):
+        logger.debug(
+            "Episodic keep hook returned %s; injecting the similarity result", type(narrowed)
+        )
+        return results
+    offered = {id(row) for row in results}
+    if any(id(row) not in offered for row in narrowed):
+        logger.debug("Episodic keep hook named a row this search did not rank; injecting it whole")
+        return results
+    # Ranked order is this module's, so the hook's own ordering is discarded: it
+    # answered a keep/drop question, which says nothing about rank.
+    chosen = {id(row) for row in narrowed}
+    return [row for row in results if id(row) in chosen]
+
+
 class VectorMemoryStore:
     """SQLite-backed structured memory with semantic keys and audit trail."""
 
@@ -4832,12 +4881,24 @@ class VectorMemoryStore:
         query_embedding: list[float] | None = None,
         query_text: str = "",
         cap: int = 3000,
+        *,
+        keep: Callable[[list[dict]], list[dict] | None] | None = None,
     ) -> str:
         """Format episodic search results for prompt injection.
 
         Results below the length-aware cosine relevance gate are dropped by
         ``search_episodic(relevance_filter=True)`` BEFORE decay ranking, so a
         relevant-but-old memory is admitted rather than ordered out by recency.
+
+        *keep*, when given, may narrow the ranked set before it is formatted; it
+        returns ``None`` to keep every result. It is the seam the
+        ``memory.recall`` decision point attaches to
+        (``decisions/points/memory_recall.py``), and it is a callable rather than
+        a filtered list so this method still owns the search: a hook that raises,
+        returns a non-list, or names rows this search did not produce leaves the
+        similarity result exactly as it is. Order stays this method's own —
+        entries are kept in ranked order and a hook can only remove some of them
+        — because a keep/drop answer says nothing about rank.
         """
         if query_embedding is None and query_text and self.embed_fn is not None:
             query_embedding = self._try_embed(query_text, PRIORITY_INTERACTIVE)
@@ -4849,10 +4910,13 @@ class VectorMemoryStore:
         )
         if not results:
             return ""
+        results = _kept_episodes(results, keep)
+        if not results:
+            return ""
         lines: list[str] = []
         total = 0
         for i, r in enumerate(results, 1):
-            text = r["text"][:1500]
+            text = r["text"][:EPISODIC_BLOCK_TEXT_CHARS]
             line = f"{i}. {text}"
             if self.algorithm_version == "v2":
                 line = f"{i}. [memory:{r['id']}] {text}"

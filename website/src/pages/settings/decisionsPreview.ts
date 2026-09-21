@@ -33,6 +33,16 @@ export const DECISIONS_LIVE_POINT = 'skills.select'
  */
 export const DECISIONS_STEER_POINT = 'message.steer'
 
+/**
+ * The point that chooses which of the memories vector similarity recalled reach
+ * the prompt.
+ *
+ * Named here beside the other two for the same reason: the strip reader
+ * dispatches on it, so a second spelling anywhere would be a record nobody
+ * renders.
+ */
+export const DECISIONS_MEMORY_POINT = 'memory.recall'
+
 /** Config path of the sampling share; the only decisions value the config PATCH accepts. */
 export const DECISIONS_BUCKET_PATH = 'decisions.bucket'
 

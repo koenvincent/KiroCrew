@@ -10237,7 +10237,22 @@
         "saved_tokens": "{{tokens}} 토큰 절약",
         "sent_history": "기록 {{chars}}자",
         "sent_label": "Jev에 보냄",
-        "sent_message": "메시지 {{chars}}자"
+        "sent_message": "메시지 {{chars}}자",
+        "point_memory_recall": "기억",
+        "memory_similarity": "유사도: {{count}}건",
+        "memory_kept": "Jev가 남김: {{count}}건",
+        "memory_saved_chars": "{{chars}}자 절약",
+        "memory_baseline_label": "유사도로 불러온 기억",
+        "memory_jev_label": "Jev가 남긴 기억",
+        "memory_candidates_label": "제시한 기억",
+        "memory_none": "기억 없음",
+        "memory_confidence_title": "기억이 프롬프트에 값한다고 Jev가 본 평균 확신도, 0에서 1까지",
+        "memory_confidence_latency_title": "기억이 프롬프트에 값한다고 Jev가 본 평균 확신도, 0에서 1까지, 그리고 답이 오기까지 걸린 시간",
+        "memory_rate_right_jev": "Jev가 기억을 옳게 남겼다",
+        "memory_rate_wrong_jev": "Jev가 기억을 잘못 남겼다",
+        "memory_rate_baseline": "유사도",
+        "memory_rate_right_baseline": "유사도가 기억을 옳게 불러왔다",
+        "memory_rate_wrong_baseline": "유사도가 기억을 잘못 불러왔다"
       },
       "toolRiskBadge": {
         "annotation_title": "Jev가 이 호출을 보고 표시했습니다. 표시는 호출이 허용되었는지와 무관합니다. 그것은 이 세션의 권한 설정이 결정하며, 호출은 거부되었을 수도 있습니다.",

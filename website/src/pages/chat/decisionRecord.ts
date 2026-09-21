@@ -36,7 +36,7 @@
  */
 import type { DecisionFeedbackSide, DecisionVerdictValue } from '../../api/client'
 import type { ChatMessage } from '../../types'
-import { DECISIONS_LIVE_POINT, DECISIONS_STEER_POINT } from '../settings/decisionsPreview'
+import { DECISIONS_LIVE_POINT, DECISIONS_MEMORY_POINT, DECISIONS_STEER_POINT } from '../settings/decisionsPreview'
 
 /** A skill the answer named that the gate then refused, with its own score. */
 export interface DecisionStripDropped {
@@ -267,6 +267,93 @@ export function readSteerRecord(raw: unknown): SteerDecisionRecord | null {
     choice,
     p,
     latencyMs: asCount(root.latency_ms),
+  }
+}
+
+/**
+ * One recalled-memory decision, as the memory strip prints it.
+ *
+ * The two lists are `baseline_keys` and `jev_keys` on the wire, not `baseline`
+ * and `jev`. That is the producer's choice and it is load-bearing here: those two
+ * names are what `readDecisionStrip` requires, so a memory record spelling them
+ * would be accepted by the skill reader and drawn as a skill selection holding
+ * memory ids. Naming each list for what it holds makes the two records decline
+ * each other on SHAPE as well as on `point`.
+ *
+ * `agree` is recomputed from the two lists for the reason `readDecisionStrip`
+ * gives: a flag disagreeing with the lists beside it could only ever hide a real
+ * divergence.
+ */
+export interface MemoryRecallRecord {
+  /** Identifies the turn this decision belongs to; the feedback POST's subject. */
+  turnId: string
+  /** Always `memory.recall`. */
+  point: typeof DECISIONS_MEMORY_POINT
+  /** The memories vector similarity recalled — every one Jev was offered. */
+  baselineKeys: string[]
+  /** The memories Jev kept, which is what the prompt carried. */
+  jevKeys: string[]
+  /** Jev kept every recalled memory. */
+  agree: boolean
+  /**
+   * The MEAN chance Jev gave one offered memory of being worth the prompt, or
+   * `null` when the record carried none.
+   *
+   * A summary and nothing more: the request asked one question per memory, so
+   * there is no single confidence to print. The producer says so too.
+   */
+  p: number | null
+  /** Prompt characters the narrower block saved, `0` when it saved none. */
+  charsSaved: number
+  /** Memories the gate offered Jev to judge. */
+  candidates: number
+  /**
+   * Characters of the message excerpt the question sent, or `null` when the
+   * record does not state it. Nullable for the reason `DecisionStripRecord`
+   * spells out: 0 is not a credible measurement of a turn that had text.
+   */
+  messageChars: number | null
+  /** Milliseconds between asking Jev and its answer. */
+  latencyMs: number
+  /** Why the decision failed, or `null` when it did not. */
+  error: string | null
+}
+
+/**
+ * Validate one raw recalled-memory record. `null` means "draw nothing".
+ *
+ * `point` is REQUIRED and must be the memory one. An absent point is the oldest
+ * producer's shape and belongs to `readDecisionStrip`, so inferring this record
+ * from the fields present would claim a decision about memory over a record that
+ * never named one.
+ */
+export function readMemoryRecallRecord(raw: unknown): MemoryRecallRecord | null {
+  const root = asRecord(raw)
+  if (!root) return null
+  if (root.point !== DECISIONS_MEMORY_POINT) return null
+  const turnId = typeof root.turn_id === 'string' ? root.turn_id : ''
+  if (!turnId) return null
+  // Both lists whole before anything is drawn, the same rule the skill reader
+  // states: the claim this strip makes is which memories were dropped, and it
+  // cannot make it about a list it could not read.
+  const baselineKeys = asNames(root.baseline_keys)
+  const jevKeys = asNames(root.jev_keys)
+  if (baselineKeys === null || jevKeys === null) return null
+  const rawP = root.p
+  const p = typeof rawP === 'number' && Number.isFinite(rawP) && rawP >= 0 && rawP <= 1 ? rawP : null
+  const error = typeof root.error === 'string' && root.error.trim() ? root.error : null
+  return {
+    turnId,
+    point: DECISIONS_MEMORY_POINT,
+    baselineKeys,
+    jevKeys,
+    agree: sameSet(baselineKeys, jevKeys),
+    p,
+    charsSaved: asCount(root.chars_saved),
+    candidates: asCount(root.candidates),
+    messageChars: asCountOrNull(root.message_chars),
+    latencyMs: asCount(root.latency_ms),
+    error,
   }
 }
 

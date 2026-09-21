@@ -10523,7 +10523,22 @@
         "saved_tokens": "{{tokens}} tokens ahorrados",
         "sent_history": "historial {{chars}} caracteres",
         "sent_label": "Enviado a Jev",
-        "sent_message": "mensaje {{chars}} caracteres"
+        "sent_message": "mensaje {{chars}} caracteres",
+        "point_memory_recall": "memoria",
+        "memory_similarity": "similitud: {{count}}",
+        "memory_kept": "Jev guardó: {{count}}",
+        "memory_saved_chars": "{{chars}} caracteres ahorrados",
+        "memory_baseline_label": "Recuperadas por similitud",
+        "memory_jev_label": "Guardadas por Jev",
+        "memory_candidates_label": "Memorias ofrecidas",
+        "memory_none": "ninguna memoria",
+        "memory_confidence_title": "Confianza media de Jev en que una memoria valía el prompt, de 0 a 1",
+        "memory_confidence_latency_title": "Confianza media de Jev en que una memoria valía el prompt, de 0 a 1, y cuánto tardó la respuesta",
+        "memory_rate_right_jev": "Jev guardó las memorias correctas",
+        "memory_rate_wrong_jev": "Jev guardó las memorias equivocadas",
+        "memory_rate_baseline": "Similitud",
+        "memory_rate_right_baseline": "La similitud recuperó las memorias correctas",
+        "memory_rate_wrong_baseline": "La similitud recuperó las memorias equivocadas"
       },
       "toolRiskBadge": {
         "annotation_title": "Jev miró esta llamada y la marcó. Eso no cambió nada sobre si la llamada estaba permitida: eso lo decidió el ajuste de permisos de esta sesión, y la llamada pudo haber sido rechazada igualmente.",

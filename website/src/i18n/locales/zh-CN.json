@@ -10237,7 +10237,22 @@
         "saved_tokens": "省下 {{tokens}} 个 token",
         "sent_history": "历史 {{chars}} 字符",
         "sent_label": "发送给 Jev",
-        "sent_message": "消息 {{chars}} 字符"
+        "sent_message": "消息 {{chars}} 字符",
+        "point_memory_recall": "记忆",
+        "memory_similarity": "相似度召回 {{count}} 条",
+        "memory_kept": "Jev 保留 {{count}} 条",
+        "memory_saved_chars": "省下 {{chars}} 个字符",
+        "memory_baseline_label": "按相似度召回",
+        "memory_jev_label": "Jev 保留",
+        "memory_candidates_label": "候选记忆",
+        "memory_none": "没有记忆",
+        "memory_confidence_title": "Jev 认为一条记忆值得进入提示词的平均把握，取值 0 到 1",
+        "memory_confidence_latency_title": "Jev 认为一条记忆值得进入提示词的平均把握，取值 0 到 1，以及回答用了多久",
+        "memory_rate_right_jev": "Jev 保留对了记忆",
+        "memory_rate_wrong_jev": "Jev 保留错了记忆",
+        "memory_rate_baseline": "相似度",
+        "memory_rate_right_baseline": "相似度召回对了记忆",
+        "memory_rate_wrong_baseline": "相似度召回错了记忆"
       },
       "toolRiskBadge": {
         "annotation_title": "Jev 看过这次调用并做了标记。标记不会影响这次调用是否被允许：那由本会话自己的权限设置决定，而且这次调用仍可能已被拒绝。",

@@ -10523,7 +10523,22 @@
         "saved_tokens": "{{tokens}} tokens economizados",
         "sent_history": "histórico {{chars}} caracteres",
         "sent_label": "Enviado ao Jev",
-        "sent_message": "mensagem {{chars}} caracteres"
+        "sent_message": "mensagem {{chars}} caracteres",
+        "point_memory_recall": "memória",
+        "memory_similarity": "semelhança: {{count}}",
+        "memory_kept": "O Jev guardou: {{count}}",
+        "memory_saved_chars": "{{chars}} caracteres economizados",
+        "memory_baseline_label": "Trazidas por semelhança",
+        "memory_jev_label": "Guardadas pelo Jev",
+        "memory_candidates_label": "Memórias oferecidas",
+        "memory_none": "nenhuma memória",
+        "memory_confidence_title": "Confiança média do Jev de que uma memória valia o prompt, de 0 a 1",
+        "memory_confidence_latency_title": "Confiança média do Jev de que uma memória valia o prompt, de 0 a 1, e quanto tempo a resposta levou",
+        "memory_rate_right_jev": "O Jev guardou as memórias certas",
+        "memory_rate_wrong_jev": "O Jev guardou as memórias erradas",
+        "memory_rate_baseline": "Semelhança",
+        "memory_rate_right_baseline": "A semelhança trouxe as memórias certas",
+        "memory_rate_wrong_baseline": "A semelhança trouxe as memórias erradas"
       },
       "toolRiskBadge": {
         "annotation_title": "O Jev olhou esta chamada e sinalizou-a. Isso não mudou nada sobre a chamada ter sido permitida: isso foi decidido pela configuração de permissões desta sessão, e a chamada pode ter sido recusada mesmo assim.",

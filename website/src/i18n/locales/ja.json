@@ -10237,7 +10237,22 @@
         "saved_tokens": "{{tokens}} トークン節約",
         "sent_history": "履歴 {{chars}} 文字",
         "sent_label": "Jev に送信",
-        "sent_message": "メッセージ {{chars}} 文字"
+        "sent_message": "メッセージ {{chars}} 文字",
+        "point_memory_recall": "記憶",
+        "memory_similarity": "類似度で {{count}} 件",
+        "memory_kept": "Jev が残した {{count}} 件",
+        "memory_saved_chars": "{{chars}} 文字節約",
+        "memory_baseline_label": "類似度で呼び出した記憶",
+        "memory_jev_label": "Jev が残した記憶",
+        "memory_candidates_label": "提示した記憶",
+        "memory_none": "記憶なし",
+        "memory_confidence_title": "記憶がプロンプトに値すると Jev が考えた平均的な確信度（0 から 1）",
+        "memory_confidence_latency_title": "記憶がプロンプトに値すると Jev が考えた平均的な確信度（0 から 1）と、答えが返るまでの時間",
+        "memory_rate_right_jev": "Jev が残した記憶は正しかった",
+        "memory_rate_wrong_jev": "Jev が残した記憶は間違っていた",
+        "memory_rate_baseline": "類似度",
+        "memory_rate_right_baseline": "類似度が呼び出した記憶は正しかった",
+        "memory_rate_wrong_baseline": "類似度が呼び出した記憶は間違っていた"
       },
       "toolRiskBadge": {
         "annotation_title": "Jev がこの呼び出しを見て印を付けました。印を付けても、その呼び出しが許可されたかどうかは変わりません。それを決めるのはこのセッションの権限設定で、呼び出しは拒否されたこともあります。",

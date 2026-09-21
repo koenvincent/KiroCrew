@@ -3414,6 +3414,42 @@ class ContextBuilder:
             )
         return envelope
 
+    def _episodic_keep_hook(
+        self, session_key: str | None, query_text: str
+    ) -> "Callable[[list[dict]], list[dict] | None] | None":
+        """The ``memory.recall`` keep hook for this turn, or ``None``.
+
+        ``None`` -- inject every memory similarity recalled, which is what this
+        method returns for every turn that is not an OWNER DASHBOARD one. That
+        restriction is this call site's, not the seam's, and it is about egress
+        plus audience: the request carries snippets of the member's own recalled
+        memories, and the receipt for the decision rides a dashboard reply
+        (`decisions/outcomes.py` hands it to `chat_runner`). A cron turn, a
+        sub-agent, a channel and an integration have no such reply, so asking on
+        their behalf would send memory text for a decision nobody is shown.
+        `has_dashboard_surface` is the same predicate the rest of this module uses
+        to mean "a person is looking at this session".
+
+        Also ``None`` without a query: with no message there is nothing to judge
+        relevance against, and `get_episodic_context` is not reached either.
+
+        The hook itself is a closure over the loop captured at construction. The
+        point's own gates (consent, the sampling bucket, a usable loop) run inside
+        it, so building one costs nothing on a turn the seam refuses.
+        """
+        if not query_text or not session_key:
+            return None
+        if not has_dashboard_surface(session_key):
+            return None
+        from kiro_crew.decisions.points.memory_recall import keep_hook
+
+        return keep_hook(
+            query_text,
+            session_key=session_key,
+            loop=self._decisions_loop,
+            owner_turn=True,
+        )
+
     def build_session_context(
         self,
         session_key: str | None = None,
@@ -3909,6 +3945,16 @@ class ContextBuilder:
                     "for explicit corrections.\n"
                 )
             elif memory is not None:
+                # Jev (memory.recall): when the point is on for this session, the
+                # memories it keeps are what the episodic block carries. Handed to
+                # the store as a `keep=` hook rather than applied here so the
+                # block is built once, by the code that owns its format, and so
+                # every refusal -- the seam off, this session unsampled, a
+                # timeout, an unreadable answer -- leaves the similarity top-k
+                # exactly as it is today. The wait is bounded and paid on THIS
+                # thread: production reaches `build_message` only through
+                # `run_in_embed_pool`, so the loop captured at construction runs
+                # only the `decide` await.
                 memory_ctx = memory.get_context(
                     prefs_cap=caps.prefs,
                     projects_cap=caps.projects,
@@ -3917,6 +3963,7 @@ class ContextBuilder:
                     episodic_cap=min(_EPISODIC_INJECT_CAP, caps.episodic),
                     query=query_text,
                     include_activity=False,
+                    episodic_keep=self._episodic_keep_hook(session_key, query_text),
                 )
                 if memory_ctx:
                     # Preferences are read complete below the model-safe ceiling.

@@ -10523,7 +10523,22 @@
         "saved_tokens": "{{tokens}} token risparmiati",
         "sent_history": "cronologia {{chars}} caratteri",
         "sent_label": "Inviato a Jev",
-        "sent_message": "messaggio {{chars}} caratteri"
+        "sent_message": "messaggio {{chars}} caratteri",
+        "point_memory_recall": "memoria",
+        "memory_similarity": "somiglianza: {{count}}",
+        "memory_kept": "Jev ha tenuto: {{count}}",
+        "memory_saved_chars": "{{chars}} caratteri risparmiati",
+        "memory_baseline_label": "Richiamate per somiglianza",
+        "memory_jev_label": "Tenute da Jev",
+        "memory_candidates_label": "Memorie proposte",
+        "memory_none": "nessuna memoria",
+        "memory_confidence_title": "Quanta fiducia media ha avuto Jev che una memoria valesse il prompt, da 0 a 1",
+        "memory_confidence_latency_title": "Quanta fiducia media ha avuto Jev che una memoria valesse il prompt, da 0 a 1, e quanto tempo ha richiesto la risposta",
+        "memory_rate_right_jev": "Jev ha tenuto le memorie giuste",
+        "memory_rate_wrong_jev": "Jev ha tenuto le memorie sbagliate",
+        "memory_rate_baseline": "Somiglianza",
+        "memory_rate_right_baseline": "La somiglianza ha richiamato le memorie giuste",
+        "memory_rate_wrong_baseline": "La somiglianza ha richiamato le memorie sbagliate"
       },
       "toolRiskBadge": {
         "annotation_title": "Jev ha guardato questa chiamata e l'ha segnalata. Questo non ha cambiato nulla sul fatto che la chiamata fosse permessa: lo ha deciso l'impostazione dei permessi di questa sessione, e la chiamata potrebbe essere stata rifiutata comunque.",

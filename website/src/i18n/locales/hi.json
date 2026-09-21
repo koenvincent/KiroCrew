@@ -10380,7 +10380,22 @@
         "saved_tokens": "{{tokens}} टोकन बचाए",
         "sent_history": "इतिहास {{chars}} अक्षर",
         "sent_label": "Jev को भेजा गया",
-        "sent_message": "संदेश {{chars}} अक्षर"
+        "sent_message": "संदेश {{chars}} अक्षर",
+        "point_memory_recall": "याद",
+        "memory_similarity": "समानता से: {{count}}",
+        "memory_kept": "Jev ने रखीं: {{count}}",
+        "memory_saved_chars": "{{chars}} अक्षर बचाए",
+        "memory_baseline_label": "समानता से आईं यादें",
+        "memory_jev_label": "Jev ने जो रखीं",
+        "memory_candidates_label": "दी गई यादें",
+        "memory_none": "कोई याद नहीं",
+        "memory_confidence_title": "एक याद प्रॉम्प्ट में जगह के लायक है, इस पर Jev का औसत भरोसा, 0 से 1 तक",
+        "memory_confidence_latency_title": "एक याद प्रॉम्प्ट में जगह के लायक है, इस पर Jev का औसत भरोसा, 0 से 1 तक, और उत्तर आने में कितना समय लगा",
+        "memory_rate_right_jev": "Jev ने सही यादें रखीं",
+        "memory_rate_wrong_jev": "Jev ने गलत यादें रखीं",
+        "memory_rate_baseline": "समानता",
+        "memory_rate_right_baseline": "समानता ने सही यादें लाईं",
+        "memory_rate_wrong_baseline": "समानता ने गलत यादें लाईं"
       },
       "toolRiskBadge": {
         "annotation_title": "Jev ने इस कॉल को देखा और इसे चिह्नित किया। इससे यह नहीं बदला कि कॉल की अनुमति थी या नहीं: वह इस सेशन की अपनी अनुमति सेटिंग ने तय किया, और कॉल फिर भी मना की जा सकती थी।",

@@ -10380,7 +10380,22 @@
         "saved_tokens": "{{tokens}} Tokens gespart",
         "sent_history": "Verlauf {{chars}} Zeichen",
         "sent_label": "An Jev gesendet",
-        "sent_message": "Nachricht {{chars}} Zeichen"
+        "sent_message": "Nachricht {{chars}} Zeichen",
+        "point_memory_recall": "Erinnerungen",
+        "memory_similarity": "Ähnlichkeit: {{count}}",
+        "memory_kept": "Jev behielt: {{count}}",
+        "memory_saved_chars": "{{chars}} Zeichen gespart",
+        "memory_baseline_label": "Per Ähnlichkeit geholt",
+        "memory_jev_label": "Von Jev behalten",
+        "memory_candidates_label": "Angebotene Erinnerungen",
+        "memory_none": "keine Erinnerungen",
+        "memory_confidence_title": "Wie sicher Jev im Schnitt war, dass eine Erinnerung den Prompt wert ist, von 0 bis 1",
+        "memory_confidence_latency_title": "Wie sicher Jev im Schnitt war, dass eine Erinnerung den Prompt wert ist, von 0 bis 1, und wie lange die Antwort gedauert hat",
+        "memory_rate_right_jev": "Jev hat die richtigen Erinnerungen behalten",
+        "memory_rate_wrong_jev": "Jev hat die falschen Erinnerungen behalten",
+        "memory_rate_baseline": "Ähnlichkeit",
+        "memory_rate_right_baseline": "Die Ähnlichkeit hat die richtigen Erinnerungen geholt",
+        "memory_rate_wrong_baseline": "Die Ähnlichkeit hat die falschen Erinnerungen geholt"
       },
       "toolRiskBadge": {
         "annotation_title": "Jev hat diesen Aufruf angesehen und markiert. Das hat nichts daran geändert, ob der Aufruf erlaubt war: darüber hat die Berechtigungseinstellung dieser Sitzung entschieden, und der Aufruf kann trotzdem abgelehnt worden sein.",
