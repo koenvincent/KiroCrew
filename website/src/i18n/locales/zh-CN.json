@@ -10237,7 +10237,18 @@
         "saved_tokens": "省下 {{tokens}} 个 token",
         "sent_history": "历史 {{chars}} 字符",
         "sent_label": "发送给 Jev",
-        "sent_message": "消息 {{chars}} 字符"
+        "sent_message": "消息 {{chars}} 字符",
+        "split_agent_inline": "智能体：{{shape}}",
+        "split_agent_spawned": "智能体：{{shape}}（启动 {{count}} 个）",
+        "split_agreed": "形式相同",
+        "split_differed": "形式不同",
+        "split_jev_chose": "Jev 建议{{shape}}",
+        "split_rate_label": "此建议",
+        "split_rate_right": "Jev 建议的形式正确",
+        "split_rate_wrong": "Jev 建议的形式错误",
+        "split_shape_delegate": "交给一个子智能体",
+        "split_shape_single": "自己完成",
+        "split_shape_split": "并行拆给多个子智能体"
       },
       "toolRiskBadge": {
         "annotation_title": "Jev 看过这次调用并做了标记。标记不会影响这次调用是否被允许：那由本会话自己的权限设置决定，而且这次调用仍可能已被拒绝。",

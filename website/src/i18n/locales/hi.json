@@ -10380,7 +10380,18 @@
         "saved_tokens": "{{tokens}} टोकन बचाए",
         "sent_history": "इतिहास {{chars}} अक्षर",
         "sent_label": "Jev को भेजा गया",
-        "sent_message": "संदेश {{chars}} अक्षर"
+        "sent_message": "संदेश {{chars}} अक्षर",
+        "split_agent_inline": "एजेंट: {{shape}}",
+        "split_agent_spawned": "एजेंट: {{shape}} ({{count}} शुरू किए)",
+        "split_agreed": "एक ही रूप",
+        "split_differed": "अलग रूप",
+        "split_jev_chose": "Jev ने {{shape}} सुझाया",
+        "split_rate_label": "यह सुझाव",
+        "split_rate_right": "Jev का सुझाव सही था",
+        "split_rate_wrong": "Jev का सुझाव गलत था",
+        "split_shape_delegate": "एक सब-एजेंट",
+        "split_shape_single": "एक ही कर्ता",
+        "split_shape_split": "समांतर सब-एजेंट"
       },
       "toolRiskBadge": {
         "annotation_title": "Jev ने इस कॉल को देखा और इसे चिह्नित किया। इससे यह नहीं बदला कि कॉल की अनुमति थी या नहीं: वह इस सेशन की अपनी अनुमति सेटिंग ने तय किया, और कॉल फिर भी मना की जा सकती थी।",

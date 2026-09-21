@@ -10523,7 +10523,18 @@
         "saved_tokens": "{{tokens}} token risparmiati",
         "sent_history": "cronologia {{chars}} caratteri",
         "sent_label": "Inviato a Jev",
-        "sent_message": "messaggio {{chars}} caratteri"
+        "sent_message": "messaggio {{chars}} caratteri",
+        "split_agent_inline": "agente: {{shape}}",
+        "split_agent_spawned": "agente: {{shape}} ({{count}} avviati)",
+        "split_agreed": "stessa forma",
+        "split_differed": "forma diversa",
+        "split_jev_chose": "Jev ha suggerito {{shape}}",
+        "split_rate_label": "Questo suggerimento",
+        "split_rate_right": "Jev ha suggerito la forma giusta",
+        "split_rate_wrong": "Jev ha suggerito la forma sbagliata",
+        "split_shape_delegate": "un sub-agente",
+        "split_shape_single": "un solo esecutore",
+        "split_shape_split": "sub-agenti in parallelo"
       },
       "toolRiskBadge": {
         "annotation_title": "Jev ha guardato questa chiamata e l'ha segnalata. Questo non ha cambiato nulla sul fatto che la chiamata fosse permessa: lo ha deciso l'impostazione dei permessi di questa sessione, e la chiamata potrebbe essere stata rifiutata comunque.",

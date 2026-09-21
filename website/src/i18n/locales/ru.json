@@ -10666,7 +10666,18 @@
         "saved_tokens": "сэкономлено токенов: {{tokens}}",
         "sent_history": "история {{chars}} символов",
         "sent_label": "Отправлено в Jev",
-        "sent_message": "сообщение {{chars}} символов"
+        "sent_message": "сообщение {{chars}} символов",
+        "split_agent_inline": "агент: {{shape}}",
+        "split_agent_spawned": "агент: {{shape}} (запущено {{count}})",
+        "split_agreed": "форма совпала",
+        "split_differed": "форма разная",
+        "split_jev_chose": "Jev предложил {{shape}}",
+        "split_rate_label": "Это предложение",
+        "split_rate_right": "Jev предложил верную форму",
+        "split_rate_wrong": "Jev предложил неверную форму",
+        "split_shape_delegate": "один подагент",
+        "split_shape_single": "один исполнитель",
+        "split_shape_split": "подагенты параллельно"
       },
       "toolRiskBadge": {
         "annotation_title": "Jev посмотрел на этот вызов и отметил его. Это никак не повлияло на то, был ли вызов разрешён: это решила настройка разрешений самой сессии, и вызов всё равно мог быть отклонён.",

@@ -33,6 +33,16 @@ export const DECISIONS_LIVE_POINT = 'skills.select'
  */
 export const DECISIONS_STEER_POINT = 'message.steer'
 
+/**
+ * The point that SUGGESTS how a request should be shaped -- one worker, one
+ * sub-agent, or several in parallel (`decisions/points/task_split.py`).
+ *
+ * An advisory: the suggestion is prepended to the turn's context as one line and
+ * the agent still decides, so the receipt on the reply compares the suggestion
+ * with what the agent actually spawned.
+ */
+export const DECISIONS_SPLIT_POINT = 'task.split'
+
 /** Config path of the sampling share; the only decisions value the config PATCH accepts. */
 export const DECISIONS_BUCKET_PATH = 'decisions.bucket'
 

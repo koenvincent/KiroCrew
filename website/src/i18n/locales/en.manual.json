@@ -4288,7 +4288,18 @@
         "saved_tokens": "saved {{tokens}} tokens",
         "sent_history": "history {{chars}} chars",
         "sent_label": "Sent to Jev",
-        "sent_message": "message {{chars}} chars"
+        "sent_message": "message {{chars}} chars",
+        "split_agent_inline": "agent: {{shape}}",
+        "split_agent_spawned": "agent: {{shape}} ({{count}} spawned)",
+        "split_agreed": "same shape",
+        "split_differed": "different shape",
+        "split_jev_chose": "Jev suggested {{shape}}",
+        "split_rate_label": "This suggestion",
+        "split_rate_right": "Jev suggested the right shape",
+        "split_rate_wrong": "Jev suggested the wrong shape",
+        "split_shape_delegate": "one sub-agent",
+        "split_shape_single": "one worker",
+        "split_shape_split": "parallel sub-agents"
       },
       "toolRiskBadge": {
         "annotation_title": "Jev looked at this call and flagged it. That changed nothing about whether the call was allowed: this session's own permission setting decided that, and the call may still have been refused.",

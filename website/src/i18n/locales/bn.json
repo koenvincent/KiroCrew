@@ -10380,7 +10380,18 @@
         "saved_tokens": "{{tokens}} টোকেন সাশ্রয়",
         "sent_history": "ইতিহাস {{chars}} অক্ষর",
         "sent_label": "Jev-কে পাঠানো হয়েছে",
-        "sent_message": "বার্তা {{chars}} অক্ষর"
+        "sent_message": "বার্তা {{chars}} অক্ষর",
+        "split_agent_inline": "এজেন্ট: {{shape}}",
+        "split_agent_spawned": "এজেন্ট: {{shape}} ({{count}} টি চালু)",
+        "split_agreed": "একই আকার",
+        "split_differed": "ভিন্ন আকার",
+        "split_jev_chose": "Jev পরামর্শ দিয়েছে {{shape}}",
+        "split_rate_label": "এই পরামর্শ",
+        "split_rate_right": "Jev ঠিক আকারের পরামর্শ দিয়েছে",
+        "split_rate_wrong": "Jev ভুল আকারের পরামর্শ দিয়েছে",
+        "split_shape_delegate": "একটি সাব-এজেন্ট",
+        "split_shape_single": "একজন কর্মী",
+        "split_shape_split": "সমান্তরাল সাব-এজেন্ট"
       },
       "toolRiskBadge": {
         "annotation_title": "Jev এই কলটি দেখে চিহ্নিত করেছে। এতে কলটির অনুমতি ছিল কি না তা বদলায়নি: সেটি এই সেশনের নিজের অনুমতি সেটিং ঠিক করেছে, আর কলটি তবুও প্রত্যাখ্যাত হতে পারত।",

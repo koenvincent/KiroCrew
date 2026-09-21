@@ -1344,6 +1344,15 @@ export interface ChatMessage {
    *  both doors; this top-level spelling is accepted too, as `decisions_strip`
    *  and the split `kind` above are. */
   decisions_tool_risk?: unknown
+  /** One task-shape SUGGESTION the gateway stamped on the assistant row that ends
+   *  the turn, when the Decisions (Jev) seam answered `task.split` for it. Typed
+   *  `unknown` because the shape is validated at the read, by
+   *  `pages/chat/decisionRecord.ts` — the line draws nothing for a record it
+   *  cannot check. An ADVISORY: the suggestion was one prepended line and the
+   *  agent chose for itself, so the record names both arms. Stamped under `meta`
+   *  on both doors; this top-level spelling is accepted too, as the two keys
+   *  above are. */
+  decisions_split?: unknown
 }
 
 export interface SubagentActivity {

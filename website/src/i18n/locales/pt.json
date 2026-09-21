@@ -10523,7 +10523,18 @@
         "saved_tokens": "{{tokens}} tokens economizados",
         "sent_history": "histórico {{chars}} caracteres",
         "sent_label": "Enviado ao Jev",
-        "sent_message": "mensagem {{chars}} caracteres"
+        "sent_message": "mensagem {{chars}} caracteres",
+        "split_agent_inline": "agente: {{shape}}",
+        "split_agent_spawned": "agente: {{shape}} ({{count}} iniciados)",
+        "split_agreed": "mesma forma",
+        "split_differed": "forma diferente",
+        "split_jev_chose": "O Jev sugeriu {{shape}}",
+        "split_rate_label": "Esta sugestão",
+        "split_rate_right": "O Jev sugeriu a forma certa",
+        "split_rate_wrong": "O Jev sugeriu a forma errada",
+        "split_shape_delegate": "um subagente",
+        "split_shape_single": "um só executor",
+        "split_shape_split": "subagentes em paralelo"
       },
       "toolRiskBadge": {
         "annotation_title": "O Jev olhou esta chamada e sinalizou-a. Isso não mudou nada sobre a chamada ter sido permitida: isso foi decidido pela configuração de permissões desta sessão, e a chamada pode ter sido recusada mesmo assim.",

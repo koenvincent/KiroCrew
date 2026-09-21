@@ -307,11 +307,14 @@ def _deny_app_yolo(request_app: str, operation: str) -> web.Response:
 
 
 #: Row-meta keys a REQUEST may never supply, because the gateway mints them and a
-#: surface reads them as the gateway's own claim. ``decisions_strip`` is a Jev
-#: decision receipt with a verdict control attached (``decisions/points/
-#: message_steer.py``, ``website/src/pages/chat/SteerDecisionLine.tsx``), so a
-#: caller-supplied one would render a decision nobody made.
-RESERVED_ROW_META_KEYS = frozenset({"decisions_strip"})
+#: surface reads them as the gateway's own claim. Each is a Jev decision receipt
+#: with a verdict control attached -- ``decisions_strip`` (``decisions/points/
+#: message_steer.py``, ``website/src/pages/chat/SteerDecisionLine.tsx``) and
+#: ``decisions_split`` (``decisions/points/task_split.py``,
+#: ``website/src/pages/chat/SplitDecisionLine.tsx``) -- so a caller-supplied one
+#: would render a decision nobody made and let its thumbs file feedback against
+#: the turn id it invented.
+RESERVED_ROW_META_KEYS = frozenset({"decisions_strip", "decisions_split"})
 
 #: The ``steer`` value that means "let Jev choose between the two paths" rather
 #: than naming one. A STRING beside the boolean the two manual modes send, so the

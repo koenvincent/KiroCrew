@@ -10237,7 +10237,18 @@
         "saved_tokens": "{{tokens}} トークン節約",
         "sent_history": "履歴 {{chars}} 文字",
         "sent_label": "Jev に送信",
-        "sent_message": "メッセージ {{chars}} 文字"
+        "sent_message": "メッセージ {{chars}} 文字",
+        "split_agent_inline": "エージェント: {{shape}}",
+        "split_agent_spawned": "エージェント: {{shape}}（{{count}} 件起動）",
+        "split_agreed": "同じ形",
+        "split_differed": "異なる形",
+        "split_jev_chose": "Jev の提案: {{shape}}",
+        "split_rate_label": "この提案",
+        "split_rate_right": "Jev の提案は正しい",
+        "split_rate_wrong": "Jev の提案は誤り",
+        "split_shape_delegate": "サブエージェント 1 つ",
+        "split_shape_single": "単独で対応",
+        "split_shape_split": "並列のサブエージェント"
       },
       "toolRiskBadge": {
         "annotation_title": "Jev がこの呼び出しを見て印を付けました。印を付けても、その呼び出しが許可されたかどうかは変わりません。それを決めるのはこのセッションの権限設定で、呼び出しは拒否されたこともあります。",

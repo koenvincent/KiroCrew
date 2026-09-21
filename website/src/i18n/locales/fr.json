@@ -10523,7 +10523,18 @@
         "saved_tokens": "{{tokens}} jetons économisés",
         "sent_history": "historique {{chars}} caractères",
         "sent_label": "Envoyé à Jev",
-        "sent_message": "message {{chars}} caractères"
+        "sent_message": "message {{chars}} caractères",
+        "split_agent_inline": "agent : {{shape}}",
+        "split_agent_spawned": "agent : {{shape}} ({{count}} lancés)",
+        "split_agreed": "même forme",
+        "split_differed": "forme différente",
+        "split_jev_chose": "Jev a suggéré {{shape}}",
+        "split_rate_label": "Cette suggestion",
+        "split_rate_right": "Jev a suggéré la bonne forme",
+        "split_rate_wrong": "Jev a suggéré la mauvaise forme",
+        "split_shape_delegate": "un sous-agent",
+        "split_shape_single": "un seul acteur",
+        "split_shape_split": "des sous-agents en parallèle"
       },
       "toolRiskBadge": {
         "annotation_title": "Jev a examiné cet appel et l'a signalé. Cela n'a rien changé à son autorisation : c'est le réglage d'autorisations de cette session qui en a décidé, et l'appel a pu être refusé malgré tout.",

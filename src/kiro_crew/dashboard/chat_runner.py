@@ -4186,6 +4186,20 @@ def _decisions_strip_meta(slot: _ChatSlot) -> dict | None:
     return {"decisions_strip": strip} if strip else None
 
 
+def _merged_row_meta(*parts: dict | None) -> dict | None:
+    """The union of several row-``meta`` fragments, or ``None`` when all are empty.
+
+    ``None`` rather than ``{}`` for the empty case, because ``slot.append`` writes
+    no ``meta`` key at all for ``None`` -- which is what keeps a row with no
+    decision byte-identical to the row this build appends today.
+    """
+    merged: dict = {}
+    for part in parts:
+        if part:
+            merged.update(part)
+    return merged or None
+
+
 def _session_auto_approves(state: DashboardState, slot: _ChatSlot) -> bool:
     """Whether this session answers its own permission requests (trust or YOLO).
 
@@ -4252,6 +4266,130 @@ async def _tool_risk_meta(
         return {"decisions_tool_risk": record} if record else None
     except Exception:  # pragma: no cover - an observation may not cost a call
         logger.debug("decisions: could not annotate the tool card", exc_info=True)
+        return None
+
+
+def _is_owner_turn(
+    *,
+    user_origin: bool,
+    turn_actor: str,
+    self_wake: bool,
+    channel_origin: bool,
+) -> bool:
+    """Whether this turn is a message the dashboard's own owner typed.
+
+    Every argument is STRUCTURAL -- stamped by the dispatch that knows, never read
+    off the message text, which the user writes. ``user_origin`` is false for an
+    app-token send; ``turn_actor`` names any non-person dispatch (``app``,
+    ``cron``, ``subagent``, ``gateway``); ``self_wake`` is a nudge/monitor loop
+    waking the slot; ``channel_origin`` is a Slack or Discord relay. A turn is the
+    owner's only when all four say so, so a new dispatch that forgets to name
+    itself is the one case this reads wrong -- and it reads wrong towards asking on
+    a turn nobody typed, which is why ``task.split`` costs nothing but a hint.
+    """
+    return bool(user_origin) and not turn_actor and not self_wake and not channel_origin
+
+
+async def _task_split_suggestion(
+    state: DashboardState,
+    *,
+    session_key: str,
+    message: str,
+) -> dict | None:
+    """Jev's suggested shape for this request, or ``None`` to prepend nothing.
+
+    An ADVISORY. The caller's only use of the answer is
+    ``task_split.hint_line``'s string, prepended to the turn's context through the
+    same pure-prepend channel a regenerate hint travels, so nothing here spawns,
+    cancels or re-shapes anything: the agent reads the line and still decides.
+
+    ``None`` on every refusal -- the seam off, the session unsampled, a scrub, a
+    timeout, an answer outside the three shapes -- so an ordinary turn's prompt is
+    byte-identical to the one this build sends today.
+
+    The prior turns come from the session's own transcript tail, read off the loop
+    and only once the ceiling is above 0: at the shipped default the request goes
+    alone, so an enabled-but-unraised install pays no transcript read. The same
+    ``exclude_last_n=1`` every other reader here passes, because this turn's user
+    message is already flushed and sending it as history too would duplicate it.
+
+    Nothing raises: this sits before the turn's first token and an observation must
+    not cost the reply. The decisions package is imported INSIDE the function for
+    the reason every other caller does it.
+    """
+    try:
+        from kiro_crew.decisions.points import task_split
+
+        history: list[dict] = []
+        budget = await asyncio.to_thread(task_split.history_budget)
+        if budget > 0:
+            log = getattr(state, "conversation_log", None)
+            if log is not None:
+                from kiro_crew.decisions.points.skills_select import HISTORY_ROLES
+
+                history = await asyncio.to_thread(
+                    log.recent,
+                    session_key,
+                    max_messages=task_split.MAX_HISTORY_MESSAGES,
+                    roles=HISTORY_ROLES,
+                    exclude_last_n=1,
+                )
+        return await task_split.suggest(message, session_key=session_key, history=history)
+    except asyncio.CancelledError:
+        raise
+    except Exception:  # pragma: no cover - an observation may not cost a turn
+        logger.debug("decisions: prepending no task.split hint", exc_info=True)
+        return None
+
+
+def _task_split_is_spawn(mcp_server_name: str, tool_name: str) -> bool:
+    """Whether a tool call is one of the two sub-agent spawns. Never raises.
+
+    Reached only on a turn that already has a suggestion outstanding, so the
+    import is paid by a decided turn and by nothing else -- the reason every other
+    caller here imports the decisions package inside the function.
+    """
+    try:
+        from kiro_crew.decisions.points.task_split import is_spawn_call
+
+        return is_spawn_call(mcp_server_name, tool_name)
+    except Exception:  # pragma: no cover - an observation may not cost a turn
+        logger.debug("decisions: could not read a tool identity for task.split")
+        return False
+
+
+async def _task_split_meta(
+    *,
+    session_key: str,
+    decided: dict | None,
+    spawn_calls: int,
+) -> dict | None:
+    """One ``decisions_split`` record for the turn's final reply, or ``None``.
+
+    The BASELINE arm of this decision is what the agent actually did, so the row is
+    written here rather than where the question was asked: *spawn_calls* is the
+    turn's own count of ``spawn_run`` / ``spawn_sub_agents`` calls, which is only
+    complete once the turn stops making them.
+
+    ``None`` whenever no suggestion was made, or the row could not be written --
+    the rule every point in this package follows, because a line whose durable row
+    was refused names a ``turn_id`` no verdict could be filed against.
+
+    Nothing raises: this runs while a reply is being persisted.
+    """
+    if not decided:
+        return None
+    try:
+        from kiro_crew.decisions.points import task_split
+
+        record = await task_split.record_outcome(
+            session_key=session_key, decided=decided, spawn_calls=spawn_calls
+        )
+        return {"decisions_split": record} if record else None
+    except asyncio.CancelledError:
+        raise
+    except Exception:  # pragma: no cover - an observation may not cost a reply
+        logger.debug("decisions: could not record the task.split outcome", exc_info=True)
         return None
 
 
@@ -4367,8 +4505,18 @@ def _flush_segment(
     broadcast: bool = True,
     quiet_persist: bool = False,
     interrupted: bool = False,
+    extra_meta: dict | None = None,
 ) -> None:
     """Finalize current text block as a segment and persist it.
+
+    ``extra_meta`` is merged into the row's own ``meta`` at APPEND time, for a
+    record the caller holds and this function cannot reach -- today the
+    ``task.split`` outcome, whose baseline arm is the turn's finished spawn count.
+    Merged rather than assigned, so it cannot displace the decision strip a
+    ``skills.select`` turn publishes through ``decisions.outcomes``, and passed
+    here rather than written onto the row afterwards for the reason
+    ``_decisions_strip_meta`` states: ``slot.append`` broadcasts the live frame
+    from inside the call.
 
     ``quiet_persist`` additionally suppresses the per-message ``chat_message``
     broadcast that ``slot.append`` emits for the finalized assistant message.
@@ -4453,7 +4601,7 @@ def _flush_segment(
         # The decision strip, when this turn made one. Passed here rather than
         # written onto the row afterwards so the frame this call broadcasts
         # carries it too -- see _decisions_strip_meta.
-        meta=_decisions_strip_meta(slot),
+        meta=_merged_row_meta(_decisions_strip_meta(slot), extra_meta),
     )
     # The append-only log's copy of the same body. Written here rather than at the
     # turn's terminal event because a turn produces SEVERAL assistant messages --
@@ -8668,6 +8816,13 @@ async def _run_chat(
     # subtract them (see _answer_text_only) without re-parsing the prose.
     _compaction_notice_chunks: list[str] = []
     _turn_tool_calls = 0  # tool dispatches this turn (refusal diagnostic)
+    # Jev's `task.split` suggestion for this turn, and the arm it is scored
+    # against. The suggestion is advice prepended to the context below; the count
+    # is the agent's own answer to the same question, taken from the trusted
+    # identity of each tool call, and the two meet on the row the final reply
+    # carries. Both stay `None`/0 for every turn the seam is off or unsampled for.
+    _split_decision: dict | None = None
+    _split_spawn_calls = 0
     # Snapshot of slot._stop_generation at turn start. `_stop_state` snaps back
     # to "idle" once a Stop resolves, so a Stop pressed AND resolved during the
     # turn is invisible to a point-in-time state check at completion. This
@@ -10148,6 +10303,30 @@ async def _run_chat(
         if regenerate_hint:
             full_message = f"[System: {regenerate_hint}]\n\n{full_message}"
 
+        # Jev (task.split): one advisory line about whether this request wants one
+        # worker, one sub-agent, or several in parallel. A pure PREPEND on the same
+        # channel the regenerate hint above uses, so it is scrubbed by the
+        # structural-marker pass below like every other dashboard-authored prefix,
+        # and the agent still chooses -- nothing here spawns or forbids anything.
+        # Asked only for a message the OWNER typed into this dashboard and only for
+        # a real turn: a slash command is dispatched to the harness rather than
+        # answered, so there is no work to shape.
+        if not is_slash and _is_owner_turn(
+            user_origin=_directive_user_origin,
+            turn_actor=_turn_actor,
+            self_wake=_directive_self_wake,
+            channel_origin=_directive_channel_origin,
+        ):
+            _split_decision = await _task_split_suggestion(
+                state, session_key=session_key, message=message
+            )
+            if _split_decision:
+                from kiro_crew.decisions.points.task_split import hint_line
+
+                _split_hint = hint_line(_split_decision)
+                if _split_hint:
+                    full_message = f"[System: {_split_hint}]\n\n{full_message}"
+
         # Enforce every structural boundary once more at provider egress.
         # ContextBuilder owns its trusted tail; everything added here is a pure
         # PREPEND. Scrub that complete dashboard-only prefix in one off-loop
@@ -10820,6 +10999,15 @@ async def _run_chat(
                 _turn_thought = True
             elif event.kind == EVENT_TOOL_CALL:
                 _turn_tool_calls += 1
+                # The agent's own answer to `task.split`, counted only while a
+                # suggestion is outstanding. Read from the trusted `_meta.kiro`
+                # identity, never a title: this count is the arm the suggestion is
+                # scored against, so a shell command or a third-party server
+                # exposing a same-named tool must not be able to move it.
+                if _split_decision is not None and _task_split_is_spawn(
+                    event.mcp_server_name or "", event.tool_name or ""
+                ):
+                    _split_spawn_calls += 1
                 # Flush pre-tool text silently (no broadcast) so it persists,
                 # but keep the streaming message in place for correct tool ordering.
                 _flush_text_stream()
@@ -14137,7 +14325,21 @@ async def _run_chat(
                         _extract_and_redact_plan_metadata(assistant_text)
                     )
             _flush_text_stream()
-            _flush_segment(state, slot, assistant_text, broadcast=False)
+            # The turn's LAST assistant row, which is where the `task.split`
+            # receipt belongs: the record compares the suggestion with the shape
+            # the agent actually took, and that shape is only settled once the
+            # turn has stopped calling tools.
+            _flush_segment(
+                state,
+                slot,
+                assistant_text,
+                broadcast=False,
+                extra_meta=await _task_split_meta(
+                    session_key=session_key,
+                    decided=_split_decision,
+                    spawn_calls=_split_spawn_calls,
+                ),
+            )
             if _stop_reason == STOP_REASON_REFUSAL:
                 # The Kiro service's content filter STREAMS its canned
                 # explanation as assistant text and then ends the turn, so the

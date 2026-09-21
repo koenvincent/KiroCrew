@@ -36,7 +36,7 @@
  */
 import type { DecisionFeedbackSide, DecisionVerdictValue } from '../../api/client'
 import type { ChatMessage } from '../../types'
-import { DECISIONS_LIVE_POINT, DECISIONS_STEER_POINT } from '../settings/decisionsPreview'
+import { DECISIONS_LIVE_POINT, DECISIONS_SPLIT_POINT, DECISIONS_STEER_POINT } from '../settings/decisionsPreview'
 
 /** A skill the answer named that the gate then refused, with its own score. */
 export interface DecisionStripDropped {
@@ -157,6 +157,19 @@ export function decisionStripFieldOf(msg: Pick<ChatMessage, 'meta' | 'decisions_
 }
 
 /**
+ * The raw `decisions_split` field off an assistant row, or `undefined`.
+ *
+ * Its OWN key rather than a third shape under `decisions_strip`: a turn can carry
+ * a skill-selection strip and a task-shape suggestion at once, and one key holds
+ * one record. Both doors are read -- the row's own top level and `meta` -- the
+ * same split `decisionStripFieldOf` reads. Returned as it sits on the message so
+ * the reference is stable across renders of a memoised row.
+ */
+export function splitRecordFieldOf(msg: Pick<ChatMessage, 'meta' | 'decisions_split'>): unknown {
+  return msg.decisions_split ?? msg.meta?.decisions_split
+}
+
+/**
  * Validate one raw record. `null` means "draw nothing".
  *
  * `agree` is recomputed from the two name lists instead of being read from the
@@ -265,6 +278,79 @@ export function readSteerRecord(raw: unknown): SteerDecisionRecord | null {
     turnId,
     point: DECISIONS_STEER_POINT,
     choice,
+    p,
+    latencyMs: asCount(root.latency_ms),
+  }
+}
+
+/**
+ * One task-shape suggestion, as the line on the assistant row prints it.
+ *
+ * `agree` is not read from the wire: see `readSplitRecord`. The two choices are
+ * the whole claim the line makes, so the flag that decides whether it reads as a
+ * match is derived from them.
+ */
+export interface SplitDecisionRecord {
+  /** Identifies the decision this line is about; the feedback POST's subject. */
+  turnId: string
+  /** Always `task.split`. */
+  point: typeof DECISIONS_SPLIT_POINT
+  /** The shape Jev suggested. */
+  jevChoice: SplitChoice
+  /** The shape the agent actually took, counted from its own spawn calls. */
+  agentChoice: SplitChoice
+  /** Sub-agent spawn calls the turn made, which is where `agentChoice` comes from. */
+  spawnCalls: number
+  /** The two choices name the same shape. */
+  agree: boolean
+  /** Jev's own confidence, or `null` when the answer carried none. */
+  p: number | null
+  /**
+   * How long the suggestion took, in whole milliseconds.
+   *
+   * There is no `error` field, and its absence is the producer's contract rather
+   * than an omission here: a `task.split` decision that FAILED prepends no hint
+   * and stamps no record, so a receipt exists only for advice that was actually
+   * given.
+   */
+  latencyMs: number
+}
+
+/** The three shapes a `task.split` record may name, in increasing fan-out. */
+export const SPLIT_CHOICES = ['single', 'delegate', 'split'] as const
+
+export type SplitChoice = typeof SPLIT_CHOICES[number]
+
+/**
+ * Validate one raw task-shape record. `null` means "draw nothing".
+ *
+ * BOTH choices are required and each is held against the three shapes, for the
+ * reason the two name lists are in `readDecisionStrip`: the line's whole claim is
+ * who wanted what, and it cannot make that claim about a value it could not read.
+ * A fourth word would name a shape no code path produces.
+ *
+ * `agree` is recomputed from the two choices instead of being read from the wire.
+ * The line prints a match or a difference, so a flag that disagreed with the
+ * words beside it would hide a real divergence behind one of them.
+ */
+export function readSplitRecord(raw: unknown): SplitDecisionRecord | null {
+  const root = asRecord(raw)
+  if (!root) return null
+  if (typeof root.point === 'string' && root.point && root.point !== DECISIONS_SPLIT_POINT) return null
+  const turnId = typeof root.turn_id === 'string' ? root.turn_id : ''
+  if (!turnId) return null
+  const jevChoice = SPLIT_CHOICES.find(name => name === root.jev_choice)
+  const agentChoice = SPLIT_CHOICES.find(name => name === root.agent_choice)
+  if (!jevChoice || !agentChoice) return null
+  const rawP = root.p
+  const p = typeof rawP === 'number' && Number.isFinite(rawP) && rawP >= 0 && rawP <= 1 ? rawP : null
+  return {
+    turnId,
+    point: DECISIONS_SPLIT_POINT,
+    jevChoice,
+    agentChoice,
+    spawnCalls: asCount(root.spawn_calls),
+    agree: jevChoice === agentChoice,
     p,
     latencyMs: asCount(root.latency_ms),
   }

@@ -10380,7 +10380,18 @@
         "saved_tokens": "{{tokens}} Tokens gespart",
         "sent_history": "Verlauf {{chars}} Zeichen",
         "sent_label": "An Jev gesendet",
-        "sent_message": "Nachricht {{chars}} Zeichen"
+        "sent_message": "Nachricht {{chars}} Zeichen",
+        "split_agent_inline": "Agent: {{shape}}",
+        "split_agent_spawned": "Agent: {{shape}} ({{count}} gestartet)",
+        "split_agreed": "gleiche Form",
+        "split_differed": "andere Form",
+        "split_jev_chose": "Jev schlug {{shape}} vor",
+        "split_rate_label": "Dieser Vorschlag",
+        "split_rate_right": "Jev hat die richtige Form vorgeschlagen",
+        "split_rate_wrong": "Jev hat die falsche Form vorgeschlagen",
+        "split_shape_delegate": "ein Sub-Agent",
+        "split_shape_single": "ein Arbeiter",
+        "split_shape_split": "parallele Sub-Agenten"
       },
       "toolRiskBadge": {
         "annotation_title": "Jev hat diesen Aufruf angesehen und markiert. Das hat nichts daran geändert, ob der Aufruf erlaubt war: darüber hat die Berechtigungseinstellung dieser Sitzung entschieden, und der Aufruf kann trotzdem abgelehnt worden sein.",

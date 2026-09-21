@@ -23,11 +23,12 @@ import { join } from 'node:path'
 
 import { describe, it, expect } from 'vitest'
 
-import { readDecisionStrip, readSteerRecord } from '../pages/chat/decisionRecord'
+import { readDecisionStrip, readSplitRecord, readSteerRecord } from '../pages/chat/decisionRecord'
 
 const SPEC = join(__dirname, '../../../docs/system-specs/modules/decisions.md')
 const SECTION = "## 8. The decision strip's record and feedback"
 const STEER_SECTION = '## 10. Mid-turn handling (`message.steer`)'
+const SPLIT_SECTION = '## 11. Task shape (`task.split`)'
 
 /** The first fenced JSON block inside *section*. */
 function specFixtureIn(section: string): Record<string, unknown> {
@@ -222,6 +223,65 @@ describe('the mid-turn handling fixture in the decisions spec', () => {
     // The teeth: masking is by key, so anything else naming a message still fails.
     expect(JSON.stringify({ ...withoutPoint, message_text: 'hi' })).toContain('message')
     expect(fixture.point).toBe('message.steer')
+  })
+})
+
+describe('the task-shape fixture in the decisions spec', () => {
+  // Same hazard as § 8's and § 10's, from the same direction: `readSplitRecord`
+  // fails safe by drawing nothing, which is byte-identical to a turn nobody
+  // suggested for. A field respelled on one side would make the line vanish
+  // rather than fail.
+  const fixture = specFixtureIn(SPLIT_SECTION)
+
+  it('is accepted by the reader, field for field', () => {
+    expect(readSplitRecord(fixture)).toEqual({
+      turnId: 'ts-4b19ce',
+      point: 'task.split',
+      jevChoice: 'split',
+      agentChoice: 'split',
+      spawnCalls: 2,
+      agree: true,
+      p: 0.84,
+      latencyMs: 190,
+    })
+  })
+
+  it('names every key the reader needs, so a dropped promise is visible here', () => {
+    for (const key of ['turn_id', 'point', 'jev_choice', 'agent_choice', 'spawn_calls', 'p', 'latency_ms']) {
+      expect(Object.keys(fixture), `the spec fixture no longer carries ${key}`).toContain(key)
+    }
+  })
+
+  it('promises an agree flag the reader deliberately recomputes', () => {
+    // It rides the record because the record IS the row, and the day-file fold
+    // reads it; the line derives its own from the two choices, so a flag that
+    // disagreed with them cannot hide a divergence.
+    expect(Object.keys(fixture)).toContain('agree')
+    expect(readSplitRecord({ ...fixture, agree: false })?.agree).toBe(true)
+  })
+
+  it('promises no error field, because a failed suggestion stamps no record', () => {
+    // The producer's own contract: a refusal prepends no hint and writes nothing,
+    // so a receipt exists only for advice that was actually given.
+    expect(Object.keys(fixture)).not.toContain('error')
+  })
+
+  it('is refused by the other two readers, and refuses their records in turn', () => {
+    // Three records, one transcript. Each must decline the others' shapes rather
+    // than render them as a claim it never validated.
+    expect(readDecisionStrip(fixture)).toBeNull()
+    expect(readSteerRecord(fixture)).toBeNull()
+    expect(readSplitRecord(specFixture())).toBeNull()
+    expect(readSplitRecord(specFixtureIn(STEER_SECTION))).toBeNull()
+  })
+
+  it('carries no message text, description or activity — the bound the log sets', () => {
+    const serialized = JSON.stringify(fixture).toLowerCase()
+    for (const forbidden of ['api_key', 'secret', 'prompt', 'message', 'description', 'content', 'activity']) {
+      expect(serialized, `the fixture leaks ${forbidden}`).not.toContain(forbidden)
+    }
+    // The teeth: masking is by key, so anything else naming a message still fails.
+    expect(JSON.stringify({ ...fixture, message_text: 'hi' })).toContain('message')
   })
 })
 
