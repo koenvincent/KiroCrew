@@ -1967,3 +1967,398 @@ def test_fingerprint_file_survives_prune_and_does_not_fake_overlay_ready(
     for p in overlay_dir.glob("*.json"):
         p.unlink()
     assert not overlay_ready(overlay_dir)
+
+
+# --- Bounded transient-keep retention windows --------------------------
+#
+# The prune keep-set spares a transient victim's previous overlay, which
+# means a pass can SERVE artifacts it did not write. Two windows that opens,
+# both bounded to one pass but both avoidable:
+#
+#   1. the env sidecar published at a fixed name during stub construction,
+#      while the overlay referencing it lands later -- a kept old-args overlay
+#      paired with a new-generation env;
+#   2. a source deleted between the listing and the read, reported as
+#      FileNotFoundError and treated as a transient fault, so the deleted
+#      agent's overlay survived one more pass.
+
+
+def _sidecar_temps(env_dir: Path) -> list[Path]:
+    """Staged, not-yet-committed sidecars: mkstemp names start with a dot."""
+    if not env_dir.is_dir():
+        return []
+    return sorted(p for p in env_dir.iterdir() if p.name.startswith("."))
+
+
+def test_a_spec_deleted_between_listing_and_read_prunes_its_overlay_now(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A vanished source is a DELETE, not a transient fault.
+
+    The listing globs the spec, the user removes it, and the read raises
+    FileNotFoundError. The generic OSError arm treats that as transient and
+    keeps the deleted agent's overlay for one more pass -- the agent is gone
+    but its MCP servers stay injectable. Confirmed-absent prunes in the SAME
+    pass, exactly as a source already gone at listing time does.
+
+    The pass is NOT cached, and that half is load-bearing: the input signatures
+    were taken while the spec still existed, so caching would let the same file,
+    restored with the same size and mtime, match a fingerprint whose outputs no
+    longer carry its overlay -- the agent's servers gone for good with nothing
+    left to invalidate. Pinned by restoring the source byte- and stat-identical
+    and requiring the overlay back.
+    """
+    src = _mk_tree(tmp_path)
+    _rewrite(tmp_path)
+    overlay = tmp_path / "mcp-gateway" / "agents" / "agent-1.json"
+    survivor = tmp_path / "mcp-gateway" / "agents" / "agent-0.json"
+    assert overlay.is_file()
+    spec_path = src / "agent-1.json"
+    spec_bytes = spec_path.read_bytes()
+    spec_stat = spec_path.stat()
+
+    _bump_mtime(spec_path)  # invalidate so the pass runs
+    real_read = agent_discovery.read_agent_spec_strict
+
+    def racing(path: Path, **kwargs: Any) -> Any:
+        if path.name == "agent-1.json":
+            path.unlink()  # lost the race between the glob and the read
+        return real_read(path, **kwargs)
+
+    with monkeypatch.context() as patch:
+        # context(), never undo(): this fixture instance is shared with the
+        # module's autouse pins and the conftest host isolation, so undoing it
+        # would let the next _rewrite read the developer's real config.
+        patch.setattr(agent_discovery, "read_agent_spec_strict", racing)
+        _rewrite(tmp_path)
+
+    assert not overlay.exists(), "the deleted agent's overlay survived the pass"
+    assert survivor.is_file()  # the unaffected agent still rewrote
+    fp = tmp_path / "mcp-gateway" / "agents" / _FINGERPRINT_NAME
+    assert not fp.exists(), "a pass that observed the deletion must not be cached"
+
+    spec_path.write_bytes(spec_bytes)
+    os.utime(spec_path, ns=(spec_stat.st_atime_ns, spec_stat.st_mtime_ns))
+    _rewrite(tmp_path)
+    assert overlay.is_file(), "a restored source with identical stats stayed pruned"
+    assert fp.is_file()  # and the healthy pass caches again
+
+
+def test_an_enoent_on_a_spec_that_still_exists_keeps_the_overlay(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """ENOENT is trusted only when a second look confirms it.
+
+    A directory component momentarily replaced -- an atomic directory swap, a
+    re-pointed symlink, an overlay/network mount -- raises FileNotFoundError
+    for a file that is still there. Pruning on that report is the same data
+    loss the keep-set exists to prevent, through a narrower door, so an
+    unconfirmed ENOENT stays transient: previous overlay kept, pass
+    uncacheable, retried.
+    """
+    src = _mk_tree(tmp_path)
+    _rewrite(tmp_path)
+    overlay = tmp_path / "mcp-gateway" / "agents" / "agent-1.json"
+    before_bytes = overlay.read_bytes()
+
+    _bump_mtime(src / "agent-1.json")
+    real_read = agent_discovery.read_agent_spec_strict
+
+    def spurious(path: Path, **kwargs: Any) -> Any:
+        if path.name == "agent-1.json":
+            raise FileNotFoundError(errno.ENOENT, "No such file or directory", str(path))
+        return real_read(path, **kwargs)
+
+    monkeypatch.setattr(agent_discovery, "read_agent_spec_strict", spurious)
+    _rewrite(tmp_path)
+
+    assert (src / "agent-1.json").is_file(), "premise: the source never went away"
+    assert overlay.is_file()
+    assert overlay.read_bytes() == before_bytes
+    assert not (tmp_path / "mcp-gateway" / "agents" / _FINGERPRINT_NAME).exists()
+
+
+def test_a_failed_overlay_write_leaves_the_previous_generations_sidecar(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A kept overlay must never pair with the next generation's env.
+
+    agent-1 changes BOTH its args and its env, then its overlay write fails.
+    The kept overlay carries the old args and points --env-file at a fixed
+    sidecar name: publishing the new env there would launch old args against
+    new credentials for the pass window. The staged write is discarded instead.
+    Per-agent, not pass-wide: agent-0's overlay landed, so its env commits.
+    """
+    src = _mk_tree(tmp_path, env={"K": "old"})
+    _rewrite(tmp_path)
+    env_dir = tmp_path / "mcp-gateway" / "stubs" / "env"
+    victim_sidecar = env_dir / rewriter.env_sidecar_name("agent-1", "srv")
+    healthy_sidecar = env_dir / rewriter.env_sidecar_name("agent-0", "srv")
+    assert json.loads(victim_sidecar.read_text())["K"] == "old"
+    assert json.loads(healthy_sidecar.read_text())["K"] == "old"
+
+    for i in (0, 1):
+        spec_path = src / f"agent-{i}.json"
+        spec = json.loads(spec_path.read_text())
+        spec["mcpServers"]["srv"]["args"] = [f"a{i}-changed"]
+        spec["mcpServers"]["srv"]["env"] = {"K": "new"}
+        spec_path.write_text(json.dumps(spec))
+
+    real_write = rewriter.atomic_write
+
+    def flaky(target: Path, *args: Any, **kwargs: Any) -> None:
+        if Path(target).name == "agent-1.json":
+            raise OSError("disk full")
+        real_write(target, *args, **kwargs)
+
+    monkeypatch.setattr(rewriter, "atomic_write", flaky)
+    _rewrite(tmp_path)
+
+    kept = json.loads((tmp_path / "mcp-gateway" / "agents" / "agent-1.json").read_text())
+    kept_flags = expand_stub_flags(kept["mcpServers"]["srv"]["args"])
+    assert "--env-file" in kept_flags, "premise: the kept overlay names a sidecar"
+    assert (
+        json.loads(victim_sidecar.read_text())["K"] == "old"
+    ), "the kept overlay's old args now launch against the new generation's env"
+    assert (
+        json.loads(healthy_sidecar.read_text())["K"] == "new"
+    ), "a sibling's successful overlay must still commit its own sidecar"
+    assert _sidecar_temps(env_dir) == [], "a discarded sidecar left its temp file behind"
+    # Degraded pass not cached: the next boot retries and both sides converge.
+    assert not (tmp_path / "mcp-gateway" / "agents" / _FINGERPRINT_NAME).exists()
+
+
+def test_a_staged_sidecar_is_owner_only_and_complete_before_it_is_committed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Protection precedes content, and deferring the commit does not move it.
+
+    Two measurements at two seams: the descriptor is locked down while the file
+    is still zero bytes (no secret existed in a readable file at any point), and
+    at the moment the OVERLAY is written the sidecar is still staged -- already
+    0o600, already holding this generation's env, not yet at its published name.
+    The staged snapshot is also what proves the commit is deferred at all.
+    """
+    src = _mk_tree(tmp_path, env={"SECRET_TOKEN": "s3cr3t"})
+    env_dir = tmp_path / "mcp-gateway" / "stubs" / "env"
+
+    sizes_at_lockdown: list[int] = []
+    real_fchmod = rewriter.platform_compat.fchmod_safe
+
+    def measuring(fd: int, mode: int) -> Any:
+        sizes_at_lockdown.append(os.fstat(fd).st_size)
+        return real_fchmod(fd, mode)
+
+    staged_seen: list[tuple[int, dict[str, Any]]] = []
+    real_write = rewriter.atomic_write
+
+    def inspecting(target: Path, *args: Any, **kwargs: Any) -> None:
+        if Path(target).name == "agent-0.json":
+            for tmp in _sidecar_temps(env_dir):
+                staged_seen.append((tmp.stat().st_mode & 0o777, json.loads(tmp.read_text())))
+        return real_write(target, *args, **kwargs)
+
+    monkeypatch.setattr(rewriter.platform_compat, "fchmod_safe", measuring)
+    monkeypatch.setattr(rewriter, "atomic_write", inspecting)
+    _rewrite(tmp_path)
+
+    assert sizes_at_lockdown, "premise: the sidecar writer locked a descriptor down"
+    assert all(
+        s == 0 for s in sizes_at_lockdown
+    ), f"a secret byte was written before the lockdown: {sizes_at_lockdown}"
+    assert staged_seen, "the sidecar was committed before its overlay was written"
+    for mode, content in staged_seen:
+        assert content == {"SECRET_TOKEN": "s3cr3t"}
+        if rewriter.platform_compat.IS_POSIX:
+            assert mode == 0o600, f"staged sidecar readable by others: {oct(mode)}"
+    # Committed by the end of the pass, at its published name, nothing left over.
+    assert (env_dir / rewriter.env_sidecar_name("agent-0", "srv")).is_file()
+    assert _sidecar_temps(env_dir) == []
+    assert (src / "agent-0.json").is_file()
+
+
+def test_the_deferred_commit_keeps_the_pass_cacheable(
+    tmp_path: Path, rewrite_counter: dict[str, int]
+) -> None:
+    """The fingerprint must sign the COMMITTED sidecar names.
+
+    The cache signature hashes every recorded sidecar; if it signed a staged
+    temp (or a name whose file is not there yet) every boot would rewrite and
+    the cache-skip path would be dead. So: signatures point at real published
+    files, and a second pass over unchanged inputs is served from cache.
+    """
+    _mk_tree(tmp_path)
+    _rewrite(tmp_path)
+    fp = json.loads((tmp_path / "mcp-gateway" / "agents" / _FINGERPRINT_NAME).read_text())
+    env_dir = tmp_path / "mcp-gateway" / "stubs" / "env"
+    recorded = fp["outputs"]["sidecars"]
+    assert recorded, "premise: the fixture declares env, so sidecars were recorded"
+    for name, sig in recorded.items():
+        assert not name.startswith("."), f"a staged temp name was recorded: {name}"
+        assert (env_dir / name).is_file(), f"recorded sidecar missing: {name}"
+        assert sig
+
+    before = rewrite_counter["n"]
+    _rewrite(tmp_path)
+    assert rewrite_counter["n"] == before, "unchanged inputs stopped being cacheable"
+
+
+def test_a_failed_sidecar_commit_publishes_no_other_generations_env(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A sidecar that cannot be renamed into place is REMOVED, not left stale.
+
+    The overlay lands first, so its stub argv already names the sidecar. If the
+    rename then fails (a same-directory ENOSPC/EIO, a Windows sharing
+    violation), a file left at the published name would hand the new command
+    another generation's credentials. Both readers treat a MISSING sidecar as
+    "declares no env", which is the degradation a failed staging write already
+    produces, and the pass is uncacheable so the next one republishes.
+    """
+    src = _mk_tree(tmp_path, env={"K": "old"})
+    _rewrite(tmp_path)
+    env_dir = tmp_path / "mcp-gateway" / "stubs" / "env"
+    victim_sidecar = env_dir / rewriter.env_sidecar_name("agent-1", "srv")
+    healthy_sidecar = env_dir / rewriter.env_sidecar_name("agent-0", "srv")
+    assert json.loads(victim_sidecar.read_text())["K"] == "old"
+
+    for i in (0, 1):
+        spec_path = src / f"agent-{i}.json"
+        spec = json.loads(spec_path.read_text())
+        spec["mcpServers"]["srv"]["args"] = [f"a{i}-changed"]
+        spec["mcpServers"]["srv"]["env"] = {"K": "new"}
+        spec_path.write_text(json.dumps(spec))
+
+    real_replace = os.replace
+
+    def flaky(source: Any, dest: Any, **kwargs: Any) -> None:
+        # Narrow and delegating: this is the module-global os.replace, which
+        # atomic_write and pytest's own teardown also call.
+        if Path(dest) == victim_sidecar:
+            raise OSError("no space left on device")
+        return real_replace(source, dest, **kwargs)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(rewriter.os, "replace", flaky)
+        _rewrite(tmp_path)
+
+    published = json.loads((tmp_path / "mcp-gateway" / "agents" / "agent-1.json").read_text())
+    flags = expand_stub_flags(published["mcpServers"]["srv"]["args"])
+    assert "--env-file" in flags, "premise: the published overlay names a sidecar"
+    assert not victim_sidecar.exists(), (
+        "a stale sidecar under a freshly published overlay pairs the new command "
+        "with another generation's credentials"
+    )
+    assert json.loads(healthy_sidecar.read_text())["K"] == "new"  # sibling unaffected
+    assert _sidecar_temps(env_dir) == []
+    assert not (tmp_path / "mcp-gateway" / "agents" / _FINGERPRINT_NAME).exists()
+
+
+def test_a_raise_between_staging_and_commit_leaves_no_credential_temp(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Staged sidecars are reclaimed on every exit from an agent's iteration.
+
+    A staged name starts with a dot and pathlib's ``*.json`` glob skips
+    dotfiles, so the sidecar prune can never reclaim one: a raise between the
+    staging and the commit would leave credential files on disk for good.
+    """
+    _mk_tree(tmp_path, env={"SECRET_TOKEN": "s3cr3t"})
+    env_dir = tmp_path / "mcp-gateway" / "stubs" / "env"
+
+    def exploding(*args: Any, **kwargs: Any) -> None:
+        raise RuntimeError("env harvest fails between staging and commit")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(rewriter, "_collect_target_env", exploding)
+        with pytest.raises(RuntimeError):
+            _rewrite(tmp_path)
+
+    assert _sidecar_temps(env_dir) == [], "a staged credential temp outlived the pass"
+    assert list(env_dir.glob("*.json")) == []  # nothing published either
+
+
+def test_a_settings_file_deleted_between_probe_and_read_injects_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The global read arm splits ENOENT exactly as the per-agent one does.
+
+    ``is_file()`` says yes, the file is removed, and the read raises
+    FileNotFoundError. Treating that as a transient fault keeps every agent's
+    previous overlay over a question this pass can in fact answer: confirmed
+    absent means there is nothing to inject, which is what the stat arm already
+    answers for a file gone before the probe. Uncacheable for the same reason a
+    vanished agent spec is.
+    """
+    src = _mk_tree(tmp_path)
+    _rewrite(tmp_path)
+    overlay = tmp_path / "mcp-gateway" / "agents" / "agent-0.json"
+    assert "global-x" in json.loads(overlay.read_text())["mcpServers"]
+    settings = tmp_path / "settings" / "mcp.json"
+    # A real ~/.kiro/settings holds more than mcp.json, and the confirmation
+    # reads that directory: an empty listing is a directory-level event, which
+    # stays transient by design.
+    (settings.parent / "other.json").write_text("{}")
+    # A stray sidecar separates the two classifications: the sidecar prune is
+    # skipped on a pass that could not READ its sources, and runs on a pass that
+    # answered every question it asked.
+    stray = tmp_path / "mcp-gateway" / "stubs" / "env" / "stray.json"
+    stray.write_text("{}")
+
+    _bump_mtime(src / "agent-0.json")  # invalidate so the pass runs
+    real_read_text = Path.read_text
+
+    def racing(self: Path, *args: Any, **kwargs: Any) -> str:
+        if self.name == "mcp.json" and "settings" in self.parts:
+            self.unlink()  # gone between the probe and this read
+            raise FileNotFoundError(errno.ENOENT, "No such file or directory", str(self))
+        return real_read_text(self, *args, **kwargs)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(Path, "read_text", racing)
+        _rewrite(tmp_path)
+
+    assert not settings.exists()
+    rewritten = json.loads(overlay.read_text())["mcpServers"]
+    assert "global-x" not in rewritten, "a file confirmed gone was still treated as unknown"
+    assert "srv" in rewritten  # the agent's own servers are untouched
+    assert not stray.exists(), "the pass was still treated as a transient read failure"
+    assert not (tmp_path / "mcp-gateway" / "agents" / _FINGERPRINT_NAME).exists()
+
+
+def test_a_vanished_agents_directory_is_not_read_as_a_deletion(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The confirmation asks the DIRECTORY, so one cause cannot answer twice.
+
+    A repointed mount or swapped directory makes every syscall naming the spec
+    report ENOENT -- a second look at the same path agrees, and a live agent's
+    overlay would be pruned, leaving its sessions unbrokered until some later
+    pass. Asking whether the containing directory still lists the name makes
+    that class transient: the listing either fails or comes back empty.
+    """
+    src = _mk_tree(tmp_path, n_agents=1)
+    _rewrite(tmp_path)
+    overlay = tmp_path / "mcp-gateway" / "agents" / "agent-0.json"
+    before_bytes = overlay.read_bytes()
+    spec_path = src / "agent-0.json"
+
+    _bump_mtime(spec_path)
+    real_read = agent_discovery.read_agent_spec_strict
+    stash = tmp_path / "agents-elsewhere"
+
+    def racing(path: Path, **kwargs: Any) -> Any:
+        if path.name == "agent-0.json":
+            # The whole directory moves out from under the pass, exactly as a
+            # re-pointed mount looks: the spec still exists, elsewhere.
+            src.rename(stash)
+        return real_read(path, **kwargs)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(agent_discovery, "read_agent_spec_strict", racing)
+        _rewrite(tmp_path)
+
+    assert (stash / "agent-0.json").is_file(), "premise: the spec was never deleted"
+    assert overlay.is_file(), "a live agent's overlay was pruned on a directory-level ENOENT"
+    assert overlay.read_bytes() == before_bytes
+    assert not (tmp_path / "mcp-gateway" / "agents" / _FINGERPRINT_NAME).exists()
