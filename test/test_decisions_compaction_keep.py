@@ -426,9 +426,26 @@ class TestRecordStore:
         assert point.take_record("s") == {"turn_id": "new"}
 
     def test_an_expired_record_is_not_handed_to_a_later_compaction(self, monkeypatch):
-        monkeypatch.setattr(point, "RECORD_TTL_SECONDS", 0.0)
+        # The clock is PINNED rather than relied on to advance: Windows'
+        # ``time.monotonic()`` has ~15.6 ms resolution, so a publish and a take in the
+        # same statement pair read the same value and nothing would have aged. Moving
+        # the clock past the TTL states the property the store has instead of
+        # measuring the platform's timer.
+        now = [1000.0]
+        monkeypatch.setattr(point.time, "monotonic", lambda: now[0])
         point.publish_record("s", {"turn_id": "t"})
+        now[0] += point.RECORD_TTL_SECONDS + 1.0
         assert point.take_record("s") is None
+        assert point.pending_count() == 0
+
+    def test_a_record_inside_its_ttl_is_still_handed_over(self, monkeypatch):
+        # The other side of the same boundary, so the sweep cannot be "expire
+        # everything" and pass the test above.
+        now = [1000.0]
+        monkeypatch.setattr(point.time, "monotonic", lambda: now[0])
+        point.publish_record("s", {"turn_id": "t"})
+        now[0] += point.RECORD_TTL_SECONDS - 1.0
+        assert point.take_record("s") == {"turn_id": "t"}
 
     def test_the_store_is_bounded(self, monkeypatch):
         monkeypatch.setattr(point, "MAX_PENDING_RECORDS", 3)
