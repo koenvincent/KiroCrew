@@ -553,13 +553,13 @@ class RunEventCoordinator(ManagerComponent):
                 "stalled": a.stalled,
                 "startedAt": a.started,
             }
-            for a in self._manager._agents.values()
+            for a in self._manager.all_agents
             if not a.done and a.parent_session_key == parent_key
         ]
 
     def get_impl(self, agent_id: str) -> SubagentInfo | None:
-        """Get agent info by ID."""
-        return self._manager._agents.get(agent_id)
+        """Get local or remote agent info by ID."""
+        return self._manager._agents.get(agent_id) or self._manager._external_agents.get(agent_id)
 
     def is_queued_impl(self, agent_id: str) -> bool:
         """Whether *agent_id* names a spawn accepted but not yet started.
@@ -1315,6 +1315,10 @@ class RunEventCoordinator(ManagerComponent):
         return (
             self._has_live_parent_run_task(parent_session_key)
             or self._has_live_parent_followup_watcher(parent_session_key)
+            or any(
+                not a.done and a.parent_session_key == parent_session_key
+                for a in self._manager.external_agents
+            )
             or any(a.parent_session_key == parent_session_key for a in self._manager.running)
         )
 
@@ -1329,6 +1333,10 @@ class RunEventCoordinator(ManagerComponent):
         return (
             self._has_live_parent_run_task(parent_session_key)
             or self._has_live_parent_followup_watcher(parent_session_key)
+            or any(
+                not a.done and a.parent_session_key == parent_session_key
+                for a in self._manager.external_agents
+            )
             or any(a.parent_session_key == parent_session_key for a in self._manager.running)
         )
 
