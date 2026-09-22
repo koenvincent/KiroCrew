@@ -22,6 +22,7 @@ if TYPE_CHECKING:
         KiroCrewConfig,
         ValidationError,
         _redact,
+        _remote_run_operation_refusal,
         _spawn_scope_refusal,
         dashboard_slot_key,
         effective_session_key,
@@ -109,6 +110,8 @@ async def api_spawn(request: web.Request) -> web.Response:
                 "include_memory": body.get("include_memory", True),
                 "include_lessons": body.get("include_lessons", True),
                 "include_project": body.get("include_project", True),
+                "executor": body.get("executor", "local"),
+                "instance_id": body.get("instance_id", ""),
                 # The dict is CLOSED -- validate_tool_args only sees what is
                 # listed here -- so omitting a schema field silently disables it
                 # rather than failing. That is what made the crew delegation
@@ -130,6 +133,16 @@ async def api_spawn(request: web.Request) -> web.Response:
             {"error": "parent_session must be a string", "code": "invalid_parent_session"},
             status=400,
         )
+    executor = str(cleaned.get("executor") or "local")
+    instance_id = str(cleaned.get("instance_id") or "")
+    if executor == "local" and instance_id:
+        return web.json_response(
+            {
+                "error": "instance_id requires executor='remote'",
+                "code": "remote_instance_without_executor",
+            },
+            status=400,
+        )
     _, refusal = await internal_memory_scope(
         request, "spawn.create", claimed_session=parent_session
     )
@@ -145,6 +158,15 @@ async def api_spawn(request: web.Request) -> web.Response:
             },
             status=409,
         )
+    requested_memory_mode = body.get("memory_mode", "")
+    if requested_memory_mode:
+        if requested_memory_mode not in ("persistent", "incognito", "temporary"):
+            return web.json_response(
+                {"error": "invalid memory_mode", "code": "invalid_memory_mode"}, status=400
+            )
+        from kiro_crew.messaging.privacy_mode import strictest
+
+        admitted_mode = strictest((admitted_mode, requested_memory_mode)) or "persistent"
     # approval_mode and silent are HTTP API parameters passed by the SDK,
     # NOT MCP tool arguments from the LLM.  The LLM's spawn_run tool
     # (mcp_core.py) does not expose these params — they are added by the
@@ -237,6 +259,63 @@ async def api_spawn(request: web.Request) -> web.Response:
         batch_total = max(0, min(int(body.get("batch_total", 0) or 0), 1000))
     except (TypeError, ValueError):
         batch_total = 0
+    if executor == "remote":
+        if request.get("app", ""):
+            return web.json_response(
+                {"error": "app tokens cannot spend a remote crew", "code": "app_token_forbidden"},
+                status=403,
+            )
+        if crew:
+            return web.json_response(
+                {
+                    "error": "remote runs cannot inherit a local Crew Member memory binding",
+                    "code": "remote_crew_binding_unsupported",
+                },
+                status=400,
+            )
+        if keep:
+            return web.json_response(
+                {
+                    "error": "remote continuable conversations are not supported yet",
+                    "code": "remote_keep_unsupported",
+                },
+                status=400,
+            )
+        from kiro_crew.dashboard.remote_subagents import (
+            RemoteSubagentError,
+            get_remote_subagent_service,
+        )
+
+        try:
+            remote_info = await get_remote_subagent_service(state).spawn(
+                task=task,
+                parent_session=parent_session,
+                agent=agent,
+                max_turns=max_turns,
+                cwd=cwd,
+                model=model,
+                reasoning_effort=reasoning_effort,
+                include_memory=cleaned.get("include_memory", True) is not False,
+                include_lessons=cleaned.get("include_lessons", True) is not False,
+                include_project=cleaned.get("include_project", True) is not False,
+                memory_mode=admitted_mode,
+                batch_id=batch_id,
+                batch_total=batch_total,
+                instance_id=instance_id,
+            )
+        except RemoteSubagentError as exc:
+            return web.json_response({"error": str(exc), "code": exc.code}, status=exc.status)
+        return web.json_response(
+            {
+                "id": remote_info.id,
+                "task": task,
+                "status": "spawned",
+                "parent_work_supported": can_work,
+                "executor": "remote",
+                "instance_id": remote_info.instance_id,
+                "remote_id": remote_info.remote_id,
+            }
+        )
     # The async moment preceding the synchronous spawn(): warm here so the
     # on-loop, cache-only agent validation inside spawn() is a hit.
     if agent:
@@ -419,6 +498,9 @@ async def api_spawn_continue(request: web.Request) -> web.Response:
     refusal = await _spawn_scope_refusal(request, claimed_session=parent_session)
     if refusal is not None:
         return refusal
+    remote_refusal = await _remote_run_operation_refusal(state, conv_id, "continuation")
+    if remote_refusal is not None:
+        return remote_refusal
     try:
         admitted_mode = await _spawn_request_memory_mode(state, request, parent_session)
     except (OSError, ValueError):
