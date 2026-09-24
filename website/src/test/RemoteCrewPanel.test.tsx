@@ -282,6 +282,29 @@ describe('RemoteCrewPanel', () => {
     expect(screen.getByText(/dev-box-1 .*port 5476/i)).toBeInTheDocument()
   })
 
+  it('explains an unmapped connection method on its badge instead of leaving it bare', async () => {
+    // A row whose method this build has no copy for shows the raw method name and
+    // no address. Without a hint nothing on the row says why; the hint names the
+    // method and says this build cannot connect over it. The mapped SSH row beside
+    // it keeps its own hint, so the fallback never replaces real copy.
+    const unmapped = { ...MANUAL_INSTANCE, id: 'u1', name: 'future-crew', connection_method: 'outbound' }
+    vi.mocked(api.listInstances).mockResolvedValue({
+      active: true,
+      warm_set_cap: 5,
+      instances: [MANUAL_INSTANCE, unmapped as unknown as typeof MANUAL_INSTANCE],
+    })
+    vi.mocked(api.cloudLaunches).mockResolvedValue({ jobs: [] })
+    renderWithProviders(<RemoteCrewPanel />)
+
+    const row = (await screen.findByText('future-crew')).closest('[data-crew-id]') as HTMLElement
+    const badge = within(row).getByText('outbound')
+    expect(badge).toHaveAttribute('title', expect.stringMatching(/doesn't support the outbound connection method/))
+    expect(badge).toHaveAttribute('aria-label', badge.getAttribute('title'))
+
+    const sshRow = screen.getByText('dev-box-1', { selector: '.font-medium' }).closest('[data-crew-id]') as HTMLElement
+    expect(within(sshRow).getByText('SSH')).toHaveAttribute('title', 'Connects over SSH.')
+  })
+
   it('treats an EC2-stamped SSH crew with no launch job as possibly cloud', async () => {
     // The EC2 stamp (`provisioner_id`) survives in the instance record even when
     // this gateway's store has no launch job for it — a carried-over config dir,
