@@ -95,6 +95,8 @@ whose app could be disabled by the time the row starts, and `approval_mode`, who
 `"auto"` skips the spawn gate AND pre-approves the run's tools. A recovered row
 faces the gate its caller faced. `scope_ref` still RECORDS both, which is why the
 schema calls that column references rather than grants: no start path reads it.
+A `kirocrew spawn run` row's origin rides its execution record
+([subagent.md § CLI](subagent.md#cli-kirocrew-spawn-run-task)).
 Pinned by
 `test_taskq_admission_integration.py::test_an_ad_hoc_auto_approval_is_never_persisted_on_the_row`,
 and the legacy importer drops a persisted `auto_approve` for the same reason
