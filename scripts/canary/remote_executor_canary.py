@@ -633,6 +633,10 @@ def main() -> int:
                 cfg_path = Path(env["KIROCREW_HOME"]) / "config.json"
                 cfg = json.loads(cfg_path.read_text(encoding="utf-8")) if cfg_path.is_file() else {}
                 cfg.setdefault("instances", {})["enabled"] = True
+                # Remote placement is an operator opt-in (default off) since the
+                # review round on the governance bypass; without it /api/spawn
+                # answers 403 remote_subagents_disabled.
+                cfg["instances"]["remote_subagents"] = True
                 cfg_path.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
                 # Round 4: "Could not resolve hostname kirocrew-canary-peer" --
                 # the gateway's ssh did not read the alias config. Write it into
