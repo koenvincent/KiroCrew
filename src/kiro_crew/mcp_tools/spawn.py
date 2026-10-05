@@ -686,7 +686,6 @@ def _collapse_effort_verdicts(pairs: list[tuple[str, str]]) -> list[tuple[str, s
     return [(", ".join(ids), text) for text, ids in grouped.items()]
 
 
-
 def _placement_suffix(placements: dict[str, str], aid: str) -> str:
     """Trailing ``[remote:<instance>]`` marker for a confirmed remote run.
 
@@ -697,6 +696,7 @@ def _placement_suffix(placements: dict[str, str], aid: str) -> str:
     """
     placement = placements.get(aid, "local")
     return "" if placement == "local" else f" [{placement}]"
+
 
 def spawn_run(name: str, args: dict[str, Any]) -> str:
     args = validate_tool_args(args, SPAWN_RUN_SCHEMA)

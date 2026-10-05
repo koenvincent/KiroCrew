@@ -301,7 +301,17 @@ async def api_spawn(request: web.Request) -> web.Response:
     except (TypeError, ValueError):
         batch_total = 0
     if executor == "remote":
+        from kiro_crew.sel import sel
+
         if request.get("app", ""):
+            sel().log_tool_invocation(
+                session_key=parent_session or "",
+                source="app_isolation",
+                tool_name="spawn_run",
+                outcome="denied",
+                error="app tokens cannot spend a remote crew",
+                metadata={"executor": "remote"},
+            )
             return web.json_response(
                 {"error": "app tokens cannot spend a remote crew", "code": "app_token_forbidden"},
                 status=403,
@@ -322,6 +332,70 @@ async def api_spawn(request: web.Request) -> web.Response:
                 },
                 status=400,
             )
+        # Remote placement must not loosen this gateway's ceiling. Two gates:
+        # 1. the operator opts in (instances.remote_subagents): the peer applies
+        #    its OWN tool-approval policy, which this gateway cannot verify, so
+        #    the model alone may not choose to leave the local approval ceiling;
+        # 2. the same spawn governance (capabilities.spawn and its agent scope)
+        #    and parent-spec availableAgents allowlist the local path enforces in
+        #    admission, checked against the effective child template.
+        from kiro_crew.subagent import (
+            _vet_parent_available_agents,
+            _vet_remote_placement_governance,
+            _vet_spawn_governance,
+        )
+
+        remote_cfg = await asyncio.to_thread(KiroCrewConfig.load)
+        if not getattr(remote_cfg.instances, "remote_subagents", False):
+            sel().log_tool_invocation(
+                session_key=parent_session or "",
+                source="subagent",
+                tool_name="spawn_run",
+                outcome="denied",
+                error="remote subagent placement is turned off on this gateway",
+                metadata={"executor": "remote"},
+            )
+            return web.json_response(
+                {
+                    "error": "remote subagent placement is turned off on this gateway "
+                    "(instances.remote_subagents)",
+                    "code": "remote_subagents_disabled",
+                },
+                status=403,
+            )
+        # The child's template: the explicit agent, else the one it inherits.
+        # Checked by both gates and sent to the peer, so a parent cannot pass
+        # the allowlist on its own name and then run a different agent remotely.
+        effective_agent = agent or admitted_execution.template_id
+        # An app-owned member session reaches here over the loopback MCP secret,
+        # not an app token, so its app identity comes from the execution record.
+        # Without it the PROFILE half of POLICY ∩ PROFILE is skipped, as the
+        # local admission gate (``app = execution.app``) does not do.
+        child_app = admitted_execution.app
+        denial = await asyncio.to_thread(
+            _vet_remote_placement_governance, parent_session, child_app
+        )
+        if not denial:
+            denial = await asyncio.to_thread(
+                _vet_spawn_governance, parent_session, effective_agent, child_app
+            )
+        if not denial:
+            denial = _vet_parent_available_agents(
+                parent_spawn_policy, effective_agent, app=child_app
+            )
+        if denial:
+            sel().log_tool_invocation(
+                session_key=parent_session or "",
+                source="subagent",
+                tool_name="spawn_run",
+                outcome="denied",
+                error="remote spawn denied by governance",
+                metadata={"executor": "remote"},
+            )
+            return web.json_response(
+                {"error": f"spawn refused: {denial}", "code": "remote_spawn_denied"},
+                status=403,
+            )
         from kiro_crew.dashboard.remote_subagents import (
             RemoteSubagentError,
             get_remote_subagent_service,
@@ -331,7 +405,7 @@ async def api_spawn(request: web.Request) -> web.Response:
             remote_info = await get_remote_subagent_service(state).spawn(
                 task=task,
                 parent_session=parent_session,
-                agent=agent,
+                agent=effective_agent,
                 max_turns=max_turns,
                 cwd=cwd,
                 model=model,

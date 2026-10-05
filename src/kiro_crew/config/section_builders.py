@@ -567,6 +567,7 @@ def _build_instances_config(
             instances_data.get("probe_failure_threshold", _DEFAULT_PROBE_FAILS),
             _DEFAULT_PROBE_FAILS,
         ),
+        remote_subagents=instances_data.get("remote_subagents", False) is True,
     )
 
 

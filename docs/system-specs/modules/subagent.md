@@ -3718,6 +3718,22 @@ records; ties rotate. The accepted response carries `executor` and the concrete
 `instance_id`, and the MCP receipt renders `[remote:<instance>]`. A local run is
 never described as remote merely because its parent is attached to an instance.
 
+Remote placement does not keep this gateway's approval ceiling: the child runs
+under the PEER's own tool-approval policy and profile, which the originating
+gateway cannot verify. Two gates decide whether that is allowed, and the model
+alone never does. The operator opt-in `instances.remote_subagents` (default
+`false`; `403 remote_subagents_disabled` otherwise) is the first. The policy
+capability `capabilities.remote_spawn` (default on) is the ceiling over it, so an
+administrator can refuse remote placement without denying `capabilities.spawn`.
+When both permit, `/api/spawn` also runs the same spawn governance
+(`capabilities.spawn` and its agent scope) and parent-spec
+`toolsSettings.subagent.availableAgents` allowlist the local admission path
+enforces, against the effective child template and with the parent's app
+identity from its execution record (so an app profile applies), and refuses with
+`403 remote_spawn_denied` plus a `denied` SEL entry. App tokens are refused.
+Automatic placement considers only crews that pass the `major.minor` version
+check; a skewed crew is skipped, and is a typed `409` only when named explicitly.
+
 `dashboard/remote_subagents.py` keeps the originating gateway as control plane:
 it verifies peer version parity, posts a silent spawn through
 `SshTunnelManager.proxy_request`, polls the peer run, stores its full result
@@ -3733,26 +3749,40 @@ filtered tracked-source tarball and uploads it through the authenticated SSM/SSH
 forward to `POST /api/remote-workspaces`. No Git credential is installed on the
 peer. Untracked files are excluded; dirty tracked files use the source builder's
 tracked fallback; credential-shaped tracked paths keep that builder's filtering.
-The peer verifies the full SHA-256 and installs under
-`~/workplace/kirocrew-remote-workspaces/<digest-prefix>`. Compressed size is
+The peer verifies the full SHA-256 and installs into a `<digest-prefix>`
+directory under its remote-workspace root (`_workspace_root()` in
+`dashboard/remote_workspaces.py`). Compressed size is
 limited to 64 MiB, expanded size to 512 MiB and members to 100,000. Only regular
-files and directories with relative POSIX names are accepted: absolute paths,
-traversal, backslashes, NULs, links, devices and FIFOs are rejected. Ownership is
-scrubbed, modes are normalized while executable bits survive, and reuse requires
-a marker matching the full digest. Valid marked snapshots older than seven days
-are pruned on a later upload; unsafe or unmarked directories are not deleted.
+files and directories with relative POSIX names are extracted: absolute paths,
+traversal, backslashes, NULs, hardlinks, devices and FIFOs are rejected, and
+symlink members (the source builder emits one per tracked symlink) are skipped,
+never created. The upload body is read to EOF under the compressed cap. Ownership
+is scrubbed, modes are normalized while executable bits survive (on POSIX), and
+reuse requires a marker matching the full digest and restarts the snapshot's age.
+Valid marked snapshots older than seven days are pruned on a later upload, except
+any snapshot a live or queued run on that peer works in; install and prune are
+serialized. Unsafe or unmarked directories are not deleted.
 An explicit `cwd` is already a path on the selected remote executor and suppresses
 snapshot upload.
 
 Remote mappings are owner-only files under
 `<data_home>/remote-subagents/<local-id>/`: `state.json` records local/peer IDs,
 placement and delivery state; `result.txt` holds the full bounded terminal text.
-Startup restores valid non-symlink records, resumes polling unfinished runs and
-re-delivers a terminal result whose `delivered` bit was not committed. Malformed
+An `incognito` or `temporary` run keeps its task and result in memory only: its
+`state.json` carries the binding with an empty task and no `result.txt` is
+written. The mapping is written BEFORE the run is registered or acknowledged; if
+that write fails the peer run is cancelled and the spawn fails with
+`507 remote_mapping_unpersisted`. Gateway startup (when `instances.enabled`)
+restores valid non-symlink records in the background, resumes polling unfinished
+runs and re-delivers a terminal result whose `delivered` bit was not committed.
+A peer that stays unreachable for 30 minutes ends the shadow run with an error
+rather than keeping its parent busy forever. Version-check and snapshot-build
+failures are typed refusals (`409`/`400`), not bare 500s. Malformed
 or redirected state fails closed. Delivered terminal records follow
 `agent.subagent_result_ttl_secs`; live and undelivered records never expire.
-Content is persisted before parent injection and the delivered bit only after a
-successful report. A process crash in the narrow interval after peer acceptance
+Content is persisted before parent injection and the delivered bit only after the
+result reached the parent: a completion parked in a wave digest or in the parent's
+slot queue stays unacknowledged, so a restart re-delivers it rather than losing it. A process crash in the narrow interval after peer acceptance
 but before the first local mapping write remains an orphan window until the peer
 spawn API has an idempotency key.
 
@@ -3765,5 +3795,5 @@ Current lifecycle boundaries are intentional:
   the concrete peer run; parent teardown gates delivery before its network await;
 - gateway shutdown stops local pollers but does not cancel peer work, allowing a
   restarted gateway to restore mappings and continue polling;
-- the authenticated peer carrier must retain the session cookie produced by the
-  one-shot link exchange; see `instances.md` §17.
+- every peer request goes through `proxy_request` and its owner credential; the
+  transport is the instance's own (`instances.md` §3, §13, §16).

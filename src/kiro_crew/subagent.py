@@ -589,6 +589,41 @@ def _vet_spawn_governance(parent_session_key: str, agent: str, app: str = "") ->
         return "subagent spawn denied: governance evaluation failed (fail-closed)"
 
 
+def _vet_remote_placement_governance(parent_session_key: str, app: str = "") -> str | None:
+    """Return a denial reason if governance forbids placing a child on a remote crew.
+
+    Resolved like :func:`_vet_spawn_governance` -- against the PARENT surface's
+    ceiling ∩ profile, with the calling app's own profile when *app* is set --
+    and failing closed the same way.
+    """
+    from kiro_crew.platform.context import PlatformCompositionError
+
+    try:
+        from kiro_crew.platform.governance_profiles import governance_permits
+
+        gate = governance_permits(
+            "capabilities.remote_spawn", "", session_key=parent_session_key, app=app
+        )
+        if not getattr(gate, "permitted", True):
+            return getattr(gate, "reason", "remote sub-agent placement disabled by policy")
+        return None
+    except PlatformCompositionError:
+        raise
+    except Exception:
+        try:
+            from kiro_crew.platform.governance_profiles import audit_governance_degraded
+
+            audit_governance_degraded(
+                "subagent_spawn",
+                session_key=parent_session_key,
+                scope="capabilities.remote_spawn",
+                failed_closed=True,
+            )
+        except Exception:
+            logger.debug("governance degrade audit unavailable", exc_info=True)
+        return "remote sub-agent placement denied: governance evaluation failed (fail-closed)"
+
+
 def spawn_allowlist(spec: Mapping[str, Any]) -> tuple[str, ...] | None:
     """The ``toolsSettings.subagent.availableAgents`` globs *spec* declares.
 
@@ -4929,7 +4964,7 @@ class SubagentManager:
         """Settle completion debt and remove a finished run atomically."""
         info = self._agents.get(agent_id)
         if info is None:
-            return "delivered"
+            return self._settle_external_before_delete(agent_id)
         if info._ending_claimed and not info.done:
             # Claimed its completed ending and still writing its result (a
             # bounded wait): ``cancel()`` declined it as done, but its report
@@ -6392,6 +6427,27 @@ class SubagentManager:
         """Remove one terminal remote shadow record from local inventory."""
         return self._external_agents.pop(agent_id, None)
 
+    def _settle_external_before_delete(self, agent_id: str) -> Literal["delivered", "pending"]:
+        """Dismiss one finished peer-owned record, unless its completion is in flight.
+
+        A record whose report is still running, or that the gateway parked in a
+        wave digest or a busy slot's queue, has not reached the parent: removing
+        it would drop the result the parent is about to read.
+        """
+        info = getattr(self, "_external_agents", {}).get(agent_id)
+        if info is None:
+            return "delivered"
+        if not info.done:
+            return "pending"
+        reporting = any(
+            report_info is info or report_info.id == agent_id
+            for report_info in self._report_owners.values()
+        )
+        if reporting or info._digest_held or info._delivery_queued:
+            return "pending"
+        self.forget_external(agent_id)
+        return "delivered"
+
     def set_external_canceller(
         self,
         callback: Callable[[SubagentInfo], Awaitable[bool]] | None,
@@ -6495,10 +6551,51 @@ class SubagentManager:
         return await self._waves._announce_digest_flush_impl(info)
 
     async def settle_queued_delivery(self, deliveries: list[SubagentDelivery]) -> None:
-        return await self._waves.settle_queued_delivery_impl(deliveries)
+        external = self._external_ids_in(deliveries)
+        await self._waves.settle_queued_delivery_impl(deliveries)
+        await self._notify_external_delivered(external)
 
     async def _settle_digest_holds(self, info: SubagentInfo) -> None:
-        return await self._waves._settle_digest_holds_impl(info)
+        # Read before the impl: it detaches the held deliveries from ``info``.
+        external = (
+            []
+            if info._report_undelivered
+            else self._external_ids_in(info._digest_settle_deliveries)
+        )
+        await self._waves._settle_digest_holds_impl(info)
+        await self._notify_external_delivered(external)
+
+    def set_external_delivery_listener(
+        self,
+        callback: Callable[[list[str]], Awaitable[None]] | None,
+    ) -> None:
+        """Bind the placement service told when a parked external result lands.
+
+        ``report_external`` cannot acknowledge a result the gateway parked in a
+        wave digest or a busy slot's queue, because it has not reached the
+        parent yet. The settle that later delivers it is the only point that
+        knows it did, so it hands the external ids on here.
+        """
+        self._external_delivery_listener = callback
+
+    def _external_ids_in(self, deliveries: Iterable[SubagentDelivery]) -> list[str]:
+        external = self._external_agents
+        return [
+            delivery.agent_id
+            for delivery in deliveries
+            if not delivery.report_owed and delivery.agent_id in external
+        ]
+
+    async def _notify_external_delivered(self, agent_ids: list[str]) -> None:
+        callback = getattr(self, "_external_delivery_listener", None)
+        if not agent_ids or callback is None:
+            return
+        try:
+            await callback(agent_ids)
+        except Exception:
+            # The parent already has the result; a failed acknowledgement can at
+            # worst re-deliver it after a restart, so it must not fail the settle.
+            logger.warning("External delivery acknowledgement failed", exc_info=True)
 
     def get(self, agent_id: str) -> SubagentInfo | None:
         return self._run_events.get_impl(agent_id)

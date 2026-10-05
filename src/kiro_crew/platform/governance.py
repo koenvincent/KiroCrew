@@ -1386,6 +1386,13 @@ SCOPE_CATALOG: Dict[str, ScopeSpec] = {
     "capabilities.spawn": ScopeSpec(
         CAPABILITY, capability_default=True, scope_matchers={"agents": "identifier"}
     ),
+    # Placing a sub-agent on a remote crew (``spawn_run`` with
+    # ``executor="remote"``). The child then runs under the PEER's approval
+    # policy and profile, not this gateway's, so an administrator must be able
+    # to refuse placement without denying ``capabilities.spawn`` outright.
+    # Default True: the operator opt-in ``instances.remote_subagents`` (off by
+    # default) is the first gate; this row is the policy ceiling over it.
+    "capabilities.remote_spawn": ScopeSpec(CAPABILITY, capability_default=True),
     "capabilities.memory_writes": ScopeSpec(CAPABILITY, capability_default=True),
     # Web browsing (the ``browser`` MCP tool driving the native panel, and the
     # playwright-cli fallback it points at) is a governable egress surface: an
