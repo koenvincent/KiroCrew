@@ -2,11 +2,11 @@ name: canary-black-pr12821
 # Throwaway helper on the fork's canary branch: format the files the PR's
 # black gate flagged with the repo's pinned black and return the patch.
 on:
-  workflow_dispatch:
-    inputs:
-      ref:
-        description: PR head sha to format
-        required: true
+  push:
+    branches: [canary/pr12821-remote-executor]
+    paths: [.github/workflows/canary-black-pr12821.yml]
+env:
+  PR_HEAD: a1dc1795a317e81860603ed29e8b1dc69d627db4
 permissions:
   contents: read
 jobs:
@@ -15,7 +15,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref }}
+          repository: koenvincent/KiroCrew
+          ref: ${{ env.PR_HEAD }}
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
