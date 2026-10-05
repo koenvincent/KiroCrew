@@ -6,7 +6,7 @@ on:
     branches: [canary/pr12821-remote-executor]
     paths: [.github/workflows/canary-black-pr12821.yml]
 env:
-  PR_HEAD: 25ee3adcbec00033f557be1ef40d6f0e0b66060e
+  PR_HEAD: 849658ff44fcc939a511bb7a22d7888c85cbe82d
 permissions:
   contents: read
 jobs:
@@ -23,29 +23,16 @@ jobs:
       - run: pip install black==26.3.1
       - run: |
           black --target-version py310 \
-            src/kiro_crew/config/integration_sections.py \
-            src/kiro_crew/config/section_builders.py \
-            src/kiro_crew/dashboard/handlers/messaging.py \
-            src/kiro_crew/dashboard/messaging_api/run_control.py \
-            src/kiro_crew/dashboard/messaging_api/run_views.py \
-            src/kiro_crew/dashboard/messaging_api/spawn.py \
-            src/kiro_crew/dashboard/remote_subagents.py \
-            src/kiro_crew/dashboard/remote_workspaces.py \
-            src/kiro_crew/dashboard/server.py \
-            src/kiro_crew/dashboard/state.py \
-            src/kiro_crew/mcp_tools/spawn.py \
-            src/kiro_crew/security_posture.py \
-            src/kiro_crew/slack/gateway.py \
-            src/kiro_crew/subagent.py \
-            src/kiro_crew/subagent_manager/cancellation.py \
-            src/kiro_crew/subagent_manager/run.py \
-            src/kiro_crew/subagent_manager/waves.py \
-            src/kiro_crew/validation.py \
-            test/test_handlers_messaging_coverage.py \
-            test/test_remote_subagent_executor.py \
-            test/test_slack_gateway.py \
-            test/test_slack_gateway_more_coverage.py \
-            test/test_spawn_audit.py
+            src/kiro_crew/instances/ssh_tunnel_manager.py \
+            src/kiro_crew/instances/transports/__init__.py \
+            src/kiro_crew/instances/transports/base.py \
+            src/kiro_crew/instances/transports/fargate.py \
+            src/kiro_crew/instances/transports/params.py \
+            src/kiro_crew/instances/transports/ssh.py \
+            src/kiro_crew/instances/transports/ssm.py \
+            test/test_cloud_fargate_single_forward_path.py \
+            test/test_instances.py \
+            test/test_instances_transports.py
           git diff > black.patch
           wc -l black.patch
       - uses: actions/upload-artifact@v4
