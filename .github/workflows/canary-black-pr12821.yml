@@ -1,0 +1,35 @@
+name: canary-black-pr12821
+# Throwaway helper on the fork's canary branch: format the files the PR's
+# black gate flagged with the repo's pinned black and return the patch.
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: PR head sha to format
+        required: true
+permissions:
+  contents: read
+jobs:
+  black:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install black==26.3.1
+      - run: |
+          black --target-version py310 \
+            src/kiro_crew/dashboard/remote_subagents.py \
+            src/kiro_crew/dashboard/remote_workspaces.py \
+            src/kiro_crew/mcp_tools/spawn.py \
+            src/kiro_crew/security_posture.py \
+            test/test_remote_subagent_executor.py
+          git diff > black.patch
+          wc -l black.patch
+      - uses: actions/upload-artifact@v4
+        with:
+          name: black-patch
+          path: black.patch
