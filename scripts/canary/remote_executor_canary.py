@@ -700,6 +700,23 @@ def run_scenarios(
         ))
         raise
 
+    # The owner startup token is reported 'session revoked' once the instance
+    # connect has run (round 8), so set the slot project while it still works.
+    project = canary_home / "canary-project"
+    project.mkdir(parents=True, exist_ok=True)
+    (project / "README.md").write_text("canary project snapshot\n", encoding="utf-8")
+    git = ["git", "-C", str(project), "-c", "user.email=canary@example.invalid",
+           "-c", "user.name=canary", "-c", "commit.gpgsign=false"]
+    subprocess.run(["git", "init", "-q", str(project)], check=True)
+    subprocess.run([*git, "add", "README.md"], check=True)
+    subprocess.run([*git, "commit", "-q", "-m", "canary snapshot"], check=True)
+
+    status_p, body_p = _http(
+        "POST",
+        owner_url(parent, f"/api/chat/slots/{session.session_key.split(':', 1)[-1]}/project"),
+        body={"project": str(project)},
+    )
+
     instance_id, connect_result = add_and_connect_peer(
         parent,
         name="canary-peer",
@@ -716,20 +733,6 @@ def run_scenarios(
     # a hand-made POST from this script is not a credential the hub ever uses.
     r = ScenarioResult("upload", False, "not run", started=time.monotonic())
     try:
-        project = canary_home / "canary-project"
-        project.mkdir(parents=True, exist_ok=True)
-        (project / "README.md").write_text("canary project snapshot\n", encoding="utf-8")
-        git = ["git", "-C", str(project), "-c", "user.email=canary@example.invalid",
-               "-c", "user.name=canary", "-c", "commit.gpgsign=false"]
-        subprocess.run(["git", "init", "-q", str(project)], check=True)
-        subprocess.run([*git, "add", "README.md"], check=True)
-        subprocess.run([*git, "commit", "-q", "-m", "canary snapshot"], check=True)
-
-        status_p, body_p = _http(
-            "POST",
-            owner_url(parent, f"/api/chat/slots/{session.session_key.split(':', 1)[-1]}/project"),
-            body={"project": str(project)},
-        )
         status_u, body_u = _http(
             "POST",
             owner_url(parent, "/api/spawn"),
