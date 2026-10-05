@@ -601,6 +601,15 @@ def main() -> int:
                 cfg = json.loads(cfg_path.read_text(encoding="utf-8")) if cfg_path.is_file() else {}
                 cfg.setdefault("instances", {})["enabled"] = True
                 cfg_path.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
+                # Round 4: "Could not resolve hostname kirocrew-canary-peer" --
+                # the gateway's ssh did not read the alias config. Write it into
+                # whatever HOME the child is actually given, not the one we hope.
+                child_home = Path(env.get("HOME") or str(canary_home))
+                child_ssh = child_home / ".ssh"
+                child_ssh.mkdir(parents=True, exist_ok=True, mode=0o700)
+                (child_ssh / "config").write_text(ssh_config.read_text(), encoding="utf-8")
+                (child_ssh / "config").chmod(0o600)
+                print(f"[canary] parent child HOME={child_home}", flush=True)
 
             # harness_environment layers over os.environ, so HOME must be set
             # here for the parent's ssh client to resolve the alias config.
@@ -635,6 +644,17 @@ def run_scenarios(
     peer_launcher: Path,
     canary_home: Path,
 ) -> None:
+    # Session first: round 3 proved this order authenticates; round 4 put the
+    # instance add before it and the bootstrap POST /api/chat came back 403.
+    try:
+        session = establish_authenticated_session(parent, slot="canary-remote-executor")
+    except Exception as exc:
+        evidence.record(ScenarioResult(
+            "session", False, f"{type(exc).__name__}: {exc}",
+            evidence={"gateway_tail": gateway_tail(parent)},
+        ))
+        raise
+
     instance_id, connect_result = add_and_connect_peer(
         parent,
         name="canary-peer",
@@ -642,8 +662,6 @@ def run_scenarios(
         remote_bin=str(peer_launcher),
     )
     evidence.record(connect_result)
-
-    session = establish_authenticated_session(parent, slot="canary-remote-executor")
 
     # -- a) upload -----------------------------------------------------
     r = ScenarioResult("upload", False, "not run", started=time.monotonic())
