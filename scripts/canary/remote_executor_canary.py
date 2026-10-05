@@ -333,8 +333,70 @@ def internal_secret(handle: GatewayHandle) -> str:
     return secret_path.read_text(encoding="utf-8").strip()
 
 
-def internal_headers(handle: GatewayHandle) -> dict[str, str]:
-    return {"X-Internal-Secret": internal_secret(handle)}
+@dataclass
+class AuthenticatedSession:
+    """A real, readable dashboard session this script can present as its own.
+
+    ``/api/spawn`` (and the other spawn-control routes) authenticate an
+    internal-secret caller's SESSION via ``X-Session-Key`` + an attestation
+    behind it (``member_memory_auth.session_key_is_attested``). A loopback TCP
+    caller has no kernel peer attestation to offer, so the supported channel is
+    a signed ``X-Session-Token`` (``session_token_sig.publish_session_token`` /
+    ``verify_session_token``) -- the same mechanism a real MCP server element
+    gets minted into its ``env`` at ``session/new``.
+
+    This script is not an MCP server, so it mints its own: it first creates a
+    REAL, readable session the ordinary way (one ``POST /api/chat`` against the
+    parent, which the fake backend answers deterministically), then signs a
+    token for that session's key using the parent's own on-disk SEL trust root
+    (``KIROCREW_HOME`` points this process at the SAME ``config_dir()`` the
+    parent gateway subprocess reads). Equivalent, for authentication purposes,
+    to the parent handing this script a server-side element's token.
+    """
+
+    session_key: str
+    token: str
+
+    def headers(self) -> dict[str, str]:
+        return {"X-Session-Key": self.session_key, "X-Session-Token": self.token}
+
+
+def establish_authenticated_session(parent: GatewayHandle, *, slot: str) -> AuthenticatedSession:
+    status, body = _http(
+        "POST",
+        owner_url(parent, "/api/chat"),
+        body={"message": "canary bootstrap turn", "slot": slot},
+        timeout=60.0,
+    )
+    if status != 200:
+        raise RuntimeError(f"POST /api/chat (bootstrap session) -> {status}: {body!r}")
+
+    session_key = f"dashboard:{slot}"
+    token = f"canary-{slot}-{os.urandom(8).hex()}"
+
+    prior_home = os.environ.get("KIROCREW_HOME")
+    os.environ["KIROCREW_HOME"] = str(parent.home)
+    try:
+        import importlib
+
+        import kiro_crew.session_token_sig as session_token_sig
+
+        importlib.reload(session_token_sig)
+        session_token_sig.publish_session_token(token, session_key)
+    finally:
+        if prior_home is None:
+            os.environ.pop("KIROCREW_HOME", None)
+        else:
+            os.environ["KIROCREW_HOME"] = prior_home
+
+    return AuthenticatedSession(session_key=session_key, token=token)
+
+
+def internal_headers(handle: GatewayHandle, session: Optional[AuthenticatedSession] = None) -> dict[str, str]:
+    headers = {"X-Internal-Secret": internal_secret(handle)}
+    if session is not None:
+        headers.update(session.headers())
+    return headers
 
 
 # --------------------------------------------------------------------------- #
@@ -509,20 +571,27 @@ def run_scenarios(
         client_key_path=peer_launcher,
     )
 
+    session = establish_authenticated_session(parent, slot="canary-remote-executor")
+
     # -- a) upload -----------------------------------------------------
     r = ScenarioResult("upload", False, "not run", started=time.monotonic())
     try:
-        payload = b"canary-snapshot-placeholder"
-        status, body = _http(
-            "POST",
-            owner_url(parent, f"/api/remote-workspaces?sha256={'0'*64}&commit={'0'*40}"),
-            headers={"Content-Type": "application/octet-stream"},
-            body=None,
-            timeout=30.0,
-        )
-        # The real route reads raw bytes, not JSON; retry with a raw body.
+        import hashlib
+        import io
+        import tarfile
+
+        buf = io.BytesIO()
+        with tarfile.open(fileobj=buf, mode="w:gz") as tf:
+            info = tarfile.TarInfo(name="canary-snapshot.txt")
+            data = b"canary snapshot placeholder\n"
+            info.size = len(data)
+            tf.addfile(info, io.BytesIO(data))
+        payload = buf.getvalue()
+        digest = hashlib.sha256(payload).hexdigest()
+        commit = "0" * 40
+
         req = urllib.request.Request(
-            owner_url(parent, f"/api/remote-workspaces?sha256={'0'*64}&commit={'0'*40}"),
+            owner_url(parent, f"/api/remote-workspaces?sha256={digest}&commit={commit}"),
             data=payload,
             method="POST",
         )
@@ -534,7 +603,7 @@ def run_scenarios(
             status = exc.code
             body = exc.read().decode("utf-8", "replace")
         r.evidence = {"status": status, "body": body if isinstance(body, dict) else str(body)[:300]}
-        r.passed = status in (200, 400) and isinstance(body, dict)
+        r.passed = status == 200 and isinstance(body, dict) and bool(body.get("path"))
         r.detail = f"POST /api/remote-workspaces -> {status}"
     except Exception as exc:
         r.detail = f"{type(exc).__name__}: {exc}"
@@ -542,7 +611,7 @@ def run_scenarios(
     evidence.record(r)
 
     # -- spawn the remote run (feeds b, c, d) ---------------------------
-    headers = internal_headers(parent)
+    headers = internal_headers(parent, session)
     status, body = _http(
         "POST",
         owner_url(parent, "/api/spawn"),
@@ -551,6 +620,7 @@ def run_scenarios(
             "task": "[[SLOW]] canary remote turn",
             "executor": "remote",
             "instance_id": instance_id,
+            "parent_session": session.session_key,
             "include_memory": False,
             "include_lessons": False,
             "include_project": False,
@@ -626,6 +696,7 @@ def run_scenarios(
                 "task": "say pong",
                 "executor": "remote",
                 "instance_id": instance_id,
+                "parent_session": session.session_key,
                 "include_memory": False,
                 "include_lessons": False,
                 "include_project": False,
@@ -661,6 +732,7 @@ def run_scenarios(
                 "task": "[[SLOW]] canary resume turn",
                 "executor": "remote",
                 "instance_id": instance_id,
+                "parent_session": session.session_key,
                 "include_memory": False,
                 "include_lessons": False,
                 "include_project": False,
@@ -673,11 +745,16 @@ def run_scenarios(
         else:
             time.sleep(POLL_SECONDS * 2)
             restarted = parent.restart()
+            # The restarted process is a NEW gateway with a fresh in-memory
+            # token-sidecar read path, but the signed mapping on disk under
+            # KIROCREW_HOME survives the restart untouched, so the same
+            # session + token this script already minted keeps authenticating.
+            resumed_headers = internal_headers(restarted, session)
             deadline = time.monotonic() + RESTART_TIMEOUT_SECS
             final = {}
             while time.monotonic() < deadline:
                 status_g, body_g = _http(
-                    "GET", owner_url(restarted, f"/api/spawn/{resume_run_id}")
+                    "GET", owner_url(restarted, f"/api/spawn/{resume_run_id}"), headers=resumed_headers
                 )
                 if status_g == 200 and isinstance(body_g, dict):
                     final = body_g
@@ -694,7 +771,7 @@ def run_scenarios(
                 _http(
                     "DELETE",
                     owner_url(restarted, f"/api/spawn/{resume_run_id}"),
-                    headers=internal_headers(restarted),
+                    headers=internal_headers(restarted, session),
                 )
     except Exception as exc:
         r.detail = f"{type(exc).__name__}: {exc}"
