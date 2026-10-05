@@ -610,6 +610,18 @@ def main() -> int:
                 (child_ssh / "config").write_text(ssh_config.read_text(), encoding="utf-8")
                 (child_ssh / "config").chmod(0o600)
                 print(f"[canary] parent child HOME={child_home}", flush=True)
+                # Round 5: still "Could not resolve hostname". OpenSSH takes
+                # ~/.ssh/config from the PASSWD home (getpwuid), never $HOME,
+                # so the alias must live there. Only on a disposable CI runner:
+                # never overwrite an operator's real ssh config.
+                if os.environ.get("GITHUB_ACTIONS") == "true":
+                    import pwd
+
+                    pw_ssh = Path(pwd.getpwuid(os.getuid()).pw_dir) / ".ssh"
+                    pw_ssh.mkdir(parents=True, exist_ok=True, mode=0o700)
+                    (pw_ssh / "config").write_text(ssh_config.read_text(), encoding="utf-8")
+                    (pw_ssh / "config").chmod(0o600)
+                    print(f"[canary] ssh alias written to passwd home {pw_ssh}", flush=True)
 
             # harness_environment layers over os.environ, so HOME must be set
             # here for the parent's ssh client to resolve the alias config.
