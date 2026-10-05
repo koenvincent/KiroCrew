@@ -6,7 +6,7 @@ on:
     branches: [canary/pr12821-remote-executor]
     paths: [.github/workflows/canary-black-pr12821.yml]
 env:
-  PR_HEAD: 849658ff44fcc939a511bb7a22d7888c85cbe82d
+  PR_HEAD: 4f4c99bcb17dc3d2b3756d4f5a972b65d1e748a8
 permissions:
   contents: read
 jobs:
@@ -23,16 +23,11 @@ jobs:
       - run: pip install black==26.3.1
       - run: |
           black --target-version py310 \
-            src/kiro_crew/instances/ssh_tunnel_manager.py \
-            src/kiro_crew/instances/transports/__init__.py \
-            src/kiro_crew/instances/transports/base.py \
-            src/kiro_crew/instances/transports/fargate.py \
-            src/kiro_crew/instances/transports/params.py \
-            src/kiro_crew/instances/transports/ssh.py \
-            src/kiro_crew/instances/transports/ssm.py \
-            test/test_cloud_fargate_single_forward_path.py \
-            test/test_instances.py \
-            test/test_instances_transports.py
+            src/kiro_crew/dashboard/messaging_api/run_control.py \
+            src/kiro_crew/dashboard/messaging_api/spawn.py \
+            src/kiro_crew/dashboard/remote_subagents.py \
+            test/test_handlers_messaging_coverage.py \
+            test/test_instances.py
           git diff > black.patch
           wc -l black.patch
       - uses: actions/upload-artifact@v4
