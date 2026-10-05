@@ -528,10 +528,20 @@ def main() -> int:
         ) as peer:
             peer_launcher = write_peer_kirocrew_launcher(canary_home, peer.port, peer.token)
 
-            parent_env_patch: dict[str, str] = {"HOME": str(canary_home)}
-
             def _parent_before_spawn(env: dict[str, str], _cwd: Path) -> None:
-                env.update(parent_env_patch)
+                # The harness passes a COPY of the child env, so mutating it does
+                # not reach the gateway. Use the hook only to write the seeded
+                # home's config: the instances manager (and therefore every
+                # remote spawn) is off unless ``instances.enabled`` is set,
+                # which surfaced as 503 remote_instances_unavailable in round 2.
+                cfg_path = Path(env["KIROCREW_HOME"]) / "config.json"
+                cfg = json.loads(cfg_path.read_text(encoding="utf-8")) if cfg_path.is_file() else {}
+                cfg.setdefault("instances", {})["enabled"] = True
+                cfg_path.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
+
+            # harness_environment layers over os.environ, so HOME must be set
+            # here for the parent's ssh client to resolve the alias config.
+            os.environ["HOME"] = str(canary_home)
 
             with spawn_feature_gateway(
                 fixture="minimal",
