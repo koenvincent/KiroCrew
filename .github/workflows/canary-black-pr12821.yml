@@ -6,7 +6,7 @@ on:
     branches: [canary/pr12821-remote-executor]
     paths: [.github/workflows/canary-black-pr12821.yml]
 env:
-  PR_HEAD: 6f5aa900c80faf2e7da28299332ec1e477e00788
+  PR_HEAD: fc1c4b5ac943fd920d6a9f72acab64c7d9ce15c4
 permissions:
   contents: read
 jobs:
@@ -22,10 +22,12 @@ jobs:
           python-version: "3.12"
       - run: pip install black==26.3.1 isort==6.0.0
       - run: |
-          isort src/kiro_crew/instances/ssh_tunnel_manager.py
-          black --target-version py310 src/kiro_crew/instances/ssh_tunnel_manager.py
+          FILES="src/kiro_crew/subagent.py src/kiro_crew/dashboard/remote_subagents.py test/test_remote_subagent_executor.py"
+          isort $FILES
+          black --target-version py310 $FILES
           git diff > black.patch
           wc -l black.patch
+          cat black.patch
       - uses: actions/upload-artifact@v4
         with:
           name: black-patch
