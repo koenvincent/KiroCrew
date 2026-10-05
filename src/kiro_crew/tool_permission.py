@@ -542,6 +542,22 @@ class HookGate:
         return Hit("hook_auto_approve", evidence, vouch=True)
 
 
+class DenyOnlyGate:
+    """*inner*'s refusals, without its auto-approve.
+
+    For a run under an interactive approval floor: the hook gate keeps every deny
+    it would give, but its grant (``auto_approve_tools`` and the like) no longer
+    stands in for the person, so an allowed request goes on to a responder.
+    """
+
+    def __init__(self, inner: Gate) -> None:
+        self._inner = inner
+
+    def judge(self, ask: Ask) -> Refusal | None:
+        verdict = self._inner.judge(ask)
+        return verdict if isinstance(verdict, Refusal) else None
+
+
 class SpecHooks:
     """The agent spec's PreToolUse hooks as a floor, on a turn they gate.
 

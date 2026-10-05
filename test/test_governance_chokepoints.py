@@ -360,6 +360,49 @@ class TestHelpers:
         d = gp.governance_permits("capabilities.memory_writes", "x", session_key="cli_chat")
         assert not d.permitted
 
+    def test_remote_placement_is_a_capability_a_policy_can_deny(self):
+        # A remote child runs under the peer's approval policy, so a ceiling
+        # must be able to refuse remote placement without denying spawn itself.
+        from kiro_crew.subagent import _vet_remote_placement_governance, _vet_spawn_governance
+
+        _install(None)
+        assert _vet_remote_placement_governance("cli_chat") is None
+        _install(
+            {
+                "version": 1,
+                "boot": {"fail_closed": True},
+                "capabilities": {
+                    "spawn": {"enabled": True},
+                    "remote_spawn": {"enabled": False},
+                },
+            }
+        )
+        assert _vet_remote_placement_governance("cli_chat")
+        assert _vet_spawn_governance("cli_chat", "") is None
+
+    def test_an_installed_policy_must_name_remote_placement_to_grant_it(self):
+        # A policy written before the row existed must not be loosened from
+        # below: omission permits every other scope, but not this one.
+        from kiro_crew.subagent import _vet_remote_placement_governance
+
+        _install(
+            {
+                "version": 1,
+                "boot": {"fail_closed": True},
+                "capabilities": {"spawn": {"enabled": True}},
+            }
+        )
+        denial = _vet_remote_placement_governance("cli_chat")
+        assert denial and "capabilities.remote_spawn" in denial
+        _install(
+            {
+                "version": 1,
+                "boot": {"fail_closed": True},
+                "capabilities": {"remote_spawn": {"enabled": True}},
+            }
+        )
+        assert _vet_remote_placement_governance("cli_chat") is None
+
     def test_governance_permits_ungoverned_is_permit(self):
         _install(None)
         d = gp.governance_permits("tools", "anything", session_key="cli_chat")

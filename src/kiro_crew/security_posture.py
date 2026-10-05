@@ -560,6 +560,23 @@ _REDACTION_SINKS: tuple[tuple[str, str, str], ...] = (
         "never rewritten) and refused whole if any record does not parse.",
     ),
     (
+        "Remote subagent placement",
+        "dashboard/remote_subagents.py",
+        'Task text sent to a peer Kiro Crew instance for `spawn_run(executor="remote")`, '
+        "and the peer's result, error, last-tool and stop-reason text coming back. "
+        "The returned text is persisted in the local shadow record and injected "
+        "into the parent session's model context and dashboard card, so it is "
+        "scrubbed with `remote_relay.redact_peer_text` (the exfiltration-URL then "
+        "credential redactors) before it is "
+        "written: a secret the peer's agent echoed does not land locally or reach "
+        "the parent model. The local shadow copy of the task is scrubbed the same "
+        "way. The task itself is forwarded to the peer VERBATIM, exactly as a local "
+        "subagent receives it, because rewriting it would change the work the "
+        "operator asked for; what bounds that exposure is the destination, the "
+        "OPERATOR'S OWN peer instance over a tunnel they authenticated, the same "
+        "basis as the session transfer bundle above.",
+    ),
+    (
         "Federated session search",
         "dashboard/handlers_instances.py",
         "Rows returned by GET /api/instances/search-sessions, straight to the "

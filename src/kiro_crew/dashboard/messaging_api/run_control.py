@@ -262,7 +262,8 @@ async def _remote_run_operation_refusal(
     from kiro_crew.dashboard.remote_subagents import get_remote_subagent_service
 
     await get_remote_subagent_service(state).ensure_restored()
-    info = state.subagents.get(run_id) if state.subagents is not None else None
+    getter = getattr(state.subagents, "get", None)
+    info = getter(run_id) if callable(getter) else None
     if info is None or getattr(info, "executor", "local") != "remote":
         return None
     return web.json_response(
@@ -831,7 +832,7 @@ async def api_spawn_delete(request: web.Request) -> web.Response:
             resources=f"persisted run {agent_id}",
         )
         return web.json_response({"ok": True, "cancelled": False, "dismissed": True})
-    if getattr(info, "executor", "local") == "remote":
+    if getattr(info, "executor", "local") == "remote" and not info.done:
         from kiro_crew.dashboard.remote_subagents import (
             RemoteSubagentError,
             get_remote_subagent_service,
@@ -842,7 +843,12 @@ async def api_spawn_delete(request: web.Request) -> web.Response:
         except RemoteSubagentError as exc:
             return web.json_response({"error": str(exc), "code": exc.code}, status=exc.status)
         return web.json_response({"ok": True, "cancelled": remote_cancelled})
-    cancelled = await manager.cancel(agent_id)
+    # A FINISHED remote run has nothing left to stop on its crew, so it takes the
+    # local settle path below instead of a peer call that a disconnected or
+    # pruned peer would answer with an error, blocking the dismissal.
+    cancelled = (
+        False if getattr(info, "executor", "local") == "remote" else await manager.cancel(agent_id)
+    )
     if not cancelled:
         settlement = await manager.settle_before_delete(agent_id)
         if settlement == "pending":

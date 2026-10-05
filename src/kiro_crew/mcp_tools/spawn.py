@@ -381,9 +381,14 @@ def schemas() -> list[dict[str, Any]]:
                     "cwd": {
                         "type": "string",
                         "description": (
-                            "Optional absolute path on the selected executor. For a remote "
-                            "run this path must already exist on that crew and pass its own "
-                            "subagent_cwd_allowed_roots policy. Applies to all batch tasks."
+                            "Optional absolute path to launch the subagent subprocess in, "
+                            "instead of the default sandbox. Enables cwd-relative resource globs "
+                            "(.kiro/steering, AGENTS.md, CLAUDE.md) to resolve against this directory. "
+                            "Must be under a configured subagent_cwd_allowed_roots entry "
+                            "(default: [~/workspace, ~/workspaces, ~/workplace, "
+                            "~/workplaces]). Applies to all tasks in a batch spawn. "
+                            "With executor='remote' it is a path on that crew, checked "
+                            "against the crew's own allowed roots."
                         ),
                     },
                     "executor": {
@@ -716,7 +721,6 @@ def _collapse_effort_verdicts(
     return [(", ".join(ids), text) for text, ids in grouped.items()]
 
 
-
 def _placement_suffix(placements: dict[str, str], aid: str) -> str:
     """Trailing ``[remote:<instance>]`` marker for a confirmed remote run.
 
@@ -727,6 +731,7 @@ def _placement_suffix(placements: dict[str, str], aid: str) -> str:
     """
     placement = placements.get(aid, "local")
     return "" if placement == "local" else f" [{placement}]"
+
 
 def spawn_run(name: str, args: dict[str, Any]) -> str:
     args = validate_tool_args(args, SPAWN_RUN_SCHEMA)

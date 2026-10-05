@@ -3983,6 +3983,55 @@ records; ties rotate. The accepted response carries `executor` and the concrete
 `instance_id`, and the MCP receipt renders `[remote:<instance>]`. A local run is
 never described as remote merely because its parent is attached to an instance.
 
+Remote placement does not keep this gateway's approval ceiling: the child runs
+under the PEER's own tool-approval policy and profile, which the originating
+gateway cannot verify. The hub narrows that with an approval floor. It works
+out the posture the same child would get locally, in the run step's order: the
+parent's own `approval_policy`, an SDK `approval_mode=auto`, this gateway's yolo,
+then the global `approval_mode=auto` only for a parent that is absent or gone.
+Anything else, including a session store it cannot read, sends
+`approval_floor: "interactive"` with the spawn, and the peer then never
+auto-approves that run's tools. That holds on every rung of the run's
+permission ladder, not only the parent's policy: the yolo and config fallbacks
+no longer make the parent `auto`, the hook gate keeps its denies but loses its
+auto-approve (`auto_approve_tools`), and the request reaches the gateway's
+approval callback marked with `approval_floor`, which skips every non-human
+shortcut there (`auto_approve_sources`, `--approval yolo/reads`, the YOLO
+override, slot trust) and leaves only the person's answer
+(`/api/spawn` accepts `""` or `"interactive"`, refuses any other value or one
+beside `approval_mode=auto`, and keeps the floor in the run's durable queue row
+so a restart cannot drop it). The floor is also recorded in the hub's mapping.
+It covers the run's tools only: whether the spawn itself needs approval on the
+peer stays the peer's policy, and an auto posture sends no floor rather than
+`approval_mode=auto`, so a crew can still be stricter than its hub.
+Version parity checks major.minor only, so a peer without this change could
+accept the run and silently drop `memory_mode` and `approval_floor`. A current
+peer's `/api/spawn` reply therefore echoes what it enforced as
+`applied: {memory_mode, approval_floor}`. When the hub sent a privacy mode or a
+floor, it requires that echo, at least as strict as what it sent; otherwise it
+cancels the peer run and refuses with `409 remote_peer_unenforced`, before any
+local mapping exists. A persistent run without a floor asks for nothing an
+older peer could drop, so it needs no echo.
+Two gates decide whether remote placement is allowed at all, and the model
+alone never does. The operator opt-in `instances.remote_subagents` (default
+`false`; `403 remote_subagents_disabled` otherwise) is the first. The policy
+capability `capabilities.remote_spawn` is the ceiling over it. Unlike other
+capabilities it is opt-in under an installed policy: the policy must name the row
+with `enabled: true`, so a policy written before the row existed does not grant
+remote placement by omission. With no policy installed the operator opt-in alone
+decides, and an evaluation error denies.
+When both permit, `/api/spawn` also runs the same spawn governance
+(`capabilities.spawn` and its agent scope) and parent-spec
+`toolsSettings.subagent.availableAgents` allowlist the local admission path
+enforces, against the effective child template and with the parent's app
+identity from its execution record (so an app profile applies), and refuses with
+`403 remote_spawn_denied` plus a `denied` SEL entry. App tokens are refused.
+An accepted remote spawn and an accepted remote cancel each write a `spawn_run`
+SEL entry (`spawned` / `cancelled`) with the local id, crew and remote id; the
+agent name is included only for a persistent run, as on the local path.
+Automatic placement considers only crews that pass the `major.minor` version
+check; a skewed crew is skipped, and is a typed `409` only when named explicitly.
+
 `dashboard/remote_subagents.py` keeps the originating gateway as control plane:
 it verifies peer version parity, posts a silent spawn through
 `SshTunnelManager.proxy_request`, polls the peer run, stores its full result
@@ -3993,31 +4042,76 @@ pending-work checks and wave/digest settlement, but never in `_agents`, local
 `_running_count`, host-memory sizing, the local reaper or the durable local task
 queue.
 
-When `include_project=true` and `cwd` is absent, the hub builds the existing
-filtered tracked-source tarball and uploads it through the authenticated SSM/SSH
-forward to `POST /api/remote-workspaces`. No Git credential is installed on the
-peer. Untracked files are excluded; dirty tracked files use the source builder's
-tracked fallback; credential-shaped tracked paths keep that builder's filtering.
-The peer verifies the full SHA-256 and installs under
-`~/workplace/kirocrew-remote-workspaces/<digest-prefix>`. Compressed size is
+When `include_project=true` and `cwd` is absent, the hub snapshots the parent
+project's tracked files and uploads the gzip tarball through the authenticated
+SSM/SSH forward to `POST /api/remote-workspaces`. A parent with no project (a channel,
+cron or CLI parent, or a chat without one) uploads nothing and the peer run gets
+no `cwd`, since `include_project` is on by default; a project that is set but
+whose directory is gone is refused with `remote_project_unavailable`. No Git
+credential is installed on the peer. The snapshot runs in the gateway, outside
+the agent sandbox, on a tree the agent can write, so it does not use the cloud
+source builder (`_snapshot_project` in `dashboard/remote_subagents.py`). Git runs
+from `trusted_git_bin()` with `hardened_git_env()` (no global or system config)
+and with the program-running repo settings pinned off on the argv
+(`core.fsmonitor`, `core.hooksPath`, `core.untrackedCache`, `core.pager`,
+`diff.external`), and only for `rev-parse HEAD` and `ls-files --stage`. The file
+bytes are read by the gateway, never by git: each tracked path is opened
+component by component with `O_NOFOLLOW` from the project's directory fd and
+must be a regular file, so a symlinked parent (`cache -> ~/.aws`) or a symlink
+leaf is skipped rather than followed. A project inside a protected directory is
+refused with `403 remote_project_protected`, and each file is checked against the
+same sensitive-path fence and the source builder's credential-name rules
+(`excluded_tracked_path` in `cloud/source.py`). Untracked files, tracked
+symlinks and submodules are excluded; dirty tracked files ship their working-tree
+content.
+The peer verifies the full SHA-256 and installs into a fresh `<digest-prefix>-<nonce>`
+directory per upload under its remote-workspace root (`_workspace_root()` in
+`dashboard/remote_workspaces.py`). Compressed size is
 limited to 64 MiB, expanded size to 512 MiB and members to 100,000. Only regular
-files and directories with relative POSIX names are accepted: absolute paths,
-traversal, backslashes, NULs, links, devices and FIFOs are rejected. Ownership is
-scrubbed, modes are normalized while executable bits survive, and reuse requires
-a marker matching the full digest. Valid marked snapshots older than seven days
-are pruned on a later upload; unsafe or unmarked directories are not deleted.
+files and directories with relative POSIX names are extracted: absolute paths,
+traversal, backslashes, NULs, hardlinks, devices and FIFOs are rejected, and
+symlink members (the hub no longer sends any; an older hub's builder did) are skipped,
+never created. The upload body is read to EOF under the compressed cap. Ownership
+is scrubbed, modes are normalized while executable bits survive (on POSIX), and
+reuse requires a marker matching the full digest and restarts the snapshot's age.
+Valid marked snapshots older than seven days are pruned on a later upload, except
+any snapshot a live or queued run on that peer works in; install and prune are
+serialized. Unsafe or unmarked directories are not deleted.
 An explicit `cwd` is already a path on the selected remote executor and suppresses
 snapshot upload.
 
 Remote mappings are owner-only files under
-`<data_home>/remote-subagents/<local-id>/`: `state.json` records local/peer IDs,
+`<data_home>/subagents/remote/<local-id>/`: `state.json` records local/peer IDs,
 placement and delivery state; `result.txt` holds the full bounded terminal text.
-Startup restores valid non-symlink records, resumes polling unfinished runs and
-re-delivers a terminal result whose `delivered` bit was not committed. Malformed
+An `incognito` or `temporary` run keeps its task and result in memory only: its
+`state.json` carries the binding with an empty task and no `result.txt` is
+written. The mapping is written BEFORE the run is registered or acknowledged; if
+that write fails the peer run is cancelled and the spawn fails with
+`507 remote_mapping_unpersisted`. Gateway startup (when `instances.enabled`)
+restores valid non-symlink records in the background, resumes polling unfinished
+runs and re-delivers a terminal result whose `delivered` bit was not committed.
+A peer that stays unreachable for 30 minutes ends the shadow run with an error
+rather than keeping its parent busy forever. Version-check and snapshot-build
+failures are typed refusals (`409`/`400`), not bare 500s. Malformed
 or redirected state fails closed. Delivered terminal records follow
 `agent.subagent_result_ttl_secs`; live and undelivered records never expire.
-Content is persisted before parent injection and the delivered bit only after a
-successful report. A process crash in the narrow interval after peer acceptance
+Content is persisted before parent injection and the delivered bit only after the
+result reached the parent: a completion parked in a wave digest or in the parent's
+slot queue stays unacknowledged, so a restart re-delivers it rather than losing it.
+A run is not marked done, and its parent hears nothing, until both `result.txt`
+and the terminal `state.json` are on disk; a failed write leaves the run live and
+the monitor re-polls the peer and retries. Dismissing a finished remote run
+records `dismissed: true` in its mapping and the panel dismissal before the record
+leaves local inventory, so a restart does not restore it; either write failing
+answers `pending` and leaves the run listed. Mapping writes for one run are
+serialized and a committed dismissal is sticky, so a delivery acknowledgement
+already in flight cannot write it back to undismissed. The records sit inside the
+`subagents/` registry because they carry the same authority (the restored parent
+session decides who may read or cancel the run and where its result lands), so
+the registry's own seal covers them: agent file-tool writes are refused, the
+sandbox mounts it read-only, and its contents stay readable. `remote` is never a
+minted run id, and every local registry walk skips a folder without its own
+`state.json`. A process crash in the narrow interval after peer acceptance
 but before the first local mapping write remains an orphan window until the peer
 spawn API has an idempotency key.
 
@@ -4030,5 +4124,5 @@ Current lifecycle boundaries are intentional:
   the concrete peer run; parent teardown gates delivery before its network await;
 - gateway shutdown stops local pollers but does not cancel peer work, allowing a
   restarted gateway to restore mappings and continue polling;
-- the authenticated peer carrier must retain the session cookie produced by the
-  one-shot link exchange; see `instances.md` §17.
+- every peer request goes through `proxy_request` and its owner credential; the
+  transport is the instance's own (`instances.md` §3, §13, §16).

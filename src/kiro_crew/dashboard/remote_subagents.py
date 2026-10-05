@@ -21,17 +21,23 @@ import math
 import os
 import re
 import subprocess
+import threading
 import time
 import uuid
+from collections.abc import Callable
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from kiro_crew.atomic_write import atomic_write
+from kiro_crew.cloud.aws import AWSError
 from kiro_crew.config.loader import data_home
 from kiro_crew.context_management import apply_completion_keep
-from kiro_crew.dashboard.remote_relay import ensure_version_parity, peer_is_connected
+from kiro_crew.dashboard.remote_relay import (
+    ensure_version_parity,
+    peer_is_connected,
+    redact_peer_text,
+)
 from kiro_crew.platform_compat import rmtree_force
-from kiro_crew.security import redact_credentials, redact_exfiltration_urls
 from kiro_crew.subagent import SubagentInfo
 
 if TYPE_CHECKING:
@@ -47,6 +53,253 @@ _POLL_SECONDS = 2.0
 _RETRY_SECONDS = 5.0
 _MAX_NOT_FOUND_POLLS = 3
 _PRUNE_INTERVAL_SECONDS = 60.0
+# A peer that stays unreachable this long ends the shadow run with an error, so
+# a deleted or dead crew cannot keep its parent busy forever.
+_UNREACHABLE_DEADLINE_SECONDS = 30 * 60.0
+
+
+# Mapping writes run on worker threads (``asyncio.to_thread``), so a per-run
+# read-merge-write needs a thread lock. A fixed stripe keeps the set bounded
+# without per-run bookkeeping; two runs sharing a stripe only serialize.
+_MAPPING_LOCKS = tuple(threading.Lock() for _ in range(32))
+
+
+def _mapping_lock(run_id: str) -> threading.Lock:
+    return _MAPPING_LOCKS[int(hashlib.sha256(run_id.encode("utf-8")).hexdigest(), 16) % 32]
+
+
+def _peer_enforces(payload: dict[str, Any], *, memory_mode: str, approval_floor: str) -> bool:
+    """Whether the peer's /api/spawn reply confirms it applied this run's tightening.
+
+    Only a tightening needs confirming: a persistent run without a floor asks the
+    peer for nothing an older peer would drop. Otherwise the reply must echo an
+    ``applied`` memory mode at least as strict as the one sent, and the floor.
+    """
+    if memory_mode in ("", "persistent") and not approval_floor:
+        return True
+    applied = payload.get("applied")
+    if not isinstance(applied, dict):
+        return False
+    from kiro_crew.messaging.privacy_mode import strictest
+
+    applied_mode = str(applied.get("memory_mode") or "")
+    if applied_mode not in ("persistent", "incognito", "temporary"):
+        return False
+    wanted = memory_mode or "persistent"
+    # strictest() ranks only the privacy modes and answers "" for persistent.
+    if (strictest((applied_mode, wanted)) or "persistent") != applied_mode:
+        return False
+    return not approval_floor or applied.get("approval_floor") == approval_floor
+
+
+class _SnapshotRefused(Exception):
+    """A project snapshot that must not be built, with the refusal to report."""
+
+    def __init__(self, message: str, *, code: str, status: int) -> None:
+        super().__init__(message)
+        self.message = message
+        self.code = code
+        self.status = status
+
+
+#: Bounds the peer enforces on install (``remote_workspaces``); refusing here
+#: avoids packaging and sending what it would reject anyway.
+_MAX_SNAPSHOT_EXPANDED_BYTES = 512 * 1024 * 1024
+_MAX_SNAPSHOT_MEMBERS = 100_000
+
+#: Settings a checkout's own ``.git/config`` can carry that make git run a
+#: program. ``-c`` outranks repo config, and global and system config are not
+#: read at all (:func:`hardened_git_env`). The two commands run here only list the
+#: index and resolve HEAD, so these cover everything either can reach.
+_GIT_NEUTRALISED_CONFIG = (
+    "core.fsmonitor=",
+    f"core.hooksPath={os.devnull}",
+    "core.untrackedCache=false",
+    "core.pager=cat",
+    "diff.external=",
+)
+
+
+def _project_git(git: str, project: Path, *args: str) -> subprocess.CompletedProcess[bytes]:
+    from kiro_crew.code_fingerprint import hardened_git_env
+
+    argv = [git, "-C", str(project)]
+    for setting in _GIT_NEUTRALISED_CONFIG:
+        argv += ["-c", setting]
+    return subprocess.run(  # noqa: S603 -- fixed argv, no shell
+        [*argv, *args],
+        check=False,
+        capture_output=True,
+        timeout=60,
+        env=hardened_git_env(GIT_OPTIONAL_LOCKS="0"),
+    )
+
+
+def _open_tracked_file(root_fd: int, rel: str) -> int | None:
+    """An fd on *rel* under *root_fd*, opened without following ANY symlink.
+
+    Each directory component is opened ``O_NOFOLLOW`` relative to the one before,
+    so a tracked path beneath a symlinked parent (``cache -> ~/.aws``) cannot
+    resolve outside the project. ``None`` when the entry is not a regular file.
+    """
+    parts = rel.split("/")
+    flags_dir = os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_DIRECTORY", 0)
+    fds: list[int] = []
+    try:
+        current = root_fd
+        for part in parts[:-1]:
+            current = os.open(part, flags_dir, dir_fd=current)
+            fds.append(current)
+        fd = os.open(parts[-1], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=current)
+    except OSError:
+        # ELOOP for a symlinked component, ENOTDIR, or a tracked file deleted
+        # in the worktree: none of them is packaged.
+        return None
+    finally:
+        for opened in fds:
+            os.close(opened)
+    import stat as _stat
+
+    if not _stat.S_ISREG(os.fstat(fd).st_mode):
+        os.close(fd)
+        return None
+    return fd
+
+
+def _snapshot_project(project: Path) -> tuple[bytes, str, str]:
+    """The parent project's tracked files as a gzip tarball, its digest and HEAD.
+
+    This runs in the gateway, outside the agent sandbox, on a tree the agent can
+    write. So git runs from a trusted binary with no global or system config and
+    with every program-running repo setting pinned off, and the files are read by
+    this process, never by git: each one is opened without following a symlink at
+    any component, must be a regular file, and is checked against the
+    sensitive-path fence and the source builder's credential-name rules. Tracked
+    symlinks and submodules are left out (the peer would skip them anyway).
+    """
+    import gzip
+    import io
+    import stat as _stat
+    import tarfile
+
+    from kiro_crew.cloud.source import custom_home_rel_parts, excluded_tracked_path
+    from kiro_crew.platform_compat import trusted_git_bin
+    from kiro_crew.security.paths import is_sensitive_resolved_path
+
+    def refused(message: str, code: str, status: int) -> _SnapshotRefused:
+        return _SnapshotRefused(message, code=code, status=status)
+
+    git = trusted_git_bin()
+    if git is None:
+        raise refused(
+            "No trusted git executable is available to snapshot the parent project.",
+            "remote_project_snapshot_failed",
+            400,
+        )
+    if is_sensitive_resolved_path(str(project)):
+        raise refused(
+            "The parent project is inside a protected directory.",
+            "remote_project_protected",
+            403,
+        )
+    head = _project_git(git, project, "rev-parse", "HEAD")
+    commit = head.stdout.decode("utf-8", "replace").strip() if head.returncode == 0 else ""
+    if not re.fullmatch(r"[a-f0-9]{40,64}", commit):
+        raise refused(
+            "The parent project does not have a verifiable Git HEAD.",
+            "remote_project_commit_unknown",
+            409,
+        )
+    listing = _project_git(git, project, "ls-files", "-z", "--stage")
+    if listing.returncode != 0:
+        raise refused(
+            "The parent project's tracked files could not be listed.",
+            "remote_project_snapshot_failed",
+            400,
+        )
+    home_parts = custom_home_rel_parts(project)
+    buffer = io.BytesIO()
+    expanded = 0
+    members = 0
+    seen: set[str] = set()
+    root_fd = os.open(str(project), os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        with gzip.GzipFile(fileobj=buffer, mode="wb", mtime=0) as gz:
+            with tarfile.open(fileobj=gz, mode="w", format=tarfile.PAX_FORMAT) as tar:
+                for entry in sorted(listing.stdout.split(b"\0")):
+                    if not entry:
+                        continue
+                    meta, _, raw_name = entry.partition(b"\t")
+                    rel = raw_name.decode("utf-8", "surrogateescape")
+                    mode = meta.split(b" ", 1)[0]
+                    if mode not in (b"100644", b"100755"):
+                        continue  # symlink (120000) or submodule (160000)
+                    if rel in seen:
+                        continue  # a conflicted path lists one entry per stage
+                    seen.add(rel)
+                    if (
+                        not rel
+                        or rel.startswith("/")
+                        or any(part in ("", ".", "..") for part in rel.split("/"))
+                        or excluded_tracked_path(rel, home_parts)
+                        # No component is a link (checked as it is opened), so
+                        # the lexical path is the canonical one.
+                        or is_sensitive_resolved_path(str(project / rel))
+                    ):
+                        continue
+                    fd = _open_tracked_file(root_fd, rel)
+                    if fd is None:
+                        continue
+                    with os.fdopen(fd, "rb") as handle:
+                        size = os.fstat(handle.fileno()).st_size
+                        expanded += size
+                        members += 1
+                        if (
+                            expanded > _MAX_SNAPSHOT_EXPANDED_BYTES
+                            or members > _MAX_SNAPSHOT_MEMBERS
+                        ):
+                            raise refused(
+                                "The tracked project snapshot is too large for remote "
+                                "execution.",
+                                "remote_project_too_large",
+                                413,
+                            )
+                        info = tarfile.TarInfo(rel)
+                        info.size = size
+                        executable = _stat.S_IMODE(os.fstat(handle.fileno()).st_mode) & 0o111
+                        info.mode = 0o755 if executable else 0o644
+                        info.mtime = 0
+                        tar.addfile(info, handle)
+                        if buffer.tell() > _MAX_WORKSPACE_ARCHIVE_BYTES:
+                            raise refused(
+                                "The tracked project snapshot is too large for remote "
+                                "execution.",
+                                "remote_project_too_large",
+                                413,
+                            )
+    finally:
+        os.close(root_fd)
+    payload = buffer.getvalue()
+    if len(payload) > _MAX_WORKSPACE_ARCHIVE_BYTES:
+        raise refused(
+            "The tracked project snapshot is too large for remote execution.",
+            "remote_project_too_large",
+            413,
+        )
+    if members == 0:
+        raise refused("The tracked project snapshot is empty.", "remote_project_empty", 400)
+    return payload, hashlib.sha256(payload).hexdigest(), commit
+
+
+def _records_root() -> Path:
+    """Where remote-placed runs keep their mappings and results.
+
+    A folder inside the local run registry, so the ``subagents`` seal covers it
+    (agent file tools may not write there, the sandbox mounts it read-only) with
+    no second protected leaf. ``remote`` is never a minted run id, which is hex,
+    and every local registry walk skips a folder without its own ``state.json``.
+    """
+    return data_home() / "subagents" / "remote"
 
 
 class RemoteSubagentError(RuntimeError):
@@ -58,10 +311,67 @@ class RemoteSubagentError(RuntimeError):
         self.status = status
 
 
-def _redact(text: object) -> str:
-    value, _ = redact_exfiltration_urls(str(text or ""))
-    value, _ = redact_credentials(value)
-    return value
+def _audit_remote(info: SubagentInfo, outcome: str) -> None:
+    """Record an accepted remote spawn or cancel in the SEL trail.
+
+    A local run logs ``outcome="spawned"`` when it starts and its cancel inside
+    the manager; a remote child leaves this gateway's approval ceiling, so its
+    placement and its stop must be just as visible. Same privacy rule as the
+    local spawn event: the agent name is recorded only for a persistent run.
+    Best-effort: the peer already holds the run, so an unloadable SEL must not
+    turn an accepted spawn into an orphan nobody can cancel.
+    """
+    metadata: dict[str, object] = {
+        "subagent_id": info.id,
+        "executor": "remote",
+        "instance_id": info.instance_id,
+        "remote_id": info.remote_id,
+    }
+    if info.memory_mode == "persistent":
+        metadata["agent"] = info.agent or "kirocrew"
+    try:
+        from kiro_crew.sel import sel
+
+        sel().log_tool_invocation(
+            session_key=info.parent_session_key or "",
+            source="subagent",
+            tool_name="spawn_run",
+            outcome=outcome,
+            metadata=metadata,
+        )
+    except Exception:
+        logger.warning("SEL audit of remote subagent %s (%s) failed", info.id, outcome)
+
+
+async def _read_reply(response: Any) -> bytes:
+    """Read a peer reply to EOF under the reply cap.
+
+    A single ``content.read(n)`` returns as soon as any bytes are buffered, so a
+    reply that arrives in more than one chunk would be parsed truncated. The
+    shared reader drains to EOF and keeps the ``len > cap`` over-cap sentinel.
+    """
+    from kiro_crew.dashboard.handlers._shared import read_capped_response
+
+    return await read_capped_response(response, _MAX_REPLY_BYTES)
+
+
+def _reached_parent(info: SubagentInfo) -> bool:
+    """True only when the completion is in the parent's context now.
+
+    ``report_external`` also returns True when the gateway parked the result in
+    a wave digest or in the parent's slot queue. Those are not delivered yet; an
+    acknowledgement there would make a restart skip a result the parent never
+    saw. The settle that later delivers it acknowledges it instead
+    (:meth:`RemoteSubagentService.acknowledge_delivered`).
+    """
+    return not (
+        getattr(info, "_digest_held", False)
+        or getattr(info, "_delivery_queued", False)
+        # The gateway gave up on the injection (a channel or cron parent whose
+        # attempts all failed) and swallowed it: the reporter still returns
+        # True, but the parent never saw the result.
+        or getattr(info, "_report_undelivered", False)
+    )
 
 
 def _state_name(status: object) -> str:
@@ -82,19 +392,74 @@ class RemoteSubagentService:
         self._restored = False
         self._last_prune = 0.0
         self._prune_lock = asyncio.Lock()
-        binder = getattr(manager, "set_external_canceller", None)
+        binder = getattr(manager, "bind_external_placement", None)
         if callable(binder):
-            binder(self.cancel)
+            binder(self)
+
+    async def dismiss(self, info: SubagentInfo) -> bool:
+        """Commit an operator dismissal of a finished run before it is forgotten."""
+        if info.executor != "remote" or not info.done:
+            return False
+        await asyncio.to_thread(self._persist_info, info, delivered=True, dismissed=True)
+        return True
+
+    async def acknowledge_delivered(self, agent_ids: list[str]) -> None:
+        """Acknowledge parked remote results the parent has now received."""
+        external = getattr(self._manager, "_external_agents", {})
+        for agent_id in agent_ids:
+            info = external.get(agent_id)
+            if info is None or info.executor != "remote" or not info.done:
+                continue
+            try:
+                await asyncio.to_thread(self._persist_info, info, delivered=True)
+            except Exception:
+                logger.warning("Could not mark remote run %s delivered", agent_id, exc_info=True)
 
     @staticmethod
     def _run_dir(run_id: str) -> Path:
         if not re.fullmatch(r"[a-f0-9]{8}", run_id):
             raise ValueError("invalid local remote-run id")
-        return data_home() / "remote-subagents" / run_id
+        return _records_root() / run_id
 
     @classmethod
-    def _persist_info(cls, info: SubagentInfo, *, delivered: bool) -> None:
+    def _persist_info(
+        cls,
+        info: SubagentInfo,
+        *,
+        delivered: bool,
+        done: bool | None = None,
+        dismissed: bool = False,
+    ) -> None:
+        """Write *info*'s mapping; *done* overrides ``info.done`` for a commit
+        that must land before the in-memory flag may flip. A *dismissed* mapping
+        is never restored and is pruned like any delivered terminal one.
+
+        Writes for one run are serialized, and a committed dismissal is sticky:
+        a delivery acknowledgement that was already in flight when the operator
+        dismissed the run must not write ``dismissed: false`` back over it."""
         run_dir = cls._run_dir(info.id)
+        with _mapping_lock(info.id):
+            if not dismissed:
+                dismissed = cls._stored_dismissed(run_dir)
+            cls._write_mapping(run_dir, info, delivered=delivered, done=done, dismissed=dismissed)
+
+    @staticmethod
+    def _stored_dismissed(run_dir: Path) -> bool:
+        try:
+            raw = json.loads((run_dir / "state.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return False
+        return isinstance(raw, dict) and raw.get("dismissed") is True
+
+    @staticmethod
+    def _write_mapping(
+        run_dir: Path,
+        info: SubagentInfo,
+        *,
+        delivered: bool,
+        done: bool | None,
+        dismissed: bool,
+    ) -> None:
         run_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
         state = {
             "version": 1,
@@ -104,11 +469,15 @@ class RemoteSubagentService:
             "instance_id": info.instance_id,
             "remote_id": info.remote_id,
             "parent_session": info.parent_session_key,
-            "task": info.task,
+            # Incognito/temporary runs keep their task and result in memory
+            # only, as the local path does; the mapping itself is still needed
+            # to recover and cancel the peer run after a restart.
+            "task": info.task if info.memory_mode == "persistent" else "",
             "agent": info.agent,
             "started": info.started,
-            "done": info.done,
+            "done": info.done if done is None else done,
             "delivered": delivered,
+            "dismissed": dismissed,
             "error": info.error,
             "stopped": info.user_stopped,
             "stop_reason": info.stop_reason,
@@ -124,6 +493,7 @@ class RemoteSubagentService:
             "include_lessons": info.include_lessons,
             "include_project": info.include_project,
             "memory_mode": info.memory_mode,
+            "approval_floor": info.approval_floor,
         }
         atomic_write(
             run_dir / "state.json",
@@ -135,7 +505,7 @@ class RemoteSubagentService:
     @classmethod
     def _prune_records(cls, ttl_secs: int, now: float) -> list[str]:
         """Remove expired delivered terminal mappings; keep all recoverable work."""
-        base = data_home() / "remote-subagents"
+        base = _records_root()
         try:
             children = tuple(base.iterdir())
         except FileNotFoundError:
@@ -179,7 +549,7 @@ class RemoteSubagentService:
 
     @classmethod
     def _load_records(cls) -> list[tuple[SubagentInfo, bool]]:
-        base = data_home() / "remote-subagents"
+        base = _records_root()
         try:
             children = tuple(base.iterdir())
         except FileNotFoundError:
@@ -189,8 +559,10 @@ class RemoteSubagentService:
             return []
         records: list[tuple[SubagentInfo, bool]] = []
         for child in children:
-            if child.is_symlink() or not child.is_dir() or not re.fullmatch(
-                r"[a-f0-9]{8}", child.name
+            if (
+                child.is_symlink()
+                or not child.is_dir()
+                or not re.fullmatch(r"[a-f0-9]{8}", child.name)
             ):
                 continue
             state_path = child / "state.json"
@@ -208,10 +580,14 @@ class RemoteSubagentService:
                 or raw.get("id") != child.name
                 or raw.get("executor") != "remote"
                 or not isinstance(raw.get("instance_id"), str)
+                or not raw["instance_id"]
                 or not isinstance(raw.get("remote_id"), str)
                 or not _REMOTE_ID_RE.fullmatch(raw["remote_id"])
             ):
                 logger.warning("Remote subagent state %s is invalid", child.name)
+                continue
+            if raw.get("dismissed") is True:
+                # Dismissed by the operator: kept on disk only until the prune.
                 continue
             memory_mode = raw.get("memory_mode", "persistent")
             if memory_mode not in ("persistent", "incognito", "temporary"):
@@ -236,10 +612,10 @@ class RemoteSubagentService:
                 continue
             info = SubagentInfo(
                 id=child.name,
-                task=_redact(raw.get("task")),
+                task=redact_peer_text(str(raw.get("task") or "")),
                 started=started,
                 done=bool(raw.get("done")),
-                error=_redact(raw.get("error")),
+                error=redact_peer_text(str(raw.get("error") or "")),
                 parent_session_key=str(raw.get("parent_session") or ""),
                 agent=str(raw.get("agent") or ""),
                 max_turns=max_turns,
@@ -259,6 +635,9 @@ class RemoteSubagentService:
                 stop_reason=str(raw.get("stop_reason") or ""),
                 stop_class=str(raw.get("stop_class") or ""),
                 partial=bool(raw.get("partial")),
+                approval_floor=(
+                    "interactive" if raw.get("approval_floor") == "interactive" else ""
+                ),
             )
             info._exec_started = info.started
             info._slot_released = True
@@ -272,7 +651,13 @@ class RemoteSubagentService:
     async def ensure_restored(self) -> None:
         """Restore mappings once, then periodically prune delivered terminals."""
         if not self._restored:
-            if self._restore_task is None:
+            if self._restore_task is None or (
+                self._restore_task.done()
+                and not self._restore_task.cancelled()
+                and self._restore_task.exception() is not None
+            ):
+                # A failed restore is retried on the next call instead of
+                # re-raising the same stored exception forever.
                 self._restore_task = asyncio.create_task(self._restore())
             await asyncio.shield(self._restore_task)
         await self._maybe_prune()
@@ -306,26 +691,42 @@ class RemoteSubagentService:
         records = await asyncio.to_thread(self._load_records)
         keep_chars = int(getattr(self._manager, "_completion_keep_chars", 0) or 0)
         keep_mode = str(getattr(self._manager, "_completion_keep", "head") or "head")
-        for info, _delivered in records:
+        restored: list[tuple[SubagentInfo, bool]] = []
+        for info, delivered in records:
             if info.result:
                 full_result = info.result
                 info.result_truncated = keep_chars > 0 and len(full_result) > keep_chars
                 info.result = apply_completion_keep(full_result, keep_mode, keep_chars)
             if self._manager.get(info.id) is None:
-                self._manager.register_external(info)
+                # One record the manager refuses must not fail the whole
+                # restore: that would leave every spawn route erroring.
+                try:
+                    self._manager.register_external(info)
+                except ValueError:
+                    logger.warning("Skipping unrestorable remote run %s", info.id, exc_info=True)
+                    continue
+            restored.append((info, delivered))
+        records = restored
         self._restored = True
-        for info, delivered in records:
+        # Live runs first: their monitors must start whatever happens to the
+        # redelivery of finished ones below.
+        for info, _delivered in records:
             if info.done:
-                if not delivered:
-                    reported = await self._manager.report_external(info)
-                    if reported:
-                        await asyncio.to_thread(self._persist_info, info, delivered=True)
                 continue
             monitor = asyncio.create_task(self._monitor(info))
             self._monitors[info.id] = monitor
-            monitor.add_done_callback(
-                lambda _task, run_id=info.id: self._monitors.pop(run_id, None)
-            )
+            monitor.add_done_callback(self._forget_monitor(info.id))
+        for info, delivered in records:
+            if not info.done or delivered:
+                continue
+            # One record's failed redelivery or acknowledgement must not strand
+            # the others; an unacknowledged one is retried on the next start.
+            try:
+                reported = await self._manager.report_external(info)
+                if reported and _reached_parent(info):
+                    await asyncio.to_thread(self._persist_info, info, delivered=True)
+            except Exception:
+                logger.warning("Could not redeliver remote run %s", info.id, exc_info=True)
 
     def _instances(self) -> Any:
         instances = getattr(self._state, "instances_manager", None)
@@ -337,7 +738,8 @@ class RemoteSubagentService:
             )
         return instances
 
-    def _choose_instance(self, requested: str) -> str:
+    def _choose_instance(self, requested: str) -> list[str]:
+        """The crews to try, in order: the requested one, else least-loaded first."""
         instances = self._instances()
         if requested:
             if not peer_is_connected(instances, requested):
@@ -346,7 +748,7 @@ class RemoteSubagentService:
                     code="remote_instance_not_connected",
                     status=409,
                 )
-            return requested
+            return [requested]
 
         try:
             statuses = instances.status_all()
@@ -375,9 +777,39 @@ class RemoteSubagentService:
         }
         least = min(active.values())
         tied = [instance_id for instance_id in candidates if active[instance_id] == least]
-        selected = tied[self._tie_cursor % len(tied)]
+        first = tied[self._tie_cursor % len(tied)]
         self._tie_cursor += 1
-        return selected
+        # Least-loaded first (the rotated tie winner leading), the rest by load:
+        # a crew that fails the version check is skipped, not fatal.
+        rest = sorted(
+            (instance_id for instance_id in candidates if instance_id != first),
+            key=lambda instance_id: (active[instance_id], instance_id),
+        )
+        return [first, *rest]
+
+    async def _select_compatible(self, requested: str) -> str:
+        """The first candidate that passes the ``major.minor`` parity check."""
+        first_error: RemoteSubagentError | None = None
+        for candidate in self._choose_instance(requested):
+            try:
+                await ensure_version_parity(self._instances(), candidate)
+                return candidate
+            except RemoteSubagentError as exc:
+                first_error = first_error or exc
+            except Exception as exc:
+                # RemoteTurnError and transport failures are not RemoteSubagentError;
+                # the HTTP handler maps only the latter, so translate here instead of
+                # letting a skewed or unreachable peer surface as a bare 500.
+                first_error = first_error or RemoteSubagentError(
+                    redact_peer_text(str(exc or "")) or "The remote crew failed the version check.",
+                    code=str(getattr(exc, "code", "") or "remote_version_mismatch"),
+                    status=409,
+                )
+        if first_error is None:  # unreachable: _choose_instance never returns []
+            raise RemoteSubagentError(
+                "No connected remote crew is available.", code="remote_pool_empty", status=409
+            )
+        raise first_error
 
     async def _request_json(
         self,
@@ -397,7 +829,7 @@ class RemoteSubagentService:
                 data=encoded,
                 content_type="application/json" if encoded is not None else "",
             ) as response:
-                raw = await response.content.read(_MAX_REPLY_BYTES + 1)
+                raw = await _read_reply(response)
                 status = int(response.status)
         except RemoteSubagentError:
             raise
@@ -426,18 +858,21 @@ class RemoteSubagentService:
             )
         return status, payload
 
-    def _parent_project(self, parent_session: str) -> Path:
+    def _parent_project(self, parent_session: str) -> Path | None:
+        """The parent's project, or ``None`` when it has none to snapshot.
+
+        A Slack, cron or CLI parent, or a project-less chat, has no project;
+        with ``include_project`` on by default that must mean "no snapshot",
+        not a refused spawn. A project that is set
+        but whose directory is gone is still refused.
+        """
         from kiro_crew.dashboard.chat_utils import dashboard_slot_key
 
         slot_name = dashboard_slot_key(parent_session)
         slot = self._state.get_slot(slot_name) if slot_name else None
         raw = getattr(slot, "project", "") if slot is not None else ""
         if not isinstance(raw, str) or not raw:
-            raise RemoteSubagentError(
-                "The parent session has no project to synchronize.",
-                code="remote_project_missing",
-                status=409,
-            )
+            return None
         project = Path(raw).expanduser().resolve()
         if not project.is_dir():
             raise RemoteSubagentError(
@@ -449,51 +884,29 @@ class RemoteSubagentService:
 
     @staticmethod
     def _build_project_archive(project: Path) -> tuple[bytes, str, str]:
-        from kiro_crew.cloud.source import build_source_tarball
-
-        archive = build_source_tarball(project)
         try:
-            if archive.stat().st_size > _MAX_WORKSPACE_ARCHIVE_BYTES:
-                raise RemoteSubagentError(
-                    "The tracked project snapshot is too large for remote execution.",
-                    code="remote_project_too_large",
-                    status=413,
-                )
-            payload = archive.read_bytes()
-            if not payload:
-                raise RemoteSubagentError(
-                    "The tracked project snapshot is empty.",
-                    code="remote_project_empty",
-                    status=400,
-                )
-            env = dict(os.environ)
-            env["GIT_OPTIONAL_LOCKS"] = "0"
-            completed = subprocess.run(  # noqa: S603 -- fixed argv, no shell
-                ["git", "-C", str(project), "rev-parse", "HEAD"],
-                check=False,
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                timeout=30,
-                env=env,
-            )
-            commit = completed.stdout.strip() if completed.returncode == 0 else ""
-            if not re.fullmatch(r"[a-f0-9]{40,64}", commit):
-                raise RemoteSubagentError(
-                    "The parent project does not have a verifiable Git HEAD.",
-                    code="remote_project_commit_unknown",
-                    status=409,
-                )
-            return payload, hashlib.sha256(payload).hexdigest(), commit
-        finally:
-            archive.unlink(missing_ok=True)
+            return _snapshot_project(project)
+        except _SnapshotRefused as exc:
+            raise RemoteSubagentError(exc.message, code=exc.code, status=exc.status) from None
 
     async def _sync_parent_project(self, instance_id: str, parent_session: str) -> str:
         project = self._parent_project(parent_session)
-        payload, digest, commit = await asyncio.to_thread(
-            self._build_project_archive, project
-        )
+        if project is None:
+            return ""
+        try:
+            payload, digest, commit = await asyncio.to_thread(self._build_project_archive, project)
+        except RemoteSubagentError:
+            raise
+        except (OSError, subprocess.SubprocessError, ValueError, AWSError) as exc:
+            # build_source_tarball raises its own errors (AWSError for a missing
+            # checkout or a git/tar failure, OSError, timeouts); report them as a
+            # refusable 400, not a bare 500.
+            logger.info("Remote project snapshot failed (%s)", type(exc).__name__)
+            raise RemoteSubagentError(
+                "The parent project could not be packaged for remote execution.",
+                code="remote_project_snapshot_failed",
+                status=400,
+            ) from None
         instances = self._instances()
         try:
             async with instances.proxy_request(
@@ -504,7 +917,7 @@ class RemoteSubagentService:
                 data=payload,
                 content_type="application/gzip",
             ) as response:
-                raw = await response.content.read(_MAX_REPLY_BYTES + 1)
+                raw = await _read_reply(response)
                 status = int(response.status)
         except Exception as exc:
             code = str(getattr(exc, "code", "") or "remote_workspace_unreachable")
@@ -527,7 +940,7 @@ class RemoteSubagentService:
             response_body = {}
         if not 200 <= status < 300:
             raise RemoteSubagentError(
-                _redact(response_body.get("error"))
+                redact_peer_text(str(response_body.get("error") or ""))
                 or f"The remote crew refused the project snapshot (HTTP {status}).",
                 code=str(response_body.get("code") or "remote_workspace_refused"),
                 status=status,
@@ -557,6 +970,7 @@ class RemoteSubagentService:
         batch_id: str,
         batch_total: int,
         instance_id: str = "",
+        approval_mode: str = "",
     ) -> SubagentInfo:
         await self.ensure_restored()
         if self._closed:
@@ -565,8 +979,7 @@ class RemoteSubagentService:
                 code="remote_executor_stopping",
                 status=503,
             )
-        selected = self._choose_instance(instance_id)
-        await ensure_version_parity(self._instances(), selected)
+        selected = await self._select_compatible(instance_id)
         remote_cwd = cwd
         if include_project and not remote_cwd:
             remote_cwd = await self._sync_parent_project(selected, parent_session)
@@ -590,11 +1003,15 @@ class RemoteSubagentService:
             peer_body["model"] = model
         if reasoning_effort:
             peer_body["reasoning_effort"] = reasoning_effort
+        approval_floor = self._approval_floor(parent_session, approval_mode)
+        if approval_floor:
+            peer_body["approval_floor"] = approval_floor
 
         status, payload = await self._request_json(selected, "POST", "api/spawn", body=peer_body)
         if not 200 <= status < 300:
             raise RemoteSubagentError(
-                _redact(payload.get("error")) or f"The remote crew refused the run (HTTP {status}).",
+                redact_peer_text(str(payload.get("error") or ""))
+                or f"The remote crew refused the run (HTTP {status}).",
                 code=str(payload.get("code") or "remote_spawn_refused"),
                 status=status,
             )
@@ -604,11 +1021,30 @@ class RemoteSubagentService:
                 "The remote crew accepted the run but returned an invalid identifier.",
                 code="remote_run_id_invalid",
             )
+        if not _peer_enforces(payload, memory_mode=memory_mode, approval_floor=approval_floor):
+            # Version parity is major.minor only, so a peer without this change
+            # can accept the run while ignoring the fields that tighten it. Stop
+            # the peer run before refusing; it never gets a local mapping.
+            try:
+                await self._request_json(selected, "DELETE", f"api/spawn/{remote_id}")
+            except Exception:
+                logger.warning(
+                    "Could not cancel unenforced remote run %s on %s",
+                    remote_id,
+                    selected,
+                    exc_info=True,
+                )
+            raise RemoteSubagentError(
+                "The remote crew did not confirm it enforces this run's memory mode "
+                "and approval floor; update it to this gateway's version.",
+                code="remote_peer_unenforced",
+                status=409,
+            )
 
         local_id = uuid.uuid4().hex[:8]
         info = SubagentInfo(
             id=local_id,
-            task=_redact(task),
+            task=redact_peer_text(str(task or "")),
             parent_session_key=parent_session,
             agent=agent,
             max_turns=max_turns,
@@ -624,14 +1060,30 @@ class RemoteSubagentService:
             executor="remote",
             instance_id=selected,
             remote_id=remote_id,
+            approval_floor=approval_floor,
         )
         info._exec_started = info.started
         info._slot_released = True
-        self._manager.register_external(info)
+        # Persist before publish: without the mapping on disk a restart can
+        # neither recover nor cancel the peer run, so a failed write must not
+        # produce a successful receipt. Stop the orphan on the peer instead.
         try:
             await asyncio.to_thread(self._persist_info, info, delivered=False)
         except Exception:
             logger.warning("Could not persist remote subagent mapping %s", info.id, exc_info=True)
+            try:
+                await self.cancel(info)
+            except Exception:
+                logger.warning(
+                    "Could not cancel unrecorded remote run %s on %s", remote_id, selected
+                )
+            raise RemoteSubagentError(
+                "The remote run could not be recorded locally and was cancelled on its crew.",
+                code="remote_mapping_unpersisted",
+                status=507,
+            ) from None
+        self._manager.register_external(info)
+        _audit_remote(info, "spawned")
         await self._manager._fire_event(
             "subagent_spawn",
             info,
@@ -639,7 +1091,7 @@ class RemoteSubagentService:
                 "task": info.task,
                 "agent": agent,
                 "model": "",
-                "requested_model": _redact(model),
+                "requested_model": redact_peer_text(str(model or "")),
                 "child_session": f"remote:{selected}:{remote_id}",
                 "executor": "remote",
                 "instance_id": selected,
@@ -647,36 +1099,88 @@ class RemoteSubagentService:
         )
         monitor = asyncio.create_task(self._monitor(info))
         self._monitors[local_id] = monitor
-        monitor.add_done_callback(lambda _task, run_id=local_id: self._monitors.pop(run_id, None))
+        monitor.add_done_callback(self._forget_monitor(local_id))
         return info
+
+    def _approval_floor(self, parent_session: str, approval_mode: str) -> str:
+        """The approval floor a remote child carries: ``""`` or ``"interactive"``.
+
+        A remote child runs under its crew's own approval policy, which may be
+        looser than this gateway's. So the crew is told the posture the same
+        child would get here, and applies the stricter of the two. The chain
+        mirrors the local run step: the parent's own policy, an explicit
+        ``approval_mode=auto`` from the SDK, this gateway's yolo, then the
+        global ``approval_mode=auto`` only for a parent that is absent or gone.
+        Anything else, including a failure to read the posture, is
+        ``"interactive"``: an unreadable posture must not loosen the child.
+        """
+        try:
+            sessions = self._manager._sessions
+            if sessions.get_approval_policy(parent_session) == "auto":
+                return ""
+            if approval_mode == "auto":
+                return ""
+            is_yolo = getattr(self._manager, "_is_yolo", None)
+            if is_yolo is not None and is_yolo():
+                return ""
+            if getattr(self._manager, "_global_approval_mode", "") == "auto" and (
+                not parent_session or sessions.has_session(parent_session) is False
+            ):
+                return ""
+        except Exception:
+            logger.warning("Could not read the approval posture for a remote spawn", exc_info=True)
+        return "interactive"
+
+    def _forget_monitor(self, run_id: str) -> Callable[[asyncio.Task[None]], None]:
+        """A done-callback that drops *run_id*'s monitor task once it finishes."""
+
+        def _done(_task: asyncio.Task[None]) -> None:
+            self._monitors.pop(run_id, None)
+
+        return _done
 
     async def _monitor(self, info: SubagentInfo) -> None:
         missing = 0
+        unreachable_since = 0.0
         while not self._closed and not info.done:
             try:
                 status, payload = await self._request_json(
                     info.instance_id, "GET", f"api/spawn/{info.remote_id}"
                 )
             except RemoteSubagentError:
+                status, payload = 0, {}
+            if not 200 <= status < 300 and status != 404:
+                now = time.monotonic()
+                unreachable_since = unreachable_since or now
+                if now - unreachable_since >= _UNREACHABLE_DEADLINE_SECONDS:
+                    if await self._finish(
+                        info,
+                        {
+                            "error": "The remote crew stayed unreachable; the run's "
+                            "outcome is unknown.",
+                            "done": True,
+                        },
+                    ):
+                        return
                 await asyncio.sleep(_RETRY_SECONDS)
                 continue
+            unreachable_since = 0.0
             if status == 404:
                 missing += 1
                 if missing < _MAX_NOT_FOUND_POLLS:
                     await asyncio.sleep(_POLL_SECONDS)
                     continue
-                await self._finish(
+                if await self._finish(
                     info,
                     {
                         "error": "The remote run is no longer available on its crew.",
                         "done": True,
                     },
-                )
-                return
-            missing = 0
-            if not 200 <= status < 300:
+                ):
+                    return
                 await asyncio.sleep(_RETRY_SECONDS)
                 continue
+            missing = 0
             raw_turns = payload.get("turns")
             try:
                 info.turns = max(
@@ -685,52 +1189,75 @@ class RemoteSubagentService:
                 )
             except (TypeError, ValueError):
                 pass
-            info.last_tool = _redact(payload.get("last_tool"))
+            info.last_tool = redact_peer_text(str(payload.get("last_tool") or ""))
             if payload.get("done") is True:
-                await self._finish(info, payload)
-                return
+                if await self._finish(info, payload):
+                    return
+                # Not committed locally: poll the peer again and retry.
+                await asyncio.sleep(_RETRY_SECONDS)
+                continue
             await asyncio.sleep(_POLL_SECONDS)
 
-    async def _finish(self, info: SubagentInfo, payload: dict[str, object]) -> None:
-        full_result = _redact(payload.get("result")) or "_No response._"
-        info.error = _redact(payload.get("error"))
+    async def _finish(self, info: SubagentInfo, payload: dict[str, object]) -> bool:
+        """Commit the run's terminal record, then publish it; True once committed.
+
+        Persist before publish: the result file (persistent runs) and the
+        ``done`` mapping must both be on disk before ``info.done`` flips or the
+        parent hears about the run. A failed write leaves the run not done and
+        returns False, so the monitor polls the peer again and retries, rather
+        than reporting a completion that a restart would contradict or a result
+        this gateway could not keep.
+        """
+        full_result = redact_peer_text(str(payload.get("result") or "")) or "_No response._"
+        info.error = redact_peer_text(str(payload.get("error") or ""))
         info.user_stopped = info.user_stopped or bool(payload.get("stopped"))
-        info.stop_reason = _redact(payload.get("stop_reason"))
-        info.stop_class = _redact(payload.get("stop_class"))
+        info.stop_reason = redact_peer_text(str(payload.get("stop_reason") or ""))
+        info.stop_class = redact_peer_text(str(payload.get("stop_class") or ""))
         info.partial = bool(payload.get("partial"))
         info.elapsed = max(0.0, time.time() - info.started)
 
-        try:
-            result_dir = data_home() / "remote-subagents" / info.id
-            await asyncio.to_thread(result_dir.mkdir, parents=True, exist_ok=True, mode=0o700)
-            result_path = result_dir / "result.txt"
-            await asyncio.to_thread(
-                atomic_write,
-                result_path,
-                full_result,
-                fsync=True,
-                restrict_to_owner=True,
-            )
-            info.result_path = str(result_path)
-        except Exception:
-            logger.warning("Could not persist remote subagent result %s", info.id, exc_info=True)
-            info.result_path = ""
+        # Incognito/temporary runs keep the result in memory only.
+        info.result_path = ""
+        if info.memory_mode == "persistent":
+            try:
+                result_dir = _records_root() / info.id
+                await asyncio.to_thread(result_dir.mkdir, parents=True, exist_ok=True, mode=0o700)
+                result_path = result_dir / "result.txt"
+                await asyncio.to_thread(
+                    atomic_write,
+                    result_path,
+                    full_result,
+                    fsync=True,
+                    restrict_to_owner=True,
+                )
+                info.result_path = str(result_path)
+            except Exception:
+                logger.warning(
+                    "Could not persist remote subagent result %s; retrying",
+                    info.id,
+                    exc_info=True,
+                )
+                return False
 
         keep_chars = int(getattr(self._manager, "_completion_keep_chars", 0) or 0)
         keep_mode = str(getattr(self._manager, "_completion_keep", "head") or "head")
         info.result_truncated = keep_chars > 0 and len(full_result) > keep_chars
         info.result = apply_completion_keep(full_result, keep_mode, keep_chars)
-        info.done = True
         try:
-            await asyncio.to_thread(self._persist_info, info, delivered=False)
+            await asyncio.to_thread(self._persist_info, info, delivered=False, done=True)
         except Exception:
-            logger.warning("Could not persist terminal remote run %s", info.id, exc_info=True)
+            logger.warning(
+                "Could not persist terminal remote run %s; retrying", info.id, exc_info=True
+            )
+            return False
+        info.done = True
         reported = await self._manager.report_external(info)
-        if reported:
+        if reported and _reached_parent(info):
             try:
                 await asyncio.to_thread(self._persist_info, info, delivered=True)
             except Exception:
                 logger.warning("Could not mark remote run %s delivered", info.id, exc_info=True)
+        return True
 
     async def cancel(self, info: SubagentInfo) -> bool:
         if info.executor != "remote" or not info.instance_id or not info.remote_id:
@@ -740,13 +1267,15 @@ class RemoteSubagentService:
         )
         if not 200 <= status < 300:
             raise RemoteSubagentError(
-                _redact(payload.get("error")) or f"The remote crew refused cancellation (HTTP {status}).",
+                redact_peer_text(str(payload.get("error") or ""))
+                or f"The remote crew refused cancellation (HTTP {status}).",
                 code=str(payload.get("code") or "remote_cancel_refused"),
                 status=status,
             )
         cancelled = bool(payload.get("cancelled", True))
         if cancelled:
             info.user_stopped = True
+            _audit_remote(info, "cancelled")
         return cancelled
 
     async def close(self) -> None:
@@ -760,7 +1289,7 @@ class RemoteSubagentService:
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
         self._monitors.clear()
-        binder = getattr(self._manager, "set_external_canceller", None)
+        binder = getattr(self._manager, "bind_external_placement", None)
         if callable(binder):
             binder(None)
 

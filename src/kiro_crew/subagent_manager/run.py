@@ -22,6 +22,7 @@ from ..tool_permission import (
     Ask,
     CallbackResponder,
     ChildRule,
+    DenyOnlyGate,
     HookGate,
     Narrator,
     ParentPolicyAuto,
@@ -1918,6 +1919,16 @@ class RunEventCoordinator(ManagerComponent):
         manager = self._manager
         rows = SubagentRows(info.id)
         prompt = _ApprovalPrompt(self, info)
+        # An interactive floor from a remote hub outranks every auto-grant on this
+        # gateway, not just the parent's policy: the hook gate keeps its denies
+        # but loses its grant, and each responder is told so it skips its own
+        # non-human shortcuts (per-source auto-approve, yolo, slot trust).
+        floored = info.approval_floor == "interactive"
+
+        def _mark(event: LLMEvent) -> LLMEvent:
+            if floored:
+                event.approval_floor = "interactive"
+            return event
 
         # Each approver is asked only while its responder reports it attached.
         def _factory_approver() -> Callable[[LLMEvent], Awaitable[object]]:
@@ -1925,11 +1936,12 @@ class RunEventCoordinator(ManagerComponent):
                 "Callable[[SubagentInfo], Callable[[LLMEvent], Awaitable[bool]]]",
                 manager._on_tool_approval_factory,
             )
-            return factory(info)
+            approve = factory(info)
+            return lambda event: approve(_mark(event))
 
         def _ask_parent(event: LLMEvent) -> Awaitable[object]:
             approve = cast("ToolApprovalCallback", manager._on_tool_approval)
-            return approve(event, info.parent_session_key)
+            return approve(_mark(event), info.parent_session_key)
 
         def _ask_for_child(event: LLMEvent) -> Awaitable[object]:
             if manager._on_tool_approval_factory:
@@ -1937,7 +1949,7 @@ class RunEventCoordinator(ManagerComponent):
             return _ask_parent(event)
 
         return Policy(
-            gate=HookGate(consult),
+            gate=DenyOnlyGate(HookGate(consult)) if floored else HookGate(consult),
             audit=SelAudit(rows, on_refusal_failure="answer", sel=sel, log=log),
             otherwise=Refusal.host("headless", _HEADLESS_DENY_REASON, DENY_CAUSE_SURFACE_POLICY),
             floors=(
@@ -2155,6 +2167,18 @@ class RunEventCoordinator(ManagerComponent):
                     source="subagent",
                     resources=f"subagent_id={info.id}",
                 )
+        if info.approval_floor == "interactive" and parent_policy == "auto":
+            # The spawner's floor outranks every local auto fallback above: a
+            # remote hub whose parent is not auto keeps this run's tools
+            # behind approval even on a gateway that would auto-approve them.
+            parent_policy = ""
+            sel().log_api_access(
+                caller=f"subagent:{info.id}",
+                operation="subagent.approval_floor_applied",
+                outcome="ok",
+                source="subagent",
+                resources=f"subagent_id={info.id}",
+            )
         # Admission captured both memory identity and this invocation's persona
         # before any asynchronous work. A continuation's explicit override is
         # effective only for this turn; its next continuation keeps its lineage.
