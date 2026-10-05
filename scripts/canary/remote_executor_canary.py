@@ -709,47 +709,74 @@ def run_scenarios(
     evidence.record(connect_result)
 
     # -- a) upload -----------------------------------------------------
+    # The snapshot upload is the HUB's job: a remote spawn with
+    # include_project=True makes the parent tar its slot project and POST it
+    # through the tunnel to the crew's /api/remote-workspaces with the
+    # credential proxy_request mints. Driving it this way tests the real path;
+    # a hand-made POST from this script is not a credential the hub ever uses.
     r = ScenarioResult("upload", False, "not run", started=time.monotonic())
     try:
-        import hashlib
-        import io
-        import tarfile
+        project = canary_home / "canary-project"
+        project.mkdir(parents=True, exist_ok=True)
+        (project / "README.md").write_text("canary project snapshot\n", encoding="utf-8")
+        git = ["git", "-C", str(project), "-c", "user.email=canary@example.invalid",
+               "-c", "user.name=canary", "-c", "commit.gpgsign=false"]
+        subprocess.run(["git", "init", "-q", str(project)], check=True)
+        subprocess.run([*git, "add", "README.md"], check=True)
+        subprocess.run([*git, "commit", "-q", "-m", "canary snapshot"], check=True)
 
-        buf = io.BytesIO()
-        with tarfile.open(fileobj=buf, mode="w:gz") as tf:
-            info = tarfile.TarInfo(name="canary-snapshot.txt")
-            data = b"canary snapshot placeholder\n"
-            info.size = len(data)
-            tf.addfile(info, io.BytesIO(data))
-        payload = buf.getvalue()
-        digest = hashlib.sha256(payload).hexdigest()
-        commit = "0" * 40
-
-        # The receiving end of a snapshot is the CREW: the parent's own
-        # _sync_parent_project proxies this POST to the peer with
-        # content_type application/gzip. Round 3 aimed it at the parent with
-        # urllib's default form content type and got a bare 500.
-        # The hub never puts the crew's token in the query: proxy_request sends
-        # it as the port-scoped ``mc_token_<port>`` cookie. Round 6 used
-        # ``?token=`` and the mixed route refused it 403.
-        req = urllib.request.Request(
-            f"http://localhost:{peer.port}/api/remote-workspaces?sha256={digest}&commit={commit}",
-            data=payload,
-            method="POST",
-            headers={"Content-Type": "application/gzip", **peer_cookie(peer)},
+        status_p, body_p = _http(
+            "POST",
+            owner_url(parent, f"/api/chat/slots/{session.session_key.split(':', 1)[-1]}/project"),
+            body={"project": str(project)},
         )
-        try:
-            with urllib.request.urlopen(req, timeout=30.0) as resp:
-                status = resp.status
-                body = json.loads(resp.read().decode("utf-8"))
-        except urllib.error.HTTPError as exc:
-            status = exc.code
-            body = exc.read().decode("utf-8", "replace")
-        r.evidence = {"status": status, "body": body if isinstance(body, dict) else str(body)[:300]}
-        r.passed = status == 200 and isinstance(body, dict) and bool(body.get("path"))
-        r.detail = f"POST /api/remote-workspaces -> {status}"
+        status_u, body_u = _http(
+            "POST",
+            owner_url(parent, "/api/spawn"),
+            headers=internal_headers(parent, session),
+            body={
+                "task": "say pong",
+                "executor": "remote",
+                "instance_id": instance_id,
+                "parent_session": session.session_key,
+                "include_memory": False,
+                "include_lessons": False,
+                "include_project": True,
+            },
+            timeout=60.0,
+        )
+        upload_run_id = str(body_u.get("id") or "") if isinstance(body_u, dict) else ""
+        final = (
+            wait_for_remote_spawn_terminal(parent, upload_run_id, timeout=SPAWN_TIMEOUT_SECS,
+                                           headers=internal_headers(parent, session))
+            if upload_run_id else {}
+        )
+        import pwd
+
+        roots = {Path(peer.home), canary_home, Path.home(), Path(pwd.getpwuid(os.getuid()).pw_dir)}
+        installed = sorted(
+            str(m.parent.name)
+            for root in roots
+            for m in (root / "workplace" / "kirocrew-remote-workspaces").glob(
+                "*/.kirocrew-remote-workspace.json"
+            )
+        )
+        r.evidence = {
+            "set_project_status": status_p,
+            "spawn_status": status_u,
+            "spawn_body": body_u if isinstance(body_u, dict) else str(body_u)[:300],
+            "final": final,
+            "installed_snapshots": installed,
+        }
+        r.passed = bool(upload_run_id) and bool(final.get("done")) and not final.get("error") \
+            and bool(installed)
+        r.detail = (
+            f"project-synced spawn -> {status_u}, done={final.get('done')}, "
+            f"snapshots installed on the crew={len(installed)}"
+        )
         if not r.passed:
-            r.evidence["gateway_tail"] = gateway_tail(peer)
+            r.evidence["parent_tail"] = gateway_tail(parent)
+            r.evidence["peer_tail"] = gateway_tail(peer)
     except Exception as exc:
         r.detail = f"{type(exc).__name__}: {exc}"
     r.ended = time.monotonic()
