@@ -52,6 +52,7 @@ from __future__ import annotations
 import contextlib
 import json
 import os
+import re
 import socket
 import subprocess
 import sys
@@ -323,6 +324,14 @@ def _http(
     return status, parsed
 
 
+PEER_LISTING_STATUS: list[int] = []
+
+
+def peer_cookie(handle: GatewayHandle) -> dict[str, str]:
+    """The credential shape proxy_request uses: a port-scoped session cookie."""
+    return {"Cookie": f"mc_token_{handle.port}={handle.token}"}
+
+
 def owner_url(handle: GatewayHandle, path: str) -> str:
     sep = "&" if "?" in path else "?"
     return f"http://localhost:{handle.port}{path}{sep}token={handle.token}"
@@ -433,9 +442,22 @@ def gateway_tail(handle: GatewayHandle, limit: int = 3000) -> str:
     the traceback only ever lives in the child's own output.
     """
     try:
-        return handle.diagnostics()[-limit:]
+        text = handle.diagnostics()[-limit:]
     except Exception as exc:  # diagnostics is best-effort evidence, never fatal
-        return f"<diagnostics unavailable: {type(exc).__name__}: {exc}>"
+        text = f"<diagnostics unavailable: {type(exc).__name__}: {exc}>"
+    # The auth middleware writes its refusal REASON only to the SEL, never to
+    # stdout, so a bare 403 needs these lines to be diagnosable.
+    denied: list[str] = []
+    sel = handle.home / "security_events.jsonl"
+    with contextlib.suppress(OSError, ValueError):
+        for line in sel.read_text(encoding="utf-8").splitlines()[-400:]:
+            row = json.loads(line)
+            if row.get("outcome") == "denied":
+                denied.append(f"{row.get('operation')} {row.get('resources')} -> {row.get('error')}")
+    if denied:
+        text += "\n--- SEL denials (last) ---\n" + "\n".join(denied[-15:])
+    # Never publish a gateway token, even a throwaway one, in a public artifact.
+    return re.sub(r"token=[A-Za-z0-9._\-]+", "token=<redacted>", text)
 
 
 def add_and_connect_peer(parent: GatewayHandle, *, name: str, remote_port: int,
@@ -515,11 +537,14 @@ def write_ssh_client_config(ssh_dir: Path, *, host_alias: str, port: int,
     return config_path
 
 
-def wait_for_remote_spawn_terminal(handle: GatewayHandle, run_id: str, *, timeout: float) -> dict[str, Any]:
+def wait_for_remote_spawn_terminal(handle: GatewayHandle, run_id: str, *, timeout: float,
+                                   headers: Optional[dict[str, str]] = None) -> dict[str, Any]:
+    # /api/spawn is a MIXED route: an owner ?token= alone is refused 403 on
+    # loopback (round 6), so poll with the same credential the POST used.
     deadline = time.monotonic() + timeout
     last: dict[str, Any] = {}
     while time.monotonic() < deadline:
-        status, body = _http("GET", owner_url(handle, f"/api/spawn/{run_id}"))
+        status, body = _http("GET", owner_url(handle, f"/api/spawn/{run_id}"), headers=headers)
         if status == 200 and isinstance(body, dict):
             last = body
             if body.get("done"):
@@ -529,7 +554,15 @@ def wait_for_remote_spawn_terminal(handle: GatewayHandle, run_id: str, *, timeou
 
 
 def peer_listing_has_run(peer_handle: GatewayHandle) -> list[dict[str, Any]]:
-    status, body = _http("GET", owner_url(peer_handle, "/api/spawn"))
+    # Same mixed-route rule as the parent: the owner ?token= alone gets 403,
+    # so present the peer's own internal secret (loopback, same host).
+    status, body = _http("GET", f"http://localhost:{peer_handle.port}/api/spawn",
+                         headers=peer_cookie(peer_handle))
+    PEER_LISTING_STATUS.append(status)
+    if status != 200:
+        status, body = _http("GET", owner_url(peer_handle, "/api/spawn"),
+                             headers=internal_headers(peer_handle))
+        PEER_LISTING_STATUS.append(status)
     if status != 200 or not isinstance(body, dict):
         return []
     rows = body.get("agents") or body.get("items") or body.get("rows") or []
@@ -696,11 +729,14 @@ def run_scenarios(
         # _sync_parent_project proxies this POST to the peer with
         # content_type application/gzip. Round 3 aimed it at the parent with
         # urllib's default form content type and got a bare 500.
+        # The hub never puts the crew's token in the query: proxy_request sends
+        # it as the port-scoped ``mc_token_<port>`` cookie. Round 6 used
+        # ``?token=`` and the mixed route refused it 403.
         req = urllib.request.Request(
-            owner_url(peer, f"/api/remote-workspaces?sha256={digest}&commit={commit}"),
+            f"http://localhost:{peer.port}/api/remote-workspaces?sha256={digest}&commit={commit}",
             data=payload,
             method="POST",
-            headers={"Content-Type": "application/gzip"},
+            headers={"Content-Type": "application/gzip", **peer_cookie(peer)},
         )
         try:
             with urllib.request.urlopen(req, timeout=30.0) as resp:
@@ -757,7 +793,12 @@ def run_scenarios(
                     break
                 time.sleep(POLL_SECONDS)
             r.evidence = {"parent_spawn_status": status, "run_id": run_id,
-                          "peer_rows": len(peer_rows)}
+                          "peer_rows": len(peer_rows),
+                          "peer_listing_statuses": sorted(set(PEER_LISTING_STATUS))}
+            _ps, parent_view = _http("GET", owner_url(parent, f"/api/spawn/{run_id}"), headers=headers)
+            r.evidence["parent_view"] = parent_view if isinstance(parent_view, dict) else str(parent_view)[:300]
+            if not found:
+                r.evidence["peer_tail"] = gateway_tail(peer)
             r.passed = found
             r.detail = (
                 f"peer /api/spawn shows {len(peer_rows)} row(s)" if found
@@ -779,7 +820,9 @@ def run_scenarios(
             )
             time.sleep(POLL_SECONDS * 2)
             peer_rows_after = peer_listing_has_run(peer)
-            parent_status, parent_body = _http("GET", owner_url(parent, f"/api/spawn/{run_id}"))
+            parent_status, parent_body = _http(
+                "GET", owner_url(parent, f"/api/spawn/{run_id}"), headers=headers
+            )
             r.evidence = {
                 "delete_status": status_c,
                 "delete_body": body_c if isinstance(body_c, dict) else str(body_c)[:300],
@@ -817,7 +860,9 @@ def run_scenarios(
         if not complete_run_id:
             r.detail = f"POST /api/spawn did not return an id (status {status_s}): {body_s!r}"[:500]
         else:
-            final = wait_for_remote_spawn_terminal(parent, complete_run_id, timeout=SPAWN_TIMEOUT_SECS)
+            final = wait_for_remote_spawn_terminal(
+                parent, complete_run_id, timeout=SPAWN_TIMEOUT_SECS, headers=headers
+            )
             r.evidence = {"run_id": complete_run_id, "final": final}
             r.passed = bool(final.get("done")) and fake_acp_backend.REPLY_TEXT in str(
                 final.get("result", "")
