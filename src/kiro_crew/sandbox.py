@@ -534,6 +534,10 @@ _CREW_READONLY_LEAVES: tuple[str, ...] = (
     # The second root holds the same authority for retained V1 runs only.
     "subagents",
     "member-memory-bindings",
+    # Remote-placed runs' mappings: the parent session a restart restores, and so
+    # which session may read or cancel the run and receives its result. Same
+    # authority as ``subagents``; the gateway is the only writer.
+    "remote-subagents",
     # Built-in named-store writes run in the gateway. Keep arbitrary sandboxed
     # code from rewriting that learning authority while allowing reads; this
     # ordinary sandbox rule is not a cross-member confidentiality boundary.
@@ -940,6 +944,9 @@ _CREW_CHILD_READABLE_LEAVES: tuple[str, ...] = (
     # effect: this leaf is not on the read-gate floor, so the mask never covers it and
     # neither classification changes what any child can open.
     "subagents",
+    # Remote-placed runs' mappings, on the same terms as ``subagents`` above: a
+    # rewritten parent session is the risk, the read-only seal is the answer.
+    "remote-subagents",
     # The decision log. Same shape as the entry above, and for the reason this module
     # gives it: read stays open on purpose, every legitimate writer is the gateway
     # outside the sandbox, and nothing writes a decision row from inside one. Also off
@@ -1431,6 +1438,7 @@ _CREW_PRECREATE_READONLY_DIR_LEAVES: tuple[str, ...] = (
     # gateway records without letting a sandbox create the missing root.
     "subagents",
     "member-memory-bindings",
+    "remote-subagents",
     "memory_stores",
     "profiles",
     # The crew webview template directory. A fence only fences an EXISTING path:
@@ -1473,6 +1481,7 @@ _CREW_NOFOLLOW_READONLY_DIR_LEAVES: tuple[str, ...] = (
     "playwright-cli",
     "subagents",
     "member-memory-bindings",
+    "remote-subagents",
     "decisions",
     "redaction-allow",
     "pi-gate",
@@ -1520,6 +1529,11 @@ _DELEGATED_OVERLAP_LEAF_REASONS: "dict[str, tuple[str, str]]" = {
         "sealed run records",
         "the agent could rewrite the app owner a retained V1 run restores its "
         "authorization from",
+    ),
+    "remote-subagents": (
+        "sealed run records",
+        "the agent could rewrite the parent session a remote run restores, and so "
+        "who may read or cancel it and where its result is delivered",
     ),
     # Sealing the seam that turns the feature on without sealing the record it writes
     # would be half a control: appending one feedback row is enough to put a verdict

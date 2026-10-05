@@ -156,7 +156,7 @@ def _written_plan(argv: list[str]) -> dict:
 
 
 @_POSIX_ONLY
-@pytest.mark.parametrize("leaf", ("subagents", "member-memory-bindings"))
+@pytest.mark.parametrize("leaf", ("subagents", "member-memory-bindings", "remote-subagents"))
 def test_run_authority_root_is_sealed_before_its_first_record(
     crew_home, tmp_path, monkeypatch, leaf
 ):
@@ -2601,7 +2601,9 @@ class TestADanglingSymlinkRefusesTheSpawn:
 
 @_POSIX_ONLY
 class TestGatewayLauncherDirectoryNeedsARealLeaf:
-    @pytest.mark.parametrize("leaf", ("playwright-cli", "subagents", "member-memory-bindings"))
+    @pytest.mark.parametrize(
+        "leaf", ("playwright-cli", "subagents", "member-memory-bindings", "remote-subagents")
+    )
     def test_a_resolving_symlink_refuses_the_spawn(self, crew_home, tmp_path, leaf):
         real = tmp_path / "attacker-controlled"
         real.mkdir()

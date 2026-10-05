@@ -2096,6 +2096,18 @@ class RunEventCoordinator(ManagerComponent):
                     source="subagent",
                     resources=f"subagent_id={info.id}",
                 )
+        if info.approval_floor == "interactive" and parent_policy == "auto":
+            # The spawner's floor outranks every local auto fallback above: a
+            # remote hub whose parent is not auto keeps this run's tools
+            # behind approval even on a gateway that would auto-approve them.
+            parent_policy = ""
+            sel().log_api_access(
+                caller=f"subagent:{info.id}",
+                operation="subagent.approval_floor_applied",
+                outcome="ok",
+                source="subagent",
+                resources=f"subagent_id={info.id}",
+            )
         # Admission captured both memory identity and this invocation's persona
         # before any asynchronous work. A continuation's explicit override is
         # effective only for this turn; its next continuation keeps its lineage.

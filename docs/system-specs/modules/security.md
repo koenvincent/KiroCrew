@@ -75,7 +75,11 @@ Cold subagent continuation restores app ownership from the canonical
 `subagents/` run records; retained V1 runs can still read their existing
 `member-memory-bindings/` sidecar. Both roots keep ordinary sandbox read-only
 protection, including empty-root precreation and refusal of redirected roots,
-and writes through the agent's file tools stay refused for both. They differ on
+and writes through the agent's file tools stay refused for both. The mappings
+of remote-placed runs under `remote-subagents/` get the same treatment as
+`subagents/` (write-gated, sealed read-only, readable), because the parent
+session a restart restores from them decides who may read or cancel the run.
+`subagents/` and `member-memory-bindings/` differ on
 the READ side, and what separates them is the record's contents rather than its
 position. `subagents/` is on the file-tool write-only gate, so its results
 remain readable. A `member-memory-bindings/` record carries the RAW session key

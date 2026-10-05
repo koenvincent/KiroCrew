@@ -1316,6 +1316,13 @@ BENIGN_SPAWNS: frozenset[str] = frozenset(
         "cloud/source.py::_git_tracked_files",
         "cloud/source.py::_tracked_tree_is_dirty",
         "cloud/source.py::_use_git_archive",
+        # Fixed `git -C <project> rev-parse HEAD` argv (shell=False, 30s timeout),
+        # run against the SAME root `cloud.source.build_source_tarball` archived a
+        # line earlier (the parent slot's project, resolved and is_dir-checked by
+        # `_parent_project`). The output is only matched against a hex-SHA regex and
+        # pinned as the workspace's commit; no agent text reaches the args. Same
+        # classification as the three `cloud/source.py` git probes above.
+        "dashboard/remote_subagents.py::_build_project_archive",
         # Release-tag probe before a packaged install's cloud launch: `<trusted
         # git> ls-remote --exit-code --tags -- <repo> refs/tags/<ref>`, a fixed
         # argv with no shell. The binary comes from

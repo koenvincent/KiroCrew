@@ -318,7 +318,13 @@ class TestSessionApprovalPolicy:
 class TestSubagentInheritsPolicy:
     """Subagent _run_inner passes parent's approval_policy to get_or_create."""
 
-    def _run_inner_and_capture(self, parent_policy: str, parent_session_key: str = "parent-key") -> dict:
+    def _run_inner_and_capture(
+        self,
+        parent_policy: str,
+        parent_session_key: str = "parent-key",
+        approval_floor: str = "",
+        is_yolo=None,
+    ) -> dict:
         """Invoke the real _run_inner and capture get_or_create kwargs."""
         from kiro_crew.providers.base import EVENT_COMPLETE, LLMEvent
         from kiro_crew.subagent import SubagentInfo, SubagentManager
@@ -349,17 +355,40 @@ class TestSubagentInheritsPolicy:
 
         mock_client.stream = fake_stream
 
-        runner = SubagentManager(sessions=sessions, ctx_builder=ctx_builder)
+        runner = SubagentManager(sessions=sessions, ctx_builder=ctx_builder, is_yolo=is_yolo)
         info = SubagentInfo(
             id="sub1",
             task="test",
             parent_session_key=parent_session_key,
+            approval_floor=approval_floor,
             execution_context=ExecutionContext(None, MemoryStoreRef("default"), "template", ""),
         )
 
         create_agent_folder(info.id, task=info.task, execution_context=info.execution_context)
         asyncio.run(runner._run_inner(info, "subagent:sub1"))
         return captured
+
+    def test_an_interactive_floor_outranks_the_config_fallback(self) -> None:
+        """A remote hub's floor keeps a parentless child's tools behind
+        approval on a gateway whose config would auto-approve them."""
+        with patch(
+            "kiro_crew.subagent.KiroCrewConfig.load",
+            return_value=MagicMock(agent=MagicMock(approval_mode="auto")),
+        ):
+            captured = self._run_inner_and_capture(
+                "", parent_session_key="", approval_floor="interactive"
+            )
+        assert captured["approval_policy"] == ""
+
+    def test_an_interactive_floor_outranks_yolo(self) -> None:
+        captured = self._run_inner_and_capture(
+            "", parent_session_key="", approval_floor="interactive", is_yolo=lambda: True
+        )
+        assert captured["approval_policy"] == ""
+
+    def test_without_a_floor_yolo_still_auto_approves(self) -> None:
+        captured = self._run_inner_and_capture("", parent_session_key="", is_yolo=lambda: True)
+        assert captured["approval_policy"] == "auto"
 
     def test_auto_policy_flows_to_child_session(self) -> None:
         captured = self._run_inner_and_capture("auto")

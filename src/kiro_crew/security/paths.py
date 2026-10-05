@@ -967,11 +967,15 @@ _WRITE_PROTECTED_HOME_PATHS: list[str] = [
     # NOT read that leaf, and an entry on this tier as well would make
     # ``security_posture`` publish "Reads allowed" for a path the read gate
     # refuses.
+    # remote-subagents: the mappings of runs placed on a remote crew, on the same
+    # terms as subagents. A restart restores each run's parent session from them,
+    # which decides who may read or cancel the run and where its result lands.
     for leaf in (
         "config.json",
         "config.local.json",
         "playwright-cli-config.json",
         "subagents",
+        "remote-subagents",
     )
 ] + [
     # Ops Mission Control's on-call schedule. WRITE-protected, not read+write

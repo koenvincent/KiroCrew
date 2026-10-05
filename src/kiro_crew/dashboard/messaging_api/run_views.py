@@ -222,9 +222,6 @@ async def api_spawn_status(request: web.Request) -> web.Response:
             data["result_meta"] = view_meta
         data["error"] = _redact(info.error) if info.error else ""
         data["stopped"] = bool(getattr(info, "user_stopped", False))
-        data["outcome"] = getattr(
-            info, "outcome", "failed" if getattr(info, "error", "") else "completed"
-        )
         data["stop_reason"] = str(getattr(info, "stop_reason", "") or "")
         data["stop_class"] = str(getattr(info, "stop_class", "") or "")
         data["partial"] = bool(getattr(info, "partial", False))
