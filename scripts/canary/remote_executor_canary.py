@@ -426,6 +426,69 @@ def register_peer_instance(parent_home: Path, *, name: str, ssh_port: int, remot
     return inst.id
 
 
+def gateway_tail(handle: GatewayHandle, limit: int = 3000) -> str:
+    """Bounded stdout/stderr tail of a harness gateway, for a 5xx or a refusal.
+
+    Round 3 recorded a bare ``500 Server got itself in trouble`` with no cause;
+    the traceback only ever lives in the child's own output.
+    """
+    try:
+        return handle.diagnostics()[-limit:]
+    except Exception as exc:  # diagnostics is best-effort evidence, never fatal
+        return f"<diagnostics unavailable: {type(exc).__name__}: {exc}>"
+
+
+def add_and_connect_peer(parent: GatewayHandle, *, name: str, remote_port: int,
+                         remote_bin: str, timeout: float = 90.0) -> tuple[str, ScenarioResult]:
+    """Register the peer through the parent's OWN API and bring its tunnel up.
+
+    Round 3 wrote ``instances.json`` behind the running gateway's back and never
+    connected, so every spawn was refused 409 ``remote_instance_not_connected``.
+    A real operator adds a crew and connects it; the canary now does the same.
+    """
+    r = ScenarioResult("connect", False, "not run", started=time.monotonic())
+    instance_id = ""
+    try:
+        status, body = _http(
+            "POST",
+            owner_url(parent, "/api/instances"),
+            body={
+                "name": name,
+                "ssh_host": "kirocrew-canary-peer",
+                "remote_port": remote_port,
+                "remote_bin": remote_bin,
+                "connection_method": "ssh",
+            },
+        )
+        if status not in (200, 201) or not isinstance(body, dict):
+            r.detail = f"POST /api/instances -> {status}: {body!r}"[:500]
+            r.evidence = {"gateway_tail": gateway_tail(parent)}
+            return instance_id, r
+        instance_id = str(body.get("id") or (body.get("instance") or {}).get("id") or "")
+        status_c, body_c = _http(
+            "POST", owner_url(parent, f"/api/instances/{instance_id}/connect"), timeout=timeout
+        )
+        state = body_c.get("state") if isinstance(body_c, dict) else None
+        deadline = time.monotonic() + timeout
+        while state != "connected" and time.monotonic() < deadline:
+            time.sleep(POLL_SECONDS)
+            _s, body_s = _http("GET", owner_url(parent, f"/api/instances/{instance_id}/status"))
+            state = body_s.get("state") if isinstance(body_s, dict) else None
+            body_c = body_s
+        r.passed = state == "connected"
+        safe = {k: v for k, v in body_c.items() if k != "token"} if isinstance(body_c, dict) else str(body_c)[:300]
+        r.evidence = {"connect_status": status_c, "final_status": safe}
+        r.detail = f"instance state={state}"
+        if not r.passed:
+            r.evidence["gateway_tail"] = gateway_tail(parent)
+    except Exception as exc:
+        r.detail = f"{type(exc).__name__}: {exc}"
+        r.evidence = {"gateway_tail": gateway_tail(parent)}
+    finally:
+        r.ended = time.monotonic()
+    return instance_id, r
+
+
 def write_ssh_client_config(ssh_dir: Path, *, host_alias: str, port: int,
                              identity_file: Path, known_hosts: Path) -> Path:
     ssh_dir.mkdir(parents=True, exist_ok=True)
@@ -572,14 +635,13 @@ def run_scenarios(
     peer_launcher: Path,
     canary_home: Path,
 ) -> None:
-    instance_id = register_peer_instance(
-        parent.home,
+    instance_id, connect_result = add_and_connect_peer(
+        parent,
         name="canary-peer",
-        ssh_port=0,  # unused; ssh_host alias carries the port via ssh config
         remote_port=peer.port,
         remote_bin=str(peer_launcher),
-        client_key_path=peer_launcher,
     )
+    evidence.record(connect_result)
 
     session = establish_authenticated_session(parent, slot="canary-remote-executor")
 
@@ -600,10 +662,15 @@ def run_scenarios(
         digest = hashlib.sha256(payload).hexdigest()
         commit = "0" * 40
 
+        # The receiving end of a snapshot is the CREW: the parent's own
+        # _sync_parent_project proxies this POST to the peer with
+        # content_type application/gzip. Round 3 aimed it at the parent with
+        # urllib's default form content type and got a bare 500.
         req = urllib.request.Request(
-            owner_url(parent, f"/api/remote-workspaces?sha256={digest}&commit={commit}"),
+            owner_url(peer, f"/api/remote-workspaces?sha256={digest}&commit={commit}"),
             data=payload,
             method="POST",
+            headers={"Content-Type": "application/gzip"},
         )
         try:
             with urllib.request.urlopen(req, timeout=30.0) as resp:
@@ -615,6 +682,8 @@ def run_scenarios(
         r.evidence = {"status": status, "body": body if isinstance(body, dict) else str(body)[:300]}
         r.passed = status == 200 and isinstance(body, dict) and bool(body.get("path"))
         r.detail = f"POST /api/remote-workspaces -> {status}"
+        if not r.passed:
+            r.evidence["gateway_tail"] = gateway_tail(peer)
     except Exception as exc:
         r.detail = f"{type(exc).__name__}: {exc}"
     r.ended = time.monotonic()
@@ -646,6 +715,7 @@ def run_scenarios(
     try:
         if not run_id:
             r.detail = f"POST /api/spawn did not return an id (status {status}): {body!r}"[:500]
+            r.evidence = {"gateway_tail": gateway_tail(parent)}
         else:
             found = False
             deadline = time.monotonic() + SPAWN_TIMEOUT_SECS
