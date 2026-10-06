@@ -1,6 +1,7 @@
 name: canary-ux-13337
 # Throwaway helper on the fork's canary branch: typecheck and test the UX fix
 # for the PeerTransport seam PR, then shoot its screenshots. Returns artifacts.
+# Round 2: Connect disabled on an unmapped row, hint shown inline.
 on:
   push:
     branches: [canary/pr12821-remote-executor]
