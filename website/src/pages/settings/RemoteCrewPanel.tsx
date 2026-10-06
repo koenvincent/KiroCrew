@@ -128,6 +128,15 @@ const connectionTypeHint = (inst: InstanceView): string => {
   return transportCopy(method)?.hint() ?? unmappedTransportHint(method)
 }
 
+// A method this build has no copy for is one it cannot dial either: Connect would
+// fail every time, so the row disables it and says why in visible text.
+const isUnmappedTransport = (inst: InstanceView): boolean =>
+  transportCopy(transportPresentation(inst).method) === undefined
+
+// The port segment carries its own leading separator ("· remote port"), which
+// reads as a stray dot when no target precedes it.
+const withoutLeadingSeparator = (text: string): string => text.replace(/^(\[?)·\s*/, '$1')
+
 /**
  * What a connected fargate crew offers instead of a dashboard: the loopback
  * URL of its turn API through the open forward, with a copy control. There
@@ -913,6 +922,8 @@ function CrewRow({
   const transient =
     deleting || lifecycleBusy || (isCloud && confirmDelete) || (!isCloud && confirmRemove)
   const target = transportTarget(inst)
+  const unmapped = isUnmappedTransport(inst)
+  const unmappedHintId = `crew-${inst.id}-unmapped-hint`
   // A CHAINED row's host is a RECORD, not a target. It arrives in the announcing
   // pane's payload and this gateway never dials it: `_resolve_transport` returns the
   // PARENT's host for any row carrying `via_instance_id`, so the row's own `ssh_host`
@@ -963,10 +974,17 @@ function CrewRow({
                 : target}
             {reportedOnly
               ? ''
-              : `${usesSsmTransport(inst) && inst.aws_region ? ` (${inst.aws_region})` : ''} ${i18nT('pages.settings.instancesPanel.port_2')} ${inst.remote_port}`}
+              : target
+                ? `${usesSsmTransport(inst) && inst.aws_region ? ` (${inst.aws_region})` : ''} ${i18nT('pages.settings.instancesPanel.port_2')} ${inst.remote_port}`
+                : ` ${withoutLeadingSeparator(i18nT('pages.settings.instancesPanel.port_2'))} ${inst.remote_port}`}
           </div>
           <div className="mt-1 flex items-center gap-1.5 flex-wrap">
             <StatusBadge status={inst.status} />
+            {unmapped && (
+              <span id={unmappedHintId} className="text-[11px] text-muted">
+                {connectionTypeHint(inst)}
+              </span>
+            )}
             {awaitingSignin && (
               <Badge variant="warn" title={i18nT('pages.settings.remoteCrewPanel.needs_sign_in_hint')}>
                 <KeyRound className="lucide-inline" /> {i18nT('pages.settings.remoteCrewPanel.needs_sign_in')}
@@ -1002,7 +1020,12 @@ function CrewRow({
             <Unplug className="lucide-inline" /> {i18nT('pages.settings.instancesPanel.disconnect')}
           </Btn>
         ) : (
-          <Btn primary onClick={() => onConnect(inst.id)} disabled={!!busy || deleting}>
+          <Btn
+            primary
+            onClick={() => onConnect(inst.id)}
+            disabled={!!busy || deleting || unmapped}
+            aria-describedby={unmapped ? unmappedHintId : undefined}
+          >
             <Plug className="lucide-inline" /> {busy === `connect:${inst.id}` ? i18nT('pages.settings.instancesPanel.connecting') : i18nT('pages.settings.instancesPanel.connect')}
           </Btn>
         )}
