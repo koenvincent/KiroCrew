@@ -5660,6 +5660,8 @@ class TestSelfHealRefreshRestart:
         assert result["code"] == "unknown"
         assert result["ok"] is False
         assert "'outbound'" in result["reason"]
+        # The way out is named: every method this build can connect over.
+        assert result["reason"].endswith("pick one of: ssh, ssm, fargate.")
 
     def test_probe_loop_tears_down_after_threshold(self, tmp_path, monkeypatch):
         from kiro_crew.instances import ssh_tunnel_manager as stm

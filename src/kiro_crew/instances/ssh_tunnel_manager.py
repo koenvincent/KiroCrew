@@ -131,6 +131,7 @@ from kiro_crew.instances.registry import _ID_RE as _INSTANCE_ID_RE
 from kiro_crew.instances.registry import (
     _NO_FORWARDER_PID,
     _UNALLOCATED_PORT,
+    CONNECTION_METHODS,
     MAX_VIA_HOPS,
     Instance,
     InstancesRegistry,
@@ -4444,7 +4445,8 @@ class SshTunnelManager:
                     code=UNKNOWN_DIAGNOSIS,
                     reason=(
                         f"connection method {inst.connection_method!r} is not supported by "
-                        f"this gateway; edit the crew to use one it supports."
+                        f"this gateway; edit this crew and pick one of: "
+                        f"{', '.join(CONNECTION_METHODS)}."
                     ),
                     probes=[{"name": "transport", "ok": False}],
                 )
