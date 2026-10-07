@@ -546,8 +546,8 @@ class DenyOnlyGate:
     """*inner*'s refusals, without its auto-approve.
 
     For a run under an interactive approval floor: the hook gate keeps every deny
-    it would give, but its grant (``auto_approve_tools`` and the like) no longer
-    stands in for the person, so an allowed request goes on to a responder.
+    it would give, but its grant (``auto_approve_tools`` and the like) does not
+    stand in for the person, so an allowed request goes on to a responder.
     """
 
     def __init__(self, inner: Gate) -> None:

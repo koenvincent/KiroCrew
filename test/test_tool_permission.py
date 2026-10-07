@@ -1283,7 +1283,7 @@ async def test_the_subagent_ladder(names, kw, low, rung, steered):
 @pytest.mark.parametrize(
     ("hook", "low", "attended", "rung"),
     [
-        # The gate's own grant (auto_approve_tools=["*"]) no longer stands in for
+        # The gate's own grant (auto_approve_tools=["*"]) does not stand in for
         # a person, at full fidelity or for a low-fidelity child.
         (TOOL_AUTO_APPROVE, False, False, "headless"),
         (TOOL_AUTO_APPROVE, True, False, "child_unattended"),

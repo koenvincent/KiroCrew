@@ -19,6 +19,7 @@ import json
 import logging
 import math
 import os
+import posixpath
 import re
 import subprocess
 import threading
@@ -141,8 +142,9 @@ def _open_tracked_file(root_fd: int, rel: str) -> int | None:
     Each directory component is opened ``O_NOFOLLOW`` relative to the one before,
     so a tracked path beneath a symlinked parent (``cache -> ~/.aws``) cannot
     resolve outside the project. ``None`` when the entry is not a regular file.
+    *rel* is a git index path, which is ``/``-separated on every OS.
     """
-    parts = rel.split("/")
+    parts = rel.split(posixpath.sep)
     flags_dir = os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_DIRECTORY", 0)
     fds: list[int] = []
     try:
@@ -240,7 +242,7 @@ def _snapshot_project(project: Path) -> tuple[bytes, str, str]:
                     if (
                         not rel
                         or rel.startswith("/")
-                        or any(part in ("", ".", "..") for part in rel.split("/"))
+                        or any(part in ("", ".", "..") for part in rel.split(posixpath.sep))
                         or excluded_tracked_path(rel, home_parts)
                         # No component is a link (checked as it is opened), so
                         # the lexical path is the canonical one.
