@@ -1251,6 +1251,7 @@ def _subagent_ladder(
     hook=TOOL_ALLOW,
     spec=None,
     consult=None,
+    approval_floor: str = "",
 ):
     manager = SubagentManager(
         sessions=MagicMock(),
@@ -1258,7 +1259,9 @@ def _subagent_ladder(
         on_tool_approval=callback,
         on_tool_approval_factory=factory,
     )
-    info = SubagentInfo(id="a1", task="t", parent_session_key="dashboard:chat-1")
+    info = SubagentInfo(
+        id="a1", task="t", parent_session_key="dashboard:chat-1", approval_floor=approval_floor
+    )
     log: list = []
     policy = manager._run_events._permission_policy(
         info,
@@ -1294,6 +1297,51 @@ async def test_the_subagent_ladder(names, kw, low, rung, steered):
     assert any(entry[0] == "steer" for entry in log) is steered
     if rung == "headless":
         assert settled.reason == _HEADLESS_DENY_REASON
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("hook", "low", "attended", "rung"),
+    [
+        # The gate's own grant (auto_approve_tools=["*"]) does not stand in for
+        # a person, at full fidelity or for a low-fidelity child.
+        (TOOL_AUTO_APPROVE, False, False, "headless"),
+        (TOOL_AUTO_APPROVE, True, False, "child_unattended"),
+        # It goes to the person instead, who is told about the floor.
+        (TOOL_AUTO_APPROVE, False, True, "callback"),
+        # A deny still refuses before anyone is asked.
+        (TOOL_DENY, False, True, "hook_deny"),
+    ],
+)
+async def test_an_interactive_floor_drops_every_auto_grant_but_keeps_denies(
+    names, hook, low, attended, rung
+):
+    asked: list = []
+
+    async def callback(event, parent_session_key=""):
+        asked.append(event.approval_floor)
+        return True
+
+    policy, _info, log = _subagent_ladder(
+        hook=hook, callback=callback if attended else None, approval_floor="interactive"
+    )
+    event = _low_fidelity_event(identity_verified=True) if low else _event()
+    settled = await settle(Ask(event, RecordingWire(log), "subagent:a1"), policy)
+    assert settled.rung == rung
+    assert asked == (["interactive"] if rung == "callback" else [])
+
+
+@pytest.mark.asyncio
+async def test_without_a_floor_the_callback_sees_no_floor():
+    asked: list = []
+
+    async def callback(event, parent_session_key=""):
+        asked.append(event.approval_floor)
+        return True
+
+    policy, _info, log = _subagent_ladder(callback=callback)
+    settled = await settle(Ask(_event(), RecordingWire(log), "subagent:a1"), policy)
+    assert settled.rung == "callback" and asked == [""]
 
 
 @pytest.mark.asyncio
