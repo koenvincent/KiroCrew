@@ -98,6 +98,24 @@ def _deferred(module_name: str, handler_name: str) -> Callable:
     return _route
 
 
+def _deferred_remote_workspace_upload() -> Callable:
+    """Bind ``POST /api/remote-workspaces`` without importing it at boot.
+
+    The module lives at ``kiro_crew.dashboard.remote_workspaces``, not under
+    ``handlers``, so :func:`_deferred` (which only resolves ``handlers``
+    submodules) would raise ``ModuleNotFoundError`` on every upload -- a 500 on
+    the first remote spawn that syncs a project.
+    """
+
+    async def _route(request: web.Request) -> web.StreamResponse:
+        from kiro_crew.dashboard import remote_workspaces
+
+        return await remote_workspaces.api_remote_workspace_upload(request)
+
+    _route.__name__ = "api_remote_workspace_upload"
+    return _route
+
+
 def _deferred_work_ledger(handler_name: str) -> Callable:
     """Bind a work-ledger route without importing the subsystem at boot.
 
@@ -121,6 +139,10 @@ def _deferred_work_ledger(handler_name: str) -> Callable:
 def _register_mcp_routes(app: web.Application) -> None:
     """Register API routes used by MCP tools (spawn, lessons, crons, etc.)."""
     app.router.add_post("/api/spawn", handlers.api_spawn)
+    app.router.add_post(
+        "/api/remote-workspaces",
+        _deferred_remote_workspace_upload(),
+    )
     app.router.add_post("/api/spawn/lost", handlers.api_spawn_lost)
     app.router.add_post("/api/spawn/mark-collected", handlers.api_spawn_mark_collected)
     # MCP Apps (SEP-1865): embedded app iframe -> gateway tool callback.

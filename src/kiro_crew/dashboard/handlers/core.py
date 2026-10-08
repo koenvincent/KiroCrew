@@ -528,8 +528,15 @@ async def api_version(request: web.Request) -> web.Response:
     session-import carriers do — so nothing is exposed to an anonymous caller
     that was not exposed before, and the fingerprint decision at
     :func:`_liveness_payload` stands unchanged.
+
+    ``spawn_enforces`` names the ``/api/spawn`` fields this gateway applies to a
+    run's permissions and privacy. A hub reads it before dispatching task text,
+    since a peer in the same ``major.minor`` series without them would accept the
+    run and silently drop the field.
     """
-    return web.json_response({"version": kiro_crew.__version__})
+    return web.json_response(
+        {"version": kiro_crew.__version__, "spawn_enforces": ["approval_floor", "memory_mode"]}
+    )
 
 
 async def api_live(request: web.Request) -> web.Response:

@@ -2465,7 +2465,12 @@ materialised by narrowing the `acp_backends` registry at gateway start),
 `approval_modes` (currently the `yolo` dashboard mode), `yolo_duration`
 (the `permanent` and `until_shutdown` no-expiry choices), `sandbox.min_level`
 (ordinal floor at `wrap_argv`), `approval_mode` (boot floor only), and every capability
-gate — `capabilities.spawn`, `capabilities.messaging`, `capabilities.cron`,
+gate — `capabilities.spawn`, `capabilities.remote_spawn` (placing a sub-agent on
+a remote crew, whose child runs under the peer's approval policy; off by default:
+an installed policy must grant this row explicitly, a policy that leaves it out
+refuses remote placement, and with no policy installed only the operator opt-in
+`instances.remote_subagents` decides), `capabilities.messaging`,
+`capabilities.cron`,
 `capabilities.memory_writes`, `capabilities.script_hooks`,
 `capabilities.browse` (the native `browser` MCP tool's dispatch chokepoint —
 default on; a deny makes the tool refuse outright, and it does NOT fall back to
