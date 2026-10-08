@@ -6,7 +6,7 @@ on:
     branches: [canary/pr12821-remote-executor]
     paths: [.github/workflows/canary-black-pr12821.yml]
 env:
-  PR_HEAD: b4f8ea223547096e4c88c686200fd480e32dde4f
+  PR_HEAD: fb10f71a17857a5e64851c22cee1a3920fe70780
 permissions:
   contents: read
 jobs:
@@ -22,7 +22,7 @@ jobs:
           python-version: "3.12"
       - run: pip install black==26.3.1 isort==6.0.0
       - run: |
-          FILES="src/kiro_crew/acp/types.py src/kiro_crew/cloud/source.py src/kiro_crew/config/integration_sections.py src/kiro_crew/config/section_builders.py src/kiro_crew/dashboard/handlers/messaging.py src/kiro_crew/dashboard/messaging_api/run_control.py src/kiro_crew/dashboard/messaging_api/run_views.py src/kiro_crew/dashboard/messaging_api/spawn.py src/kiro_crew/dashboard/remote_subagents.py src/kiro_crew/dashboard/remote_workspaces.py src/kiro_crew/dashboard/server.py src/kiro_crew/dashboard/server_runtime/mcp_routes.py src/kiro_crew/dashboard/state.py src/kiro_crew/mcp_tools/spawn.py src/kiro_crew/platform/governance.py src/kiro_crew/providers/acp.py src/kiro_crew/security_posture.py src/kiro_crew/slack/gateway.py src/kiro_crew/subagent.py src/kiro_crew/subagent_manager/admission/gate.py src/kiro_crew/subagent_manager/cancellation.py src/kiro_crew/subagent_manager/run.py src/kiro_crew/subagent_manager/waves.py src/kiro_crew/tool_permission.py src/kiro_crew/validation.py test/test_admission_gate.py test/test_background_approval_routing.py test/test_cron_approval_mode.py test/test_cron_thread_routing.py test/test_dashboard_server_composition_contract.py test/test_governance_chokepoints.py test/test_handlers_messaging_coverage.py test/test_instances.py test/test_remote_subagent_executor.py test/test_security_posture.py test/test_slack_gateway.py test/test_slack_gateway_more_coverage.py test/test_spawn_audit.py test/test_subagent_panel_durable_replay.py test/test_tool_permission.py"
+          FILES="src/kiro_crew/dashboard/remote_subagents.py src/kiro_crew/mcp_tools/spawn.py src/kiro_crew/dashboard/messaging_api/run_control.py src/kiro_crew/security_posture.py test/test_remote_subagent_executor.py test/test_dashboard_server_composition_contract.py"
           isort $FILES
           black --target-version py310 $FILES
           git diff > black.patch
