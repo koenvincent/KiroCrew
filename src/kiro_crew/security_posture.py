@@ -566,7 +566,7 @@ _REDACTION_SINKS: tuple[tuple[str, str, str], ...] = (
         "and the peer's result, error, last-tool and stop-reason text coming back. "
         "The returned text is persisted in the local shadow record and injected "
         "into the parent session's model context and dashboard card, so it is "
-        "scrubbed with `remote_relay.redact_peer_text` (the exfiltration-URL then "
+        "scrubbed with `peer_redaction.redact_peer_text` (the exfiltration-URL then "
         "credential redactors) before it is "
         "written: a secret the peer's agent echoed does not land locally or reach "
         "the parent model. The local shadow copy of the task is scrubbed the same "

@@ -33,11 +33,9 @@ from kiro_crew.atomic_write import atomic_write
 from kiro_crew.cloud.aws import AWSError
 from kiro_crew.config.loader import data_home
 from kiro_crew.context_management import apply_completion_keep
-from kiro_crew.dashboard.remote_relay import (
-    ensure_version_parity,
-    peer_is_connected,
-    redact_peer_text,
-)
+import kiro_crew
+from kiro_crew.apps.version import versions_compatible
+from kiro_crew.dashboard.peer_redaction import redact_peer_text
 from kiro_crew.platform_compat import rmtree_force
 from kiro_crew.subagent import SubagentInfo
 
@@ -379,6 +377,41 @@ def _reached_parent(info: SubagentInfo) -> bool:
 def _state_name(status: object) -> str:
     value = getattr(status, "state", "")
     return str(getattr(value, "value", value) or "")
+
+
+def _peer_is_connected(instances: Any, instance_id: str) -> bool:
+    """True when the tunnel to *instance_id* is up. Any read failure is False."""
+    try:
+        return _state_name(instances.status(instance_id)) == "connected"
+    except Exception:
+        return False
+
+
+async def _ensure_version_parity(instances: Any, instance_id: str) -> None:
+    """Refuse a crew that does not run this hub's ``major.minor`` series.
+
+    The spawn, poll and cancel bodies carry no version of their own, so a crew a
+    feature release apart can drop a field this hub relies on. An unknown
+    version cannot be proven compatible and is refused as well. The crew's
+    version string is peer text, so it is redacted before it is bounded.
+    """
+    ok, value = await instances.peer_version(instance_id)
+    local = kiro_crew.__version__
+    if not ok:
+        raise RemoteSubagentError(
+            f"Could not confirm the remote crew's Kiro Crew version (this machine "
+            f"runs {local}), so the run was not placed on it.",
+            code="remote_version_unknown",
+            status=409,
+        )
+    if not versions_compatible(local, value):
+        shown = redact_peer_text(value)[:64]
+        raise RemoteSubagentError(
+            f"The remote crew runs Kiro Crew {shown} but this machine runs {local}. "
+            f"A run is placed only on a crew at the same major.minor version.",
+            code="remote_version_mismatch",
+            status=409,
+        )
 
 
 class RemoteSubagentService:
@@ -744,7 +777,7 @@ class RemoteSubagentService:
         """The crews to try, in order: the requested one, else least-loaded first."""
         instances = self._instances()
         if requested:
-            if not peer_is_connected(instances, requested):
+            if not _peer_is_connected(instances, requested):
                 raise RemoteSubagentError(
                     "The selected remote crew is not connected.",
                     code="remote_instance_not_connected",
@@ -794,14 +827,14 @@ class RemoteSubagentService:
         first_error: RemoteSubagentError | None = None
         for candidate in self._choose_instance(requested):
             try:
-                await ensure_version_parity(self._instances(), candidate)
+                await _ensure_version_parity(self._instances(), candidate)
                 return candidate
             except RemoteSubagentError as exc:
                 first_error = first_error or exc
             except Exception as exc:
-                # RemoteTurnError and transport failures are not RemoteSubagentError;
-                # the HTTP handler maps only the latter, so translate here instead of
-                # letting a skewed or unreachable peer surface as a bare 500.
+                # A transport failure while reading the version is not a
+                # RemoteSubagentError; the HTTP handler maps only the latter, so
+                # translate here instead of letting it surface as a bare 500.
                 first_error = first_error or RemoteSubagentError(
                     redact_peer_text(str(exc or "")) or "The remote crew failed the version check.",
                     code=str(getattr(exc, "code", "") or "remote_version_mismatch"),

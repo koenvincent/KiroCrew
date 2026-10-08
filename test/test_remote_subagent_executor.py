@@ -1598,12 +1598,10 @@ async def test_settles_hand_only_delivered_external_ids_to_the_listener() -> Non
 async def test_version_skew_is_a_typed_refusal_not_a_bare_500(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from kiro_crew.dashboard.remote_relay import RemoteTurnError
+    async def unreachable(*_args: object, **_kwargs: object) -> None:
+        raise ConnectionError("version read failed")
 
-    async def skewed(*_args: object, **_kwargs: object) -> None:
-        raise RemoteTurnError("peer runs 0.1.0")
-
-    monkeypatch.setattr("kiro_crew.dashboard.remote_subagents.ensure_version_parity", skewed)
+    monkeypatch.setattr("kiro_crew.dashboard.remote_subagents._ensure_version_parity", unreachable)
     instances = _Instances([])
     service = RemoteSubagentService(
         SimpleNamespace(instances_manager=instances), _Manager()  # type: ignore[arg-type]
