@@ -6,7 +6,7 @@ on:
     branches: [canary/pr12821-remote-executor]
     paths: [.github/workflows/canary-black-pr12821.yml]
 env:
-  PR_HEAD: cc227639dd216c515a5f645836289b05bbaa7acc
+  PR_HEAD: 61ceb8db033733225ffce6db61266b70eeae2cbf
 permissions:
   contents: read
 jobs:
@@ -22,7 +22,7 @@ jobs:
           python-version: "3.12"
       - run: pip install black==26.3.1 isort==6.0.0
       - run: |
-          FILES="src/kiro_crew/dashboard/remote_subagents.py src/kiro_crew/dashboard/remote_workspaces.py src/kiro_crew/dashboard/messaging_api/spawn.py test/test_remote_subagent_executor.py test/test_handlers_messaging_coverage.py test/test_dashboard_server_composition_contract.py"
+          FILES="src/kiro_crew/cli_commands.py src/kiro_crew/dashboard/handlers/core.py src/kiro_crew/dashboard/handlers/remote_approvals.py src/kiro_crew/dashboard/messaging_api/run_views.py src/kiro_crew/dashboard/remote_subagents.py src/kiro_crew/dashboard/server_runtime/mcp_routes.py src/kiro_crew/platform/governance.py src/kiro_crew/subagent.py src/kiro_crew/subagent_manager/hub_approvals.py src/kiro_crew/subagent_manager/run.py src/kiro_crew/tool_permission.py test/test_dashboard_server_composition_contract.py test/test_governance_policy.py test/test_remote_subagent_executor.py test/test_tool_permission.py"
           isort $FILES
           black --target-version py310 $FILES
           git diff > black.patch
