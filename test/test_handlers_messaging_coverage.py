@@ -215,6 +215,21 @@ class TestApiSpawn:
         assert _payload(resp)["code"] == "approval_floor_conflict"
         mgr.spawn.assert_not_called()
 
+    @pytest.mark.parametrize("backend", ["claude", "codex"])
+    def test_409_on_a_floor_this_gateways_backend_cannot_carry(self, backend) -> None:
+        """Another harness pre-approves through a surface the floor cannot reach,
+        so accepting the run would drop the floor without a person or SEL row."""
+        mgr = _mgr()
+        body = {"task": "x", "approval_floor": "interactive"}
+        with patch(
+            "kiro_crew.config.loader.KiroCrewConfig.load",
+            return_value=SimpleNamespace(agent=SimpleNamespace(acp_backend=backend)),
+        ):
+            resp = _run(mod.api_spawn, _Req(_state(subagents=mgr), body))
+        assert resp.status == 409
+        assert _payload(resp)["code"] == "approval_floor_unenforceable"
+        mgr.spawn.assert_not_called()
+
     def test_an_interactive_floor_reaches_the_manager(self) -> None:
         mgr = _mgr()
         mgr.spawn.return_value = _info()
@@ -2360,6 +2375,35 @@ class TestRemoteSpawnGovernance:
         body = {"task": "x", "executor": "remote", "agent": "scout"}
         return _run(mod.api_spawn, _Req(_state(subagents=_mgr()), body))
 
+    @pytest.mark.parametrize(
+        "binding",
+        [("worker", "member-worker"), (None, "research")],
+        ids=["member-bound-parent", "named-store-parent"],
+    )
+    def test_a_bound_parent_cannot_spawn_remotely_without_naming_a_crew(
+        self, monkeypatch: pytest.MonkeyPatch, binding
+    ) -> None:
+        # The child inherits the parent's binding through derive_execution, but
+        # the peer gets no store identity and would read its own Global memory.
+        from kiro_crew.execution_context import ExecutionContext, MemoryStoreRef
+
+        member, store = binding
+        service = self._arm(monkeypatch, opted_in=True)
+        monkeypatch.setattr(
+            "kiro_crew.subagent._vet_remote_placement_governance", lambda *_a, **_k: None
+        )
+        monkeypatch.setattr("kiro_crew.subagent._vet_spawn_governance", lambda *_a, **_k: None)
+        parent = ExecutionContext(member, MemoryStoreRef(store, member), "template", "kirocrew")
+        monkeypatch.setattr(
+            "kiro_crew.execution_context.derive_execution", lambda *_a, **_k: parent
+        )
+
+        response = self._spawn()
+
+        assert response.status == 400
+        assert _payload(response)["code"] == "remote_crew_binding_unsupported"
+        service.spawn.assert_not_awaited()
+
     def test_refused_unless_the_operator_opted_in(self, monkeypatch: pytest.MonkeyPatch) -> None:
         # A Normal-mode parent cannot reach a peer whose looser approval policy
         # would run its tool calls unapproved: placement is off by default.
@@ -2464,7 +2508,9 @@ class TestRemoteSpawnGovernance:
 
         def derive(parent: Any, **kw: Any) -> Any:
             out = real(parent, **kw)
-            return SimpleNamespace(template_id=template, store=out.store, app=app)
+            return SimpleNamespace(
+                template_id=template, store=out.store, app=app, member_id=out.member_id
+            )
 
         monkeypatch.setattr(mod_execution, "derive_execution", derive)
 

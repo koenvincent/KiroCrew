@@ -113,6 +113,8 @@ from kiro_crew.crew_log.schema import KIND_SESSION, MAX_ENTRY_BYTES, Entry
 from kiro_crew.crew_log.session_tree import OpenedRecord, log_rank_of
 from kiro_crew.crew_log.store import (
     CrewLog,
+    ReadCursor,
+    ResumePoint,
     log_exception_text,
     segment_paths,
     session_units_by_slot,
@@ -4342,14 +4344,36 @@ class _SlotStream:
     :func:`fold_slot_checkpoint` has always answered with; it starts at *since*, so a
     warm tail that turned out to be empty reports the position it resumed from rather
     than dropping to zero.
+
+    *resume* is a :class:`~kiro_crew.crew_log.store.ResumePoint` from an earlier pass,
+    and it turns the walk of ONE unit's log into a read of its tail: without it,
+    reaching ``since + 1`` means decoding every record below it, so a poll that finds
+    one new entry decodes the whole log. It names a byte offset in one file, so it is
+    applied only when this stream reads exactly one unit -- the warm tail's shape --
+    and a stream over several units ignores it rather than aiming a position at the
+    wrong log.
+
+    :attr:`points` is the third thing the caller needs afterwards: per unit, the
+    resume point the walk reached, for the next pass to hand back. A unit that
+    yielded nothing leaves no entry in it at all, which is how the caller tells
+    "nothing arrived, keep the point you have" from "this is the new point".
     """
 
-    def __init__(self, unit_ids: Sequence[str], *, base: int = 0, since: int = 0) -> None:
+    def __init__(
+        self,
+        unit_ids: Sequence[str],
+        *,
+        base: int = 0,
+        since: int = 0,
+        resume: "ResumePoint | None" = None,
+    ) -> None:
         self._unit_ids = tuple(unit_ids)
         self._base = base
         self._since = since
+        self._resume = resume if len(self._unit_ids) == 1 else None
         self.reached = since
         self.heights: dict[str, int] = {}
+        self.points: "dict[str, ResumePoint]" = {}
 
     def __iter__(self) -> "Iterator[_Ordinal]":
         base = self._base
@@ -4359,7 +4383,16 @@ class _SlotStream:
                 continue
             top = base
             reached = self._since
-            for entry in handle.iter_from(self._since + 1, known=KNOWN_TYPES):
+            # One cursor PER UNIT. A shared one would end the pass holding whichever
+            # unit yielded last, and a later unit that yielded nothing would leave an
+            # earlier unit's offset standing as this unit's position.
+            cursor = ReadCursor()
+            for entry in handle.iter_from(
+                self._since + 1,
+                known=KNOWN_TYPES,
+                resume=self._resume,
+                cursor=cursor,
+            ):
                 ordinal = base + entry.seq
                 top = max(top, ordinal)
                 reached = max(reached, entry.seq)
@@ -4367,6 +4400,8 @@ class _SlotStream:
             base = top
             self.heights[unit_id] = reached
             self.reached = reached
+            if cursor.at is not None:
+                self.points[unit_id] = cursor.at
 
 
 @dataclass
@@ -4413,6 +4448,14 @@ class _SlotMemo:
     #: :func:`_persist_slot_fold` measures a write against, carried on the cell so a
     #: continuation decides without reading the file to find out.
     saved: int = 0
+    #: Where in the NEWEST unit's log this cell's fold stopped, as a byte offset the
+    #: next read can open the file at. Without it a continuation still decodes every
+    #: record below the seq it resumes from, so an idle board's poll costs the whole
+    #: log however little arrived -- the second linear term in a warm read, beside the
+    #: digest the cut counter replaced. ``None`` means no position is vouched for and
+    #: the next read walks from the top: a pass that yielded nothing new, a unit list
+    #: that changed, or a point the store itself declined to issue.
+    resume: "ResumePoint | None" = None
     #: What ORDERS this cell against every other value of the same (slot, fold). Minted
     #: when the cell is built, so a cell CARRIED FORWARD unchanged keeps its number and a
     #: cell that folded anything new gets a higher one. See :func:`_next_slot_revision`.
@@ -4813,6 +4856,7 @@ def _fold_slot_warm_locked(
                 units[-1:],
                 base=sum(mark.last_seq for mark in marks[:-1]),
                 since=memo.reached,
+                resume=_resume_from(memo),
             )
             for event in tail:
                 memo.registry.drive(memo.store, event)
@@ -4824,6 +4868,7 @@ def _fold_slot_warm_locked(
                 reached=tail.reached,
                 prefix=_vouched(units[-1], before),
                 saved=memo.saved,
+                resume=tail.points.get(units[-1], memo.resume),
                 revision=_minted_revision(),
                 weight=_cell_weight(name, memo.registry, memo.store),
             )
@@ -4854,6 +4899,7 @@ def _fold_slot_warm_locked(
         # Nothing on disk is standing behind this value: a cold fold is what happens when
         # no savepoint could be used, so the next write is owed for the whole position.
         saved=0,
+        resume=cold.points.get(units[-1]) if units else None,
         # A cold fold is where the three rollover cases land -- a new unit, a unit
         # recreated under the same id, a rewritten prefix -- and every one of them can
         # leave ``reached`` unmoved or lower. The mint is what makes the value after them
@@ -5011,6 +5057,14 @@ def _resume_slot_fold(
         reached=tail.reached,
         prefix=_vouched(units[-1], before),
         saved=saved.watermark,
+        # No resume point, so the first continuation of a cell that stood on a savepoint
+        # walks the newest unit once and reports a point of its own. The tail folded here
+        # could issue one, and it would be as sound as any other: the cut count is what
+        # vouches for an unread prefix, and this pass holds it. It is left unset because
+        # a point is an optimisation and this is the one pass that cannot be checked
+        # against the loop that wrote it -- the state it continues came from another
+        # process, so ``reached`` here is the savepoint's position advanced by this tail
+        # rather than a height this cell folded end to end.
         revision=_minted_revision(),
         weight=_cell_weight(name, registry, slot),
     )
@@ -5164,6 +5218,27 @@ def _digest_to_carry(
     if not units or not marks:
         return None
     return None if marks[-1].cuts is not None else _unit_prefix(units[-1])
+
+
+def _resume_from(memo: "_SlotMemo") -> "ResumePoint | None":
+    """*memo*'s resume point, but only where it agrees with what *memo* folded.
+
+    The point and ``reached`` are two records of the same fact -- the last entry this
+    cell consumed from its newest unit -- written by the same loop, so they agree by
+    construction today. This asserts it anyway, because the two failures are not the
+    same size. A point BELOW ``reached`` costs a few extra records on the next read.
+    A point ABOVE it would make the next read open the file past entries the cell
+    never folded and never yield them, which is state silently missing from a fold
+    that reports itself complete.
+
+    So anything other than equality drops back to the full walk: the store's own
+    checks cannot catch this one, since an offset that is a perfectly good record
+    boundary for the seq it names is exactly what this would hand them.
+    """
+    point = memo.resume
+    if point is None or point.seq != memo.reached:
+        return None
+    return point
 
 
 def _vouched(unit_id: str, before: "_PrefixSeen | None") -> "_PrefixSeen | None":

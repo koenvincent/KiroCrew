@@ -111,20 +111,20 @@
   </style>
 
   <div class="wkb-top">
-    <h2 class="wkb-ttl">Work board <i>&middot;</i> <span data-dashboard-field="goal">&mdash;</span></h2>
+    <h2 class="wkb-ttl"><span data-i18n="title">Work board</span> <i>&middot;</i> <span data-dashboard-field="goal">&mdash;</span></h2>
     <span class="wkb-fresh" id="wkb-fresh"><b></b><span>&mdash;</span></span>
   </div>
 
   <div class="wkb-meta">
-    <span>Board <span class="wkb-code" data-dashboard-field="generation">&mdash;</span></span>
-    <span>Round <b data-dashboard-field="round">&mdash;</b></span>
-    <span>Goal rev <b data-dashboard-field="goal_version">&mdash;</b></span>
-    <span>Writes <b data-dashboard-field="entries">&mdash;</b></span>
-    <span>Last write <b data-dashboard-field="last_entry_at">&mdash;</b></span>
+    <span><span data-i18n="m_board">Board</span> <span class="wkb-code" data-dashboard-field="generation">&mdash;</span></span>
+    <span><span data-i18n="m_round">Round</span> <b data-dashboard-field="round">&mdash;</b></span>
+    <span><span data-i18n="m_goalrev">Goal rev</span> <b data-dashboard-field="goal_version">&mdash;</b></span>
+    <span><span data-i18n="m_writes">Writes</span> <b data-dashboard-field="entries">&mdash;</b></span>
+    <span><span data-i18n="m_lastwrite">Last write</span> <b data-dashboard-field="last_entry_at">&mdash;</b></span>
   </div>
   <div class="wkb-meta">
-    <span>Opened <b data-dashboard-field="created_at">&mdash;</b></span>
-    <span>Depth <b data-dashboard-field="depth">&mdash;</b></span>
+    <span><span data-i18n="m_opened">Opened</span> <b data-dashboard-field="created_at">&mdash;</b></span>
+    <span><span data-i18n="m_depth">Depth</span> <b data-dashboard-field="depth">&mdash;</b></span>
   </div>
 
   <p class="wkb-head" id="wkb-head">&mdash;</p>
@@ -132,7 +132,7 @@
 
   <div class="wkb-card">
     <div class="wkb-lbl">
-      <span>By round</span><span class="wkb-unit" id="wkb-roundunit">&mdash;</span>
+      <span data-i18n="by_round">By round</span><span class="wkb-unit" id="wkb-roundunit">&mdash;</span>
     </div>
     <div class="wkb-rounds" id="wkb-rounds"></div>
   </div>
@@ -140,14 +140,90 @@
   <div class="wkb-board" id="wkb-board"></div>
 
   <div class="wkb-note">
-    <span data-dashboard-field="items">&mdash;</span> on the board,
-    <span data-dashboard-field="omitted">&mdash;</span> not shown (list truncated).
+    <span data-dashboard-field="items">&mdash;</span> <span data-i18n="note_on_board">on the board,</span>
+    <span data-dashboard-field="omitted">&mdash;</span> <span data-i18n="note_not_shown">not shown (list truncated).</span>
   </div>
 
   <script>
   (function () {
     var DASH = '\u2014';
     var SVGNS = 'http://www.w3.org/2000/svg';
+
+    // The page's own words, one table per UI language. A key a language lacks
+    // falls back to English. Values the ledger or a crewmate wrote are never
+    // looked up here. The zh-CN strings are \u-escaped so the source stays ASCII.
+    var I18N = {
+      en: {
+        title: 'Work board',
+        m_board: 'Board', m_round: 'Round', m_goalrev: 'Goal rev', m_writes: 'Writes',
+        m_lastwrite: 'Last write', m_opened: 'Opened', m_depth: 'Depth',
+        by_round: 'By round',
+        note_on_board: 'on the board,', note_not_shown: 'not shown (list truncated).',
+        col_prog: 'In progress', col_await: 'Awaiting verdict', col_acc: 'Accepted',
+        col_shut: 'Rejected / left',
+        worker_status: 'worker {v}', worker_silent: 'worker silent',
+        fail_one: '{n} fail', fail_many: '{n} fails', pr: 'PR {n}',
+        nothing_written: 'Nothing written on this item yet.',
+        f_worker: 'worker', f_reported: 'reported',
+        nothing_here: 'Nothing here.',
+        more_in_column: '{n} more in this column, not drawn',
+        no_round: 'No round', round_n: 'Round {n}',
+        item_one: '{n} item', item_many: '{n} items',
+        no_item_round: 'No item carries a round.',
+        round_unit_one: '{n} round', round_unit_many: '{n} rounds',
+        board_no_item: 'This board carries no item yet.',
+        hl_of: ' of ', hl_accepted: ' items accepted. ',
+        hl_waits_one: ' waits on your verdict, ', hl_waits_many: ' wait on your verdict, ',
+        hl_worker: ' still with a worker.',
+        stale: 'Stale', fresh: 'Fresh'
+      },
+      'zh-CN': {
+        title: '\u5de5\u4f5c\u770b\u677f',
+        m_board: '\u770b\u677f', m_round: '\u8f6e\u6b21', m_goalrev: '\u76ee\u6807\u7248\u672c', m_writes: '\u5199\u5165',
+        m_lastwrite: '\u6700\u540e\u5199\u5165', m_opened: '\u5f00\u542f\u4e8e', m_depth: '\u5c42\u7ea7',
+        by_round: '\u6309\u8f6e\u6b21',
+        note_on_board: '\u9879\u5728\u770b\u677f\u4e0a\uff0c', note_not_shown: '\u9879\u672a\u663e\u793a\uff08\u5217\u8868\u5df2\u622a\u65ad\uff09\u3002',
+        col_prog: '\u8fdb\u884c\u4e2d', col_await: '\u5f85\u88c1\u5b9a', col_acc: '\u5df2\u63a5\u53d7',
+        col_shut: '\u5df2\u62d2\u7edd / \u5df2\u79bb\u5f00',
+        worker_status: '\u6267\u884c\u8005 {v}', worker_silent: '\u6267\u884c\u8005\u65e0\u6c47\u62a5',
+        fail_one: '{n} \u6b21\u5931\u8d25', fail_many: '{n} \u6b21\u5931\u8d25', pr: 'PR {n}',
+        nothing_written: '\u8be5\u4e8b\u9879\u8fd8\u6ca1\u6709\u4efb\u4f55\u8bb0\u5f55\u3002',
+        f_worker: '\u6267\u884c\u8005', f_reported: '\u6c47\u62a5\u4e8e',
+        nothing_here: '\u6682\u65e0\u5185\u5bb9\u3002',
+        more_in_column: '\u6b64\u5217\u8fd8\u6709 {n} \u9879\u672a\u7ed8\u5236',
+        no_round: '\u65e0\u8f6e\u6b21', round_n: '\u7b2c {n} \u8f6e',
+        item_one: '{n} \u9879', item_many: '{n} \u9879',
+        no_item_round: '\u6ca1\u6709\u4e8b\u9879\u5e26\u6709\u8f6e\u6b21\u3002',
+        round_unit_one: '{n} \u8f6e', round_unit_many: '{n} \u8f6e',
+        board_no_item: '\u6b64\u770b\u677f\u8fd8\u6ca1\u6709\u4efb\u4f55\u4e8b\u9879\u3002',
+        hl_of: ' / ', hl_accepted: ' \u9879\u5df2\u63a5\u53d7\u3002',
+        hl_waits_one: ' \u9879\u5f85\u4f60\u88c1\u5b9a\uff0c', hl_waits_many: ' \u9879\u5f85\u4f60\u88c1\u5b9a\uff0c',
+        hl_worker: ' \u9879\u4ecd\u5728\u6267\u884c\u4e2d\u3002',
+        stale: '\u5df2\u8fc7\u671f', fresh: '\u6700\u65b0'
+      }
+    };
+    function locale() {
+      var l = (window.kirocrew || {}).locale;
+      return typeof l === 'string' && Object.prototype.hasOwnProperty.call(I18N, l) ? l : 'en';
+    }
+    function has(key) {
+      return Object.prototype.hasOwnProperty.call(I18N.en, key);
+    }
+    function i18n(key, vars) {
+      var table = I18N[locale()];
+      var s = Object.prototype.hasOwnProperty.call(table, key) ? table[key] : I18N.en[key];
+      if (s === undefined) s = key;
+      if (vars) {
+        s = s.replace(/\{(\w+)\}/g, function (m, k) {
+          return Object.prototype.hasOwnProperty.call(vars, k) ? String(vars[k]) : m;
+        });
+      }
+      return s;
+    }
+    function applyStatic() {
+      var nodes = document.querySelectorAll('[data-i18n]');
+      for (var i = 0; i < nodes.length; i++) nodes[i].textContent = i18n(nodes[i].getAttribute('data-i18n'));
+    }
     //: Cards drawn per column. The work fold is already bounded and reports what it
     //: dropped, but a wide board would still stack a hundred cards into one column
     //: and bury the three that matter, so each column caps and SAYS what it held back.
@@ -319,9 +395,9 @@
         var g = groups[order[o]];
         var isNow = g.round !== null && g.round === now;
         var row = el('div', 'wkb-round' + (isNow ? ' is-now' : ''));
-        var label = el('div', 'r', g.round === null ? 'No round' : 'Round ' + g.round);
+        var label = el('div', 'r', g.round === null ? i18n('no_round') : i18n('round_n', { n: g.round }));
         label.appendChild(el('em', null,
-          g.items.length + (g.items.length === 1 ? ' item' : ' items')));
+          i18n(g.items.length === 1 ? 'item_one' : 'item_many', { n: g.items.length })));
         row.appendChild(label);
 
         var bar = svgEl('svg', { viewBox: '0 0 100 7', preserveAspectRatio: 'none' });
@@ -333,11 +409,11 @@
         row.appendChild(tallyRow(tally(g.items)));
         host.appendChild(row);
       }
-      if (!order.length) host.appendChild(el('div', 'wkb-none', 'No item carries a round.'));
+      if (!order.length) host.appendChild(el('div', 'wkb-none', i18n('no_item_round')));
       var unit = document.getElementById('wkb-roundunit');
       if (unit) {
         unit.textContent = order.length
-          ? order.length + (order.length === 1 ? ' round' : ' rounds')
+          ? i18n(order.length === 1 ? 'round_unit_one' : 'round_unit_many', { n: order.length })
           : DASH;
       }
     }
@@ -354,7 +430,7 @@
       //: Both are prose somebody wrote about this item; neither is a measurement, so
       //: an item with neither says so rather than showing an empty line.
       var said = txt(it.summary) || txt(it.decision);
-      box.appendChild(el('div', 'said', said || 'Nothing written on this item yet.'));
+      box.appendChild(el('div', 'said', said || i18n('nothing_written')));
 
       var pills = el('div', 'wkb-pills');
       function pill(label, tone) {
@@ -363,24 +439,27 @@
         pills.appendChild(p);
       }
       var status = txt(it.status);
-      pill(status ? 'worker ' + status : 'worker silent',
+      pill(status ? i18n('worker_status', { v: status }) : i18n('worker_silent'),
         (status && STATUS_TONES[status]) || null);
       var verdict = txt(it.verdict);
       if (verdict) {
+        //: The verdict VALUE is concatenated as it came, so a verdict the product adds
+        //: later still shows rather than falling out of a lookup. Only its colour
+        //: branches, on pass alone.
         pill('verdict ' + verdict,
           verdict === 'pass' ? 'var(--ok, #22c55e)' : 'var(--danger, #ef4444)');
       }
       var fails = num(it.fails);
-      if (fails) pill(fails + (fails === 1 ? ' fail' : ' fails'), 'var(--danger, #ef4444)');
+      if (fails) pill(i18n(fails === 1 ? 'fail_one' : 'fail_many', { n: fails }), 'var(--danger, #ef4444)');
       var pr = num(it.pr);
-      if (pr) pill('PR ' + pr, 'var(--info, #0891b2)');
+      if (pr) pill(i18n('pr', { n: pr }), 'var(--info, #0891b2)');
       box.appendChild(pills);
 
       var foot = el('div', 'wkb-foot');
       var worker = txt(it.spender);
-      foot.appendChild(document.createTextNode('worker '));
+      foot.appendChild(document.createTextNode(i18n('f_worker') + ' '));
       foot.appendChild(el('em', null, worker || DASH));
-      foot.appendChild(document.createTextNode('  \u00b7  reported '));
+      foot.appendChild(document.createTextNode('  \u00b7  ' + i18n('f_reported') + ' '));
       foot.appendChild(el('em', null, stamp(it.last_report_at, false) || DASH));
       box.appendChild(foot);
       return box;
@@ -396,7 +475,7 @@
         var col = el('div', 'wkb-col');
         var head = el('div', 'wkb-colh');
         head.appendChild(swatch(COLS[c][2]));
-        head.appendChild(el('h3', null, COLS[c][1]));
+        head.appendChild(el('h3', null, i18n('col_' + key)));
         head.appendChild(el('span', 'n', String(counts[key])));
         col.appendChild(head);
 
@@ -409,10 +488,9 @@
           col.appendChild(card(list[i], list[i] === star));
           shown += 1;
         }
-        if (!shown) col.appendChild(el('div', 'wkb-none', 'Nothing here.'));
+        if (!shown) col.appendChild(el('div', 'wkb-none', i18n('nothing_here')));
         if (held) {
-          col.appendChild(el('div', 'wkb-more',
-            held + ' more in this column, not drawn'));
+          col.appendChild(el('div', 'wkb-more', i18n('more_in_column', { n: held })));
         }
         host.appendChild(col);
       }
@@ -423,20 +501,19 @@
       if (!out) return;
       out.textContent = '';
       if (!list.length) {
-        out.textContent = 'This board carries no item yet.';
+        out.textContent = i18n('board_no_item');
         return;
       }
       var t = tally(list);
       function bold(v) { return el('b', null, String(v)); }
       out.appendChild(bold(t.acc));
-      out.appendChild(document.createTextNode(' of '));
+      out.appendChild(document.createTextNode(i18n('hl_of')));
       out.appendChild(bold(list.length));
-      out.appendChild(document.createTextNode(' items accepted. '));
+      out.appendChild(document.createTextNode(i18n('hl_accepted')));
       out.appendChild(bold(t.await));
-      out.appendChild(document.createTextNode(t.await === 1
-        ? ' waits on your verdict, ' : ' wait on your verdict, '));
+      out.appendChild(document.createTextNode(i18n(t.await === 1 ? 'hl_waits_one' : 'hl_waits_many')));
       out.appendChild(bold(t.prog));
-      out.appendChild(document.createTextNode(' still with a worker.'));
+      out.appendChild(document.createTextNode(i18n('hl_worker')));
     }
 
     function drawFreshness() {
@@ -445,12 +522,13 @@
       if (!node) return;
       node.className = 'wkb-fresh' + (api.stale ? ' is-stale' : '');
       var seq = num(api.seq);
-      node.lastChild.textContent = (api.stale ? 'Stale' : 'Fresh') +
+      node.lastChild.textContent = i18n(api.stale ? 'stale' : 'fresh') +
         ' \u00b7 seq ' + (seq === null ? DASH : seq);
     }
 
     function render() {
       var f = fields();
+      applyStatic();
       //: Every cell is written from the field bag rather than left as the host filled
       //: it: a long slot key and a full ISO stamp both need shortening, and the array
       //: cell would otherwise read as dumped JSON.
@@ -465,7 +543,7 @@
       put('last_entry_at', stamp(f.last_entry_at, true));
 
       var list = items();
-      put('items', list.length + (list.length === 1 ? ' item' : ' items'));
+      put('items', i18n(list.length === 1 ? 'item_one' : 'item_many', { n: list.length }));
 
       drawFreshness();
       drawHeadline(list);

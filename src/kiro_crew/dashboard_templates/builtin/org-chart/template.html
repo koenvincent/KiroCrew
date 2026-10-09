@@ -116,28 +116,116 @@
   </style>
 
   <div class="oc-head">
-    <h2>Who dispatched whom</h2>
-    <div class="oc-sub">last fold write <span data-dashboard-field="last_entry_at">-</span></div>
+    <h2 data-i18n="oc_title">Who dispatched whom</h2>
+    <div class="oc-sub"><span data-i18n="oc_last_write">last fold write</span> <span data-dashboard-field="last_entry_at">-</span></div>
   </div>
   <div class="oc-sub" id="oc-scope">-</div>
 
-  <div class="oc-sect">the reporting graph</div>
+  <div class="oc-sect" data-i18n="oc_graph_sect">the reporting graph</div>
   <div id="oc-graph"></div>
 
-  <div class="oc-sect" id="oc-cards-t">latest run, one card per worker session</div>
+  <div class="oc-sect" id="oc-cards-t" data-i18n="oc_cards_sect">latest run, one card per worker session</div>
   <div class="oc-cards" id="oc-cards"></div>
 
   <div class="oc-foot" id="oc-foot"></div>
   <div class="oc-sub" style="margin-top: 7px;">
-    <span data-dashboard-field="items">-</span> board(s) drawn,
-    <span data-dashboard-field="omitted">-</span> not shown,
-    <span data-dashboard-field="spenders_omitted">-</span> worker(s) past the fold's cap
+    <span data-dashboard-field="items">-</span> <span data-i18n="oc_boards_drawn">board(s) drawn,</span>
+    <span data-dashboard-field="omitted">-</span> <span data-i18n="oc_not_shown">not shown,</span>
+    <span data-dashboard-field="spenders_omitted">-</span> <span data-i18n="oc_past_cap">worker(s) past the fold's cap</span>
   </div>
 
   <script>
   (function () {
     var DASH = '\u2014';
     var MID = '\u00b7';
+
+    // The page's own words, one table per UI language. A key a language lacks falls back
+    // to English. Values the fold or a crewmate wrote are never looked up here. The
+    // zh-CN strings are \u-escaped so the source stays ASCII.
+    var I18N = {
+      en: {
+        oc_title: 'Who dispatched whom', oc_last_write: 'last fold write',
+        oc_graph_sect: 'the reporting graph',
+        oc_cards_sect: 'latest run, one card per worker session',
+        oc_boards_drawn: 'board(s) drawn,', oc_not_shown: 'not shown,',
+        oc_past_cap: 'worker(s) past the fold\'s cap',
+        situ_run: 'working', situ_idle: 'idle', situ_cold: 'silent 2h+', situ_need: 'needs you',
+        situ_mute: 'no report', situ_done: 'accepted', situ_bad: 'rejected', situ_gone: 'abandoned',
+        role_lead: 'lead', role_sublead: 'sub-lead', role_its_board: 'its board',
+        role_worker: 'worker', role_unbound: 'unbound',
+        no_goal_recorded: 'a board with no goal recorded', no_goal_short: 'a board with no goal',
+        fact_round: 'round ', fact_dispatched: ' dispatched', fact_accepted: ' accepted',
+        fact_need_you: ' need you', fact_credits: ' credits',
+        last_word: 'last word', ago_suffix: ' ago',
+        nothing_dispatched: 'nothing dispatched from this board yet',
+        not_bound: 'not bound to a worker',
+        never_reported_prefix: 'This session has never reported. Its newest task is ',
+        reported_no_summary: 'It reported with no summary, so the record has a stamp and no words.',
+        no_report_stamped: 'no report stamped', credits_nobody: ' credits (nobody measured)',
+        worked_suffix: ' worked', tasks_on_session: ' tasks on this session',
+        pr_prefix: 'PR ', acceptance_prefix: 'acceptance ',
+        blocked_waiting: 'blocked, waiting on someone', asking_conductor: 'asking its conductor',
+        open_via: 'open via ', last_report_prefix: 'last report ',
+        keys_title: 'The fold aliases a worker\u2019s session key, so the card carries the board and item a host resolves the session from instead.',
+        empty_no_board: 'No board has reached this crewmate\u2019s record yet, so there is nobody to chart.',
+        scope_leads: ' lead(s) ', scope_subleads: ' sub-lead(s) ', scope_sessions: ' worker session(s)',
+        foot_cut: ' task(s) were cut by the fold\u2019s per-board cap, so they are in neither the graph nor the cards.',
+        foot_mute: ' session(s) have never reported. Their cards say so rather than showing a silence, which is a different fact.',
+        foot_alias: 'A card carries the board and item a host opens the session from. The fold aliases the session key itself, so no page here can name a worker\u2019s session.'
+      },
+      'zh-CN': {
+        oc_title: '\u8c01\u6d3e\u53d1\u4e86\u8c01', oc_last_write: '\u8bb0\u5f55\u6700\u540e\u5199\u5165',
+        oc_graph_sect: '\u6c47\u62a5\u5173\u7cfb\u56fe',
+        oc_cards_sect: '\u6700\u65b0\u8fd0\u884c\uff0c\u6bcf\u4e2a\u6267\u884c\u8005\u4f1a\u8bdd\u4e00\u5f20\u5361\u7247',
+        oc_boards_drawn: '\u4e2a\u770b\u677f\u5df2\u7ed8\u5236\uff0c', oc_not_shown: '\u672a\u663e\u793a\uff0c',
+        oc_past_cap: '\u4e2a\u6267\u884c\u8005\u8d85\u51fa\u8bb0\u5f55\u4e0a\u9650',
+        situ_run: '\u5de5\u4f5c\u4e2d', situ_idle: '\u7a7a\u95f2', situ_cold: '\u9759\u9ed8\u8d852\u5c0f\u65f6', situ_need: '\u9700\u8981\u4f60',
+        situ_mute: '\u65e0\u6c47\u62a5', situ_done: '\u5df2\u63a5\u53d7', situ_bad: '\u5df2\u62d2\u7edd', situ_gone: '\u5df2\u653e\u5f03',
+        role_lead: '\u7275\u5934', role_sublead: '\u6b21\u7ea7\u7275\u5934', role_its_board: '\u5b83\u7684\u770b\u677f',
+        role_worker: '\u6267\u884c\u8005', role_unbound: '\u672a\u7ed1\u5b9a',
+        no_goal_recorded: '\u4e00\u4e2a\u672a\u8bb0\u5f55\u76ee\u6807\u7684\u770b\u677f', no_goal_short: '\u4e00\u4e2a\u6ca1\u6709\u76ee\u6807\u7684\u770b\u677f',
+        fact_round: '\u8f6e\u6b21 ', fact_dispatched: ' \u4e2a\u5df2\u6d3e\u53d1', fact_accepted: ' \u4e2a\u5df2\u63a5\u53d7',
+        fact_need_you: ' \u4e2a\u9700\u8981\u4f60', fact_credits: ' \u70b9\u82b1\u8d39',
+        last_word: '\u6700\u540e\u53d1\u8a00', ago_suffix: ' \u524d',
+        nothing_dispatched: '\u6b64\u770b\u677f\u5c1a\u672a\u6d3e\u53d1\u4efb\u4f55\u4efb\u52a1',
+        not_bound: '\u672a\u7ed1\u5b9a\u5230\u6267\u884c\u8005',
+        never_reported_prefix: '\u6b64\u4f1a\u8bdd\u4ece\u672a\u6c47\u62a5\u3002\u5b83\u6700\u65b0\u7684\u4efb\u52a1\u662f ',
+        reported_no_summary: '\u5b83\u6c47\u62a5\u4e86\u4f46\u6ca1\u6709\u6458\u8981\uff0c\u6240\u4ee5\u8bb0\u5f55\u53ea\u6709\u65f6\u95f4\u6233\u800c\u6ca1\u6709\u6587\u5b57\u3002',
+        no_report_stamped: '\u65e0\u6c47\u62a5\u65f6\u95f4\u6233', credits_nobody: ' \u70b9\u82b1\u8d39\uff08\u65e0\u4eba\u7edf\u8ba1\uff09',
+        worked_suffix: ' \u5df2\u5de5\u4f5c', tasks_on_session: ' \u4e2a\u4efb\u52a1\u5728\u6b64\u4f1a\u8bdd\u4e0a',
+        pr_prefix: 'PR ', acceptance_prefix: '\u9a8c\u6536 ',
+        blocked_waiting: '\u53d7\u963b\uff0c\u7b49\u5f85\u4ed6\u4eba', asking_conductor: '\u6b63\u5728\u8be2\u95ee\u5176\u6307\u6325',
+        open_via: '\u6253\u5f00\u65b9\u5f0f ', last_report_prefix: '\u6700\u540e\u6c47\u62a5 ',
+        keys_title: '\u8bb0\u5f55\u4e3a\u6267\u884c\u8005\u7684\u4f1a\u8bdd\u5bc6\u94a5\u8bbe\u7f6e\u4e86\u522b\u540d\uff0c\u6240\u4ee5\u5361\u7247\u6539\u4e3a\u643a\u5e26\u4e3b\u673a\u636e\u4ee5\u89e3\u6790\u4f1a\u8bdd\u7684\u770b\u677f\u4e0e\u6761\u76ee\u3002',
+        empty_no_board: '\u5c1a\u65e0\u770b\u677f\u8fdb\u5165\u8fd9\u4f4d\u961f\u53cb\u7684\u8bb0\u5f55\uff0c\u56e0\u6b64\u6ca1\u6709\u53ef\u7ed8\u5236\u7684\u5bf9\u8c61\u3002',
+        scope_leads: ' \u4e2a\u7275\u5934 ', scope_subleads: ' \u4e2a\u6b21\u7ea7\u7275\u5934 ', scope_sessions: ' \u4e2a\u6267\u884c\u8005\u4f1a\u8bdd',
+        foot_cut: ' \u4e2a\u4efb\u52a1\u88ab\u8bb0\u5f55\u7684\u5355\u770b\u677f\u4e0a\u9650\u622a\u65ad\uff0c\u56e0\u6b64\u5b83\u4eec\u65e2\u4e0d\u5728\u5173\u7cfb\u56fe\u4e2d\uff0c\u4e5f\u4e0d\u5728\u5361\u7247\u4e2d\u3002',
+        foot_mute: ' \u4e2a\u4f1a\u8bdd\u4ece\u672a\u6c47\u62a5\u3002\u5b83\u4eec\u7684\u5361\u7247\u5982\u5b9e\u8bf4\u660e\uff0c\u800c\u975e\u663e\u793a\u4e00\u6bb5\u9759\u9ed8\uff0c\u8fd9\u662f\u4e0d\u540c\u7684\u4e8b\u5b9e\u3002',
+        foot_alias: '\u5361\u7247\u643a\u5e26\u4e3b\u673a\u636e\u4ee5\u6253\u5f00\u4f1a\u8bdd\u7684\u770b\u677f\u4e0e\u6761\u76ee\u3002\u8bb0\u5f55\u672c\u8eab\u4e3a\u4f1a\u8bdd\u5bc6\u94a5\u8bbe\u7f6e\u4e86\u522b\u540d\uff0c\u6240\u4ee5\u8fd9\u91cc\u6ca1\u6709\u9875\u9762\u80fd\u6307\u51fa\u6267\u884c\u8005\u7684\u4f1a\u8bdd\u3002'
+      }
+    };
+    function locale() {
+      var l = (window.kirocrew || {}).locale;
+      return typeof l === 'string' && Object.prototype.hasOwnProperty.call(I18N, l) ? l : 'en';
+    }
+    function has(key) {
+      return Object.prototype.hasOwnProperty.call(I18N.en, key);
+    }
+    function i18n(key, vars) {
+      var table = I18N[locale()];
+      var s = Object.prototype.hasOwnProperty.call(table, key) ? table[key] : I18N.en[key];
+      if (s === undefined) s = key;
+      if (vars) {
+        s = s.replace(/\{(\w+)\}/g, function (m, k) {
+          return Object.prototype.hasOwnProperty.call(vars, k) ? String(vars[k]) : m;
+        });
+      }
+      return s;
+    }
+    function applyStatic() {
+      var nodes = document.querySelectorAll('[data-i18n]');
+      for (var i = 0; i < nodes.length; i++) nodes[i].textContent = i18n(nodes[i].getAttribute('data-i18n'));
+    }
 
     /* The project report's threshold, so the two pages do not disagree about the same
        worker. See the note in `timeline`. */
@@ -154,14 +242,14 @@
          - reported, silent since -> idle, with the length said out loud
          - never reported -> not a long silence, an absent one. */
     var SITU = {
-      run:  ['working', 'var(--oc-run)'],
-      idle: ['idle', 'var(--oc-idle)'],
-      cold: ['silent 2h+', 'var(--oc-cold)'],
-      need: ['needs you', 'var(--oc-need)'],
-      mute: ['no report', 'var(--oc-gone)'],
-      done: ['accepted', 'var(--oc-done)'],
-      bad:  ['rejected', 'var(--oc-bad)'],
-      gone: ['abandoned', 'var(--oc-gone)']
+      run:  ['situ_run', 'var(--oc-run)'],
+      idle: ['situ_idle', 'var(--oc-idle)'],
+      cold: ['situ_cold', 'var(--oc-cold)'],
+      need: ['situ_need', 'var(--oc-need)'],
+      mute: ['situ_mute', 'var(--oc-gone)'],
+      done: ['situ_done', 'var(--oc-done)'],
+      bad:  ['situ_bad', 'var(--oc-bad)'],
+      gone: ['situ_gone', 'var(--oc-gone)']
     };
 
     function text(v) { return typeof v === 'string' && v.trim() ? v.trim() : null; }
@@ -302,16 +390,16 @@
     function boardFacts(board) {
       var out = [];
       var r = num(board.round);
-      if (r !== null) out.push('round ' + r);
+      if (r !== null) out.push(i18n('fact_round') + r);
       var total = num(board.total);
-      out.push((total === null ? board.tasks.length : total) + ' dispatched');
+      out.push((total === null ? board.tasks.length : total) + i18n('fact_dispatched'));
       var acc = num(board.accepted);
-      if (acc !== null) out.push(acc + ' accepted');
+      if (acc !== null) out.push(acc + i18n('fact_accepted'));
       var nd = num(board.needs_you);
-      if (nd) out.push(nd + ' need you');
+      if (nd) out.push(nd + i18n('fact_need_you'));
       out.push(board.credits_reported === true
-        ? (num(board.credits) || 0).toFixed(2) + ' credits'
-        : DASH + ' credits');
+        ? (num(board.credits) || 0).toFixed(2) + i18n('fact_credits')
+        : DASH + i18n('fact_credits'));
       return out.join(' ' + MID + ' ');
     }
 
@@ -327,15 +415,15 @@
       var who = text(task.spender);
       var situ = situation(task, now);
       var node = el('div', 'oc-node');
-      var label = who === null ? 'unbound' : 'worker ' + who;
-      var line = SITU[situ][0];
+      var label = who === null ? i18n('role_unbound') : i18n('role_worker') + ' ' + who;
+      var line = i18n(SITU[situ][0]);
       var last = stamp(task.last_report_at);
-      if (last !== null) line += ' ' + MID + ' last word ' + span(Math.max(0, now - last)) + ' ago';
+      if (last !== null) line += ' ' + MID + ' ' + i18n('last_word') + ' ' + span(Math.max(0, now - last)) + i18n('ago_suffix');
 
       if (kid.sub) {
         var sub = kid.sub.board;
         node.appendChild(chip(
-          'sub-lead',
+          i18n('role_sublead'),
           text(task.title) || text(task.item_id) || DASH,
           label + ' ' + MID + ' ' + line,
           'oc-is-sub',
@@ -346,8 +434,8 @@
            reader can see WHICH board the names below belong to. */
         var own = el('div', 'oc-node');
         own.appendChild(chip(
-          'its board',
-          text(sub.goal) || 'a board with no goal recorded',
+          i18n('role_its_board'),
+          text(sub.goal) || i18n('no_goal_recorded'),
           boardFacts(sub),
           null,
           null
@@ -371,7 +459,7 @@
     function drawKids(n, into, now) {
       if (!n.kids.length) {
         into.appendChild(el('div', 'oc-node oc-none-line',
-          'nothing dispatched from this board yet'));
+          i18n('nothing_dispatched')));
         return;
       }
       for (var i = 0; i < n.kids.length; i++) drawKid(n.kids[i], into, now);
@@ -381,8 +469,8 @@
       var board = n.board;
       var wrap = el('div', 'oc-node');
       wrap.appendChild(chip(
-        'lead',
-        text(board.goal) || 'a board with no goal recorded',
+        i18n('role_lead'),
+        text(board.goal) || i18n('no_goal_recorded'),
         boardFacts(board),
         'oc-is-lead',
         null
@@ -419,7 +507,7 @@
             order.push(key);
           }
           row.tasks.push({ task: task, board: board });
-          var goal = text(board.goal) || text(board.id) || 'a board with no goal';
+          var goal = text(board.goal) || text(board.id) || i18n('no_goal_short');
           if (row.boards.indexOf(goal) < 0) row.boards.push(goal);
           /* ONE figure per session, taken rather than summed: the fold repeats a
              session's spend on each of its task rows, and adding them would multiply
@@ -466,9 +554,9 @@
 
       var top = el('div', 'oc-card-top');
       top.appendChild(el('b', null, row.worker === null
-        ? 'not bound to a worker'
-        : 'worker ' + row.worker));
-      var stat = el('span', 'oc-stat' + (situ === 'mute' ? ' oc-stat-mute' : ''), SITU[situ][0]);
+        ? i18n('not_bound')
+        : i18n('role_worker') + ' ' + row.worker));
+      var stat = el('span', 'oc-stat' + (situ === 'mute' ? ' oc-stat-mute' : ''), i18n(SITU[situ][0]));
       stat.style.color = colour;
       top.appendChild(stat);
       card.appendChild(top);
@@ -483,11 +571,11 @@
         card.appendChild(line);
       } else if (row.latestAt === null) {
         card.appendChild(el('div', 'oc-said oc-none',
-          'This session has never reported. Its newest task is '
+          i18n('never_reported_prefix')
           + (text(task.title) || text(task.item_id) || DASH) + '.'));
       } else {
         card.appendChild(el('div', 'oc-said oc-none',
-          'It reported with no summary, so the record has a stamp and no words.'));
+          i18n('reported_no_summary')));
       }
 
       var facts = el('div', 'oc-facts');
@@ -497,36 +585,36 @@
 
       if (row.latestAt !== null) {
         var ago = el('span', (situ === 'idle' || situ === 'cold') ? 'oc-wait' : null,
-          span(Math.max(0, now - row.latestAt)) + ' ago');
-        ago.title = 'last report ' + dayClock(row.latestAt) + ' UTC';
+          span(Math.max(0, now - row.latestAt)) + i18n('ago_suffix'));
+        ago.title = i18n('last_report_prefix') + dayClock(row.latestAt) + ' UTC';
         facts.appendChild(ago);
       } else {
-        facts.appendChild(el('span', 'oc-wait', 'no report stamped'));
+        facts.appendChild(el('span', 'oc-wait', i18n('no_report_stamped')));
       }
 
       facts.appendChild(el('span', null, row.reported
-        ? row.credits.toFixed(2) + ' credits'
-        : DASH + ' credits (nobody measured)'));
+        ? row.credits.toFixed(2) + i18n('fact_credits')
+        : DASH + i18n('credits_nobody')));
 
       var dur = num(task.duration_ms);
-      if (dur) facts.appendChild(el('span', null, span(dur) + ' worked'));
+      if (dur) facts.appendChild(el('span', null, span(dur) + i18n('worked_suffix')));
 
       if (row.tasks.length > 1) {
-        var more = el('span', null, row.tasks.length + ' tasks on this session');
+        var more = el('span', null, row.tasks.length + i18n('tasks_on_session'));
         more.title = row.boards.join(' \u00b7 ');
         facts.appendChild(more);
       }
       var pr = text(task.pr) || (num(task.pr) !== null ? String(task.pr) : null);
-      if (pr) facts.appendChild(el('span', null, 'PR ' + pr));
+      if (pr) facts.appendChild(el('span', null, i18n('pr_prefix') + pr));
       var verdict = text(task.verdict);
       if (verdict) {
         facts.appendChild(el('span', verdict === 'fail' ? 'oc-warn' : null,
-          'acceptance ' + verdict));
+          i18n('acceptance_prefix') + verdict));
       }
       if (situ === 'need') {
         facts.appendChild(el('span', 'oc-warn', text(task.status) === 'blocked'
-          ? 'blocked, waiting on someone'
-          : 'asking its conductor'));
+          ? i18n('blocked_waiting')
+          : i18n('asking_conductor')));
       }
       card.appendChild(facts);
 
@@ -539,17 +627,17 @@
          Printing an alias as if it were a link would be a dead link; printing the key
          would be the leak the fold exists to prevent. */
       var keys = el('div', 'oc-keys');
-      keys.appendChild(document.createTextNode('open via '));
+      keys.appendChild(document.createTextNode(i18n('open_via')));
       keys.appendChild(el('code', null,
         (text(pair.board.id) || DASH) + ' / ' + (text(task.item_id) || DASH)));
-      keys.title = 'The fold aliases a worker\u2019s session key, so the card carries the '
-        + 'board and item a host resolves the session from instead.';
+      keys.title = i18n('keys_title');
       card.appendChild(keys);
       return card;
     }
 
     /* ---------------------------------------------------------------- */
     function render() {
+      applyStatic();
       var cells = document.body.querySelectorAll('[data-dashboard-field]');
       for (var c = 0; c < cells.length; c++) {
         if (!cells[c].textContent.trim()) cells[c].textContent = DASH;
@@ -577,8 +665,7 @@
       var now = Date.now();
 
       if (!list.length) {
-        graph.appendChild(el('div', 'oc-empty',
-          'No board has reached this crewmate\u2019s record yet, so there is nobody to chart.'));
+        graph.appendChild(el('div', 'oc-empty', i18n('empty_no_board')));
         cardsTitle.hidden = true;
         scope.textContent = DASH;
         return;
@@ -593,27 +680,21 @@
 
       var subs = 0;
       for (var s in g.subOf) if (Object.prototype.hasOwnProperty.call(g.subOf, s)) subs++;
-      scope.textContent = g.roots.length + ' lead(s) ' + MID + ' ' + subs + ' sub-lead(s) '
-        + MID + ' ' + rows.length + ' worker session(s)';
+      scope.textContent = g.roots.length + i18n('scope_leads') + MID + ' ' + subs + i18n('scope_subleads')
+        + MID + ' ' + rows.length + i18n('scope_sessions');
 
       /* The absences, said rather than left to be noticed. */
       var cut = 0;
       for (var b = 0; b < list.length; b++) cut += num(list[b].tasks_omitted) || 0;
       if (cut) {
-        foot.appendChild(el('p', null, cut
-          + ' task(s) were cut by the fold\u2019s per-board cap, so they are in neither the '
-          + 'graph nor the cards.'));
+        foot.appendChild(el('p', null, cut + i18n('foot_cut')));
       }
       var mute = 0;
       for (var m = 0; m < rows.length; m++) if (rows[m].latestAt === null) mute++;
       if (mute) {
-        foot.appendChild(el('p', null, mute
-          + ' session(s) have never reported. Their cards say so rather than showing a '
-          + 'silence, which is a different fact.'));
+        foot.appendChild(el('p', null, mute + i18n('foot_mute')));
       }
-      foot.appendChild(el('p', null,
-        'A card carries the board and item a host opens the session from. The fold '
-        + 'aliases the session key itself, so no page here can name a worker\u2019s session.'));
+      foot.appendChild(el('p', null, i18n('foot_alias')));
     }
 
     render();

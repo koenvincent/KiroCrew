@@ -326,6 +326,7 @@ class TestSubagentInheritsPolicy:
         is_yolo=None,
         publish=None,
         captured: dict | None = None,
+        events: tuple = (),
     ) -> dict:
         """Invoke the real _run_inner and capture get_or_create kwargs.
 
@@ -358,6 +359,8 @@ class TestSubagentInheritsPolicy:
 
         # Client streams a single COMPLETE event (no tool calls)
         async def fake_stream(msg):
+            for event in events:
+                yield event
             yield LLMEvent(kind=EVENT_COMPLETE)
 
         mock_client.stream = fake_stream
@@ -379,7 +382,16 @@ class TestSubagentInheritsPolicy:
                 captured["published_base"] = base
                 return PublishedSpec(name=f"{base}--readonly", digest="d")
 
-        with patch("kiro_crew.dashboard.side_readonly_spec.publish_readonly_spec", publish):
+        async def floored_hooks(base, cwd):
+            captured["floored_hooks_base"] = base
+            from kiro_crew.agent_sdk.spec_hooks import TurnSpecHooks
+
+            return TurnSpecHooks([], cwd, False, True)
+
+        with (
+            patch("kiro_crew.dashboard.side_readonly_spec.publish_readonly_spec", publish),
+            patch("kiro_crew.subagent.floored_spec_hooks", floored_hooks),
+        ):
             asyncio.run(runner._run_inner(info, "subagent:sub1"))
         captured["info"] = info
         return captured
@@ -392,10 +404,13 @@ class TestSubagentInheritsPolicy:
         )
         assert captured["published_base"] == "kirocrew"
         assert captured["agent"] == "kirocrew--readonly"
+        # The derived spec drops hooks; the template's PreToolUse ones still gate.
+        assert captured["floored_hooks_base"] == "kirocrew"
 
     def test_a_run_without_a_floor_keeps_its_own_spec(self) -> None:
         captured = self._run_inner_and_capture("", parent_session_key="")
         assert "published_base" not in captured
+        assert "floored_hooks_base" not in captured
         assert captured["agent"] != "kirocrew--readonly"
 
     def test_a_floored_run_whose_spec_cannot_be_derived_is_refused(self) -> None:
@@ -415,12 +430,37 @@ class TestSubagentInheritsPolicy:
             )
         assert "agent" not in captured, "the base agent must never be launched"
 
+    def test_a_floored_run_on_a_backend_that_cannot_carry_it_is_refused(self) -> None:
+        """The backend can change between admission and start; the run must not
+        start under a harness whose own grants the derived spec cannot empty."""
+        captured: dict = {}
+        with patch(
+            "kiro_crew.subagent_manager.hub_approvals.floor_enforceable", return_value=False
+        ):
+            with pytest.raises(RuntimeError, match="approval floor"):
+                self._run_inner_and_capture(
+                    "", parent_session_key="", approval_floor="interactive", captured=captured
+                )
+        assert "agent" not in captured, "no agent may be launched"
+        assert "published_base" not in captured
+
+    def test_a_floored_run_cannot_switch_agents(self) -> None:
+        """Another agent brings its own backend grants, which the floor's derived
+        spec never emptied, so the run ends instead of following the switch."""
+        from kiro_crew.providers.base import EVENT_AGENT_SWITCHED, LLMEvent
+
+        switch = LLMEvent(kind=EVENT_AGENT_SWITCHED, text="other-agent")
+        with pytest.raises(RuntimeError, match="switch agents"):
+            self._run_inner_and_capture(
+                "", parent_session_key="", approval_floor="interactive", events=(switch,)
+            )
+
     def test_an_interactive_floor_outranks_the_config_fallback(self) -> None:
         """A remote hub's floor keeps a parentless child's tools behind
         approval on a gateway whose config would auto-approve them."""
         with patch(
             "kiro_crew.subagent.KiroCrewConfig.load",
-            return_value=MagicMock(agent=MagicMock(approval_mode="auto")),
+            return_value=MagicMock(agent=MagicMock(approval_mode="auto", acp_backend="")),
         ):
             captured = self._run_inner_and_capture(
                 "", parent_session_key="", approval_floor="interactive"

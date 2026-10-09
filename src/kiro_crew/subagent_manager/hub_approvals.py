@@ -70,13 +70,37 @@ async def ask_hub(run_id: str, event: Any, *, timeout: float | None = None) -> b
         logger.info("Hub approval %s for run %s went unanswered; rejected", approval_id, run_id)
         return False
     finally:
+        # Once off the map the future is unreachable: ``resolve`` cannot find it
+        # and nothing awaits it again, so it is dropped rather than settled.
         waits = _PENDING.get(run_id)
         if waits is not None:
             waits.pop(approval_id, None)
             if not waits:
                 _PENDING.pop(run_id, None)
-        if not pending.future.done():
-            pending.future.cancel()
+
+
+def floor_enforceable() -> bool:
+    """Whether this gateway's sub-agent harness can carry an approval floor.
+
+    The floor rests on a kiro-cli agent-spec mechanism: a floored run launches
+    as the derived ``<agent>--readonly`` spec, whose emptied grants make every
+    tool call raise a permission request the ladder hands to the hub. Another
+    harness pre-approves through a surface that spec cannot reach
+    (claude-agent-acp ``permissions.allow`` / ``bypassPermissions``), so a call
+    it pre-approves would run with no person and no SEL row. This is the same
+    positive capability the side chat's read-only tools rest on
+    (``ACP_BACKENDS_SIDE_READONLY``, harness-parity H6), never a negation, and an
+    unreadable config reads as not enforceable.
+    """
+    from kiro_crew.acp_backends import ACP_BACKENDS_SIDE_READONLY
+    from kiro_crew.config.loader import KiroCrewConfig
+
+    try:
+        backend = KiroCrewConfig.load().agent.acp_backend
+    except Exception:
+        logger.warning("agent.acp_backend is unreadable; the approval floor is not enforceable")
+        return False
+    return backend in ACP_BACKENDS_SIDE_READONLY
 
 
 def pending_for(run_id: str) -> list[dict[str, str]]:

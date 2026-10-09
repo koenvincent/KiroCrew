@@ -219,6 +219,9 @@ async def api_member_dashboard(request: web.Request) -> web.Response:
     if owner_denied is not None:
         return owner_denied
     slug, _member = resolved
+    # The reader's UI language, as the browser resolved it. Checked against the
+    # shipped catalogs in `dashboard_frame.page_locale`; anything else is English.
+    locale = request.query.get("locale", "")
     if request.query.get("preview") == "1":
         # The STAGED page, which no version records. Served from the same route and
         # behind the same owner check: a staged page carries this crewmate's fold
@@ -233,7 +236,7 @@ async def api_member_dashboard(request: web.Request) -> web.Response:
         # The CURRENT version, not a new one, because staging wrote none. A reader that
         # saw this number move would believe the page had been installed.
         body["preview"] = True
-        rendered = await _run(lambda: _render(slug, _member, staged))
+        rendered = await _run(lambda: _render(slug, _member, staged, locale))
         if rendered is not None:
             body["rendered_html"] = rendered
         return web.json_response(body)
@@ -266,7 +269,7 @@ async def api_member_dashboard(request: web.Request) -> web.Response:
         instance.STATE_EMPTY,
         instance.STATE_STALE,
     ):
-        rendered = await _run(lambda: _render(slug, _member, record))
+        rendered = await _run(lambda: _render(slug, _member, record, locale))
         if rendered is not None:
             body["rendered_html"] = rendered
     return web.json_response(body)
@@ -510,7 +513,7 @@ def read_fields(slug: str, member: str, manifest: Any) -> Any:
         feed.unsubscribe()
 
 
-def _render(slug: str, member: str, record: Any) -> str | None:
+def _render(slug: str, member: str, record: Any, locale: str = "") -> str | None:
     """The live page with its values filled in: the frame's half of contract v3 part 5.
 
     Fold values come through :class:`~kiro_crew.dashboard_feed.DashboardFeed`, which
@@ -561,6 +564,7 @@ def _render(slug: str, member: str, record: Any) -> str | None:
             # Masked like the values beside them: a stamp is not a secret, but this is
             # the one chokepoint and a field added here later would otherwise skip it.
             written_at={name: str(_page_safe(at)) for name, at in read.written_at.items()},
+            locale=locale,
         )
         # The catalog's page, redacted like the values that go into it. The scrub is
         # kept because this is the one step producing both the raw body and the

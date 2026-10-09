@@ -8,6 +8,7 @@ import { useTheme } from '../../hooks/useTheme'
 import { useSandboxDoc } from '../../hooks/useSandboxDoc'
 import { buildSrcdoc, readThemeVars } from '../../lib/widgetSrcdoc'
 import { i18nT } from '../../i18n/t'
+import { useLanguage } from '../../i18n/LanguageProvider'
 
 /**
  * The sandbox grants for a crewmate's dynamic dashboard, and the ONE line of
@@ -144,9 +145,13 @@ export default function CrewDynamicDashboard({ slug, member, displayName, onAct 
   // eslint-disable-next-line react-hooks/exhaustive-deps
   const themeVars = useMemo(() => readThemeVars(), [theme, colorTheme, themeVersion])
 
+  // The language the page renders its own words in. In the key, so switching the
+  // UI language re-reads the page in the new one.
+  const { resolved: locale } = useLanguage()
+
   const { data, isLoading, isError, refetch } = useQuery({
-    queryKey: ['member-dashboard', slug, member],
-    queryFn: () => api.memberDashboard(slug, member),
+    queryKey: ['member-dashboard', slug, member, locale],
+    queryFn: () => api.memberDashboard(slug, member, locale),
     enabled: Boolean(slug) && Boolean(member),
     // THE FALLBACK, not the mechanism. Liveness comes from the two WS frames
     // `handleDashboardMoved` listens for; this is what covers the gap when one is

@@ -200,6 +200,19 @@ async def api_spawn(request: web.Request) -> web.Response:
             },
             status=400,
         )
+    if approval_floor:
+        from kiro_crew.subagent_manager.hub_approvals import floor_enforceable
+
+        if not floor_enforceable():
+            # This harness pre-approves through a surface the floor cannot
+            # reach, so accepting the run would drop the floor silently.
+            return web.json_response(
+                {
+                    "error": "this gateway's agent backend cannot enforce an approval floor",
+                    "code": "approval_floor_unenforceable",
+                },
+                status=409,
+            )
     silent = body.get("silent", False)
     if not isinstance(silent, bool):
         silent = str(silent).lower() in ("true", "1", "yes")
@@ -296,7 +309,15 @@ async def api_spawn(request: web.Request) -> web.Response:
                 {"error": "app tokens cannot spend a remote crew", "code": "app_token_forbidden"},
                 status=403,
             )
-        if crew:
+        # The admitted execution, not only an explicit ``crew``: a parent that is
+        # itself member-bound (or on a named store) passes that binding on, and
+        # the peer, which receives no store identity, would build a default-store
+        # execution and read its own Global memory instead.
+        if (
+            crew
+            or admitted_execution.member_id is not None
+            or admitted_execution.store.store_id != "default"
+        ):
             return web.json_response(
                 {
                     "error": "remote runs cannot inherit a local Crew Member memory binding",

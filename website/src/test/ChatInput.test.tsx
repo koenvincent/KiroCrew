@@ -1145,6 +1145,42 @@ describe('ChatInput', () => {
       // First arg should be a DOMRect-like object
       expect(onModelClick.mock.calls[0][0]).toBeTruthy()
     })
+
+    it('opens the model and agent pickers on the mouse press, once per press', () => {
+      const onModelClick = vi.fn()
+      const onAgentClick = vi.fn()
+      renderWithProviders(
+        <ChatInput {...defaultProps}
+          providerId="acp"
+          modelName="claude-opus-4.7"
+          onModelClick={onModelClick}
+          agentName="kirocrew"
+          onAgentClick={onAgentClick}
+        />
+      )
+      const model = screen.getByTestId('composer-model-chip')
+      fireEvent.pointerDown(model, { pointerType: 'mouse', button: 0 })
+      expect(onModelClick).toHaveBeenCalledOnce()
+      fireEvent.click(model, { detail: 1 })
+      expect(onModelClick).toHaveBeenCalledOnce()
+
+      const agent = screen.getByRole('button', { name: 'Agent: kirocrew' })
+      fireEvent.pointerDown(agent, { pointerType: 'mouse', button: 0 })
+      expect(onAgentClick).toHaveBeenCalledOnce()
+      fireEvent.click(agent, { detail: 1 })
+      expect(onAgentClick).toHaveBeenCalledOnce()
+    })
+
+    it('reports composer focus captured at the press, before focus moves to the chip', () => {
+      const onModelClick = vi.fn()
+      renderWithProviders(
+        <ChatInput {...defaultProps} providerId="acp" modelName="claude-opus-4.7" onModelClick={onModelClick} />
+      )
+      const editor = screen.getByRole('textbox')
+      editor.focus()
+      fireEvent.pointerDown(screen.getByTestId('composer-model-chip'), { pointerType: 'mouse', button: 0 })
+      expect(onModelClick.mock.calls[0][2]).toBe(true)
+    })
   })
 
   describe('prompt optimizer (slot binding)', () => {

@@ -30,12 +30,12 @@
     .ask { font-size: 10.5px; color: var(--muted-strong, #889); margin-top: 4px; }
   </style>
 
-  <h2>PR watch</h2>
+  <h2 data-i18n="title">PR watch</h2>
   <div class="goal" data-dashboard-field="goal">-</div>
   <div class="meta">
-    <span>round <span data-dashboard-field="round">-</span></span>
-    <span>session <span data-dashboard-field="lifecycle">-</span></span>
-    <span>last write <span data-dashboard-field="last_entry_at">-</span></span>
+    <span><span data-i18n="round">round</span> <span data-dashboard-field="round">-</span></span>
+    <span><span data-i18n="session">session</span> <span data-dashboard-field="lifecycle">-</span></span>
+    <span><span data-i18n="last_write">last write</span> <span data-dashboard-field="last_entry_at">-</span></span>
   </div>
 
   <div class="verdict">
@@ -46,34 +46,118 @@
   <div class="kpis" id="kpis"></div>
 
   <div class="meta" style="margin-top: 11px;">
-    <span style="font-weight: 600; color: var(--text-strong, #fff);">Still in the way</span>
+    <span style="font-weight: 600; color: var(--text-strong, #fff);" data-i18n="still_in_way">Still in the way</span>
     <span class="wrote" id="wrote"></span>
   </div>
   <div id="lanes"></div>
   <div class="sub" style="margin-top: 5px;">
-    <span data-dashboard-field="lanes">-</span> lane(s) read in all; green ones are not listed.
+    <span data-dashboard-field="lanes">-</span> <span data-i18n="lanes_note">lane(s) read in all; green ones are not listed.</span>
   </div>
 
   <div class="meta" style="margin-top: 11px;">
-    <span style="font-weight: 600; color: var(--text-strong, #fff);">Waiting on a person</span>
-    <span>pending <span data-dashboard-field="approvals_pending">-</span></span>
-    <span>asked <span data-dashboard-field="approvals_requested">-</span></span>
+    <span style="font-weight: 600; color: var(--text-strong, #fff);" data-i18n="waiting_person">Waiting on a person</span>
+    <span><span data-i18n="pending">pending</span> <span data-dashboard-field="approvals_pending">-</span></span>
+    <span><span data-i18n="asked">asked</span> <span data-dashboard-field="approvals_requested">-</span></span>
   </div>
   <div id="asks"></div>
-  <div class="sub"><span data-dashboard-field="pending_requests">-</span> request(s) named.</div>
+  <div class="sub"><span data-dashboard-field="pending_requests">-</span> <span data-i18n="requests_named">request(s) named.</span></div>
 
   <div class="meta" style="margin-top: 11px;">
-    <span style="font-weight: 600; color: var(--text-strong, #fff);">Items carrying a PR</span>
+    <span style="font-weight: 600; color: var(--text-strong, #fff);" data-i18n="items_carrying_pr">Items carrying a PR</span>
   </div>
   <div id="items"></div>
   <div class="sub" style="margin-top: 7px;">
-    <span data-dashboard-field="items">-</span> on the board,
-    <span data-dashboard-field="omitted">-</span> not shown (list truncated)
+    <span data-dashboard-field="items">-</span> <span data-i18n="on_board">on the board,</span>
+    <span data-dashboard-field="omitted">-</span> <span data-i18n="not_shown">not shown (list truncated)</span>
   </div>
 
   <script>
     (function () {
       var DASH = '\u2014';
+
+      // The page's own words, one table per UI language. A key a language lacks falls
+      // back to English. Values the record or a crewmate wrote are never looked up
+      // here. The zh-CN strings are \u-escaped so the source stays ASCII.
+      var I18N = {
+        en: {
+          title: 'PR watch', round: 'round', session: 'session', last_write: 'last write',
+          still_in_way: 'Still in the way', lanes_note: 'lane(s) read in all; green ones are not listed.',
+          waiting_person: 'Waiting on a person', pending: 'pending', asked: 'asked',
+          requests_named: 'request(s) named.', items_carrying_pr: 'Items carrying a PR',
+          on_board: 'on the board,', not_shown: 'not shown (list truncated)',
+          lane_fail: 'red', lane_skipped: 'did not run', lane_running: 'running', lane_pass: 'green',
+          owner_not_said: 'owner not said',
+          lanes_all_green: 'Every lane the crewmate read came back green.',
+          lanes_none: 'No lane reading yet. The crewmate has not written one.',
+          asks_none: 'Nothing is waiting on a person right now.',
+          no_lane_read: 'no lane read', items_no_pr: 'No item on this board carries a PR number.',
+          v_no_word: 'No word yet', v_still_red: 'Still red', v_needs_you: 'Needs you',
+          v_checks_green: 'Checks green',
+          v_say_none: 'The crewmate has not written a lane reading, so this page cannot say.',
+          v_say_red: '{n} lane(s) in the way', v_say_red_asks: ', and {n} ask(s) waiting on a person.',
+          v_say_needs: 'Every lane is green; {n} ask(s) are waiting on a person.',
+          v_say_green: 'Every lane the crewmate read came back green. Green is not merged.',
+          kpi_waiting: 'waiting on you', unit_lanes: 'lane(s)', unit_asks: 'ask(s)',
+          wrote: 'crewmate wrote this',
+          state_open: 'open', state_accepted: 'accepted', state_rejected: 'rejected',
+          state_blocked: 'blocked', state_abandoned: 'abandoned', state_unknown: 'unknown'
+        },
+        'zh-CN': {
+          title: 'PR \u76d1\u770b', round: '\u8f6e\u6b21', session: '\u4f1a\u8bdd', last_write: '\u6700\u540e\u5199\u5165',
+          still_in_way: '\u4ecd\u5728\u963b\u6321', lanes_note: '\u6761\u68c0\u67e5\u5df2\u8bfb\u53d6\uff1b\u7eff\u8272\u7684\u672a\u5217\u51fa\u3002',
+          waiting_person: '\u7b49\u5f85\u4eba\u5de5\u5904\u7406', pending: '\u5f85\u5904\u7406', asked: '\u5df2\u8bf7\u6c42',
+          requests_named: '\u4e2a\u8bf7\u6c42\u5df2\u5217\u51fa\u3002', items_carrying_pr: '\u5e26 PR \u7684\u4e8b\u9879',
+          on_board: '\u9879\u5728\u770b\u677f\u4e0a\uff0c', not_shown: '\u9879\u672a\u663e\u793a\uff08\u5217\u8868\u5df2\u622a\u65ad\uff09',
+          lane_fail: '\u7ea2\u706f', lane_skipped: '\u672a\u8fd0\u884c', lane_running: '\u8fd0\u884c\u4e2d', lane_pass: '\u7eff\u706f',
+          owner_not_said: '\u672a\u6ce8\u660e\u8d1f\u8d23\u4eba',
+          lanes_all_green: '\u961f\u53cb\u8bfb\u53d6\u7684\u6bcf\u4e00\u6761\u68c0\u67e5\u90fd\u662f\u7eff\u706f\u3002',
+          lanes_none: '\u8fd8\u6ca1\u6709\u68c0\u67e5\u8bfb\u6570\u3002\u961f\u53cb\u5c1a\u672a\u5199\u5165\u3002',
+          asks_none: '\u76ee\u524d\u6ca1\u6709\u9700\u8981\u4eba\u5de5\u5904\u7406\u7684\u4e8b\u9879\u3002',
+          no_lane_read: '\u65e0\u68c0\u67e5\u8bfb\u6570', items_no_pr: '\u6b64\u770b\u677f\u4e0a\u6ca1\u6709\u4e8b\u9879\u5e26 PR \u7f16\u53f7\u3002',
+          v_no_word: '\u5c1a\u65e0\u7ed3\u8bba', v_still_red: '\u4ecd\u4e3a\u7ea2\u706f', v_needs_you: '\u9700\u8981\u4f60',
+          v_checks_green: '\u68c0\u67e5\u901a\u8fc7',
+          v_say_none: '\u961f\u53cb\u5c1a\u672a\u5199\u5165\u68c0\u67e5\u8bfb\u6570\uff0c\u672c\u9875\u65e0\u6cd5\u5224\u65ad\u3002',
+          v_say_red: '{n} \u6761\u68c0\u67e5\u4ecd\u5728\u963b\u6321', v_say_red_asks: '\uff0c\u8fd8\u6709 {n} \u4e2a\u8bf7\u6c42\u7b49\u5f85\u4eba\u5de5\u5904\u7406\u3002',
+          v_say_needs: '\u6bcf\u4e00\u6761\u68c0\u67e5\u90fd\u662f\u7eff\u706f\uff1b{n} \u4e2a\u8bf7\u6c42\u6b63\u5728\u7b49\u5f85\u4eba\u5de5\u5904\u7406\u3002',
+          v_say_green: '\u961f\u53cb\u8bfb\u53d6\u7684\u6bcf\u4e00\u6761\u68c0\u67e5\u90fd\u662f\u7eff\u706f\u3002\u7eff\u706f\u4e0d\u7b49\u4e8e\u5df2\u5408\u5e76\u3002',
+          kpi_waiting: '\u7b49\u5f85\u4f60', unit_lanes: '\u6761', unit_asks: '\u4e2a\u8bf7\u6c42',
+          wrote: '\u961f\u53cb\u5199\u5165',
+          state_open: '\u8fdb\u884c\u4e2d', state_accepted: '\u5df2\u63a5\u53d7', state_rejected: '\u5df2\u62d2\u7edd',
+          state_blocked: '\u53d7\u963b', state_abandoned: '\u5df2\u653e\u5f03', state_unknown: '\u672a\u77e5'
+        }
+      };
+      function locale() {
+        var l = (window.kirocrew || {}).locale;
+        return typeof l === 'string' && Object.prototype.hasOwnProperty.call(I18N, l) ? l : 'en';
+      }
+      function has(key) {
+        return Object.prototype.hasOwnProperty.call(I18N.en, key);
+      }
+      function i18n(key, vars) {
+        var table = I18N[locale()];
+        var s = Object.prototype.hasOwnProperty.call(table, key) ? table[key] : I18N.en[key];
+        if (s === undefined) s = key;
+        if (vars) {
+          s = s.replace(/\{(\w+)\}/g, function (m, k) {
+            return Object.prototype.hasOwnProperty.call(vars, k) ? String(vars[k]) : m;
+          });
+        }
+        return s;
+      }
+      // A state the ledger stamps is shown in the reader's language when this page
+      // knows it, and as recorded when it does not.
+      function stateLabel(state) {
+        return has('state_' + state) ? i18n('state_' + state) : state;
+      }
+      // A lane reading's own word, in the reader's language when known and as the raw
+      // reading otherwise, so an unknown lane state still names itself.
+      function laneLabel(state) {
+        return has('lane_' + state) ? i18n('lane_' + state) : state;
+      }
+      function applyStatic() {
+        var nodes = document.querySelectorAll('[data-i18n]');
+        for (var i = 0; i < nodes.length; i++) nodes[i].textContent = i18n(nodes[i].getAttribute('data-i18n'));
+      }
 
       // The four lane readings this page knows, and the ONE distinction it exists for:
       // `fail` is a check that ran and returned a finding; `skipped` is a check that
@@ -156,13 +240,13 @@
           var st = document.createElement('span');
           st.className = 'st';
           st.style.color = meta[2];
-          st.textContent = meta[1];
+          st.textContent = laneLabel(meta[0]);
           el.appendChild(st);
           // WHO clears it. A red lane nobody can name an owner for is the one a reader
           // stares at, so an absent owner says so rather than being left blank.
           var own = document.createElement('span');
           own.className = 'own';
-          own.textContent = text(lane.owner) || 'owner not said';
+          own.textContent = text(lane.owner) || i18n('owner_not_said');
           el.appendChild(own);
           var pr = num(lane.pr);
           if (pr) {
@@ -177,8 +261,8 @@
           var ok = document.createElement('div');
           ok.className = 'ask';
           ok.textContent = lanes.length
-            ? 'Every lane the crewmate read came back green.'
-            : 'No lane reading yet. The crewmate has not written one.';
+            ? i18n('lanes_all_green')
+            : i18n('lanes_none');
           host.appendChild(ok);
         }
         return shown.length;
@@ -200,7 +284,7 @@
         if (!requests.length) {
           var none = document.createElement('div');
           none.className = 'ask';
-          none.textContent = 'Nothing is waiting on a person right now.';
+          none.textContent = i18n('asks_none');
           host.appendChild(none);
         }
       }
@@ -236,9 +320,9 @@
           chips.className = 'chips';
           var meta = laneRow(worst[pr] || 'unknown');
           chips.appendChild(chip('PR ' + pr, 'var(--info, #6aa9ff)'));
-          chips.appendChild(chip(worst[pr] ? meta[1] : 'no lane read', worst[pr] ? meta[2] : 'var(--muted-strong, #778)'));
+          chips.appendChild(chip(worst[pr] ? laneLabel(worst[pr]) : i18n('no_lane_read'), worst[pr] ? meta[2] : 'var(--muted-strong, #778)'));
           var state = text(it.state);
-          if (state) chips.appendChild(chip(state, null));
+          if (state) chips.appendChild(chip(stateLabel(state), null));
           var verdict = text(it.verdict);
           // The acceptance verdict is NOT a CI result and the two are kept apart: a
           // green board with a failed acceptance is the case a reader must see.
@@ -249,7 +333,7 @@
         if (!drawn) {
           var none = document.createElement('div');
           none.className = 'ask';
-          none.textContent = 'No item on this board carries a PR number.';
+          none.textContent = i18n('items_no_pr');
           host.appendChild(none);
         }
       }
@@ -263,17 +347,17 @@
         if (!lanes.length) {
           // The honest fourth value. A verdict with no silence state becomes a stale
           // lie the moment the crewmate stops writing, and that is the normal case.
-          colour = '#9aa'; label = 'No word yet';
-          sentence = 'The crewmate has not written a lane reading, so this page cannot say.';
+          colour = '#9aa'; label = i18n('v_no_word');
+          sentence = i18n('v_say_none');
         } else if (reds) {
-          colour = '#ff5c5c'; label = 'Still red';
-          sentence = reds + ' lane(s) in the way' + (pendingApprovals ? ', and ' + pendingApprovals + ' ask(s) waiting on a person.' : '.');
+          colour = '#ff5c5c'; label = i18n('v_still_red');
+          sentence = i18n('v_say_red', { n: reds }) + (pendingApprovals ? i18n('v_say_red_asks', { n: pendingApprovals }) : '.');
         } else if (pendingApprovals) {
-          colour = '#ffd230'; label = 'Needs you';
-          sentence = 'Every lane is green; ' + pendingApprovals + ' ask(s) are waiting on a person.';
+          colour = '#ffd230'; label = i18n('v_needs_you');
+          sentence = i18n('v_say_needs', { n: pendingApprovals });
         } else {
-          colour = '#35d07f'; label = 'Checks green';
-          sentence = 'Every lane the crewmate read came back green. Green is not merged.';
+          colour = '#35d07f'; label = i18n('v_checks_green');
+          sentence = i18n('v_say_green');
         }
         word.textContent = label;
         word.style.color = colour;
@@ -303,6 +387,7 @@
 
       function render() {
         var f = fields();
+        applyStatic();
         var cells = document.body.querySelectorAll('[data-dashboard-field]');
         for (var c = 0; c < cells.length; c++) {
           if (!cells[c].textContent.trim()) cells[c].textContent = DASH;
@@ -324,10 +409,10 @@
         var kpis = document.getElementById('kpis');
         if (kpis) {
           kpis.textContent = '';
-          kpis.appendChild(kpi('red', lanes.length ? reds : null, 'lane(s)', 'var(--danger, #ff5c5c)'));
-          kpis.appendChild(kpi('did not run', lanes.length ? never : null, 'lane(s)', 'var(--warn, #ffd230)'));
-          kpis.appendChild(kpi('green', lanes.length ? green : null, 'lane(s)', 'var(--ok, #35d07f)'));
-          kpis.appendChild(kpi('waiting on you', pending || (num(f.approvals_pending) === 0 ? 0 : null), 'ask(s)', 'var(--warn, #ffd230)'));
+          kpis.appendChild(kpi(i18n('lane_fail'), lanes.length ? reds : null, i18n('unit_lanes'), 'var(--danger, #ff5c5c)'));
+          kpis.appendChild(kpi(i18n('lane_skipped'), lanes.length ? never : null, i18n('unit_lanes'), 'var(--warn, #ffd230)'));
+          kpis.appendChild(kpi(i18n('lane_pass'), lanes.length ? green : null, i18n('unit_lanes'), 'var(--ok, #35d07f)'));
+          kpis.appendChild(kpi(i18n('kpi_waiting'), pending || (num(f.approvals_pending) === 0 ? 0 : null), i18n('unit_asks'), 'var(--warn, #ffd230)'));
         }
 
         var shown = drawLanes(lanes);
@@ -344,7 +429,7 @@
         if (wrote) {
           var agentic = bag().agentic;
           var marked = Array.isArray(agentic) && agentic.indexOf('lanes') !== -1;
-          wrote.textContent = marked ? 'crewmate wrote this' : '';
+          wrote.textContent = marked ? i18n('wrote') : '';
         }
 
         // Each array cell gets a count: the host binds by textContent, so left alone

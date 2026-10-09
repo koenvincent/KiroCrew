@@ -26,6 +26,10 @@ from kiro_crew.dashboard.chat_utils import (
     slot_history_key,
 )
 from kiro_crew.dashboard.handlers import session_control as handlers_sc
+from kiro_crew.dashboard.slot_persistence.turn_marker import (
+    _RESTART_INTERRUPTION_KIND,
+    _RESTART_INTERRUPTION_MSG,
+)
 from kiro_crew.mcp_dashboard import TABLE
 from kiro_crew.mcp_tools.dashboard_client import InMemoryDashboardClient
 from kiro_crew.mcp_tools.table import Caller, ToolContext
@@ -129,6 +133,63 @@ def test_a_turn_that_ended_with_no_reply_is_retried(tmp_path, dispatched, audits
 
     assert _retry(state, caller)["ok"] is True
     dispatched.started.assert_awaited_once()
+
+
+def _partial_turn(slot) -> None:
+    """A turn that streamed some text and ran a tool before it ended."""
+    slot.append("user", "do the thing", "msg msg-u")
+    slot.append("assistant", "Starting on it.", "msg msg-a")
+    slot.append("tool", "tool output", "msg msg-tool")
+
+
+def test_a_backend_error_after_partial_output_is_retried(tmp_path, dispatched, audits):
+    """The provider failed mid-turn: the error row after the partial reply is the failure."""
+    state = _make_state(tmp_path)
+    caller = state.get_or_create_slot("chat-1")
+    target = state.get_or_create_slot("chat-2")
+    _partial_turn(target)
+    target.append("error", "Backend error: stream reset by peer", "msg msg-err")
+
+    assert _retry(state, caller)["ok"] is True
+    (entry,) = list(target._queue)
+    assert entry["content"] == _MANUAL_RESUME_MSG
+    dispatched.started.assert_awaited_once()
+
+
+def test_a_gateway_restart_after_partial_output_is_retried(tmp_path, dispatched, audits):
+    """A force exit mid-turn leaves the restore's interruption row, which makes it retryable.
+
+    The row is the one ``_reconcile_local_turn_marker`` appends when a leftover
+    turn-in-flight marker is found on restore.
+    """
+    state = _make_state(tmp_path)
+    caller = state.get_or_create_slot("chat-1")
+    target = state.get_or_create_slot("chat-2")
+    _partial_turn(target)
+    target.append(
+        "error",
+        _RESTART_INTERRUPTION_MSG,
+        "msg msg-err",
+        meta={"kind": _RESTART_INTERRUPTION_KIND},
+    )
+
+    assert _retry(state, caller)["ok"] is True
+    dispatched.started.assert_awaited_once()
+
+
+def test_a_partial_turn_with_no_error_row_is_refused(tmp_path, dispatched, audits):
+    """Without the error row the same tail reads as a finished answer.
+
+    This is why the restart case depends on the turn-in-flight marker writing
+    its interruption row: the transcript alone cannot tell the two apart.
+    """
+    state = _make_state(tmp_path)
+    caller = state.get_or_create_slot("chat-1")
+    target = state.get_or_create_slot("chat-2")
+    _partial_turn(target)
+
+    assert _refused(state, caller).code == "turn_not_failed"
+    dispatched.started.assert_not_awaited()
 
 
 def test_a_turn_that_succeeded_is_refused(tmp_path, dispatched, audits):

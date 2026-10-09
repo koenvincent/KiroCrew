@@ -8,6 +8,7 @@ import { effortLabel } from '../../lib/effort'
 import { fmtPercent } from '../../i18n/format'
 import { i18nT } from '../../i18n/t'
 import type { ComposerControl } from '../composerControl'
+import { usePressActivation } from '../../hooks/usePressActivation'
 import type { ChatInputProps } from './props'
 import type { useAutoCompactThreshold } from './autoCompact'
 
@@ -151,10 +152,13 @@ export function AgentChip({ agentName, agentLabel, agentIsInheritedDefault, agen
   shelfCompact: boolean
   onAgentClick: NonNullable<ChatInputProps['onAgentClick']>
 }) {
+  // Opens on the mouse press (usePressActivation); keyboard and touch on click.
+  const bindPress = usePressActivation()
+  const press = bindPress<HTMLButtonElement>(el => onAgentClick(el.getBoundingClientRect(), el))
   return (
     <button
       className={`inline-flex items-center gap-1.5 h-7 min-w-0 text-[12px] px-2.5 rounded-md bg-transparent hover:bg-[color-mix(in_srgb,var(--bg-elevated)_84%,var(--text))] transition-colors border-none cursor-pointer disabled:cursor-not-allowed disabled:hover:bg-transparent ${agentSource === 'package' ? 'text-[var(--aim)] hover:text-[var(--aim)]' : 'text-muted hover:text-text disabled:hover:text-muted'}`}
-      onClick={e => onAgentClick(e.currentTarget.getBoundingClientRect(), e.currentTarget)}
+      {...press}
       disabled={isRunning}
       // Inherited default: explain what the ` . default` marker means, on
       // hover (title) AND keyboard focus / screen readers (aria-label),
@@ -335,18 +339,25 @@ export function ModelChip({ modelName, modelIsJevRouted, modelIsInheritedDefault
         : modelIsAutoChosen
           ? `${i18nT('components.chatInput.model_2', { name: modelName })} · ${i18nT('components.jobForm.auto')}`
           : i18nT('components.chatInput.model_2', { name: modelName })}${effortSuffix}`
+  // Opens on the mouse press (usePressActivation); keyboard and touch on click.
+  const bindPress = usePressActivation()
+  const press = bindPress<HTMLButtonElement>(el => {
+    const composerHadFocus = modelChipPressedFromComposerRef.current
+    modelChipPressedFromComposerRef.current = false
+    onModelClick(el.getBoundingClientRect(), el, composerHadFocus)
+  })
   return (
   <button
     className="inline-flex items-center gap-1.5 h-7 min-w-0 text-[12px] text-muted hover:text-text px-2 rounded-md bg-transparent hover:bg-[color-mix(in_srgb,var(--bg-elevated)_84%,var(--text))] transition-colors border-none cursor-pointer disabled:cursor-not-allowed disabled:hover:bg-transparent disabled:hover:text-muted"
-    onMouseDown={() => {
+    onPointerDown={e => {
+      // Read before the press moves focus to the chip: the picker hands focus
+      // back to the composer on close only when the composer had it. Pointer-
+      // down precedes that focus move for mouse, touch and pen alike.
       const editor = composerControl()?.getRootElement()
       modelChipPressedFromComposerRef.current = !!editor && editor.contains(document.activeElement)
+      press.onPointerDown(e)
     }}
-    onClick={e => {
-      const composerHadFocus = modelChipPressedFromComposerRef.current
-      modelChipPressedFromComposerRef.current = false
-      onModelClick(e.currentTarget.getBoundingClientRect(), e.currentTarget, composerHadFocus)
-    }}
+    onClick={press.onClick}
     disabled={isRunning}
     data-testid="composer-model-chip"
     // Inherited default: mirror the agent chip -- ` · default` marker on

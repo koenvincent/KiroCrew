@@ -42,7 +42,7 @@
  */
 import { Fragment, lazy, Suspense, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import { useLocation, useNavigate, useSearchParams } from 'react-router-dom'
-import { ArrowLeft, Check, ChevronRight, Circle, Goal, LayoutDashboard, Loader2, MessageCircleQuestionMark, Plus, RotateCw, Sparkles, Square, Star, Users, X, Zap } from 'lucide-react'
+import { ArrowLeft, Check, ChevronRight, Circle, Goal, LayoutDashboard, Loader2, MessageCircleQuestionMark, Plus, RotateCw, Sparkles, Square, Star, X, Zap } from 'lucide-react'
 import { usePreviewFlag } from '../../hooks/usePreviewFlag'
 import { PREVIEW_DASHBOARD } from '../../utils/previewFlags'
 import { PanelRightSolid } from '../../components/icons/panels'
@@ -154,6 +154,8 @@ import { usePanelTabDescriptors } from '../../hooks/panelTabRegistry'
 import CrewWakeSection from '../../components/CrewWakeSection'
 import { crewWakeQueryKey, wakesCrew } from '../../components/crew/wakesCrew'
 import { usePanelDocumentActions } from '../../hooks/usePanelDocumentActions'
+import { useRunInTerminalBridge, useRunInTerminalRefs } from '../../hooks/useRunInTerminalBridge'
+import { RunInTerminalScope } from '../../components/runInTerminalScope'
 import ResizeHandle from '../../components/ResizeHandle'
 import { cn } from '../../lib/utils'
 import { LIST_SHELL_CLS, LIST_HEADER_CLS, LIST_TITLE_CLS, LIST_BODY_CLS, ROW_BOX_CLS, ROW_IDLE_CLS, ROW_ACTIVE_CLS, ROW_TITLE_CLS, ROW_STATUS_CLS } from '../../components/listShell'
@@ -1191,7 +1193,9 @@ export default function MembersPage() {
       }),
     [setRawCollapsedTeams],
   )
-  // The New team / Edit team dialog. `team` set = edit. Mounted only while
+  // The team dialog. `team` set = edit, which is the only way in while team
+  // creation is hidden for the phase (the roster header's "+" menu below says
+  // what was removed and what returns it). Mounted only while
   // open, so its fields start from the team it was opened for.
   const [teamDialog, setTeamDialog] = useState<{ team?: CrewTeam } | null>(null)
   // Set when a URL NAMED a member that is gone: the user asked for someone
@@ -2244,6 +2248,22 @@ export default function MembersPage() {
     showActionError,
     onOpened: revealPanelAfterOpen,
   })
+  // "Run in terminal" from a crewmate chat's code blocks. Without a host here
+  // the request had no receiver and the button timed out. The shell starts in
+  // the member slot's project — the cwd this page's own Terminal tab spawns in
+  // — and only once the slot record carrying it has arrived (slotRecordPresent).
+  const runInTerminalCwdRef = useRef<string | undefined>(projectDir)
+  runInTerminalCwdRef.current = projectDir
+  const runInTerminalReadyRef = useRef(slotRecordPresent)
+  runInTerminalReadyRef.current = slotRecordPresent
+  const runInTerminalRefs = useRunInTerminalRefs()
+  const runInTerminalScope = useRunInTerminalBridge({
+    queryClient,
+    showActionError,
+    cwdRef: runInTerminalCwdRef,
+    readyRef: runInTerminalReadyRef,
+    ...runInTerminalRefs,
+  })
   // Transcript file links focus a side-panel tab, but the schedule draft now
   // lives in the separate Profile card. Opening a file leaves that card mounted,
   // so this compatibility wrapper deliberately does not invoke the draft guard.
@@ -3232,6 +3252,7 @@ export default function MembersPage() {
     // This page has no bottom row for the side panel, so every panel glyph
     // in its transcripts draws the right-dock pane.
     <SidePanelDockHost value={false}>
+    <RunInTerminalScope.Provider value={runInTerminalScope}>
     <div className="flex h-full min-h-0" data-testid="members-page">
       {/* Card columns (roster + thread) keep the page's original insets. */}
       <div className="flex flex-1 min-w-0 gap-2 pr-2 pb-2">
@@ -3300,13 +3321,21 @@ export default function MembersPage() {
               greeting would stay unsent with nothing left to say so. The
               notice above the chat column names the step; its retry or
               dismissal is what re-enables the item. The hold is the ITEM's,
-              not the menu's: New team has no part in the follow-up. */}
+              not the menu's, so a second door added here is unaffected. */}
+          {/* NEW TEAM IS HIDDEN FOR THE CURRENT PHASE. Teams are not ready to
+              be offered as something to create, so the only door that made one
+              is not drawn. Everything a team already has keeps working: the
+              roster still groups by team, a group header still opens its team
+              view, and that view's Edit still opens this dialog in edit mode
+              (`TeamDialog` below, `team` set). Restoring the door is reverting
+              the commit that removed the item: the dialog's create mode, its
+              `team_new` / `team_create` labels and `api.teams.create` are all
+              still here and still covered (`TeamDialog.test.tsx`). */}
           {/* The whole menu is hidden while the empty roster's hero is the
               create door: two doors to one dialog read as two different
-              actions (a team of no one has nothing to group yet either). It
-              returns with the first row, when the hero is gone. Also hidden
-              until the first read has answered: the names the dialog checks
-              a new one against are unknown until then. */}
+              actions. It returns with the first row, when the hero is gone.
+              Also hidden until the first read has answered: the names the
+              dialog checks a new one against are unknown until then. */}
           {loaded && !(!loadError && hasNoCrewmates(members)) && (
           <DropdownMenu>
             <DropdownMenuTrigger asChild>
@@ -3338,10 +3367,6 @@ export default function MembersPage() {
                     </span>
                   )}
                 </span>
-              </DropdownMenuItem>
-              <DropdownMenuItem onSelect={() => setTeamDialog({})} data-testid="member-add-team">
-                <Users size={13} className="lucide-inline text-muted" aria-hidden="true" />
-                <span className="flex-1">{t('pages.membersPage.team_new')}</span>
               </DropdownMenuItem>
             </DropdownMenuContent>
           </DropdownMenu>
@@ -3848,6 +3873,7 @@ export default function MembersPage() {
                 <CrewmateSwitcher
                   className="hidden md:flex"
                   members={orderedMembers}
+                  defaultAgent={defaultAgent}
                   activeName={active.name}
                   signals={signalsOf}
                   onPick={(name) => {
@@ -4718,10 +4744,10 @@ export default function MembersPage() {
             </AnimatePresence>
           </>)
         })()}
-      {/* New team / Edit team. A saved team opens its team view; a deleted one
-          that was open drops `?team=` and the bare URL falls to the page's
-          default (the remembered or most recently used crewmate, or the hero
-          on an empty roster). */}
+      {/* Edit team (create is hidden for the phase). A saved team opens its
+          team view; a deleted one that was open drops `?team=` and the bare
+          URL falls to the page's default (the remembered or most recently used
+          crewmate, or the hero on an empty roster). */}
       {teamDialog && (
         <TeamDialog
           open
@@ -4757,6 +4783,7 @@ export default function MembersPage() {
         <CrewEditorDialog ctl={crewEditor} />
       </Suspense>
     </div>
+    </RunInTerminalScope.Provider>
     </SidePanelDockHost>
   )
 }

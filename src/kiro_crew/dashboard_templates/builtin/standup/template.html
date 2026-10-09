@@ -32,13 +32,13 @@
     .mom span { color: var(--muted, #9aa); }
   </style>
 
-  <h2>Standup</h2>
+  <h2 data-i18n="title">Standup</h2>
   <div class="goal" data-dashboard-field="goal">-</div>
   <div class="meta">
-    <span>round <span data-dashboard-field="round">-</span></span>
-    <span>turns <span data-dashboard-field="turns_completed">-</span></span>
-    <span>last board write <span data-dashboard-field="last_entry_at">-</span></span>
-    <span>last ledger write <span data-dashboard-field="last_progress_at">-</span></span>
+    <span><span data-i18n="round">round</span> <span data-dashboard-field="round">-</span></span>
+    <span><span data-i18n="turns">turns</span> <span data-dashboard-field="turns_completed">-</span></span>
+    <span><span data-i18n="last_board_write">last board write</span> <span data-dashboard-field="last_entry_at">-</span></span>
+    <span><span data-i18n="last_ledger_write">last ledger write</span> <span data-dashboard-field="last_progress_at">-</span></span>
   </div>
 
   <div class="head">
@@ -51,26 +51,94 @@
   <div class="cols" id="cols"></div>
 
   <div class="meta" style="margin-top: 11px;">
-    <span style="font-weight: 600; color: var(--text-strong, #fff);">Turns, newest last</span>
-    <span>entry <span data-dashboard-field="last_seq">-</span></span>
-    <span>asks waiting <span data-dashboard-field="approvals_pending">-</span></span>
+    <span style="font-weight: 600; color: var(--text-strong, #fff);" data-i18n="turns_newest_last">Turns, newest last</span>
+    <span><span data-i18n="entry">entry</span> <span data-dashboard-field="last_seq">-</span></span>
+    <span><span data-i18n="asks_waiting">asks waiting</span> <span data-dashboard-field="approvals_pending">-</span></span>
   </div>
   <div class="spark" id="spark"></div>
   <div class="feed" id="feed"></div>
   <div class="sub" style="margin-top: 5px;">
-    <span data-dashboard-field="moments">-</span> moment(s) kept,
-    <span data-dashboard-field="moments_dropped">-</span> dropped (feed truncated).
-    Clock read at <span data-dashboard-field="last_time">-</span>.
+    <span data-dashboard-field="moments">-</span> <span data-i18n="moments_kept">moment(s) kept,</span>
+    <span data-dashboard-field="moments_dropped">-</span> <span data-i18n="dropped_truncated">dropped (feed truncated).</span>
+    <span data-i18n="clock_read_at">Clock read at</span> <span data-dashboard-field="last_time">-</span>.
   </div>
   <div class="sub">
-    <span data-dashboard-field="items">-</span> item(s) on the board,
-    <span data-dashboard-field="omitted">-</span> not shown.
+    <span data-dashboard-field="items">-</span> <span data-i18n="items_on_board">item(s) on the board,</span>
+    <span data-dashboard-field="omitted">-</span> <span data-i18n="not_shown_standup">not shown.</span>
   </div>
 
   <script>
     (function () {
       var DASH = '\u2014';
       var QUIET_MS = 15 * 60 * 1000;
+
+      // The page's own words, one table per UI language. A key a language lacks falls
+      // back to English. Values the record or a crewmate wrote are never looked up
+      // here. The zh-CN strings are \u-escaped so the source stays ASCII.
+      var I18N = {
+        en: {
+          title: 'Standup', round: 'round', turns: 'turns',
+          last_board_write: 'last board write', last_ledger_write: 'last ledger write',
+          turns_newest_last: 'Turns, newest last', entry: 'entry', asks_waiting: 'asks waiting',
+          moments_kept: 'moment(s) kept,', dropped_truncated: 'dropped (feed truncated).',
+          clock_read_at: 'Clock read at', items_on_board: 'item(s) on the board,',
+          not_shown_standup: 'not shown.',
+          col_done_t: 'Finished', col_done_c: 'items the conductor accepted',
+          col_await_t: 'Claimed done', col_await_c: 'waiting on the conductor\u2019s own verdict',
+          col_new_t: 'Still moving', col_new_c: 'open, nobody reported a blocker',
+          col_stuck_t: 'Stuck', col_stuck_c: 'blocked, asking, rejected or failed',
+          quiet_for: 'quiet {t}', no_report: 'no report yet', worker_prefix: 'worker {v} \u00b7 ',
+          more_not_listed: '{n} more not listed', under_a_minute: 'under a minute',
+          turn_n: 'turn {n}', credits_suffix: ' credits',
+          feed_nothing: 'nothing yet',
+          feed_none_desc: 'the timeline fold has no moment for this session',
+          quiet_unknown: 'No write time on the record, so this page cannot say whether anything is still moving.',
+          quiet_band: 'No new entry for {t}. Nothing has written to the record since.',
+          wrote: 'crewmate wrote this', no_headline: 'no headline written'
+        },
+        'zh-CN': {
+          title: '\u7ad9\u4f1a', round: '\u8f6e\u6b21', turns: '\u56de\u5408',
+          last_board_write: '\u770b\u677f\u6700\u540e\u5199\u5165', last_ledger_write: '\u8d26\u672c\u6700\u540e\u5199\u5165',
+          turns_newest_last: '\u56de\u5408\uff0c\u6700\u65b0\u5728\u540e', entry: '\u6761\u76ee', asks_waiting: '\u7b49\u5f85\u7684\u8bf7\u6c42',
+          moments_kept: '\u4e2a\u7247\u6bb5\u5df2\u4fdd\u7559\uff0c', dropped_truncated: '\u4e2a\u88ab\u4e22\u5f03\uff08\u4fe1\u606f\u6d41\u5df2\u622a\u65ad\uff09\u3002',
+          clock_read_at: '\u65f6\u949f\u8bfb\u6570\u4e8e', items_on_board: '\u4e2a\u4e8b\u9879\u5728\u770b\u677f\u4e0a\uff0c',
+          not_shown_standup: '\u4e2a\u672a\u663e\u793a\u3002',
+          col_done_t: '\u5df2\u5b8c\u6210', col_done_c: '\u6307\u6325\u8005\u5df2\u63a5\u53d7\u7684\u4e8b\u9879',
+          col_await_t: '\u81ea\u79f0\u5b8c\u6210', col_await_c: '\u7b49\u5f85\u6307\u6325\u8005\u81ea\u5df1\u7684\u88c1\u5b9a',
+          col_new_t: '\u4ecd\u5728\u63a8\u8fdb', col_new_c: '\u8fdb\u884c\u4e2d\uff0c\u65e0\u4eba\u62a5\u544a\u963b\u788d',
+          col_stuck_t: '\u5361\u4f4f', col_stuck_c: '\u53d7\u963b\u3001\u8be2\u95ee\u3001\u88ab\u62d2\u6216\u5931\u8d25',
+          quiet_for: '\u5b89\u9759 {t}', no_report: '\u5c1a\u65e0\u62a5\u544a', worker_prefix: '\u6267\u884c\u8005 {v} \u00b7 ',
+          more_not_listed: '\u53e6\u6709 {n} \u4e2a\u672a\u5217\u51fa', under_a_minute: '\u4e0d\u5230\u4e00\u5206\u949f',
+          turn_n: '\u7b2c {n} \u8f6e', credits_suffix: ' \u989d\u5ea6',
+          feed_nothing: '\u8fd8\u6ca1\u6709',
+          feed_none_desc: '\u6b64\u4f1a\u8bdd\u5728\u65f6\u95f4\u7ebf\u6298\u53e0\u4e2d\u6ca1\u6709\u4efb\u4f55\u7247\u6bb5',
+          quiet_unknown: '\u8bb0\u5f55\u4e2d\u6ca1\u6709\u5199\u5165\u65f6\u95f4\uff0c\u56e0\u6b64\u672c\u9875\u65e0\u6cd5\u5224\u65ad\u662f\u5426\u8fd8\u6709\u8fdb\u5c55\u3002',
+          quiet_band: '\u5df2\u6709 {t} \u6ca1\u6709\u65b0\u6761\u76ee\u3002\u6b64\u540e\u6ca1\u6709\u4efb\u4f55\u5185\u5bb9\u5199\u5165\u8bb0\u5f55\u3002',
+          wrote: '\u961f\u53cb\u5199\u5165', no_headline: '\u672a\u5199\u5165\u8981\u70b9'
+        }
+      };
+      function locale() {
+        var l = (window.kirocrew || {}).locale;
+        return typeof l === 'string' && Object.prototype.hasOwnProperty.call(I18N, l) ? l : 'en';
+      }
+      function has(key) {
+        return Object.prototype.hasOwnProperty.call(I18N.en, key);
+      }
+      function i18n(key, vars) {
+        var table = I18N[locale()];
+        var s = Object.prototype.hasOwnProperty.call(table, key) ? table[key] : I18N.en[key];
+        if (s === undefined) s = key;
+        if (vars) {
+          s = s.replace(/\{(\w+)\}/g, function (m, k) {
+            return Object.prototype.hasOwnProperty.call(vars, k) ? String(vars[k]) : m;
+          });
+        }
+        return s;
+      }
+      function applyStatic() {
+        var nodes = document.querySelectorAll('[data-i18n]');
+        for (var i = 0; i < nodes.length; i++) nodes[i].textContent = i18n(nodes[i].getAttribute('data-i18n'));
+      }
 
       function text(v) { return typeof v === 'string' && v.trim() ? v.trim() : null; }
       function num(v) { return typeof v === 'number' && isFinite(v) ? v : null; }
@@ -83,7 +151,7 @@
       function ago(ms) {
         if (ms === null || ms < 0) return null;
         var m = Math.floor(ms / 60000);
-        if (m < 1) return 'under a minute';
+        if (m < 1) return i18n('under_a_minute');
         if (m < 60) return m + 'm';
         var h = Math.floor(m / 60);
         return h + 'h ' + (m % 60) + 'm';
@@ -134,7 +202,7 @@
           var ch = document.createElement('div');
           ch.className = 'ch';
           var b = document.createElement('b');
-          b.textContent = COLS[c][1];
+          b.textContent = i18n('col_' + key + '_t');
           var i2 = document.createElement('i');
           i2.textContent = items.length ? String(list.length) : DASH;
           i2.style.color = COLS[c][3];
@@ -142,7 +210,7 @@
           ch.appendChild(i2);
           col.appendChild(ch);
           var u = document.createElement('u');
-          u.textContent = COLS[c][2];
+          u.textContent = i18n('col_' + key + '_c');
           col.appendChild(u);
           // Three rows at most per column: a reader skimming four columns wants the
           // names, and a column that lists thirty is a board, not a standup.
@@ -152,15 +220,15 @@
             row.textContent = text(list[j].title) || text(list[j].item_id) || DASH;
             var sub = document.createElement('span');
             var quiet = ago(Date.now() - (stamp(list[j].last_report_at) || 0));
-            var when = stamp(list[j].last_report_at) ? 'quiet ' + quiet : 'no report yet';
-            var who = text(list[j].spender) ? 'worker ' + text(list[j].spender) + ' \u00b7 ' : '';
+            var when = stamp(list[j].last_report_at) ? i18n('quiet_for', { t: quiet }) : i18n('no_report');
+            var who = text(list[j].spender) ? i18n('worker_prefix', { v: text(list[j].spender) }) : '';
             sub.textContent = who + when;
             row.appendChild(sub);
             col.appendChild(row);
           }
           if (list.length > 3) {
             var more = document.createElement('u');
-            more.textContent = (list.length - 3) + ' more not listed';
+            more.textContent = i18n('more_not_listed', { n: list.length - 3 });
             col.appendChild(more);
           }
           host.appendChild(col);
@@ -203,11 +271,11 @@
           row.appendChild(what);
           var say = document.createElement('span');
           var bits = [];
-          if (num(mo.turn) !== null) bits.push('turn ' + num(mo.turn));
+          if (num(mo.turn) !== null) bits.push(i18n('turn_n', { n: num(mo.turn) }));
           var dur = num(mo.duration_ms);
           if (dur !== null) bits.push((dur / 1000).toFixed(1) + 's');
           var cr = num(mo.credits);
-          if (cr !== null) bits.push(cr.toFixed(2) + ' credits');
+          if (cr !== null) bits.push(cr.toFixed(2) + i18n('credits_suffix'));
           var sr = text(mo.stop_reason);
           if (sr) bits.push(sr);
           var tool = text(mo.tool);
@@ -220,10 +288,10 @@
           var none = document.createElement('div');
           none.className = 'mom';
           var nb = document.createElement('b');
-          nb.textContent = 'nothing yet';
+          nb.textContent = i18n('feed_nothing');
           none.appendChild(nb);
           var ns = document.createElement('span');
-          ns.textContent = 'the timeline fold has no moment for this session';
+          ns.textContent = i18n('feed_none_desc');
           none.appendChild(ns);
           feed.appendChild(none);
         }
@@ -240,7 +308,7 @@
         if (last === null) {
           var unk = document.createElement('div');
           unk.className = 'quiet';
-          unk.textContent = 'No write time on the record, so this page cannot say whether anything is still moving.';
+          unk.textContent = i18n('quiet_unknown');
           host.appendChild(unk);
           return;
         }
@@ -248,7 +316,7 @@
         if (silent < QUIET_MS) return;
         var band = document.createElement('div');
         band.className = 'quiet';
-        band.textContent = 'No new entry for ' + ago(silent) + '. Nothing has written to the record since.';
+        band.textContent = i18n('quiet_band', { t: ago(silent) });
         host.appendChild(band);
       }
 
@@ -274,6 +342,7 @@
 
       function render() {
         var f = fields();
+        applyStatic();
         var cells = document.body.querySelectorAll('[data-dashboard-field]');
         for (var c = 0; c < cells.length; c++) {
           if (!cells[c].textContent.trim()) cells[c].textContent = DASH;
@@ -293,7 +362,7 @@
         if (wrote) {
           var agentic = bag().agentic;
           var marked = Array.isArray(agentic) && agentic.indexOf('headline') !== -1;
-          wrote.textContent = marked ? 'crewmate wrote this' : 'no headline written';
+          wrote.textContent = marked ? i18n('wrote') : i18n('no_headline');
         }
 
         var counts = { items: items.length, moments: moments.length };

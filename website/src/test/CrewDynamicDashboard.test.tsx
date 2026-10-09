@@ -18,6 +18,7 @@ import CrewDynamicDashboard, {
   READY_MESSAGE_TYPE,
 } from '../pages/members/CrewDynamicDashboard'
 import { handleDashboardMoved } from '../hooks/useWebSocket'
+import { LANG_STORAGE_KEY } from '../i18n/detect'
 
 /**
  * Every srcdoc the component minted, newest LAST, and a url that CHANGES on each
@@ -96,8 +97,19 @@ describe('CrewDynamicDashboard', () => {
   it('reads the crewmate\'s own instance by slug AND exact member name', async () => {
     const read = vi.spyOn(api, 'memberDashboard').mockResolvedValue(page())
     mount()
-    await waitFor(() => expect(read).toHaveBeenCalledWith('oncall', 'oncall'))
+    await waitFor(() => expect(read).toHaveBeenCalledWith('oncall', 'oncall', 'en'))
     expect(await screen.findByTestId('crew-dashboard-frame')).toBeInTheDocument()
+  })
+
+  it('asks for the page in the UI language the reader chose', async () => {
+    localStorage.setItem(LANG_STORAGE_KEY, 'zh-CN')
+    try {
+      const read = vi.spyOn(api, 'memberDashboard').mockResolvedValue(page())
+      mount()
+      await waitFor(() => expect(read).toHaveBeenCalledWith('oncall', 'oncall', 'zh-CN'))
+    } finally {
+      localStorage.removeItem(LANG_STORAGE_KEY)
+    }
   })
 
   it('shows the page the read resolved, in a frame granting scripts and nothing else', async () => {

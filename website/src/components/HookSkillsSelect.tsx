@@ -9,6 +9,7 @@ import { Brain, ChevronDown, Plus } from 'lucide-react'
 import { api } from '../api/client'
 import { Btn } from './ui'
 import { useFilteredDropdown } from '../hooks/useFilteredDropdown'
+import { usePressActivation } from '../hooks/usePressActivation'
 import { i18nT } from '../i18n/t'
 import HookSkillsDropdown from './HookSkillsDropdown'
 
@@ -48,6 +49,7 @@ export default function SkillsMultiSelect({ selected, onChange }: Props) {
 
   const { open, setOpen, filter, setFilter, dropdownRef, inputRef, filtered } =
     useFilteredDropdown(candidates)
+  const bindPress = usePressActivation()
 
   const add = (key: string) => { onChange([...selected, key]) }
   const remove = (key: string) => { onChange(selected.filter(k => k !== key)) }
@@ -71,7 +73,7 @@ export default function SkillsMultiSelect({ selected, onChange }: Props) {
         <Btn
           ref={btnRef}
           className="flex items-center gap-1 px-2 py-0.5 text-[12px]"
-          onClick={() => setOpen(!open)}
+          {...bindPress(() => setOpen(o => !o))}
         >
           <Plus className="lucide-inline" /> {i18nT('components.skillsMultiSelect.add_skill')}
           <ChevronDown className="lucide-inline text-muted" />

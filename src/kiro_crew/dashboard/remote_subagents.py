@@ -14,6 +14,7 @@ performs its bounded re-mint retry.
 from __future__ import annotations
 
 import asyncio
+import functools
 import hashlib
 import json
 import logging
@@ -1290,7 +1291,7 @@ class RemoteSubagentService:
             if key not in self._relays:
                 task = asyncio.create_task(self._relay_one(info, approval_id, item))
                 self._relays[key] = task
-                task.add_done_callback(lambda _t, key=key: self._forget_relay(key, _t))
+                task.add_done_callback(functools.partial(self._forget_relay, key))
 
     def _forget_relay(self, key: tuple[str, str], task: asyncio.Task[None]) -> None:
         if self._relays.get(key) is task:

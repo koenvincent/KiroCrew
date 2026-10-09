@@ -51,6 +51,16 @@ each page overwrites that one cell with a count and draws the real thing from
 `message`, because the order of the host's first fill against the script is not the
 page's to assume.
 
+## The reader's language
+
+`window.kirocrew.locale` is the reader's UI language, checked against the catalogs the
+app ships, and `en` for anything else. Each page keeps one `I18N` table per language
+(`en` and `zh-CN` today) and picks its own words by it: static words carry
+`data-i18n="<key>"` with the English text in the markup, script-written words go through
+`i18n(key, vars)`, and a key a language lacks falls back to English. Values from
+`fields` are never translated. In `project-report` a crewmate's `verdict.words` still
+wins over the table. zh-CN strings are `\u` escapes so the sources stay ASCII.
+
 No page fetches anything: the frame's CSP blocks the network, so a chart drawn from a CDN
 renders as a hole. The charts are plain elements sized in the page's own JS.
 

@@ -872,6 +872,30 @@ function RemoteCrewNamesError() {
   )
 }
 
+/** The runs-elsewhere chip of a remote-EXECUTED local row, with the peer's
+ *  display name read from the SHARED ['instances'] cache. Its own component so
+ *  the query observer exists only on rows that are actually bound: an observer
+ *  in every row, even a disabled one, re-registers its options on every row
+ *  render, and each registration is a query-cache event every cache listener
+ *  answers, a per-row cost a full folder pays on each sidebar commit. Falls
+ *  back to the instance id: it is less friendly but it is true, and a blank chip
+ *  would claim the session runs somewhere unnamed. */
+function ExecutorCrewChip({ instanceId }: { instanceId: string }) {
+  const { data } = useQuery({
+    queryKey: ['instances'],
+    queryFn: () => api.listInstances(),
+    enabled: !!instanceId,
+  })
+  const name = data?.instances?.find(i => i.id === instanceId)?.name || instanceId
+  return (
+    <RemoteCrewChip
+      name={name}
+      label={i18nT('pages.chatSidebar.on_instance', { name })}
+      title={i18nT('pages.chatSidebar.runs_on_crew', { name })}
+    />
+  )
+}
+
 const SessionRow = memo(function SessionRow({ view, actions }: SessionRowProps) {
   const {
     slot: s, showDivider, scope, navScope, holdContainer, isActive, isOut, isPinned, isUnread, isRunning,
@@ -906,7 +930,7 @@ const SessionRow = memo(function SessionRow({ view, actions }: SessionRowProps) 
   // worse than no control, and none of close / duplicate / rename / reorder can
   // be honoured for a session whose slot lives on another machine.
   //
-  // `peerId`, NOT the `instance_id` that `remoteCrewName` below reads: these two
+  // `peerId`, NOT the `instance_id` that `ExecutorCrewChip` below reads: these two
   // sit in one scope and mean opposite things. This one says the session is not
   // ours; that one says the session IS ours and dispatches elsewhere. It and
   // `peerName` come from the row model's origin check, set on a peer view only.
@@ -930,18 +954,6 @@ const SessionRow = memo(function SessionRow({ view, actions }: SessionRowProps) 
   // i18nT strings must re-translate even when no prop moves.
   const langGen = useLanguageGeneration()
   const dispatch = useAppDispatch()
-  // The peer's display name for the runs-elsewhere chip. Read from the SHARED
-  // ['instances'] cache and enabled only for a row that is actually bound, so a
-  // peerless install never issues the query. Falls back to the instance id: it is
-  // less friendly but it is true, and a blank chip would claim the session runs
-  // somewhere unnamed.
-  const remoteCrewQuery = useQuery({
-    queryKey: ['instances'],
-    queryFn: () => api.listInstances(),
-    enabled: s.executor === 'remote' && !!s.instance_id,
-  })
-  const remoteCrewName =
-    remoteCrewQuery.data?.instances?.find(i => i.id === s.instance_id)?.name || s.instance_id || ''
   const ime = useImeGuard()
   const simplifiedToolNames = useSimplifiedToolNames()
   const uiLang = useLanguage().resolved
@@ -2068,13 +2080,7 @@ const SessionRow = memo(function SessionRow({ view, actions }: SessionRowProps) 
                *  is first on a federated search row: it qualifies the whole row,
                *  so a user scanning the list should meet it before the per-session
                *  flags that only make sense once you know where the session is. */}
-              {s.executor === 'remote' && !inCrewGroup && (
-                <RemoteCrewChip
-                  name={remoteCrewName}
-                  label={i18nT('pages.chatSidebar.on_instance', { name: remoteCrewName })}
-                  title={i18nT('pages.chatSidebar.runs_on_crew', { name: remoteCrewName })}
-                />
-              )}
+              {s.executor === 'remote' && !inCrewGroup && <ExecutorCrewChip instanceId={s.instance_id || ''} />}
               {s.memory_mode === 'incognito' && <span className="text-muted" title={i18nT('pages.chatSidebar.incognito_no_memory_writes')}><EyeOff size={10} /></span>}
               {s.memory_mode === 'temporary' && <span className="text-aim" title={i18nT('pages.chatSidebar.temporary_no_memory_reads_or_writes')}><VenetianMask size={10} /></span>}
               {/* Trailing meta grouped under ONE ml-auto: two sibling auto
@@ -3343,12 +3349,25 @@ function ChatSidebar({
   const navigateRef = useRef(navigate)
   navigateRef.current = navigate
   const openElsewhere = useCallback((path: string) => { navigateRef.current(path) }, [])
+  // The caller's source-reveal handler is rebuilt whenever its own inputs move,
+  // and a new identity here would rebuild `rowActions` and re-render every row.
+  // Rows only ever CALL it, so they get a stable forwarder to the latest one;
+  // its presence still tracks the caller's, which the chips read as "can reveal".
+  const onOpenSourceRef = useRef(onOpenSource)
+  onOpenSourceRef.current = onOpenSource
+  const hasOpenSource = !!onOpenSource
+  const stableOpenSource = useMemo(
+    () => (hasOpenSource
+      ? (slotKey: string, link: { url: string; kind: 'change' | 'issue' }) => onOpenSourceRef.current?.(slotKey, link) ?? false
+      : undefined),
+    [hasOpenSource],
+  )
   // What every session row can do, built once: the row's memo compares this one
   // reference, so none of these may take a new identity per render.
   const rowActions = useMemo(() => ({
     renameInputRef, onRenameStart, onRenameChange, onRenameCommit, onRenameCancel, onAutoTitle,
     onDuplicate: sessionActions.duplicate, onCloseSession: sessionActions.close,
-    onMenuCloseAutoFocus, onSelectSlot, onOpenSlotInNewTab, onOpenSource,
+    onMenuCloseAutoFocus, onSelectSlot, onOpenSlotInNewTab, onOpenSource: stableOpenSource,
     onOpenPeerSession: openPeerSession,
     onNativeDragStart: startBoardCardDrag, onNativeDragEnd: endNativeSessionDrag,
     onPinnedKeyboardReorder: reorderPinnedByKeyboard,
@@ -3356,7 +3375,7 @@ function ChatSidebar({
   }), [
     renameInputRef, onRenameStart, onRenameChange, onRenameCommit, onRenameCancel, onAutoTitle,
     sessionActions.duplicate, sessionActions.close, onMenuCloseAutoFocus, onSelectSlot, onOpenSlotInNewTab,
-    onOpenSource, openPeerSession, startBoardCardDrag, endNativeSessionDrag, reorderPinnedByKeyboard,
+    stableOpenSource, openPeerSession, startBoardCardDrag, endNativeSessionDrag, reorderPinnedByKeyboard,
     openElsewhere, toggleConductorExpanded,
   ])
   // The values every row shows the same way, ONE object per change of any of them:
@@ -3402,11 +3421,34 @@ function ChatSidebar({
   // collides (Framer paints one, hides the rest). Distinct scope = distinct id.
   // Paint-order stamp threaded through every row this render — see
   // RowPlacement.orderStamp for why the memo boundary needs it.
-  let sessionRowOrderStamp = 0
+  // Stamps are keyed by (scope, row) and remembered for this render's closure.
+  // Folder blocks are rendered by a CHILD (SortableFolderBlock /
+  // SortableSubfolderBlock call `renderFolderBlock` from their own render), and
+  // dnd-kit re-renders those children on its own, e.g. when it re-measures a
+  // droppable after a row mounts. That deferred call runs after this render's
+  // pass has stamped every row, so a running counter would hand every row in
+  // the block the clamped stamp: all of them re-render with row animation off,
+  // then again when the next shell render restores the real stamps. Reusing the
+  // stamp the pass already assigned keeps the deferred render's row view
+  // identical, so the rows bail out of it. `sessionRowStampCount` is the running
+  // total across scopes, which is what the clamp counts.
+  const sessionRowStamps = new Map<string, Map<string, number>>()
+  let sessionRowStampCount = 0
   const renderSessionRow = (s: Slot, _indent: number, showDivider: boolean, scope = 'list', navScope = scope, holdContainer = navScope, conductor?: ConductorRowView) => {
     // Clamped, not raw: rows past the window share a stamp and bail out of a
     // displacement above them (see SIDEBAR_DISPLACEMENT_WINDOW).
-    const orderStamp = Math.min(sessionRowOrderStamp++, SIDEBAR_DISPLACEMENT_WINDOW)
+    let scopeStamps = sessionRowStamps.get(scope)
+    if (!scopeStamps) {
+      scopeStamps = new Map<string, number>()
+      sessionRowStamps.set(scope, scopeStamps)
+    }
+    const stampKey = sessionRowIdentity(s)
+    let orderStamp = scopeStamps.get(stampKey)
+    if (orderStamp === undefined) {
+      orderStamp = Math.min(sessionRowStampCount, SIDEBAR_DISPLACEMENT_WINDOW)
+      sessionRowStampCount += 1
+      scopeStamps.set(stampKey, orderStamp)
+    }
     const view = rowViews.view(s, {
       scope, navScope, holdContainer, showDivider, orderStamp, conductor,
       // staticRows (the compositor drawer) folds into the one row-animation

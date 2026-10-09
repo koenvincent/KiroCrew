@@ -262,9 +262,12 @@ export function createAgentsEndpoints({ post, put, del, j, jfetch: fetch, sessio
     // wrong cells as agentic -- which is the one thing this surface must not get
     // wrong, because it is the reader's only signal of how much to trust a number.
     // `member` is the exact crew name, as every member route takes it (slugs are lossy).
-    memberDashboard: (slug: string, member: string) =>
+    // `locale` is the UI language the page should render its own words in; the
+    // gateway checks it against the shipped catalogs and falls back to English.
+    memberDashboard: (slug: string, member: string, locale = '') =>
       fetch(
-        '/api/members/' + encodeURIComponent(slug) + '/dashboard?member=' + encodeURIComponent(member),
+        '/api/members/' + encodeURIComponent(slug) + '/dashboard?member=' + encodeURIComponent(member)
+          + (locale ? '&locale=' + encodeURIComponent(locale) : ''),
       ).then(j) as Promise<{
         instance_version: number
         template: { id: string; version: number }

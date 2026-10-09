@@ -106,6 +106,7 @@ if TYPE_CHECKING:
         extract_options,
         failure_name,
         fire_tool_hooks,
+        floored_spec_hooks,
         hook_gate_kwargs,
         invalidate_stale_kas_session,
         is_registered_agent_name,
@@ -2028,8 +2029,17 @@ class RunEventCoordinator(ManagerComponent):
         cannot be derived refuses the run instead of launching the base agent.
         """
         from kiro_crew.dashboard.side_readonly_spec import ReadOnlySpecError, publish_readonly_spec
+        from kiro_crew.subagent_manager.hub_approvals import floor_enforceable
 
         base = agent or "kirocrew"
+        if not floor_enforceable():
+            # Admission checks this too; the backend can change between the
+            # spawn and the start, and the run must not start without the floor.
+            info.error_code = "approval_floor_unenforceable"
+            raise RuntimeError(
+                "spawn refused: the approval floor needs a backend whose tool grants "
+                "the derived spec controls, and this gateway's backend is not one"
+            )
         try:
             published = await asyncio.to_thread(publish_readonly_spec, base, cwd or None)
         except ReadOnlySpecError as exc:
@@ -2268,7 +2278,9 @@ class RunEventCoordinator(ManagerComponent):
             ),
         )
         turn_execution = replace(execution, template_id=agent)
+        floor_base = ""
         if info.approval_floor == "interactive":
+            floor_base = agent or "kirocrew"
             agent = await self._floored_agent(info, agent, effective_cwd)
             turn_execution = replace(execution, template_id=agent)
         extra_kwargs: dict[str, Any] = {
@@ -2780,6 +2792,10 @@ class RunEventCoordinator(ManagerComponent):
         # On such a backend PreToolUse hooks gate each permission request below;
         # the KAS projection turns every call they cover into one.
         _spec = await turn_spec_hooks(client, agent)
+        if floor_base:
+            # The derived spec carries no hooks, so the template's PreToolUse
+            # denies are fired here, before the hub's person is asked.
+            _spec = await floored_spec_hooks(floor_base, effective_cwd)
         # The run's permission ladder. Imported here because this body runs on
         # the facade's globals (bind_component_globals), not this module's.
         from kiro_crew import tool_permission
@@ -3262,6 +3278,13 @@ class RunEventCoordinator(ManagerComponent):
                 # A mid-run mode switch runs a different agent, so ITS spec hooks gate
                 # the permission requests that follow, not the previous agent's. An
                 # unnamed switch falls back to the agent the session recorded for it.
+                if floor_base:
+                    # Another agent brings its own backend grants, which the
+                    # derived spec emptied; the floor cannot follow the switch.
+                    info.error_code = "approval_floor_unenforceable"
+                    raise RuntimeError(
+                        "spawn refused: an approval-floored run cannot switch agents"
+                    )
                 _spec = await turn_spec_hooks(client, event.text or "")
                 _policy = _policy_for(_spec)
                 await refuse_stale_switch(client, event.text or "")

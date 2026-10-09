@@ -26,17 +26,17 @@
     .legend b { width: 8px; height: 8px; border-radius: 2px; display: inline-block; margin-right: 4px; }
   </style>
 
-  <h2>Flow</h2>
+  <h2 data-i18n="title">Flow</h2>
   <div class="goal" data-dashboard-field="goal">-</div>
   <div class="meta">
-    <span>round <span data-dashboard-field="round">-</span></span>
-    <span>entries <span data-dashboard-field="entries">-</span></span>
-    <span>generation <span data-dashboard-field="generation">-</span></span>
+    <span><span data-i18n="round">round</span> <span data-dashboard-field="round">-</span></span>
+    <span><span data-i18n="entries">entries</span> <span data-dashboard-field="entries">-</span></span>
+    <span><span data-i18n="generation">generation</span> <span data-dashboard-field="generation">-</span></span>
   </div>
   <div class="meta">
-    <span>opened <span data-dashboard-field="created_at">-</span></span>
-    <span>first write <span data-dashboard-field="first_entry_at">-</span></span>
-    <span>last write <span data-dashboard-field="last_entry_at">-</span></span>
+    <span><span data-i18n="opened">opened</span> <span data-dashboard-field="created_at">-</span></span>
+    <span><span data-i18n="first_write">first write</span> <span data-dashboard-field="first_entry_at">-</span></span>
+    <span><span data-i18n="last_write">last write</span> <span data-dashboard-field="last_entry_at">-</span></span>
   </div>
 
   <div class="kpis" id="kpis"></div>
@@ -44,14 +44,14 @@
   <div class="charts">
     <div class="chart">
       <div class="glow"></div>
-      <div class="ct">Burndown</div>
-      <div class="cc">items still open at each step, against a straight pace</div>
+      <div class="ct" data-i18n="burndown">Burndown</div>
+      <div class="cc" data-i18n="burndown_cc">items still open at each step, against a straight pace</div>
       <div class="plot" id="burn"></div>
       <div class="ax" id="burnax"></div>
     </div>
     <div class="chart">
-      <div class="ct">Cumulative flow</div>
-      <div class="cc">how many items sat in each state at each step</div>
+      <div class="ct" data-i18n="cfd">Cumulative flow</div>
+      <div class="cc" data-i18n="cfd_cc">how many items sat in each state at each step</div>
       <div class="plot" id="cfd"></div>
       <div class="ax" id="cfdax"></div>
       <div class="legend" id="cfdlegend"></div>
@@ -59,8 +59,8 @@
   </div>
 
   <div class="sub" style="margin-top: 7px;">
-    <span data-dashboard-field="items">-</span> item(s) counted,
-    <span data-dashboard-field="omitted">-</span> not shown (list truncated, so both charts are drawn on a part of the board)
+    <span data-dashboard-field="items">-</span> <span data-i18n="items_counted">item(s) counted,</span>
+    <span data-dashboard-field="omitted">-</span> <span data-i18n="not_shown_flow">not shown (list truncated, so both charts are drawn on a part of the board)</span>
   </div>
 
   <script>
@@ -70,6 +70,67 @@
       var STEPS = 24;
       var W = 300;
       var H = 96;
+
+      // The page's own words, one table per UI language. A key a language lacks falls
+      // back to English. Values the record wrote are never looked up here. The zh-CN
+      // strings are \u-escaped so the source stays ASCII.
+      var I18N = {
+        en: {
+          title: 'Flow', round: 'round', entries: 'entries', generation: 'generation',
+          opened: 'opened', first_write: 'first write', last_write: 'last write',
+          burndown: 'Burndown', burndown_cc: 'items still open at each step, against a straight pace',
+          cfd: 'Cumulative flow', cfd_cc: 'how many items sat in each state at each step',
+          items_counted: 'item(s) counted,',
+          not_shown_flow: 'not shown (list truncated, so both charts are drawn on a part of the board)',
+          band_accepted: 'accepted', band_rejected: 'rejected or left', band_open: 'open',
+          kpi_accepted: 'accepted', kpi_still_open: 'still open', kpi_rejected: 'rejected or left',
+          kpi_of: 'of {n}', unit_items: 'item(s)',
+          empty_undrawable: 'No open and close stamps span a window, so neither chart can be drawn.',
+          empty_none: 'No item on this board yet.',
+          cfd_top: 'top of band = {n} opened'
+        },
+        'zh-CN': {
+          title: '\u6d41\u52a8', round: '\u8f6e\u6b21', entries: '\u6761\u76ee', generation: '\u4e16\u4ee3',
+          opened: '\u5f00\u542f\u4e8e', first_write: '\u9996\u6b21\u5199\u5165', last_write: '\u6700\u540e\u5199\u5165',
+          burndown: '\u71c3\u5c3d', burndown_cc: '\u6bcf\u4e00\u6b65\u4ecd\u5f00\u542f\u7684\u4e8b\u9879\uff0c\u5bf9\u7167\u5300\u901f\u57fa\u51c6\u7ebf',
+          cfd: '\u7d2f\u79ef\u6d41', cfd_cc: '\u6bcf\u4e00\u6b65\u5404\u72b6\u6001\u4e0b\u7684\u4e8b\u9879\u6570\u91cf',
+          items_counted: '\u4e2a\u4e8b\u9879\u5df2\u8ba1\u5165\uff0c',
+          not_shown_flow: '\u9879\u672a\u663e\u793a\uff08\u5217\u8868\u5df2\u622a\u65ad\uff0c\u6545\u4e24\u5f20\u56fe\u8868\u7ed8\u5236\u4e8e\u770b\u677f\u7684\u4e00\u90e8\u5206\uff09',
+          band_accepted: '\u5df2\u63a5\u53d7', band_rejected: '\u5df2\u62d2\u7edd\u6216\u5df2\u653e\u5f03', band_open: '\u8fdb\u884c\u4e2d',
+          kpi_accepted: '\u5df2\u63a5\u53d7', kpi_still_open: '\u4ecd\u5f00\u542f', kpi_rejected: '\u5df2\u62d2\u7edd\u6216\u5df2\u653e\u5f03',
+          kpi_of: '\u5171 {n}', unit_items: '\u4e2a\u4e8b\u9879',
+          empty_undrawable: '\u6ca1\u6709\u5f00\u542f\u4e0e\u5173\u95ed\u65f6\u95f4\u6233\u80fd\u6784\u6210\u4e00\u4e2a\u65f6\u95f4\u7a97\uff0c\u56e0\u6b64\u4e24\u5f20\u56fe\u90fd\u65e0\u6cd5\u7ed8\u5236\u3002',
+          empty_none: '\u770b\u677f\u4e0a\u8fd8\u6ca1\u6709\u4efb\u4f55\u4e8b\u9879\u3002',
+          cfd_top: '\u6ce2\u6bb5\u9876\u90e8 = {n} \u9879\u5df2\u5f00\u542f'
+        }
+      };
+      function locale() {
+        var l = (window.kirocrew || {}).locale;
+        return typeof l === 'string' && Object.prototype.hasOwnProperty.call(I18N, l) ? l : 'en';
+      }
+      function has(key) {
+        return Object.prototype.hasOwnProperty.call(I18N.en, key);
+      }
+      function i18n(key, vars) {
+        var table = I18N[locale()];
+        var s = Object.prototype.hasOwnProperty.call(table, key) ? table[key] : I18N.en[key];
+        if (s === undefined) s = key;
+        if (vars) {
+          s = s.replace(/\{(\w+)\}/g, function (m, k) {
+            return Object.prototype.hasOwnProperty.call(vars, k) ? String(vars[k]) : m;
+          });
+        }
+        return s;
+      }
+      // A band's own word, in the reader's language when known and as declared
+      // otherwise, so a band the page gains later still names itself.
+      function bandLabel(key, fallback) {
+        return has('band_' + key) ? i18n('band_' + key) : fallback;
+      }
+      function applyStatic() {
+        var nodes = document.querySelectorAll('[data-i18n]');
+        for (var i = 0; i < nodes.length; i++) nodes[i].textContent = i18n(nodes[i].getAttribute('data-i18n'));
+      }
 
       // Stack order, bottom up: finished at the bottom so the band that GROWS is the
       // one a reader wants flat, and the open band on top is the pile-up.
@@ -175,6 +236,7 @@
 
       function render() {
         var f = fields();
+        applyStatic();
         var cells = document.body.querySelectorAll('[data-dashboard-field]');
         for (var c = 0; c < cells.length; c++) {
           if (!cells[c].textContent.trim()) cells[c].textContent = DASH;
@@ -200,9 +262,9 @@
           else if (st === 'open') open += 1;
           else shut += 1;
         }
-        kpis.appendChild(kpi('accepted', list.length ? done : null, 'of ' + list.length, list.length ? done / list.length : null));
-        kpis.appendChild(kpi('still open', list.length ? open : null, 'item(s)', null));
-        kpis.appendChild(kpi('rejected or left', list.length ? shut : null, 'item(s)', null));
+        kpis.appendChild(kpi(i18n('kpi_accepted'), list.length ? done : null, i18n('kpi_of', { n: list.length }), list.length ? done / list.length : null));
+        kpis.appendChild(kpi(i18n('kpi_still_open'), list.length ? open : null, i18n('unit_items'), null));
+        kpis.appendChild(kpi(i18n('kpi_rejected'), list.length ? shut : null, i18n('unit_items'), null));
 
         var lo = stamp(f.first_entry_at) || stamp(f.created_at);
         var hi = stamp(f.last_entry_at);
@@ -215,8 +277,8 @@
         if (open && hi !== null && hi < Date.now()) hi = Date.now();
         if (lo === null || hi === null || hi <= lo || !list.length) {
           var why = list.length
-            ? 'No open and close stamps span a window, so neither chart can be drawn.'
-            : 'No item on this board yet.';
+            ? i18n('empty_undrawable')
+            : i18n('empty_none');
           empty(burn, why);
           empty(cfd, why);
           var cell0 = document.querySelector('[data-dashboard-field="items"]');
@@ -313,14 +375,14 @@
           var sw = document.createElement('b');
           sw.style.background = BANDS[n][2];
           row.appendChild(sw);
-          row.appendChild(document.createTextNode(BANDS[n][1] + ' ' + stacks[at.length - 1][key]));
+          row.appendChild(document.createTextNode(bandLabel(key, BANDS[n][1]) + ' ' + stacks[at.length - 1][key]));
           legend.appendChild(row);
         }
         cfd.appendChild(cs);
         var cl = document.createElement('span');
         cl.textContent = clock(lo);
         var cr = document.createElement('span');
-        cr.textContent = 'top of band = ' + peak + ' opened';
+        cr.textContent = i18n('cfd_top', { n: peak });
         var cr2 = document.createElement('span');
         cr2.textContent = clock(hi);
         cfdax.appendChild(cl);

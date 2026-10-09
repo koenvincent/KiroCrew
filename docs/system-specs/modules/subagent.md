@@ -4015,9 +4015,21 @@ so a restart cannot drop it). A floored run also launches as `<agent>--readonly`
 the side surface's derived spec (`dashboard/side_readonly_spec.py`) with the
 backend's own grants emptied (`allowedTools`, MCP `autoApprove`, `toolsSettings`
 grants, lifecycle hooks): kiro-cli approves those itself, so they never raise a
-request the ladder could hold. The shared template is untouched, and a spec that
+request the ladder could hold. The derived spec also drops `hooks`, so the
+template's PreToolUse hooks are fired by Crew on every permission request
+(`spec_hooks.floored_spec_hooks`), before the hub's person is asked: a denying
+hook still refuses, and an unreadable spec refuses every request. Its other
+lifecycle commands do not run. A floored run that switches agents mid-run ends
+(`approval_floor_unenforceable`), since the new agent's grants were never
+emptied. The shared template is untouched, and a spec that
 cannot be derived refuses the run (`approval_floor_unenforceable`) rather than
-launching the base agent. The floor is also recorded in the hub's mapping.
+launching the base agent. That spec only controls kiro-cli's grants, so the floor
+holds only on a gateway whose `agent.acp_backend` is in
+`ACP_BACKENDS_SIDE_READONLY` (the same positive set the side chat's read-only
+tools rest on): elsewhere `/api/version` leaves `approval_floor` and
+`approval_relay` out of `spawn_enforces`, `/api/spawn` refuses a floored run with
+`409 approval_floor_unenforceable`, and the run step refuses it again if the
+backend changed after admission. The floor is also recorded in the hub's mapping.
 It covers the run's tools only: whether the spawn itself needs approval on the
 peer stays the peer's policy, and an auto posture sends no floor rather than
 `approval_mode=auto`, so a crew can still be stricter than its hub.
@@ -4151,7 +4163,11 @@ spawn API has an idempotency key.
 
 Current lifecycle boundaries are intentional:
 
-- remote Crew Member memory bindings and `keep=true` are rejected;
+- remote Crew Member memory bindings and `keep=true` are rejected
+  (`400 remote_crew_binding_unsupported`), judged on the ADMITTED execution: an
+  explicit `crew`, and equally a parent that is itself member-bound or on a named
+  store, since the peer receives no store identity and would read its own Global
+  memory;
 - `spawn_continue`, `spawn_steer`, `spawn_release` and retry on a remote shadow ID
   return `409 remote_operation_unsupported` rather than entering local-only code;
 - per-run cancel, dashboard Stop-all and parent teardown route cancellation to

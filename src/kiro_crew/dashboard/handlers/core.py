@@ -539,13 +539,16 @@ async def api_version(request: web.Request) -> web.Response:
     run and silently drop the field. ``approval_relay`` says a floored run's tool
     requests are handed to the hub (``approvals`` on the run's status, answered on
     ``/api/spawn/{id}/approvals/{approval_id}``) instead of prompting here.
+    Both floor entries are listed only when this gateway's harness can carry the
+    floor (``hub_approvals.floor_enforceable``), so a hub refuses to send a
+    floored run to a crew whose backend would pre-approve its tools.
     """
-    return web.json_response(
-        {
-            "version": kiro_crew.__version__,
-            "spawn_enforces": ["approval_floor", "approval_relay", "memory_mode"],
-        }
-    )
+    from kiro_crew.subagent_manager.hub_approvals import floor_enforceable
+
+    enforces = ["memory_mode"]
+    if floor_enforceable():
+        enforces = ["approval_floor", "approval_relay", "memory_mode"]
+    return web.json_response({"version": kiro_crew.__version__, "spawn_enforces": enforces})
 
 
 async def api_live(request: web.Request) -> web.Response:

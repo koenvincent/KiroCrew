@@ -248,7 +248,7 @@ class TestTheTreeItDraws:
             "renderPills iterates the raw board list, so every nested board gets a "
             "pill of its own"
         )
-        assert "pill(ALL, 'All', roots.length)" in body, (
+        assert "pill(ALL, i18n('pill_all'), roots.length)" in body, (
             "the All pill counts boards rather than epics, so it disagrees with the "
             "tree under it"
         )

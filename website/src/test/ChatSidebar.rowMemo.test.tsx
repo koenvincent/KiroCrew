@@ -516,3 +516,34 @@ describe('chat sidebar — agent default session colour', () => {
     expect(tintOf(rowFor('k-own'))).toBe(SESSION_TINT)
   })
 })
+
+/**
+ * The page rebuilds its source-reveal handler whenever that handler's own
+ * inputs move. Rows only call it, so a new identity must not reach the row
+ * actions object, which every row's memo compares by reference.
+ */
+describe('chat sidebar — onOpenSource identity', () => {
+  it('a new onOpenSource identity re-renders no rows', () => {
+    const slots = [slot('k-a'), slot('k-b'), slot('k-c')]
+    const { wrap } = renderSidebarWithSlots(slots)
+    let setOpen: ((f: () => boolean) => void) | undefined
+    function Harness() {
+      const [openSource, setOpenSource] = React.useState<() => boolean>(() => () => true)
+      setOpen = (f) => setOpenSource(() => f)
+      return (
+        <ChatSidebar
+          slots={slots} activeSlot={null} unreadSlots={EMPTY_UNREAD}
+          history={EMPTY_HISTORY} historyHasMore={false} defaultAgent="" installedAgents={EMPTY_AGENTS}
+          onOpenSource={openSource}
+        />
+      )
+    }
+    render(wrap(<Harness />))
+    expect(counts['k-a']).toBeGreaterThan(0)
+    for (const k of Object.keys(counts)) delete counts[k]
+
+    act(() => { setOpen!(() => false) })
+
+    expect(counts).toEqual({})
+  })
+})

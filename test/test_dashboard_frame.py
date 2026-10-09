@@ -113,6 +113,10 @@ class TestTheComposedDocument:
             "<script>var s = window.kirocrew.fields.entries;</script>"
         )
 
+    @staticmethod
+    def island(doc: str) -> str:
+        return doc.split('id="kirocrew-dashboard-data">')[1].split("</script>")[0]
+
     def doc(self, **over: Any) -> str:
         read = dashboard_frame.read_payload(
             over.pop("fields", {"risk_note": "two blocked", "entries": 3}), **over
@@ -268,7 +272,39 @@ class TestTheComposedDocument:
             # Empty rather than absent: a page reads this map unconditionally, and a
             # missing key would make a template branch on whether the host is new.
             "written_at": {},
+            # English when the caller names no language, for the same reason.
+            "locale": "en",
         }
+
+    def test_the_document_language_comes_from_the_read(self) -> None:
+        """A page in the reader's language needs a document that says which one."""
+        doc = self.doc(locale="zh-CN")
+        assert '<html lang="zh-CN">' in doc
+        assert json.loads(self.island(doc))["locale"] == "zh-CN"
+
+    @pytest.mark.parametrize(
+        "raw",
+        ["xx-YY", "zh-TW", "zh-cn", "", None, 7, 'en"><script>alert(1)</script>', "en-XA"],
+    )
+    def test_a_language_the_app_does_not_ship_falls_back_to_english(self, raw: Any) -> None:
+        """The same gate as the persisted UI language: only a shipped catalog's tag."""
+        doc = self.doc(locale=raw)
+        assert '<html lang="en">' in doc
+        assert json.loads(self.island(doc))["locale"] == "en"
+
+    def test_a_hand_built_read_cannot_put_an_unchecked_tag_in_markup(self) -> None:
+        read = dashboard_frame.read_payload({})
+        read["locale"] = '"><b>x</b>'
+        doc = dashboard_frame.compose(self.page(), read)
+        assert '<html lang="en">' in doc
+
+    def test_the_bootstrap_sets_the_language_for_a_host_that_writes_its_own_html(self) -> None:
+        """``compose_body`` drops ``<html>``, so the bootstrap carries the language."""
+        body = dashboard_frame.compose_body(
+            self.page(), dashboard_frame.read_payload({}, locale="zh-CN")
+        )
+        assert "<html" not in body
+        assert "document.documentElement.lang = read.locale" in body
 
     def test_the_refill_replaces_the_global_wholesale(self) -> None:
         """A page holding a reference to the old object keeps reading consistent

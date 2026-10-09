@@ -88,7 +88,12 @@ function board(tasks: Array<Record<string, unknown>>, over: Record<string, unkno
  */
 function mount(
   fields: Record<string, unknown>,
-  extra: { written_at?: Record<string, string>; agentic?: string[]; seq?: number } = {},
+  extra: {
+    written_at?: Record<string, string>
+    agentic?: string[]
+    seq?: number
+    locale?: string
+  } = {},
 ) {
   ;(window as unknown as { kirocrew: unknown }).kirocrew = {
     fields,
@@ -97,6 +102,9 @@ function mount(
     stale: false,
     missing: [],
     written_at: extra.written_at ?? {},
+    // The host sets this only when the reader has a non-English UI locale; an absent
+    // key is the English default, which is what every existing case above relies on.
+    ...(extra.locale === undefined ? {} : { locale: extra.locale }),
   }
   document.body.replaceChildren(
     ...new DOMParser().parseFromString(MARKUP, 'text/html').body.childNodes,
@@ -1068,6 +1076,42 @@ describe('project-report: the page the gateway ships', () => {
         last_entry_at: iso(3),
       })
       expect(document.querySelector('.pr-dr')).toBeNull()
+    })
+  })
+
+  // ------------------------------------------------ the desk words follow the locale
+  describe('the desk words default from the locale, overridden by the verdict', () => {
+    // The desk's labels have per-locale defaults in the page's own I18N table, and a
+    // crewmate's `verdict.words` still overrides any of them, in every locale. The
+    // "Write my own" button (`word_own`) is on every needs-you card, so it is the one
+    // word read in all three readings here. zh-CN expectations are \u escapes so the
+    // file stays ASCII.
+    const deskFields = (over: Record<string, unknown> = {}) => ({
+      items: [],
+      for_you: [{ text: 'Approve the staging rollout', workstream: '' }],
+      ...over,
+    })
+    const ownButton = () => text('.pr-todo-opt.pr-own')
+
+    it('renders a desk default word in zh-CN', () => {
+      // \u81ea\u5df1\u5199 is the zh-CN table default for word_own ("Write my own").
+      mount(deskFields(), { locale: 'zh-CN' })
+      expect(ownButton()).toBe('\u81ea\u5df1\u5199')
+    })
+
+    it('lets a verdict.words override beat the zh-CN table default', () => {
+      // \u6211\u6765\u5199 is the crewmate's own wording; it wins over the table even
+      // under zh-CN, which is the rule that must hold in every locale.
+      mount(deskFields({ verdict: { words: { own: '\u6211\u6765\u5199' } } }), {
+        locale: 'zh-CN',
+      })
+      expect(ownButton()).toBe('\u6211\u6765\u5199')
+      expect(ownButton()).not.toBe('\u81ea\u5df1\u5199')
+    })
+
+    it('renders the English default word when the locale is en', () => {
+      mount(deskFields(), { locale: 'en' })
+      expect(ownButton()).toBe('Write my own')
     })
   })
 })

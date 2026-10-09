@@ -79,6 +79,7 @@ from kiro_crew.agent_discovery import (
 from kiro_crew.agent_sdk.capabilities import capabilities_of
 from kiro_crew.agent_sdk.provider_identity import PROVIDER_CLAUDE_CODE
 from kiro_crew.agent_sdk.spec_hooks import (
+    floored_spec_hooks,
     invalidate_stale_kas_session,
     refuse_stale_switch,
     replace_stale_shared_session,
@@ -6641,6 +6642,7 @@ _COMPONENT_GLOBAL_BINDINGS = (
     time,
     transient_retry_delay,
     turn_spec_hooks,
+    floored_spec_hooks,
     invalidate_stale_kas_session,
     refuse_stale_switch,
     replace_stale_shared_session,

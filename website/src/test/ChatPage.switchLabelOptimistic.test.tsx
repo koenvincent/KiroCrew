@@ -319,13 +319,15 @@ describe('ChatPage — a model pick returns focus to the composer only if it had
   const composer = () => document.querySelector<HTMLTextAreaElement>('textarea[data-composer-input]')!
   // `focusComposer` focuses on the next animation frame.
   const nextFrame = () => act(() => new Promise<void>(r => requestAnimationFrame(() => r())))
-  // A real pointer press: `mousedown` (where the chip reads focus) moves focus
-  // onto the button as the browser would, then `click` opens the picker.
+  // A real mouse press, in the browser's event order: `pointerdown` (where the
+  // chip reads focus and opens the picker), `mousedown`, focus moving onto the
+  // button, then the `click` the chip swallows because the press already acted.
   const pressChip = async (chip: HTMLElement) => {
     await act(async () => {
+      fireEvent.pointerDown(chip, { pointerType: 'mouse', button: 0 })
       fireEvent.mouseDown(chip)
       chip.focus()
-      fireEvent.click(chip)
+      fireEvent.click(chip, { detail: 1 })
     })
   }
 

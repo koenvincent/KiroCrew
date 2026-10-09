@@ -1347,6 +1347,21 @@ async def test_an_interactive_floor_hands_every_request_to_the_hub(
 
 
 @pytest.mark.asyncio
+async def test_a_floored_runs_template_hooks_refuse_before_the_hub_is_asked(names):
+    from kiro_crew.subagent_manager import hub_approvals
+
+    # Hooks that cannot be read give no verdict, so they refuse like a deny.
+    policy, _info, log = _subagent_ladder(
+        spec=TurnSpecHooks([], None, True, True), approval_floor="interactive"
+    )
+    settled = await asyncio.wait_for(
+        settle(Ask(_event(), RecordingWire(log), "subagent:a1"), policy), timeout=5
+    )
+    assert settled.rung == "spec_hook"
+    assert hub_approvals.pending_for("a1") == []
+
+
+@pytest.mark.asyncio
 async def test_without_a_floor_the_callback_sees_no_floor():
     asked: list = []
 

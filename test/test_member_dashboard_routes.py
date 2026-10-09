@@ -260,6 +260,15 @@ async def test_a_live_dashboard_comes_back_with_its_values_filled_in(monkeypatch
     read = json.loads(island)
     assert read["fields"] == {"credits": 1.5, "phase": "reviewing"}
     assert read["agentic"] == ["phase"] and read["seq"] == 7
+    # No locale asked for: the page renders its own words in English.
+    assert read["locale"] == "en"
+
+    # The reader's UI language reaches the page; one the app does not ship is English.
+    async with _client() as client:
+        for asked, got in (("zh-CN", "zh-CN"), ("xx-YY", "en")):
+            body = await (await client.get(_q("", locale=asked))).json()
+            island = body["rendered_html"].split('id="kirocrew-dashboard-data">', 1)[1]
+            assert json.loads(island.split("</script>", 1)[0])["locale"] == got, asked
 
 
 def test_no_worker_session_key_survives_the_render_mask():

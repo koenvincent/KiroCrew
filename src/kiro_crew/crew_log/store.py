@@ -107,6 +107,7 @@ from kiro_crew.crew_log.schema import (
 from kiro_crew.jsonl_util import (
     UnreadableRecord,
     bounded_raw_records,
+    bounded_raw_records_with_offsets,
     strict_raw_records,
 )
 from kiro_crew.owner_only_files import OWNER_ONLY_FILE_MODE, mkdirs_owner_only, owner_only_opener
@@ -2790,7 +2791,31 @@ class _Bounded:
 def _iter_entries(path: Path, end: int | None = None) -> Iterator[Entry]:
     """Every parseable entry in *path*, oldest first, header excluded.
 
+    A projection of :func:`_iter_entries_located`, which owns the framing, the skip
+    posture and the strict per-record decode. One implementation rather than two, so
+    a reader that wants byte offsets and one that does not cannot come to disagree
+    about where a record begins or whether it counts.
+    """
+    for entry, _at in _iter_entries_located(path, end):
+        yield entry
+
+
+def _iter_entries_located(
+    path: Path, end: int | None = None, *, start: int = 0
+) -> "Iterator[tuple[Entry, int]]":
+    """Every parseable entry in *path* and the byte offset its record begins at.
+
     *end*, when given, is the byte offset the read stops at (see :class:`_Bounded`).
+
+    *start* is where the read BEGINS, and it is how a reader resumes at a record it
+    has already located instead of walking to it. Zero reads the file from the top,
+    where record 1 is the header and is skipped; any other value is already past the
+    header, so nothing is skipped there -- a resumed read that dropped its first
+    record would silently lose the entry the caller seeked to.
+
+    The offset is the record's OWN start, taken from the framing layer rather than
+    accumulated here, so an over-cap record -- which the framer discards in full,
+    terminator included -- cannot leave every later offset short by its length.
 
     A malformed interior line is SKIPPED, not raised on: the log is append-only
     and one damaged line must not hide the history in front of it. The file is
@@ -2806,20 +2831,26 @@ def _iter_entries(path: Path, end: int | None = None) -> Iterator[Entry]:
     line is damage and is skipped exactly like unparseable JSON.
 
     The file is read in BINARY mode and framed by
-    :func:`jsonl_util.bounded_raw_records`, so no universal-newline translation
-    can rewrite the bytes on the way in, and one planted line cannot cost more
-    than :data:`MAX_ENTRY_BYTES` of memory however long it is. That cap is the
-    format's own write limit, so a longer line is not something this writer
+    :func:`jsonl_util.bounded_raw_records_with_offsets`, so no universal-newline
+    translation can rewrite the bytes on the way in, and one planted line cannot
+    cost more than :data:`MAX_ENTRY_BYTES` of memory however long it is. That cap is
+    the format's own write limit, so a longer line is not something this writer
     produced: it is damage, and the skip posture already applies to damage.
     """
     try:
         with open(path, "rb") as raw_source:
+            if start:
+                raw_source.seek(start)
             source: Any = raw_source if end is None else _Bounded(raw_source, end)
-            for index, raw in enumerate(
-                bounded_raw_records(source, path, cap=MAX_ENTRY_BYTES, label="crew log")
+            for index, (at, _stop, raw) in enumerate(
+                bounded_raw_records_with_offsets(
+                    source, path, cap=MAX_ENTRY_BYTES, label="crew log"
+                )
             ):
-                if index == 0:
+                if index == 0 and not start:
                     continue  # the header
+                if raw is None:
+                    continue  # an over-cap record, reported so a resumer can step past it
                 stripped = raw.strip()
                 if not stripped:
                     continue
@@ -2828,7 +2859,7 @@ def _iter_entries(path: Path, end: int | None = None) -> Iterator[Entry]:
                     continue
                 entry = Entry.from_dict(parsed)
                 if entry is not None:
-                    yield entry
+                    yield entry, at
     except FileNotFoundError:
         return
 
@@ -2881,6 +2912,70 @@ def _read_first_entry_seq(path: Path) -> int | None:
 # --------------------------------------------------------------------------- #
 # Read results
 # --------------------------------------------------------------------------- #
+
+
+@dataclass(frozen=True)
+class ResumePoint:
+    """Where a walk of one unit's log stopped, as a position a later walk can seek to.
+
+    What it buys is the difference between a tail read that costs the TAIL and one
+    that costs the LOG. :meth:`CrewLog.iter_from` yields from a seq, and reaching that
+    seq means decoding every record below it -- so a reader that polls a growing log
+    for its newest entry decodes the whole of it on every poll, however little
+    arrived. Handed one of these, the same walk opens the file at the record it
+    already knows and decodes only what came after.
+
+    Every field is part of the proof, and a walk that cannot confirm one of them walks
+    the log from the top instead:
+
+    ``segment`` is the FILE NAME, not a path, because a unit's history is several
+    files and a byte offset means nothing without the one it indexes. A name absent
+    from disk -- retention dropped it -- is not an error, it is a resume point that
+    has stopped applying.
+
+    ``offset`` is where the record carrying ``seq`` BEGINS. It must be a record
+    boundary, and that is checked by reading there and requiring the framed record to
+    start at exactly this value: an offset landing inside a record yields the
+    remainder, which does not parse, and the next record then starts above the
+    offset.
+
+    ``seq`` is what the record at ``offset`` must carry. This is the positive check --
+    the one that says the bytes at the offset are the bytes the reader thinks they
+    are, rather than merely that something parses there. It also ANCHORS the walk's
+    "every seq must advance" rule: the resumed walk's first record is this one, so
+    every record after it is still compared against a known predecessor.
+
+    ``cuts`` is :meth:`CrewLog.cuts` as it read when the offset was taken. A cut is
+    the only thing in this store that moves a committed record, so an unchanged count
+    is what says the bytes BELOW the offset -- which the resumed walk does not read --
+    are the bytes they were. ``None`` is not proven and never resumes: a log with no
+    counter has no evidence for its prefix, so it gets the full walk.
+    """
+
+    segment: str
+    offset: int
+    seq: int
+    cuts: int | None
+
+
+@dataclass
+class ReadCursor:
+    """Where the walk a caller is driving has reached, for it to remember.
+
+    Mutable and passed IN, because :meth:`CrewLog.iter_from` is a generator and a
+    generator's return value is not reachable by a caller that iterates it. The same
+    shape :class:`~kiro_crew.crew_log.projection._SlotStream` already uses for the
+    heights it reports: the walk fills it as it goes, and the caller reads it when the
+    walk is done.
+
+    ``at`` names the last entry the walk YIELDED, not the last record it framed. That
+    is the position a continuation wants: a reader resumes to find what it has not
+    folded, and a record it skipped -- an ignorable type it does not know, a damaged
+    line -- is one it has not folded either, so a point past it would hide it from
+    every later read.
+    """
+
+    at: "ResumePoint | None" = None
 
 
 @dataclass(frozen=True)
@@ -3696,6 +3791,8 @@ class CrewLog:
         *,
         known: Collection[str] | None = None,
         strict_seq: bool = True,
+        resume: "ResumePoint | None" = None,
+        cursor: "ReadCursor | None" = None,
     ) -> Iterator[Entry]:
         """Every entry from *seq* onward, OLDEST first -- the shape a fold wants.
 
@@ -3739,9 +3836,50 @@ class CrewLog:
         reading. A caller that FOLDS state must keep the default -- tolerating
         a non-advancing seq there is how two reads of the same bytes disagree,
         which is the defect this parameter's default closes.
+
+        *resume* is a :class:`ResumePoint` this unit handed out on an earlier walk,
+        and it is what makes a tail read cost the TAIL. Reaching *seq* otherwise
+        means decoding every record below it, so a reader polling a growing log for
+        its newest entry decodes the whole log on every poll. Given a point it can
+        confirm, the walk opens the file AT that record and decodes only what follows.
+
+        A point never narrows what this call answers. It is ignored outright when *seq*
+        is below the point's own seq, because opening at the point would drop the
+        records between the two and hand back a short answer to a caller that asked for
+        them. So the same *seq* yields the same entries whether a point is passed or
+        not, and the point only changes how much was read to produce them.
+
+        What a resume gives up is exactly the prefix it does not read. The checks
+        here -- the advancing-seq rule, each earlier segment's header, each segment's
+        filename-against-first-entry claim, contiguity across the boundaries below
+        the point -- apply only to the records this walk reads, so records below the
+        point go unchecked. A resume is therefore honoured only when ``cuts`` still
+        reads as it did (so the store itself has not moved a committed record) AND
+        the record at ``offset`` still carries ``seq``; anything else, including a
+        point this log never issued, falls back to the full walk. See
+        :meth:`_resume_at` for each refusal.
+
+        *cursor* is where this walk REPORTS its own resume point, for the caller to
+        hand back next time. It is filled per yielded entry, so after the walk it
+        names the last one -- and a walk that yielded nothing leaves it untouched,
+        which is what lets a caller keep the point it already had.
         """
         walked = 0
-        for entry in self._iter_segments():
+        # Read ONCE, before any record, and stamped into every point this walk hands
+        # out. A cut landing mid-walk then leaves the point carrying the count from
+        # before it, which the next read compares unequal and falls back on -- the
+        # error falls towards a full walk. Reading it afterwards would stamp the
+        # count from after the cut, and the next read would resume over cut bytes.
+        cuts = self.cuts() if (cursor is not None or resume is not None) else None
+        # A point may start the walk only where it cannot hide an entry this call asked
+        # for. Opening at the point yields its own record and everything after it, so
+        # the answer is whole exactly when *seq* is at or above the point's seq. Asked
+        # for anything lower, the records in between are owed, and a point that skipped
+        # them would make this an optimisation that changes the answer -- which is the
+        # one thing it must never be. :meth:`_resume_at` cannot see this: it is handed
+        # the point and the bytes, and answers whether they agree, not what was asked.
+        usable = resume if resume is not None and seq >= resume.seq else None
+        for entry, segment, at in self._iter_segments_located(resume=usable, cuts=cuts):
             if entry.seq <= walked:
                 if strict_seq:
                     raise CrewLogError(
@@ -3765,6 +3903,8 @@ class CrewLog:
                         field="type",
                     )
                 continue
+            if cursor is not None:
+                cursor.at = ResumePoint(segment=segment, offset=at, seq=entry.seq, cuts=cuts)
             yield entry
 
     def _durable_end(self, path: Path) -> int:
@@ -3778,6 +3918,86 @@ class CrewLog:
     def _iter_segments(self) -> Iterator[Entry]:
         """Every entry of every segment, oldest first, refusing bad provenance.
 
+        A projection of :meth:`_iter_segments_located`, which owns the provenance
+        refusals and the walk. Two walks over a unit's segments would be two answers
+        waiting to disagree about which files are authoritative.
+        """
+        for entry, _segment, _at in self._iter_segments_located():
+            yield entry
+
+    def _resume_at(
+        self,
+        paths: "list[Path]",
+        resume: "ResumePoint | None",
+        newest_end: int | None,
+        cuts: int | None,
+    ) -> "tuple[int, int]":
+        """Which segment index and byte offset a walk may start at, for *resume*.
+
+        ``(0, 0)`` means "start at the top", and it is the answer to every question
+        this cannot settle -- a resume point is an optimisation token, so a token that
+        does not check out costs the full walk and never a wrong answer.
+
+        The refusals, each for its own reason:
+
+        * **No point, or a nonsense offset.** Offset zero is the header's own
+          position, so it names no entry; a negative or non-integer one names nothing
+          at all.
+        * **The cut count moved, or either reading is unknown.** This is the only
+          evidence there is about the prefix the resumed walk does NOT read: a cut is
+          the one thing in the store that changes a committed record, so an unchanged
+          count is what says those bytes still are what they were. ``None`` is not
+          proven rather than zero (see :func:`read_cuts`), so a log with no counter
+          takes the full walk -- it has nothing to vouch for its prefix with. The
+          counter is a seqlock, so ``None`` also covers a reading taken while a cut is
+          in flight: that one is odd, and admitting it would let a reader match the
+          same odd value again over bytes the cut had meanwhile replaced.
+        * **The named segment is gone.** Retention removes whole segments off the
+          front, and a point into one of them is stale rather than wrong.
+        * **The offset is at or past the durable end.** Bytes past it are an append
+          still in flight (see :meth:`_durable_end`).
+        * **The offset is not a record boundary.** Read there and the framing layer
+          reports where the record it delivers actually began: an offset inside a
+          record yields that record's remainder, which does not parse, and the first
+          entry found then starts ABOVE the offset.
+        * **The record there is not the expected seq.** The positive check, and the
+          one that makes the whole thing safe to build on: it says the bytes at the
+          offset are the bytes the caller thinks they are, not merely that something
+          parses there. It also leaves the walk's advancing-seq rule anchored, since
+          the resumed walk's first record is this known one.
+        """
+        if resume is None:
+            return 0, 0
+        if not isinstance(resume.offset, int) or isinstance(resume.offset, bool):
+            return 0, 0
+        if resume.offset <= 0:
+            return 0, 0
+        if resume.cuts is None or cuts is None or resume.cuts != cuts:
+            return 0, 0
+        index = next((at for at, path in enumerate(paths) if path.name == resume.segment), None)
+        if index is None:
+            return 0, 0
+        end = newest_end if index == len(paths) - 1 else None
+        if end is not None and resume.offset >= end:
+            return 0, 0
+        found = next(_iter_entries_located(paths[index], end, start=resume.offset), None)
+        if found is None:
+            return 0, 0
+        entry, at = found
+        if at != resume.offset or entry.seq != resume.seq:
+            return 0, 0
+        return index, resume.offset
+
+    def _iter_segments_located(
+        self,
+        *,
+        resume: "ResumePoint | None" = None,
+        cuts: int | None = None,
+    ) -> "Iterator[tuple[Entry, str, int]]":
+        """Every entry of every segment with its segment name and byte offset.
+
+        Oldest first, refusing bad provenance.
+
         Every segment repeats the header because retention may remove the first one.
         Each header must therefore identify this same crew log and schema before any
         entry from that independent file becomes authoritative. The filename's first
@@ -3789,6 +4009,13 @@ class CrewLog:
         unreadable record must not make the rest of the file unreadable. Across two
         files a gap is a different thing: a half-finished copy or deleted middle
         segment is invisible unless the boundary is checked.
+
+        *resume*, when :meth:`_resume_at` accepts it, starts the walk inside one
+        segment and SKIPS every segment before it. The header of the resumed segment
+        is still checked -- it is the file the walk reads -- but the earlier ones are
+        not opened, and the boundary into the resumed segment has no previous entry
+        to be compared against, so it is not checked either. That is the prefix the
+        resume trades away, and :meth:`_resume_at` is where it is paid for.
         """
         expected = 0
         paths = segment_paths(self._kind, self._id)
@@ -3799,7 +4026,10 @@ class CrewLog:
         # still in flight, and a reader that yields them can hand a fold an entry the
         # durable log never keeps. Older segments take no more appends.
         newest_end = self._durable_end(paths[-1]) if paths else None
+        from_index, from_offset = self._resume_at(paths, resume, newest_end, cuts)
         for index, path in enumerate(paths):
+            if index < from_index:
+                continue
             raw_header = _read_header_line(path)
             parsed_header = None if not raw_header else _parses_to_object(raw_header)
             try:
@@ -3834,7 +4064,8 @@ class CrewLog:
 
             at_boundary = bool(index) and expected > 0
             end = newest_end if index == len(paths) - 1 else None
-            for entry in _iter_entries(path, end):
+            begin = from_offset if index == from_index else 0
+            for entry, at in _iter_entries_located(path, end, start=begin):
                 if at_boundary and entry.seq != expected:
                     raise CrewLogError(
                         f"segment {path.name} starts at seq {entry.seq}, but the "
@@ -3845,7 +4076,7 @@ class CrewLog:
                     )
                 at_boundary = False
                 expected = entry.seq + 1
-                yield entry
+                yield entry, path.name, at
 
     def get(self, seq: int) -> Entry | None:
         """The entry at *seq*, or ``None``.

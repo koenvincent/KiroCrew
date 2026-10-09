@@ -327,6 +327,11 @@ _BOOTSTRAP_JS: Final[str] = f"""
     document.documentElement.setAttribute(
       'data-dashboard-stale', read.stale ? 'true' : 'false'
     );
+    // A host that wraps compose_body writes its own root element, so the reader's
+    // language is set here too, from the same read the page picks its words by.
+    if (typeof read.locale === 'string' && read.locale) {{
+      document.documentElement.lang = read.locale;
+    }}
   }}
   // THE REFILL, which is what makes this a live dashboard rather than a snapshot.
   // The host posts a new read when a fold advances; the page is not reloaded, so a
@@ -460,6 +465,23 @@ _BAND_JS: Final[str] = f"""
 """
 
 
+#: The language a page renders its own words in when the host names none it ships.
+DEFAULT_LOCALE: Final[str] = "en"
+
+
+def page_locale(value: object) -> str:
+    """The UI language a page may render in: a shipped catalog's tag, else English.
+
+    The same gate the gateway uses for the persisted UI language, so a tag the app
+    has no catalog for cannot reach a page as a language the chrome around it does
+    not speak. Imported lazily: ``context`` is heavy and this module is on the
+    panel read path.
+    """
+    from kiro_crew.context import normalize_ui_language_tag
+
+    return normalize_ui_language_tag(value, source="dashboard locale") or DEFAULT_LOCALE
+
+
 def read_payload(
     fields: Mapping[str, Any],
     agentic: list[str] | tuple[str, ...] = (),
@@ -467,6 +489,7 @@ def read_payload(
     stale: bool = False,
     missing: list[str] | tuple[str, ...] = (),
     written_at: Mapping[str, str] | None = None,
+    locale: object = DEFAULT_LOCALE,
 ) -> dict[str, Any]:
     """The object the page sees as ``window.kirocrew``.
 
@@ -483,6 +506,9 @@ def read_payload(
     has happened since, and a time inside the value would be the writer's own claim
     about its own freshness. Empty for a page with no agentic fields, and missing a
     name whose cell has never been written.
+
+    ``locale`` is the reader's UI language, checked by :func:`page_locale`. A page
+    picks its own words by it; the values in ``fields`` are never translated.
     """
     return {
         "fields": dict(fields),
@@ -491,6 +517,7 @@ def read_payload(
         "stale": bool(stale),
         "missing": sorted(missing),
         "written_at": dict(written_at or {}),
+        "locale": page_locale(locale),
     }
 
 
@@ -524,13 +551,16 @@ def compose(html: str, read: Mapping[str, Any], title: str = "") -> str:
     except (TypeError, ValueError):
         logger.warning("the dashboard read could not be serialized", exc_info=True)
         blob = json.dumps(read_payload({}, stale=True))
+    # Re-checked here rather than trusted from the read: a caller that built its own
+    # mapping instead of using read_payload must not put an unchecked tag in markup.
+    lang = page_locale(read.get("locale") if isinstance(read, Mapping) else None)
     island = (
         f'<script type="application/json" id="{_DATA_ELEMENT_ID}">'
         f"{escape_json_for_html(blob)}</script>"
     )
     return (
         "<!doctype html>\n"
-        '<html lang="en">\n'
+        f'<html lang="{lang}">\n'
         "<head>\n"
         '<meta charset="utf-8">\n'
         '<meta name="viewport" content="width=device-width, initial-scale=1">\n'

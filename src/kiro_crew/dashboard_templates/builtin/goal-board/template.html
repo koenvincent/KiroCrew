@@ -17,17 +17,17 @@
     .item .line em { color: var(--text, #e6e6e6); font-style: normal; }
   </style>
 
-  <h2>Goal board</h2>
+  <h2 data-i18n="title">Goal board</h2>
   <div class="goal" data-dashboard-field="goal">-</div>
   <div class="meta">
-    <span>round <span data-dashboard-field="round">-</span></span>
-    <span>goal version <span data-dashboard-field="goal_version">-</span></span>
-    <span>depth <span data-dashboard-field="depth">-</span></span>
-    <span>entries <span data-dashboard-field="entries">-</span></span>
+    <span><span data-i18n="round">round</span> <span data-dashboard-field="round">-</span></span>
+    <span><span data-i18n="goal_version">goal version</span> <span data-dashboard-field="goal_version">-</span></span>
+    <span><span data-i18n="depth">depth</span> <span data-dashboard-field="depth">-</span></span>
+    <span><span data-i18n="entries">entries</span> <span data-dashboard-field="entries">-</span></span>
   </div>
   <div class="meta">
-    <span>opened <span data-dashboard-field="created_at">-</span></span>
-    <span>last write <span data-dashboard-field="last_entry_at">-</span></span>
+    <span><span data-i18n="opened">opened</span> <span data-dashboard-field="created_at">-</span></span>
+    <span><span data-i18n="last_write">last write</span> <span data-dashboard-field="last_entry_at">-</span></span>
   </div>
 
   <div class="states" id="states"></div>
@@ -36,13 +36,66 @@
   <div id="items"></div>
 
   <div class="sub" style="margin-top: 7px;">
-    <span data-dashboard-field="items">-</span> on the board,
-    <span data-dashboard-field="omitted">-</span> not shown (list truncated)
+    <span data-dashboard-field="items">-</span> <span data-i18n="on_board">on the board,</span>
+    <span data-dashboard-field="omitted">-</span> <span data-i18n="not_shown">not shown (list truncated)</span>
   </div>
 
   <script>
     (function () {
       var DASH = '\u2014';
+
+      // The page's own words, one table per UI language. A key a language lacks
+      // falls back to English. Values the ledger or a crewmate wrote are never
+      // looked up here. The zh-CN strings are \u-escaped so the source stays ASCII.
+      var I18N = {
+        en: {
+          title: 'Goal board', round: 'round', goal_version: 'goal version', depth: 'depth',
+          entries: 'entries', opened: 'opened', last_write: 'last write',
+          on_board: 'on the board,', not_shown: 'not shown (list truncated)',
+          verdict: 'verdict {v}', fails: '{n} fail(s)', worker_status: 'worker {v}', pr: 'PR {n}',
+          decision: 'decision', reported: 'reported', worker: 'worker',
+          empty: 'No item on this board yet.',
+          state_open: 'open', state_accepted: 'accepted', state_rejected: 'rejected',
+          state_blocked: 'blocked', state_abandoned: 'abandoned', state_unknown: 'unknown'
+        },
+        'zh-CN': {
+          title: '\u76ee\u6807\u770b\u677f', round: '\u8f6e\u6b21', goal_version: '\u76ee\u6807\u7248\u672c', depth: '\u5c42\u7ea7',
+          entries: '\u6761\u76ee', opened: '\u5f00\u542f\u4e8e', last_write: '\u6700\u540e\u5199\u5165',
+          on_board: '\u9879\u5728\u770b\u677f\u4e0a\uff0c', not_shown: '\u9879\u672a\u663e\u793a\uff08\u5217\u8868\u5df2\u622a\u65ad\uff09',
+          verdict: '\u88c1\u5b9a {v}', fails: '{n} \u6b21\u5931\u8d25', worker_status: '\u6267\u884c\u8005 {v}', pr: 'PR {n}',
+          decision: '\u51b3\u5b9a', reported: '\u6c47\u62a5', worker: '\u6267\u884c\u8005',
+          empty: '\u770b\u677f\u4e0a\u8fd8\u6ca1\u6709\u4efb\u4f55\u4e8b\u9879\u3002',
+          state_open: '\u8fdb\u884c\u4e2d', state_accepted: '\u5df2\u63a5\u53d7', state_rejected: '\u5df2\u62d2\u7edd',
+          state_blocked: '\u53d7\u963b', state_abandoned: '\u5df2\u653e\u5f03', state_unknown: '\u672a\u77e5'
+        }
+      };
+      function locale() {
+        var l = (window.kirocrew || {}).locale;
+        return typeof l === 'string' && Object.prototype.hasOwnProperty.call(I18N, l) ? l : 'en';
+      }
+      function has(key) {
+        return Object.prototype.hasOwnProperty.call(I18N.en, key);
+      }
+      function i18n(key, vars) {
+        var table = I18N[locale()];
+        var s = Object.prototype.hasOwnProperty.call(table, key) ? table[key] : I18N.en[key];
+        if (s === undefined) s = key;
+        if (vars) {
+          s = s.replace(/\{(\w+)\}/g, function (m, k) {
+            return Object.prototype.hasOwnProperty.call(vars, k) ? String(vars[k]) : m;
+          });
+        }
+        return s;
+      }
+      // A state the ledger stamps is shown in the reader's language when this page
+      // knows it, and as recorded when it does not.
+      function stateLabel(state) {
+        return has('state_' + state) ? i18n('state_' + state) : state;
+      }
+      function applyStatic() {
+        var nodes = document.querySelectorAll('[data-i18n]');
+        for (var i = 0; i < nodes.length; i++) nodes[i].textContent = i18n(nodes[i].getAttribute('data-i18n'));
+      }
 
       // The states the work ledger stamps. Colour per state, named here rather than
       // derived, because a state this page has no colour for must still be VISIBLE:
@@ -111,7 +164,7 @@
           var sw = document.createElement('b');
           sw.style.background = colourFor(state);
           row.appendChild(sw);
-          row.appendChild(document.createTextNode(' ' + state + ' ' + counts[state]));
+          row.appendChild(document.createTextNode(' ' + stateLabel(state) + ' ' + counts[state]));
           tally.appendChild(row);
         }
       }
@@ -132,39 +185,40 @@
           var chips = document.createElement('div');
           chips.className = 'chips';
           var state = text(it.state) || 'unknown';
-          chips.appendChild(chip(state, colourFor(state)));
+          chips.appendChild(chip(stateLabel(state), colourFor(state)));
           // A VERDICT and a STATE are different facts and the board keeps both: the
           // verdict is what the acceptance evaluator answered, the state is what the
           // conductor then stamped. Showing only one hides a disagreement.
           var verdict = text(it.verdict);
-          if (verdict) chips.appendChild(chip('verdict ' + verdict, null));
+          if (verdict) chips.appendChild(chip(i18n('verdict', { v: verdict }), null));
           var fails = num(it.fails);
-          if (fails) chips.appendChild(chip(fails + ' fail(s)', 'var(--danger, #ff5c5c)'));
+          if (fails) chips.appendChild(chip(i18n('fails', { n: fails }), 'var(--danger, #ff5c5c)'));
           var status = text(it.status);
           // The worker's own last word, which is a CLAIM rather than an acceptance.
-          if (status) chips.appendChild(chip('worker ' + status, null));
+          if (status) chips.appendChild(chip(i18n('worker_status', { v: status }), null));
           var pr = num(it.pr);
-          if (pr) chips.appendChild(chip('PR ' + pr, 'var(--info, #6aa9ff)'));
+          if (pr) chips.appendChild(chip(i18n('pr', { n: pr }), 'var(--info, #6aa9ff)'));
           card.appendChild(chips);
 
           var decision = text(it.decision);
-          if (decision) card.appendChild(line('decision', decision));
+          if (decision) card.appendChild(line(i18n('decision'), decision));
           var summary = text(it.summary);
-          if (summary) card.appendChild(line('reported', summary));
+          if (summary) card.appendChild(line(i18n('reported'), summary));
           var worker = text(it.spender);
-          if (worker) card.appendChild(line('worker', worker));
+          if (worker) card.appendChild(line(i18n('worker'), worker));
           host.appendChild(card);
         }
         if (!list.length) {
           var empty = document.createElement('div');
           empty.className = 'line';
-          empty.textContent = 'No item on this board yet.';
+          empty.textContent = i18n('empty');
           host.appendChild(empty);
         }
       }
 
       function render() {
         var list = items();
+        applyStatic();
         // A conductor that opened no board leaves `conductor.goal` and the stamps as
         // the empty string. The host binds that as blank, which reads as a page that
         // failed to load, so it becomes a dash.

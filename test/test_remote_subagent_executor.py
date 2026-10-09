@@ -2585,3 +2585,77 @@ async def test_a_floored_runs_status_lists_its_parked_requests(
         for item in hub_approvals.pending_for(run):
             hub_approvals.resolve(run, str(item["id"]), False)
     assert await asyncio.gather(*waits) == [False, False]
+
+
+@pytest.mark.parametrize(
+    ("backend", "enforceable"), [("", True), ("claude", False), ("codex", False), ("kas", False)]
+)
+def test_only_a_harness_the_derived_spec_controls_carries_the_floor(
+    monkeypatch: pytest.MonkeyPatch, backend: str, enforceable: bool
+) -> None:
+    from kiro_crew.config.loader import KiroCrewConfig
+    from kiro_crew.subagent_manager import hub_approvals
+
+    monkeypatch.setattr(
+        KiroCrewConfig,
+        "load",
+        classmethod(lambda _cls: SimpleNamespace(agent=SimpleNamespace(acp_backend=backend))),
+    )
+    assert hub_approvals.floor_enforceable() is enforceable
+
+
+def test_an_unreadable_config_cannot_carry_the_floor(monkeypatch: pytest.MonkeyPatch) -> None:
+    from kiro_crew.config.loader import KiroCrewConfig
+    from kiro_crew.subagent_manager import hub_approvals
+
+    def _broken(_cls):
+        raise OSError("config.json unreadable")
+
+    monkeypatch.setattr(KiroCrewConfig, "load", classmethod(_broken))
+    assert hub_approvals.floor_enforceable() is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("enforceable", [True, False])
+async def test_the_version_route_advertises_the_floor_only_where_it_holds(
+    monkeypatch: pytest.MonkeyPatch, enforceable: bool
+) -> None:
+    from kiro_crew.dashboard.handlers.core import api_version
+
+    monkeypatch.setattr(
+        "kiro_crew.subagent_manager.hub_approvals.floor_enforceable", lambda: enforceable
+    )
+    payload = json.loads((await api_version(cast(Any, object()))).body)
+    listed = set(payload["spawn_enforces"])
+    assert "memory_mode" in listed
+    assert ({"approval_floor", "approval_relay"} <= listed) is enforceable
+    assert not ({"approval_floor", "approval_relay"} & listed) or enforceable
+
+
+@pytest.mark.asyncio
+async def test_a_floored_run_keeps_only_its_templates_pre_tool_hooks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from kiro_crew.agent_sdk import spec_hooks
+    from kiro_crew.hooks import HOOK_EVENT_POST_TOOL_USE, HOOK_EVENT_PRE_TOOL_USE, ScriptHook
+
+    deny = ScriptHook(name="deny-rm", event=HOOK_EVENT_PRE_TOOL_USE, command="exit 2")
+    audit = ScriptHook(name="audit", event=HOOK_EVENT_POST_TOOL_USE, command="true")
+    seen: list[tuple[str, object]] = []
+
+    def fired(agent_id: str, project_dir: object) -> tuple[list[ScriptHook], list[str], int]:
+        seen.append((agent_id, project_dir))
+        return [deny, audit], [], 0
+
+    monkeypatch.setattr(spec_hooks, "crew_fired_spec_hooks", fired)
+    gated = await spec_hooks.floored_spec_hooks("kirocrew", "/work/repo")
+    assert seen == [("kirocrew", "/work/repo")]
+    assert [hook.name for hook in gated.hooks] == ["deny-rm"]
+    assert gated.gated is True and gated.unreadable is False
+
+    def unreadable(*_a: object) -> object:
+        raise ValueError("spec did not parse")
+
+    monkeypatch.setattr(spec_hooks, "crew_fired_spec_hooks", unreadable)
+    blocked = await spec_hooks.floored_spec_hooks("kirocrew", None)
+    assert blocked.unreadable is True and blocked.gated is True

@@ -482,7 +482,7 @@
   <div class="pr-head">
     <div class="pr-titles">
       <div>
-        <div class="pr-eyebrow">What this crewmate is doing</div>
+        <div class="pr-eyebrow" data-i18n="doing">What this crewmate is doing</div>
         <div class="pr-title" id="pr-title">Project report</div>
         <!-- Whether the page is being fed, and as of when. Under the title rather
              than in a footer: it qualifies every number above it. -->
@@ -516,12 +516,12 @@
        element per field, and the host fills them before the page does. -->
   <div class="pr-note" id="pr-note">
     <span data-dashboard-field="items">&mdash;</span>,
-    <span data-dashboard-field="omitted">&mdash;</span> more not shown,
-    <span data-dashboard-field="series">&mdash;</span> with spend,
-    <span data-dashboard-field="for_you">&mdash;</span> raised by the crewmate,
-    <span data-dashboard-field="verdict">&mdash;</span> verdict,
+    <span data-dashboard-field="omitted">&mdash;</span> <span data-i18n="note_more_not_shown">more not shown</span>,
+    <span data-dashboard-field="series">&mdash;</span> <span data-i18n="note_with_spend">with spend</span>,
+    <span data-dashboard-field="for_you">&mdash;</span> <span data-i18n="note_raised">raised by the crewmate</span>,
+    <span data-dashboard-field="verdict">&mdash;</span> <span data-i18n="note_verdict">verdict</span>,
     <span data-dashboard-field="ci">&mdash;</span>,
-    last entry <span data-dashboard-field="last_entry_at">&mdash;</span>.
+    <span data-i18n="note_last_entry">last entry</span> <span data-dashboard-field="last_entry_at">&mdash;</span>.
   </div>
 </div>
 
@@ -529,6 +529,205 @@
 (function () {
   var DASH = '—';
   var SVGNS = 'http://www.w3.org/2000/svg';
+
+  // The page's own words, one table per UI language. A key a language lacks falls
+  // back to English. Values the ledger or a crewmate wrote are never looked up here.
+  // The desk words (word_*) are the per-locale defaults a verdict's own `words` may
+  // override. The zh-CN strings are \u-escaped so the source stays ASCII.
+  var I18N = {
+    en: {
+      doing: 'What this crewmate is doing', page_title: 'Project report',
+      note_more_not_shown: 'more not shown', note_with_spend: 'with spend',
+      note_raised: 'raised by the crewmate', note_verdict: 'verdict', note_last_entry: 'last entry',
+      live_yes: 'Live', live_no: 'No new entry', updated: 'Updated', entry_label: 'entry',
+      just_now: 'just now', ago: '{t} ago', quiet_prefix: 'quiet ',
+      verdict_on_track: 'On track', verdict_needs_you: 'Needs you', verdict_blocked: 'Blocked',
+      verdict_no_word: 'No word yet',
+      verdict_superseded_head: 'The crewmate has not posted since the log last advanced.',
+      verdict_none_head: 'The crewmate has not posted a verdict yet.',
+      verdict_past: 'Its last word was "{h}". Read it as a past reading.',
+      verdict_blocker_label: 'The one in the way: ', crewmate_wrote: 'crewmate wrote this',
+      vp_accepted: 'Accepted', vp_rejected: 'Rejected', vp_unblock: 'Unblock',
+      vp_answer: 'Answer', vp_awaiting: 'Awaiting crewmate review',
+      lanes_red: '{n} red', lanes_did_not_run: '{n} did not run',
+      lane_never_started: 'lane never started \u2014 not a finding',
+      rerun_it: 'rerun it', owner_maintainer: 'maintainer', owner_yours: 'yours',
+      stale_no_entry: 'No new entry for {t}.',
+      stale_reading: 'Every number below is a last-known reading.', fold_seq: 'fold seq {n}',
+      kpi_in_flight: 'In flight', kpi_accepted: 'Accepted', kpi_needs_you: 'Needs you',
+      kpi_nothing_waiting: 'nothing waiting on you', kpi_one_answer: 'one answer needed',
+      kpi_answers: 'answers needed',
+      cost_spent: 'spent', credits: 'credits', cost_last_hour: 'last hour',
+      cost_reported_none: 'reported no cost', cost_show: 'show breakdown', cost_hide: 'hide breakdown',
+      hero_title: 'Credits per hour', hero_empty: 'No hourly record yet',
+      hero_none: 'These {n} hours carry a record; none of them reported a cost, and nothing was accepted in them',
+      hero_legend_credits: 'credits that hour', hero_legend_none: 'no hour reported a cost',
+      hero_line_label: 'items accepted that hour',
+      cap_all: 'every workstream together', cap_one: 'this workstream only',
+      cap_record: 'every hour on record',
+      sun_inside: 'inside', sun_outside: 'outside', sun_hover: 'hover for a name',
+      sun_no_cost: 'No cost was reported',
+      lvl_epic: 'epic', lvl_epics: 'epics', lvl_story: 'story', lvl_stories: 'stories',
+      lvl_task: 'task', lvl_tasks: 'tasks',
+      todo_title: 'Needs you', todo_caption: 'each one says what to do',
+      todo_nothing_left: 'Nothing left to pick.', shelf_new: 'New since you looked',
+      tree_this_epic: 'This epic', tree_every_epic: 'Every epic',
+      tree_cap_one: 'story \u00b7 task \u00b7 subtask, with what each cost in credits',
+      tree_cap_all: 'epic \u00b7 story \u00b7 task \u00b7 subtask, with what each cost in credits',
+      crew_title: 'Who is working',
+      crew_cap_each: 'each worker, what it is on, and what it last said',
+      crew_no_open: 'No worker has open work.', crew_nothing_said: 'nothing said yet',
+      crew_blocked: 'blocked', crew_question: 'asks you', crew_quiet: 'gone quiet',
+      crew_progress: 'working', crew_done: 'awaiting review', crew_none: 'no report yet',
+      worker_prefix: 'worker ',
+      pipe_title: 'How the work moves',
+      pipe_cap: 'worker \u00b7 acceptance check \u00b7 the lead accepts',
+      pipe_empty_task: 'No task on this workstream yet.',
+      pipe_all: 'Every task accepted', pipe_progress: 'In progress', accepted_word: 'accepted',
+      stage_worker: 'With a worker',
+      stage_worker_empty: 'Nothing in flight. Every task has reached the acceptance check.',
+      stage_ruled: 'Ruled, not yet accepted', stage_ruled_empty: 'Nothing waiting on the lead.',
+      stage_accepted: 'Accepted', stage_accepted_empty: 'Nothing accepted yet.',
+      gate_worker: '\u2193 when the worker reports done',
+      gate_lead: '\u2193 when the lead takes the verdict', no_worker_bound: 'no worker bound',
+      dr_said: 'What the worker last said',
+      dr_said_empty: 'The worker has not reported on this task yet.',
+      dr_decided: 'What the conductor decided',
+      dr_decided_empty: 'No ruling on this task. Nothing was asked of the conductor, or nothing has been answered yet.',
+      dr_verdict: 'Verdict',
+      dr_verdict_empty: 'Not adjudicated. A verdict appears once the conductor has run the acceptance check over this task\u2019s own bar.',
+      dr_result: 'Result / handoff',
+      dr_result_empty: 'No output yet. A pull request, a branch or a handoff summary appears here when the task produces one.',
+      pull_request: 'Pull request', accepted_by: 'Accepted by the conductor.',
+      dr_lanes: 'Lanes',
+      dr_lanes_green: 'Every lane green on the last board the crewmate read.',
+      dr_lanes_none: 'No lane board for this task. The crewmate writes one when it reads a pull request\u2019s checks.',
+      events_label: 'Events', of_word: 'of', ev_recorded_pre: 'This task recorded ',
+      ev_recorded_post: ', and the page is no longer carrying their text.',
+      ev_none: 'No events recorded against this task yet.',
+      round_word: 'round', close_word: 'Close', task_word: 'task',
+      show_only: 'Show only this workstream', pill_all: 'All',
+      empty_all: 'No workstream yet. Nothing needs you, and nothing has been spent.',
+      empty_hint: 'Give this crewmate a goal in the chat, and its work shows up here: what is in flight, what it cost, and anything waiting on you.',
+      empty_no_tree: 'No workstream yet, so there is no tree to show. What is below was not raised by a board.',
+      no_workstream_dot: 'No workstream yet.',
+      sent_done: 'done ', sent_spent: ', spent ', sent_in_flight: ' in flight, spent ',
+      sent_credits: ' credits, ', needs_you_suffix: ' needs you', need_you_suffix: ' need you',
+      word_blocked: 'Blocked', word_asks: 'Asks you', word_pick: 'Pick one', word_approve: 'OK to go?',
+      word_only_you: 'Only you', word_go: 'Go ahead', word_not_now: 'Not now', word_done: 'Done it',
+      word_cant: "Can't now", word_redispatch: 'Re-dispatch it', word_drop: 'Drop it',
+      word_own: 'Write my own', word_yes: 'Yes', word_no: 'No', word_earlier: 'Earlier',
+      word_answered: 'Answered', word_undo: 'Undo', word_context: 'Context', word_why: 'Why',
+      word_how: 'How', word_words: "worker's words"
+    },
+    'zh-CN': {
+      doing: '\u8fd9\u4e2a\u961f\u53cb\u6b63\u5728\u505a\u4ec0\u4e48', page_title: '\u9879\u76ee\u62a5\u544a',
+      note_more_not_shown: '\u5176\u4f59\u672a\u663e\u793a', note_with_spend: '\u6709\u82b1\u8d39',
+      note_raised: '\u7531\u961f\u53cb\u63d0\u51fa', note_verdict: '\u88c1\u5b9a', note_last_entry: '\u6700\u540e\u6761\u76ee',
+      live_yes: '\u5b9e\u65f6', live_no: '\u65e0\u65b0\u6761\u76ee', updated: '\u5237\u65b0\u4e8e', entry_label: '\u6761\u76ee',
+      just_now: '\u521a\u521a', ago: '{t}\u524d', quiet_prefix: '\u6c89\u9ed8 ',
+      verdict_on_track: '\u8fdb\u5c55\u987a\u5229', verdict_needs_you: '\u9700\u8981\u4f60', verdict_blocked: '\u53d7\u963b',
+      verdict_no_word: '\u6682\u65e0\u6d88\u606f',
+      verdict_superseded_head: '\u65e5\u5fd7\u4e0a\u6b21\u63a8\u8fdb\u540e\uff0c\u961f\u53cb\u8fd8\u6ca1\u6709\u53d1\u5e03\u6d88\u606f\u3002',
+      verdict_none_head: '\u961f\u53cb\u8fd8\u6ca1\u6709\u53d1\u5e03\u88c1\u5b9a\u3002',
+      verdict_past: '\u5b83\u6700\u540e\u7684\u8bf4\u6cd5\u662f "{h}"\u3002\u8bf7\u5f53\u4f5c\u8fc7\u5f80\u8bfb\u6570\u770b\u5f85\u3002',
+      verdict_blocker_label: '\u963b\u788d\u6240\u5728\uff1a', crewmate_wrote: '\u961f\u53cb\u586b\u5199',
+      vp_accepted: '\u63a5\u53d7', vp_rejected: '\u9a73\u56de', vp_unblock: '\u89e3\u9664\u963b\u585e',
+      vp_answer: '\u56de\u7b54', vp_awaiting: '\u7b49\u5f85\u961f\u53cb\u590d\u6838',
+      lanes_red: '{n} \u6761\u7ea2\u8272', lanes_did_not_run: '{n} \u6761\u672a\u8fd0\u884c',
+      lane_never_started: '\u8be5\u901a\u9053\u4ece\u672a\u542f\u52a8 \u2014 \u5e76\u975e\u95ee\u9898',
+      rerun_it: '\u91cd\u8dd1\u5b83', owner_maintainer: '\u7ef4\u62a4\u8005', owner_yours: '\u4f60\u7684',
+      stale_no_entry: '{t} \u6ca1\u6709\u65b0\u6761\u76ee\u3002',
+      stale_reading: '\u4e0b\u9762\u6bcf\u4e2a\u6570\u5b57\u90fd\u662f\u6700\u8fd1\u4e00\u6b21\u8bfb\u6570\u3002', fold_seq: 'fold \u5e8f\u53f7 {n}',
+      kpi_in_flight: '\u8fdb\u884c\u4e2d', kpi_accepted: '\u901a\u8fc7', kpi_needs_you: '\u9700\u8981\u4f60',
+      kpi_nothing_waiting: '\u6ca1\u6709\u5f85\u4f60\u5904\u7406\u7684\u4e8b', kpi_one_answer: '\u9700\u8981\u4e00\u4e2a\u56de\u7b54',
+      kpi_answers: '\u9700\u8981\u56de\u7b54',
+      cost_spent: '\u82b1\u8d39', credits: '\u989d\u5ea6', cost_last_hour: '\u6700\u8fd1\u4e00\u5c0f\u65f6',
+      cost_reported_none: '\u672a\u62a5\u544a\u82b1\u8d39', cost_show: '\u5c55\u5f00\u660e\u7ec6', cost_hide: '\u6536\u8d77\u660e\u7ec6',
+      hero_title: '\u6bcf\u5c0f\u65f6\u989d\u5ea6', hero_empty: '\u6682\u65e0\u6bcf\u5c0f\u65f6\u8bb0\u5f55',
+      hero_none: '\u8fd9 {n} \u5c0f\u65f6\u6709\u8bb0\u5f55\uff1b\u6ca1\u6709\u4efb\u4f55\u4e00\u4e2a\u62a5\u544a\u4e86\u82b1\u8d39\uff0c\u5176\u4e2d\u4e5f\u6ca1\u6709\u4efb\u4f55\u9879\u901a\u8fc7',
+      hero_legend_credits: '\u8be5\u5c0f\u65f6\u989d\u5ea6', hero_legend_none: '\u6ca1\u6709\u4efb\u4f55\u5c0f\u65f6\u62a5\u544a\u82b1\u8d39',
+      hero_line_label: '\u8be5\u5c0f\u65f6\u901a\u8fc7\u7684\u9879',
+      cap_all: '\u6240\u6709\u5de5\u4f5c\u6d41\u5408\u8ba1', cap_one: '\u4ec5\u6b64\u5de5\u4f5c\u6d41',
+      cap_record: '\u8bb0\u5f55\u5728\u6848\u7684\u6bcf\u4e00\u5c0f\u65f6',
+      sun_inside: '\u5185\u73af', sun_outside: '\u5916\u73af', sun_hover: '\u60ac\u505c\u67e5\u770b\u540d\u79f0',
+      sun_no_cost: '\u6ca1\u6709\u62a5\u544a\u4efb\u4f55\u82b1\u8d39',
+      lvl_epic: '\u53f2\u8bd7', lvl_epics: '\u53f2\u8bd7', lvl_story: '\u6545\u4e8b', lvl_stories: '\u6545\u4e8b',
+      lvl_task: '\u4efb\u52a1', lvl_tasks: '\u4efb\u52a1',
+      todo_title: '\u9700\u8981\u4f60', todo_caption: '\u6bcf\u4e00\u9879\u90fd\u8bf4\u660e\u8be5\u505a\u4ec0\u4e48',
+      todo_nothing_left: '\u6ca1\u6709\u53ef\u6311\u9009\u7684\u9879\u4e86\u3002', shelf_new: '\u4f60\u4e0a\u6b21\u67e5\u770b\u540e\u7684\u65b0\u5185\u5bb9',
+      tree_this_epic: '\u672c\u53f2\u8bd7', tree_every_epic: '\u6bcf\u4e2a\u53f2\u8bd7',
+      tree_cap_one: '\u6545\u4e8b \u00b7 \u4efb\u52a1 \u00b7 \u5b50\u4efb\u52a1\uff0c\u9644\u6bcf\u9879\u82b1\u8d39\u7684\u989d\u5ea6',
+      tree_cap_all: '\u53f2\u8bd7 \u00b7 \u6545\u4e8b \u00b7 \u4efb\u52a1 \u00b7 \u5b50\u4efb\u52a1\uff0c\u9644\u6bcf\u9879\u82b1\u8d39\u7684\u989d\u5ea6',
+      crew_title: '\u8c01\u5728\u5de5\u4f5c',
+      crew_cap_each: '\u6bcf\u4e2a\u5de5\u4f5c\u8005\u3001\u5728\u505a\u4ec0\u4e48\u3001\u6700\u540e\u8bf4\u4e86\u4ec0\u4e48',
+      crew_no_open: '\u6ca1\u6709\u5de5\u4f5c\u8005\u6709\u5f00\u653e\u7684\u5de5\u4f5c\u3002', crew_nothing_said: '\u6682\u65e0\u53d1\u8a00',
+      crew_blocked: '\u53d7\u963b', crew_question: '\u95ee\u4f60', crew_quiet: '\u6c89\u9ed8\u4e86',
+      crew_progress: '\u5de5\u4f5c\u4e2d', crew_done: '\u5f85\u590d\u6838', crew_none: '\u6682\u65e0\u62a5\u544a',
+      worker_prefix: '\u5de5\u4f5c\u8005 ',
+      pipe_title: '\u5de5\u4f5c\u5982\u4f55\u63a8\u8fdb',
+      pipe_cap: '\u5de5\u4f5c\u8005 \u00b7 \u9a8c\u6536\u68c0\u67e5 \u00b7 \u7275\u5934\u8005\u63a5\u53d7',
+      pipe_empty_task: '\u6b64\u5de5\u4f5c\u6d41\u6682\u65e0\u4efb\u52a1\u3002',
+      pipe_all: '\u6240\u6709\u4efb\u52a1\u90fd\u901a\u8fc7', pipe_progress: '\u8fdb\u884c\u4e2d', accepted_word: '\u63a5\u53d7',
+      stage_worker: '\u6709\u5de5\u4f5c\u8005\u5728\u505a',
+      stage_worker_empty: '\u6ca1\u6709\u8fdb\u884c\u4e2d\u7684\u4efb\u52a1\u3002\u6bcf\u4e2a\u4efb\u52a1\u90fd\u5230\u8fbe\u4e86\u9a8c\u6536\u68c0\u67e5\u3002',
+      stage_ruled: '\u51fa\u4e86\u88c1\u5b9a\uff0c\u5c1a\u672a\u63a5\u53d7', stage_ruled_empty: '\u6ca1\u6709\u7b49\u5f85\u7275\u5934\u8005\u7684\u4efb\u52a1\u3002',
+      stage_accepted: '\u63a5\u53d7', stage_accepted_empty: '\u5c1a\u65e0\u63a5\u53d7\u7684\u4efb\u52a1\u3002',
+      gate_worker: '\u2193 \u5f53\u5de5\u4f5c\u8005\u62a5\u544a\u5b8c\u6210\u65f6',
+      gate_lead: '\u2193 \u5f53\u7275\u5934\u8005\u91c7\u7eb3\u88c1\u5b9a\u65f6', no_worker_bound: '\u672a\u7ed1\u5b9a\u5de5\u4f5c\u8005',
+      dr_said: '\u5de5\u4f5c\u8005\u6700\u540e\u7684\u53d1\u8a00',
+      dr_said_empty: '\u5de5\u4f5c\u8005\u8fd8\u6ca1\u6709\u62a5\u544a\u6b64\u4efb\u52a1\u3002',
+      dr_decided: '\u6307\u6325\u8005\u7684\u51b3\u5b9a',
+      dr_decided_empty: '\u6b64\u4efb\u52a1\u6ca1\u6709\u88c1\u51b3\u3002\u6ca1\u6709\u5411\u6307\u6325\u8005\u63d0\u51fa\u4efb\u4f55\u95ee\u9898\uff0c\u6216\u8fd8\u6ca1\u6709\u4efb\u4f55\u56de\u7b54\u3002',
+      dr_verdict: '\u88c1\u5b9a',
+      dr_verdict_empty: '\u5c1a\u672a\u88c1\u5b9a\u3002\u5f85\u6307\u6325\u8005\u5bf9\u6b64\u4efb\u52a1\u81ea\u8eab\u7684\u6807\u51c6\u8fd0\u884c\u9a8c\u6536\u68c0\u67e5\u540e\uff0c\u624d\u4f1a\u51fa\u73b0\u88c1\u5b9a\u3002',
+      dr_result: '\u7ed3\u679c / \u4ea4\u63a5',
+      dr_result_empty: '\u5c1a\u65e0\u4ea7\u51fa\u3002\u5f53\u4efb\u52a1\u4ea7\u751f\u62c9\u53d6\u8bf7\u6c42\u3001\u5206\u652f\u6216\u4ea4\u63a5\u6458\u8981\u65f6\uff0c\u4f1a\u663e\u793a\u5728\u8fd9\u91cc\u3002',
+      pull_request: '\u62c9\u53d6\u8bf7\u6c42', accepted_by: '\u6307\u6325\u8005\u63a5\u53d7\u3002',
+      dr_lanes: '\u901a\u9053',
+      dr_lanes_green: '\u961f\u53cb\u6700\u540e\u8bfb\u53d6\u7684\u770b\u677f\u4e0a\uff0c\u6bcf\u6761\u901a\u9053\u90fd\u662f\u7eff\u8272\u3002',
+      dr_lanes_none: '\u6b64\u4efb\u52a1\u6ca1\u6709\u901a\u9053\u770b\u677f\u3002\u5f53\u961f\u53cb\u8bfb\u53d6\u62c9\u53d6\u8bf7\u6c42\u7684\u68c0\u67e5\u65f6\u4f1a\u5199\u5165\u4e00\u4e2a\u3002',
+      events_label: '\u4e8b\u4ef6', of_word: '/', ev_recorded_pre: '\u6b64\u4efb\u52a1\u8bb0\u5f55\u4e86 ',
+      ev_recorded_post: '\uff0c\u9875\u9762\u4e0d\u518d\u4fdd\u7559\u5b83\u4eec\u7684\u6587\u672c\u3002',
+      ev_none: '\u6b64\u4efb\u52a1\u5c1a\u65e0\u8bb0\u5f55\u7684\u4e8b\u4ef6\u3002',
+      round_word: '\u8f6e', close_word: '\u5173\u95ed', task_word: '\u4efb\u52a1',
+      show_only: '\u53ea\u770b\u6b64\u5de5\u4f5c\u6d41', pill_all: '\u5168\u90e8',
+      empty_all: '\u6682\u65e0\u5de5\u4f5c\u6d41\u3002\u6ca1\u6709\u5f85\u4f60\u5904\u7406\u7684\u4e8b\uff0c\u4e5f\u6ca1\u6709\u4efb\u4f55\u82b1\u8d39\u3002',
+      empty_hint: '\u5728\u804a\u5929\u4e2d\u7ed9\u8fd9\u4e2a\u961f\u53cb\u4e00\u4e2a\u76ee\u6807\uff0c\u5b83\u7684\u5de5\u4f5c\u5c31\u4f1a\u663e\u793a\u5728\u8fd9\u91cc\uff1a\u8fdb\u884c\u4e2d\u7684\u5185\u5bb9\u3001\u82b1\u8d39\uff0c\u4ee5\u53ca\u4efb\u4f55\u7b49\u5f85\u4f60\u7684\u4e8b\u9879\u3002',
+      empty_no_tree: '\u6682\u65e0\u5de5\u4f5c\u6d41\uff0c\u6240\u4ee5\u6ca1\u6709\u53ef\u663e\u793a\u7684\u6811\u3002\u4e0b\u9762\u7684\u5185\u5bb9\u4e0d\u662f\u7531\u770b\u677f\u63d0\u51fa\u7684\u3002',
+      no_workstream_dot: '\u6682\u65e0\u5de5\u4f5c\u6d41\u3002',
+      sent_done: '\u5b8c\u6210 ', sent_spent: '\uff0c\u82b1\u8d39 ', sent_in_flight: ' \u8fdb\u884c\u4e2d\uff0c\u82b1\u8d39 ',
+      sent_credits: ' \u989d\u5ea6\uff0c', needs_you_suffix: ' \u9700\u8981\u4f60', need_you_suffix: ' \u9700\u8981\u4f60',
+      word_blocked: '\u53d7\u963b', word_asks: '\u95ee\u4f60', word_pick: '\u9009\u4e00\u4e2a', word_approve: '\u53ef\u4ee5\u5417\uff1f',
+      word_only_you: '\u4ec5\u4f60\u53ef\u505a', word_go: '\u7ee7\u7eed', word_not_now: '\u6682\u4e0d', word_done: '\u641e\u5b9a\u4e86',
+      word_cant: '\u73b0\u5728\u4e0d\u884c', word_redispatch: '\u91cd\u65b0\u6d3e\u53d1', word_drop: '\u653e\u5f03\u5b83',
+      word_own: '\u81ea\u5df1\u5199', word_yes: '\u662f', word_no: '\u5426', word_earlier: '\u8f83\u65e9',
+      word_answered: '\u56de\u590d\u8fc7', word_undo: '\u64a4\u9500', word_context: '\u80cc\u666f', word_why: '\u4e3a\u4f55',
+      word_how: '\u5982\u4f55', word_words: '\u5de5\u4f5c\u8005\u7684\u539f\u8bdd'
+    }
+  };
+  function locale() {
+    var l = (window.kirocrew || {}).locale;
+    return typeof l === 'string' && Object.prototype.hasOwnProperty.call(I18N, l) ? l : 'en';
+  }
+  function has(key) {
+    return Object.prototype.hasOwnProperty.call(I18N.en, key);
+  }
+  function i18n(key, vars) {
+    var table = I18N[locale()];
+    var s = Object.prototype.hasOwnProperty.call(table, key) ? table[key] : I18N.en[key];
+    if (s === undefined) s = key;
+    if (vars) {
+      s = s.replace(/\{(\w+)\}/g, function (m, k) {
+        return Object.prototype.hasOwnProperty.call(vars, k) ? String(vars[k]) : m;
+      });
+    }
+    return s;
+  }
+  function applyStatic() {
+    var nodes = document.querySelectorAll('[data-i18n]');
+    for (var i = 0; i < nodes.length; i++) nodes[i].textContent = i18n(nodes[i].getAttribute('data-i18n'));
+  }
 
   //: The four levels of the tree, each with the tag a row wears and its one tint. A
   //: level is named here rather than derived from the data's depth because the tag is
@@ -678,7 +877,7 @@
   //: every minute would be precision the number does not have.
   function fmtSince(ms) {
     var mins = Math.floor(ms / 60000);
-    if (mins < 1) return 'just now';
+    if (mins < 1) return i18n('just_now');
     if (mins < 60) return mins + 'm';
     var hrs = Math.floor(mins / 60);
     return hrs + 'h' + (mins % 60 ? (mins % 60) + 'm' : '');
@@ -694,7 +893,7 @@
   //: " ago" too. "just now" already carries its own tense and takes no suffix.
   function fmtAgo(ms) {
     var s = fmtSince(ms);
-    return s === 'just now' ? s : s + ' ago';
+    return s === i18n('just_now') ? s : i18n('ago', { t: s });
   }
 
   //: Past this, a row's silence is worth a reader's attention. One number, named,
@@ -904,7 +1103,7 @@
     host.hidden = false;
     host.setAttribute('data-live', live ? 'true' : 'false');
     clear(label);
-    label.appendChild(el('b', null, live ? 'Live' : 'No new entry'));
+    label.appendChild(el('b', null, live ? i18n('live_yes') : i18n('live_no')));
     // A WALL-CLOCK read time, which is the one place this page spells a local hour:
     // "updated" is about the reader's own now, not about an hour in the record.
     //
@@ -917,7 +1116,8 @@
     var d = new Date(Date.now());
     var hh = ('0' + d.getHours()).slice(-2) + ':' + ('0' + d.getMinutes()).slice(-2);
     label.appendChild(document.createTextNode(
-      '\u00a0\u00b7 Updated ' + hh + (since === null ? '' : ' \u00b7 entry ' + fmtAgo(since))
+      '\u00a0\u00b7 ' + i18n('updated') + ' ' + hh +
+      (since === null ? '' : ' \u00b7 ' + i18n('entry_label') + ' ' + fmtAgo(since))
     ));
   }
 
@@ -1164,8 +1364,7 @@
     var plot = el('div', 'pr-plot');
     host.appendChild(plot);
     if (!points.length) {
-      plot.appendChild(el('div', 'pr-empty',
-        'No hourly record yet'));
+      plot.appendChild(el('div', 'pr-empty', i18n('hero_empty')));
       return host;
     }
     //: Every hour at zero credits is not a chart. The fold's series carries an hour
@@ -1178,10 +1377,7 @@
       if ((num(points[i].accepted) || 0) > 0) accepted = true;
     }
     if (!measured && !accepted) {
-      plot.appendChild(el('div', 'pr-empty',
-        'These ' + points.length +
-        ' hours carry a record; none of them reported a cost' +
-        ', and nothing was accepted in them'));
+      plot.appendChild(el('div', 'pr-empty', i18n('hero_none', { n: points.length })));
       return host;
     }
     plots.push({ plot: plot, points: points, measured: measured });
@@ -1192,11 +1388,10 @@
       var sw1 = el('span', 'pr-swatch');
       sw1.style.background = 'color-mix(in oklab, var(--pr-s1) 56%, transparent)';
       a.appendChild(sw1);
-      a.appendChild(document.createTextNode('credits that hour'));
+      a.appendChild(document.createTextNode(i18n('hero_legend_credits')));
       legend.appendChild(a);
     } else {
-      legend.appendChild(el('span', null,
-        'no hour reported a cost'));
+      legend.appendChild(el('span', null, i18n('hero_legend_none')));
     }
     var b = el('span');
     var sw2 = el('span', 'pr-swatch');
@@ -1383,7 +1578,8 @@
     var innerR = 46, innerBand = 19, outerR = 68, outerBand = 13;
     var svg = svgEl('svg', { width: size, height: size,
       viewBox: '0 0 ' + size + ' ' + size, role: 'img' });
-    svg.setAttribute('aria-label', inner[1] + ' inside, ' + outer[1] + ' outside');
+    svg.setAttribute('aria-label', i18n('lvl_' + inner[1]) + ' ' + i18n('sun_inside') +
+      ', ' + i18n('lvl_' + outer[1]) + ' ' + i18n('sun_outside'));
     var total = 0, i, j;
     for (i = 0; i < groups.length; i++) total += groups[i].value;
 
@@ -1402,7 +1598,7 @@
         var span = (groups[i].value / total) * Math.PI * 2;
         var colour = SERIES_COLOURS[i % SERIES_COLOURS.length];
         ringSeg(svg, c, innerR, innerBand, from, span, colour,
-          groups[i].label + ' — ' + fmtCr(groups[i].value) + ' credits');
+          groups[i].label + ' — ' + fmtCr(groups[i].value) + ' ' + i18n('credits'));
         var kids = groups[i].kids, ksum = 0;
         for (j = 0; j < kids.length; j++) ksum += kids[j].value;
         var at = from;
@@ -1411,7 +1607,7 @@
           ringSeg(svg, c, outerR, outerBand, at, kspan,
             'color-mix(in oklab, ' + colour + ' ' + SHADES[j % SHADES.length] +
             '%, var(--pr-card))',
-            kids[j].label + ' — ' + fmtCr(kids[j].value) + ' credits');
+            kids[j].label + ' — ' + fmtCr(kids[j].value) + ' ' + i18n('credits'));
           at += kspan;
         }
         from += span;
@@ -1423,16 +1619,17 @@
     svg.appendChild(mid);
     var cap = svgEl('text', { x: c, y: c + 14, 'text-anchor': 'middle',
       'font-size': '9.5', fill: 'var(--muted, #7f7f88)' });
-    cap.textContent = 'credits';
+    cap.textContent = i18n('credits');
     svg.appendChild(cap);
     host.appendChild(svg);
 
     host.appendChild(el('div', 'pr-sun-k',
-      inner[1] + ' inside \u00b7 ' + outer[1] + ' outside \u00b7 hover for a name'));
+      i18n('lvl_' + inner[1]) + ' ' + i18n('sun_inside') + ' \u00b7 ' +
+      i18n('lvl_' + outer[1]) + ' ' + i18n('sun_outside') + ' \u00b7 ' + i18n('sun_hover')));
 
     var rows = el('div', 'pr-sun-rows');
     if (!groups.length) {
-      rows.appendChild(el('div', 'pr-empty', 'No cost was reported'));
+      rows.appendChild(el('div', 'pr-empty', i18n('sun_no_cost')));
     }
     for (i = 0; i < groups.length; i++) {
       var row = el('div', 'pr-row');
@@ -1443,8 +1640,8 @@
       dot.style.borderRadius = '999px';
       nm.insertBefore(dot, nm.firstChild);
       left.appendChild(nm);
-      left.appendChild(el('div', 'pr-row-s', fmtCr(groups[i].value) + ' credits \u00b7 ' +
-        plural(groups[i].kids.length, outer[0], outer[1])));
+      left.appendChild(el('div', 'pr-row-s', fmtCr(groups[i].value) + ' ' + i18n('credits') +
+        ' \u00b7 ' + plural(groups[i].kids.length, outer[0], outer[1])));
       row.appendChild(left);
       row.appendChild(el('div', 'pr-row-p',
         total > 0 ? Math.round((groups[i].value / total) * 100) + '%' : DASH));
@@ -1458,13 +1655,13 @@
     var v = txt(t.verdict);
     var pill = el('span', 'pr-vp');
     if (v === 'pass') {
-      pill.textContent = 'Accepted';
+      pill.textContent = i18n('vp_accepted');
       pill.style.background = 'var(--ok-subtle, rgba(34,197,94,.12))';
       pill.style.color = 'var(--ok, #22c55e)';
       return pill;
     }
     if (v === 'fail') {
-      pill.textContent = 'Rejected';
+      pill.textContent = i18n('vp_rejected');
       pill.style.background = 'var(--danger-subtle, rgba(239,68,68,.12))';
       pill.style.color = 'var(--danger, #ef4444)';
       return pill;
@@ -1475,13 +1672,13 @@
       //: "Unblock it in chat" or "Answer in chat". A reader matching the tree against
       //: the card was given two names for one thing and had to guess they were one.
       pill.textContent = st === 'blocked'
-        ? 'Unblock' : 'Answer';
+        ? i18n('vp_unblock') : i18n('vp_answer');
       pill.style.background = 'var(--warn-subtle, rgba(234,179,8,.12))';
       pill.style.color = 'var(--warn, #eab308)';
       return pill;
     }
     if (columnOf(t) === 'await') {
-      pill.textContent = 'Awaiting crewmate review';
+      pill.textContent = i18n('vp_awaiting');
       pill.style.background = 'color-mix(in oklab, var(--pr-s2) 20%, var(--pr-card))';
       pill.style.color = 'var(--text, #e4e4e7)';
       return pill;
@@ -1520,7 +1717,7 @@
     if (txt(t.state) === 'accepted') return null;
     var ms = sinceMs(t.last_report_at);
     if (ms === null) return null;
-    var chip = el('span', 'pr-chip', 'quiet ' + fmtSince(ms));
+    var chip = el('span', 'pr-chip', i18n('quiet_prefix') + fmtSince(ms));
     if (ms >= QUIET_MS) chip.className = 'pr-chip pr-chip-quiet';
     return chip;
   }
@@ -1552,7 +1749,7 @@
       //: does -- the same gesture the round-4 board had on a workstream title.
       title.setAttribute('role', 'button');
       title.setAttribute('tabindex', '0');
-      title.setAttribute('title', 'Show only this workstream');
+      title.setAttribute('title', i18n('show_only'));
     }
     x.appendChild(title);
     if (n.sub) x.appendChild(el('div', 'pr-n-s', n.sub));
@@ -1655,10 +1852,10 @@
     //: this number sits beside a tree that draws one root per epic.
     var epics = rootBoards(list).length;
 
-    wrap.appendChild(kpi('In flight', String(open), open === 1 ? 'item' : 'items',
+    wrap.appendChild(kpi(i18n('kpi_in_flight'), String(open), open === 1 ? 'item' : 'items',
       plural(epics, 'workstream', 'workstreams'), true,
       { spark: sparkline(points, 62, 26, 'color-mix(in oklab, var(--pr-s2) 85%, var(--pr-card))') }));
-    wrap.appendChild(kpi('Accepted', String(acc), acc === 1 ? 'item' : 'items',
+    wrap.appendChild(kpi(i18n('kpi_accepted'), String(acc), acc === 1 ? 'item' : 'items',
       acc + ' / ' + plural(total, 'item', 'items'), true,
       { bar: total ? acc / total : 0 }));
 
@@ -1668,7 +1865,7 @@
     //: doing. It is now the one line in `sectionCost`, which keeps this card's exact
     //: value and subtitle, and the charts are a click away.
 
-    wrap.appendChild(kpi('Needs you', String(need.total),
+    wrap.appendChild(kpi(i18n('kpi_needs_you'), String(need.total),
       need.total === 1 ? 'item' : 'items',
       //: The subtitle describes the SAME set the number counts, so it says how many of
       //: that set the crewmate raised -- "of which", never "plus". A subtitle that adds
@@ -1677,8 +1874,8 @@
       need.total
         ? (need.mine
             ? need.mine + ' of them raised by the crewmate'
-            : need.total === 1 ? 'one answer needed' : 'answers needed')
-        : 'nothing waiting on you',
+            : need.total === 1 ? i18n('kpi_one_answer') : i18n('kpi_answers'))
+        : i18n('kpi_nothing_waiting'),
       !need.total, {}));
     return wrap;
   }
@@ -1716,15 +1913,15 @@
     var tail = points.length ? num(points[points.length - 1].credits) : null;
     var row = el('div', 'pr-cost');
     var line = el('div', 'pr-cost-l');
-    line.appendChild(document.createTextNode('spent '));
+    line.appendChild(document.createTextNode(i18n('cost_spent') + ' '));
     line.appendChild(el('b', null, fmtCr(cr)));
-    line.appendChild(document.createTextNode(' credits'));
+    line.appendChild(document.createTextNode(' ' + i18n('credits')));
     var trail = list.length && measured !== list.length
-      ? '\u00a0\u00b7 ' + (list.length - measured) + ' reported no cost'
-      : (tail === null ? '' : '\u00a0\u00b7 last hour ' + fmtCr(tail));
+      ? '\u00a0\u00b7 ' + (list.length - measured) + ' ' + i18n('cost_reported_none')
+      : (tail === null ? '' : '\u00a0\u00b7 ' + i18n('cost_last_hour') + ' ' + fmtCr(tail));
     if (trail) line.appendChild(el('span', 'pr-cost-t', trail));
     row.appendChild(line);
-    var btn = el('button', 'pr-cost-b', costOpen ? 'hide breakdown' : 'show breakdown');
+    var btn = el('button', 'pr-cost-b', costOpen ? i18n('cost_hide') : i18n('cost_show'));
     btn.type = 'button';
     btn.setAttribute('aria-expanded', costOpen ? 'true' : 'false');
     btn.onclick = function () { costOpen = !costOpen; render(); };
@@ -1743,10 +1940,10 @@
   function sectionHero(points, caption) {
     var hero = el('div', 'pr-card pr-hero');
     var hh = el('div', 'pr-card-h');
-    hh.appendChild(el('div', 'pr-card-t', 'Credits per hour'));
+    hh.appendChild(el('div', 'pr-card-t', i18n('hero_title')));
     hh.appendChild(el('div', 'pr-card-c', caption));
     hero.appendChild(hh);
-    hero.appendChild(heroChart(points, 'items accepted that hour'));
+    hero.appendChild(heroChart(points, i18n('hero_line_label')));
     return hero;
   }
 
@@ -1780,24 +1977,18 @@
   //: outlined. A crewmate item may carry `options` (an array of strings) in the
   //: for_you field it writes. A blocked item gets the two moves a lead has.
   var OPT_MAX = 6;
-  //: THE DESK'S WORDS. The page has no language of its own: the crewmate writes
-  //: `verdict.words` in whatever language it speaks with this person, and the page
-  //: reads every desk label from it. It rides on the verdict, which the lead
-  //: already rewrites every round, rather than a fourth agentic field. A word the crewmate left out falls back to
-  //: English, so a crewmate that never wrote the field still gets a working desk.
-  var WORD_DEFAULTS = {
-    blocked: 'Blocked', asks: 'Asks you', pick: 'Pick one', approve: 'OK to go?',
-    only_you: 'Only you', go: 'Go ahead', not_now: 'Not now', done: 'Done it',
-    cant: "Can't now", redispatch: 'Re-dispatch it', drop: 'Drop it',
-    own: 'Write my own', yes: 'Yes', no: 'No', earlier: 'Earlier',
-    answered: 'Answered', undo: 'Undo', context: 'Context', why: 'Why', how: 'How',
-    words: "worker's words"
-  };
+  //: THE DESK'S WORDS. The crewmate writes `verdict.words` in whatever language it
+  //: speaks with this person, and that override always wins. Where it leaves a word
+  //: out, the default is this page's own I18N table for the reader's locale, English
+  //: the fallback -- so the desk reads in the reader's language even for a crewmate
+  //: that never wrote the field, and a crewmate's own wording still wins in every
+  //: locale. The words ride on the verdict, which the lead rewrites every round,
+  //: rather than a fourth agentic field.
   function W(key) {
     var vd = fields().verdict;
     var u = vd && typeof vd === 'object' && !Array.isArray(vd) ? vd.words : null;
     var v = u && typeof u === 'object' && !Array.isArray(u) ? txt(u[key]) || '' : '';
-    return v && v.length <= 40 ? v : WORD_DEFAULTS[key];
+    return v && v.length <= 40 ? v : i18n('word_' + key);
   }
   var KIND_WORD = { 'Blocked': 'blocked', 'Asks you': 'asks', 'Pick one': 'pick',
     'OK to go?': 'approve', 'Only you': 'only_you' };
@@ -2012,8 +2203,8 @@
   function todoCard(list, scope) {
     var card = el('div', 'pr-card');
     var h = el('div', 'pr-card-h');
-    h.appendChild(el('div', 'pr-card-t', 'Needs you'));
-    h.appendChild(el('div', 'pr-card-c', 'each one says what to do'));
+    h.appendChild(el('div', 'pr-card-t', i18n('todo_title')));
+    h.appendChild(el('div', 'pr-card-c', i18n('todo_caption')));
     card.appendChild(h);
 
     var need = needsYou(list, scope);
@@ -2073,7 +2264,7 @@
       x.appendChild(meta);
       if (row.agent && forYouIsAgentic()) {
         x.appendChild(document.createTextNode(' '));
-        x.appendChild(el('span', 'pr-agent', 'crewmate wrote this'));
+        x.appendChild(el('span', 'pr-agent', i18n('crewmate_wrote')));
       }
       //: The next step, on its own line and never folded into the meta line: the meta
       //: line is where the task came from, which a reader skims, and the step is the
@@ -2169,7 +2360,7 @@
     var oldRows = open.filter(function (r) { return !r.isNew; });
 
     var desk = el('div', 'pr-desk');
-    var ns = drawShelf(newRows, 'New since you looked');
+    var ns = drawShelf(newRows, i18n('shelf_new'));
     if (ns) desk.appendChild(ns);
     //: Older items and items already answered are FOLDED, one line each when
     //: closed: they are still true, but they are not what a reader acts on now.
@@ -2187,7 +2378,7 @@
       desk.appendChild(fold(W('answered'), picked.length, ps));
     }
     if (!open.length && picked.length) {
-      desk.insertBefore(el('div', 'pr-empty', 'Nothing left to pick.'), desk.firstChild);
+      desk.insertBefore(el('div', 'pr-empty', i18n('todo_nothing_left')), desk.firstChild);
     }
     card.appendChild(desk);
 
@@ -2219,10 +2410,8 @@
   function sectionTree(nodes, one) {
     var card = el('div', 'pr-card');
     var h = el('div', 'pr-card-h');
-    h.appendChild(el('div', 'pr-card-t', one ? 'This epic' : 'Every epic'));
-    h.appendChild(el('div', 'pr-card-c', one
-      ? 'story \u00b7 task \u00b7 subtask, with what each cost in credits'
-      : 'epic \u00b7 story \u00b7 task \u00b7 subtask, with what each cost in credits'));
+    h.appendChild(el('div', 'pr-card-t', one ? i18n('tree_this_epic') : i18n('tree_every_epic')));
+    h.appendChild(el('div', 'pr-card-c', one ? i18n('tree_cap_one') : i18n('tree_cap_all')));
     card.appendChild(h);
 
     if (!treeInit && nodes.length) {
@@ -2230,7 +2419,7 @@
       seedOpen(nodes);
     }
     if (!nodes.length) {
-      card.appendChild(el('div', 'pr-empty', 'No workstream yet.'));
+      card.appendChild(el('div', 'pr-empty', i18n('no_workstream_dot')));
       return card;
     }
 
@@ -2267,7 +2456,7 @@
       return b;
     }
     var roots = rootBoards(list);
-    host.appendChild(pill(ALL, 'All', roots.length));
+    host.appendChild(pill(ALL, i18n('pill_all'), roots.length));
     for (var i = 0; i < roots.length; i++) {
       var s = roots[i];
       host.appendChild(pill(txt(s.id) || String(i), txt(s.goal) || String(i),
@@ -2289,9 +2478,9 @@
       host.appendChild(el('b', null, strong));
       host.appendChild(document.createTextNode(after));
     }
-    bit(String(open), ' in flight, spent ');
-    bit(fmtCr(cr), ' credits, ');
-    bit(String(need), need === 1 ? ' needs you' : ' need you');
+    bit(String(open), i18n('sent_in_flight'));
+    bit(fmtCr(cr), i18n('sent_credits'));
+    bit(String(need), need === 1 ? i18n('needs_you_suffix') : i18n('need_you_suffix'));
   }
 
   //: WHO IS WORKING, AND ON WHAT (Paperclip's Latest Run card, team/REPORT.md #7).
@@ -2368,16 +2557,16 @@
 
     var card = el('div', 'pr-card');
     var h = el('div', 'pr-card-h');
-    h.appendChild(el('span', 'pr-card-t', 'Who is working'));
+    h.appendChild(el('span', 'pr-card-t', i18n('crew_title')));
     h.appendChild(el('span', 'pr-card-c', rows.length
       ? plural(rows.length, 'worker', 'workers') + ' with work open, the stuck ones first'
-      : 'each worker, what it is on, and what it last said'));
+      : i18n('crew_cap_each')));
     card.appendChild(h);
     if (!rows.length) {
       card.appendChild(el('div', 'pr-empty', unbound
         ? 'No worker is bound yet. ' + plural(unbound, 'open task waits', 'open tasks wait')
           + ' for one.'
-        : 'No worker has open work.'));
+        : i18n('crew_no_open')));
       return card;
     }
     var box = el('div', 'pr-crew');
@@ -2407,17 +2596,17 @@
     row.setAttribute('role', 'button');
     row.setAttribute('data-crew-state', key);
     row.appendChild(el('i', 'pr-crew-dot'));
-    row.appendChild(el('span', 'pr-crew-who', 'worker ' + r.who));
+    row.appendChild(el('span', 'pr-crew-who', i18n('worker_prefix') + r.who));
     var main = el('div', 'pr-crew-main');
     var title = txt(r.t.title) || DASH;
     main.appendChild(el('div', 'pr-crew-t',
       r.n > 1 ? title + '  \u00b7 +' + (r.n - 1) + ' more' : title));
     //: One line, as on the needs-you cards; the row opens the drawer for the rest.
     var said = headline(crewSaid(r.t));
-    main.appendChild(el('div', 'pr-crew-said', said || 'nothing said yet'));
+    main.appendChild(el('div', 'pr-crew-said', said || i18n('crew_nothing_said')));
     row.appendChild(main);
     var side = el('div', 'pr-crew-side');
-    side.appendChild(el('span', 'pr-crew-st', spec[0]));
+    side.appendChild(el('span', 'pr-crew-st', i18n('crew_' + key)));
     var q = quietChip(r.t);
     if (q) side.appendChild(q);
     row.appendChild(side);
@@ -2433,7 +2622,7 @@
   }
 
   function renderGlobal(list) {
-    document.getElementById('pr-title').textContent = 'Project report';
+    document.getElementById('pr-title').textContent = i18n('page_title');
     sentenceAll(list);
     var host = document.getElementById('pr-view');
     clear(host);
@@ -2460,11 +2649,8 @@
       //: actually about: nothing, from any of the three records.
       if (!need.total && !spent) {
         var card = el('div', 'pr-card');
-        card.appendChild(el('div', 'pr-empty',
-          'No workstream yet. Nothing needs you, and nothing has been spent.'));
-        card.appendChild(el('div', 'pr-empty',
-          'Give this crewmate a goal in the chat, and its work shows up here: what '
-          + 'is in flight, what it cost, and anything waiting on you.'));
+        card.appendChild(el('div', 'pr-empty', i18n('empty_all')));
+        card.appendChild(el('div', 'pr-empty', i18n('empty_hint')));
         host.appendChild(card);
         //: The accounting line counts things that do not exist yet, so every clause
         //: would read "0". Hidden rather than reworded: a row of zeroes is not a
@@ -2480,12 +2666,10 @@
       //: cannot see it needs to know it is EMPTY rather than broken. What follows is
       //: then introduced as having come from somewhere else.
       var lead = el('div', 'pr-card');
-      lead.appendChild(el('div', 'pr-empty',
-        'No workstream yet, so there is no tree to show. What is below was not '
-        + 'raised by a board.'));
+      lead.appendChild(el('div', 'pr-empty', i18n('empty_no_tree')));
       box.appendChild(lead);
       if (need.total) box.appendChild(todoCard(list, null));
-      if (spent) box.appendChild(sectionCost(list, pts, 'every hour on record'));
+      if (spent) box.appendChild(sectionCost(list, pts, i18n('cap_record')));
       host.appendChild(box);
       var note2 = document.getElementById('pr-note');
       if (note2) note2.hidden = false;
@@ -2500,7 +2684,7 @@
     for (var i = 0; i < LAYOUT.length; i++) {
       if (LAYOUT[i] === 'kpi') box.appendChild(sectionKpi(list, points));
       else if (LAYOUT[i] === 'hero') {
-        box.appendChild(sectionCost(list, points, 'every workstream together'));
+        box.appendChild(sectionCost(list, points, i18n('cap_all')));
       } else if (LAYOUT[i] === 'todo') box.appendChild(todoCard(list, null));
       else if (LAYOUT[i] === 'crew') box.appendChild(sectionCrew(list));
       else if (LAYOUT[i] === 'tree') {
@@ -2530,13 +2714,13 @@
     var need = needsYou([s], scope).total;
     var host = document.getElementById('pr-sentence');
     clear(host);
-    host.appendChild(document.createTextNode('done '));
+    host.appendChild(document.createTextNode(i18n('sent_done')));
     host.appendChild(el('b', null, acc + ' / ' + tot));
-    host.appendChild(document.createTextNode(', spent '));
+    host.appendChild(document.createTextNode(i18n('sent_spent')));
     host.appendChild(el('b', null, fmtCr(cr)));
-    host.appendChild(document.createTextNode(' credits, '));
+    host.appendChild(document.createTextNode(i18n('sent_credits')));
     host.appendChild(el('b', null, String(need)));
-    host.appendChild(document.createTextNode(need === 1 ? ' needs you' : ' need you'));
+    host.appendChild(document.createTextNode(need === 1 ? i18n('needs_you_suffix') : i18n('need_you_suffix')));
 
     var box = el('div');
     box.style.display = 'grid';
@@ -2556,7 +2740,7 @@
     box.appendChild(sectionTree(nodes, true));
     //: One board's own hours, behind the same toggle: a reader who collapsed cost on
     //: the global view and then opened an epic did not ask to see it again.
-    box.appendChild(sectionCost([s], seriesOf(s), 'this workstream only'));
+    box.appendChild(sectionCost([s], seriesOf(s), i18n('cap_one')));
 
     var host2 = document.getElementById('pr-view');
     clear(host2);
@@ -2566,6 +2750,7 @@
   // ---------------------------------------------------------------- render
 
   function render() {
+    applyStatic();
     var list = streams();
     plots = [];
     var found = null;
@@ -2583,7 +2768,7 @@
     put('series', plural(seriesOf(fields()).length, 'hour', 'hours'));
     put('for_you', forYou().length);
     var vd = verdict();
-    put('verdict', vd ? VERDICTS[vd.state][0] : null);
+    put('verdict', vd ? i18n('verdict_' + vd.state) : null);
     var board = ciBoard();
     //: THE NOUN SURVIVES THE ABSENT CASE. `ci` is the only slot here that is both
     //: conditional and carries its own noun, so passing null left the line reading
@@ -2633,24 +2818,24 @@
     var card = el('div', 'pr-vd');
     card.style.setProperty('--pr-vd-c', pair[1]);
     var left = el('div');
-    left.appendChild(el('div', 'pr-vd-state', pair[0]));
+    left.appendChild(el('div', 'pr-vd-state', i18n('verdict_' + vd.state)));
     if (vd.state === 'no_word') {
       //: THE HONEST SILENCE. Two different ways to arrive here and a reader needs to
       //: know which: nobody has posted at all, or somebody posted and the board has
       //: moved since. The second is the dangerous one, so it names what it is
       //: downgrading rather than quietly hiding the lead's own word.
       left.appendChild(el('div', 'pr-vd-head', vd.superseded
-        ? 'The crewmate has not posted since the log last advanced.'
-        : 'The crewmate has not posted a verdict yet.'));
+        ? i18n('verdict_superseded_head')
+        : i18n('verdict_none_head')));
       if (vd.superseded && vd.headline) {
         left.appendChild(el('div', 'pr-vd-block',
-          'Its last word was "' + vd.headline + '". Read it as a past reading.'));
+          i18n('verdict_past', { h: vd.headline })));
       }
     } else {
       if (vd.headline) left.appendChild(el('div', 'pr-vd-head', vd.headline));
       if (vd.blocker) {
         var b = el('div', 'pr-vd-block');
-        b.appendChild(el('b', null, 'The one in the way: '));
+        b.appendChild(el('b', null, i18n('verdict_blocker_label')));
         b.appendChild(document.createTextNode(vd.blocker));
         left.appendChild(b);
       }
@@ -2662,7 +2847,7 @@
     //: it is a judgment. Only when the host says this cell IS agentic, so a page
     //: rendered from a manifest that changed does not claim it on the host's behalf.
     if (agenticNames().indexOf('verdict') !== -1) {
-      meta.appendChild(el('span', 'pr-chip', 'crewmate wrote this'));
+      meta.appendChild(el('span', 'pr-chip', i18n('crewmate_wrote')));
     }
     var age = sinceMs(vd.wroteAt);
     if (age !== null) meta.appendChild(el('span', null, fmtAgo(age)));
@@ -2682,8 +2867,8 @@
     var card = el('div', 'pr-lanes');
     var head = el('div', 'pr-lanes-h');
     var words = [];
-    if (failed) words.push(plural(failed, 'red', 'red'));
-    if (never) words.push(never + ' did not run');
+    if (failed) words.push(i18n('lanes_red', { n: failed }));
+    if (never) words.push(i18n('lanes_did_not_run', { n: never }));
     head.appendChild(el('b', null, words.join(', ')));
     var where = [];
     if (board.pr) where.push(/^\d+$/.test(board.pr) ? 'PR #' + board.pr : board.pr);
@@ -2701,13 +2886,14 @@
       row.appendChild(mark);
       row.appendChild(el('div', 'pr-lane-n', txt(l.name)));
       row.appendChild(el('div', 'pr-lane-w', never_ran
-        ? (txt(l.why) || 'lane never started \u2014 not a finding')
+        ? (txt(l.why) || i18n('lane_never_started'))
         : (txt(l.why) || '')));
       //: WHO CAN CLEAR IT, which is what decides whether the reader can act at all.
       //: A lane that never started is neither party's finding, so it is tagged with
       //: the act instead: somebody has to re-run it.
       var owner = txt(l.owner);
-      var tag = never_ran ? 'rerun it' : (owner === 'maintainer' ? 'maintainer' : 'yours');
+      var tag = never_ran ? i18n('rerun_it')
+        : (owner === 'maintainer' ? i18n('owner_maintainer') : i18n('owner_yours'));
       row.appendChild(el('span', 'pr-chip', tag));
       card.appendChild(row);
     }
@@ -2729,11 +2915,10 @@
     var ms = sinceMs(at);
     if (ms === null || ms < QUIET_MS) return;
     var band = el('div', 'pr-stale');
-    band.appendChild(el('b', null, 'No new entry for ' + fmtSince(ms) + '.'));
-    band.appendChild(document.createTextNode(
-      'Every number below is a last-known reading.'));
+    band.appendChild(el('b', null, i18n('stale_no_entry', { t: fmtSince(ms) })));
+    band.appendChild(document.createTextNode(i18n('stale_reading')));
     var seq = num((window.kirocrew || {}).seq);
-    if (seq !== null) band.appendChild(el('i', null, 'fold seq ' + seq));
+    if (seq !== null) band.appendChild(el('i', null, i18n('fold_seq', { n: seq })));
     host.appendChild(band);
   }
 
@@ -2767,17 +2952,17 @@
     var panel = el('div', 'pr-dr');
     panel.setAttribute('role', 'dialog');
     panel.setAttribute('aria-modal', 'false');
-    panel.setAttribute('aria-label', txt(t.title) || 'task');
+    panel.setAttribute('aria-label', txt(t.title) || i18n('task_word'));
 
     var head = el('div', 'pr-dr-h');
     var titles = el('div');
     titles.appendChild(el('div', 'pr-dr-t', txt(t.title) || DASH));
     titles.appendChild(el('div', 'pr-dr-s',
       (txt(found.board.goal) || txt(found.board.id) || DASH)
-      + ' \u00b7 round ' + (num(found.board.round) || 0)));
+      + ' \u00b7 ' + i18n('round_word') + ' ' + (num(found.board.round) || 0)));
     head.appendChild(titles);
     var shut = el('button', 'pr-dr-x', '\u2715');
-    shut.setAttribute('aria-label', 'Close');
+    shut.setAttribute('aria-label', i18n('close_word'));
     shut.addEventListener('click', function () { drawerAt = null; renderDrawer(); });
     head.appendChild(shut);
     panel.appendChild(head);
@@ -2797,24 +2982,17 @@
     chips.appendChild(el('span', 'pr-chip pr-chip-cr', fmtCr(credits(t))));
     if (chips.firstChild) body.appendChild(chips);
 
-    body.appendChild(section('What the worker last said', txt(t.summary),
-      'The worker has not reported on this task yet.'));
-    body.appendChild(section('What the conductor decided', txt(t.decision),
-      'No ruling on this task. Nothing was asked of the conductor, or nothing has '
-      + 'been answered yet.'));
-    body.appendChild(section('Verdict', txt(t.verdict),
-      'Not adjudicated. A verdict appears once the conductor has run the acceptance '
-      + 'check over this task\u2019s own bar.'));
+    body.appendChild(section(i18n('dr_said'), txt(t.summary), i18n('dr_said_empty')));
+    body.appendChild(section(i18n('dr_decided'), txt(t.decision), i18n('dr_decided_empty')));
+    body.appendChild(section(i18n('dr_verdict'), txt(t.verdict), i18n('dr_verdict_empty')));
 
     //: THE RESULT BLOCK, and its empty text is the point of it. A reader opening a
     //: finished task wants the thing it produced; a blank area there reads as a
     //: page that failed rather than as work that has not landed.
     var out = [];
-    if (txt(t.pr)) out.push('Pull request ' + txt(t.pr));
-    if (txt(t.state) === 'accepted') out.push('Accepted by the conductor.');
-    body.appendChild(section('Result / handoff', out.join(' \u00b7 '),
-      'No output yet. A pull request, a branch or a handoff summary appears here when '
-      + 'the task produces one.'));
+    if (txt(t.pr)) out.push(i18n('pull_request') + ' ' + txt(t.pr));
+    if (txt(t.state) === 'accepted') out.push(i18n('accepted_by'));
+    body.appendChild(section(i18n('dr_result'), out.join(' \u00b7 '), i18n('dr_result_empty')));
 
     body.appendChild(lanesSection(t));
     body.appendChild(eventsSection(t));
@@ -2848,15 +3026,14 @@
   //: that brought the reader here.
   function lanesSection(t) {
     var sec = el('div', 'pr-dr-sec');
-    sec.appendChild(el('div', 'pr-dr-k', 'Lanes'));
+    sec.appendChild(el('div', 'pr-dr-k', i18n('dr_lanes')));
     var board = ciBoard();
     var mine = board && txt(board.pr) && txt(board.pr) === txt(t.pr) ? redLanes(board) : [];
     if (!mine.length) {
       var c = checksOf(t);
       sec.appendChild(el('div', 'pr-dr-none', c && c.fail === 0 && c.pass > 0
-        ? 'Every lane green on the last board the crewmate read.'
-        : 'No lane board for this task. The crewmate writes one when it reads a '
-          + 'pull request\u2019s checks.'));
+        ? i18n('dr_lanes_green')
+        : i18n('dr_lanes_none')));
       return sec;
     }
     for (var i = 0; i < mine.length; i++) {
@@ -2865,7 +3042,7 @@
       var row = el('div', 'pr-dr-e');
       row.appendChild(el('div', 'pr-dr-e-m', never ? '\u25cb' : '\u2717'));
       var x = el('div', 'pr-dr-e-t', txt(l.name));
-      var why = txt(l.why) || (never ? 'lane never started \u2014 not a finding' : '');
+      var why = txt(l.why) || (never ? i18n('lane_never_started') : '');
       if (why) x.appendChild(el('div', 'pr-dr-e-k', why));
       row.appendChild(x);
       sec.appendChild(row);
@@ -2885,13 +3062,12 @@
       ? t.events.filter(function (r) { return r && typeof r === 'object'; }) : [];
     var seen = num(t.events_seen) || 0;
     sec.appendChild(el('div', 'pr-dr-k', rows.length < seen
-      ? 'Events \u00b7 ' + rows.length + ' of ' + seen
-      : 'Events' + (seen ? ' \u00b7 ' + seen : '')));
+      ? i18n('events_label') + ' \u00b7 ' + rows.length + ' ' + i18n('of_word') + ' ' + seen
+      : i18n('events_label') + (seen ? ' \u00b7 ' + seen : '')));
     if (!rows.length) {
       sec.appendChild(el('div', 'pr-dr-none', seen
-        ? 'This task recorded ' + plural(seen, 'event', 'events')
-          + ', and the page is no longer carrying their text.'
-        : 'No events recorded against this task yet.'));
+        ? i18n('ev_recorded_pre') + plural(seen, 'event', 'events') + i18n('ev_recorded_post')
+        : i18n('ev_none')));
       return sec;
     }
     var list = el('div', 'pr-dr-ev');
@@ -2924,12 +3100,11 @@
     var tasks = tasksOf(board);
     var card = el('div', 'pr-card');
     var h = el('div', 'pr-card-h');
-    h.appendChild(el('div', 'pr-card-t', 'How the work moves'));
-    h.appendChild(el('div', 'pr-card-c',
-      'worker \u00b7 acceptance check \u00b7 the lead accepts'));
+    h.appendChild(el('div', 'pr-card-t', i18n('pipe_title')));
+    h.appendChild(el('div', 'pr-card-c', i18n('pipe_cap')));
     card.appendChild(h);
     if (!tasks.length) {
-      card.appendChild(el('div', 'pr-empty', 'No task on this workstream yet.'));
+      card.appendChild(el('div', 'pr-empty', i18n('pipe_empty_task')));
       return card;
     }
 
@@ -2949,8 +3124,9 @@
     var pipe = el('div', 'pr-pipe');
     var head = el('div', 'pr-pipe-h');
     head.appendChild(el('b', null, accepted.length === tasks.length
-      ? 'Every task accepted' : 'In progress'));
-    head.appendChild(el('span', null, accepted.length + ' / ' + tasks.length + ' accepted'));
+      ? i18n('pipe_all') : i18n('pipe_progress')));
+    head.appendChild(el('span', null,
+      accepted.length + ' / ' + tasks.length + ' ' + i18n('accepted_word')));
     pipe.appendChild(head);
     var bar = el('div', 'pr-pipe-bar');
     var fill = el('i');
@@ -2958,14 +3134,11 @@
     bar.appendChild(fill);
     pipe.appendChild(bar);
 
-    stage(pipe, 'With a worker', running,
-      'Nothing in flight. Every task has reached the acceptance check.');
-    pipe.appendChild(el('div', 'pr-pipe-gate', '\u2193 when the worker reports done'));
-    stage(pipe, 'Ruled, not yet accepted', ruled,
-      'Nothing waiting on the lead.');
-    pipe.appendChild(el('div', 'pr-pipe-gate', '\u2193 when the lead takes the verdict'));
-    stage(pipe, 'Accepted', accepted,
-      'Nothing accepted yet.');
+    stage(pipe, i18n('stage_worker'), running, i18n('stage_worker_empty'));
+    pipe.appendChild(el('div', 'pr-pipe-gate', i18n('gate_worker')));
+    stage(pipe, i18n('stage_ruled'), ruled, i18n('stage_ruled_empty'));
+    pipe.appendChild(el('div', 'pr-pipe-gate', i18n('gate_lead')));
+    stage(pipe, i18n('stage_accepted'), accepted, i18n('stage_accepted_empty'));
     card.appendChild(pipe);
     return card;
   }
@@ -2986,7 +3159,7 @@
       //: the conductor sees a key. The alias keeps the only property a reader needs,
       //: which is that two rows run by one worker carry one token.
       var who = txt(t.spender);
-      x.appendChild(el('div', 'pr-pipe-w', who ? 'worker ' + who : 'no worker bound'));
+      x.appendChild(el('div', 'pr-pipe-w', who ? i18n('worker_prefix') + who : i18n('no_worker_bound')));
       row.appendChild(x);
       var v = verdictPill(t);
       row.appendChild(v || el('span', 'pr-chip', txt(t.status) || txt(t.state) || DASH));

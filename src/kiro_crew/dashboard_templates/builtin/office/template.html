@@ -179,7 +179,7 @@
 
   <div class="of-card">
     <div class="of-card-h">
-      <div class="of-card-t">Waiting for your review</div>
+      <div class="of-card-t" data-i18n="rv_title">Waiting for your review</div>
       <div class="of-card-c" id="rv-head">each one is a draft</div>
     </div>
     <div class="of-todo" id="rv"></div>
@@ -187,16 +187,16 @@
 
   <div class="of-card">
     <div class="of-card-h">
-      <div class="of-card-t">Delivered today</div>
-      <div class="of-card-c">accepted and ruled on</div>
+      <div class="of-card-t" data-i18n="dl_title">Delivered today</div>
+      <div class="of-card-c" data-i18n="dl_sub">accepted and ruled on</div>
     </div>
     <div class="of-rows" id="dl"></div>
   </div>
 
   <div class="of-card">
     <div class="of-card-h">
-      <div class="of-card-t">In progress</div>
-      <div class="of-card-c">still being written</div>
+      <div class="of-card-t" data-i18n="ip_title">In progress</div>
+      <div class="of-card-c" data-i18n="ip_sub">still being written</div>
     </div>
     <div class="of-tree" id="ip"></div>
   </div>
@@ -221,6 +221,120 @@
   <script>
     (function () {
       var DASH = '\u2014';
+
+      // The page's own words, one table per UI language. A key a language lacks falls
+      // back to English. Values the fold or a crewmate wrote are never looked up here.
+      // The zh-CN strings are \u-escaped so the source stays ASCII.
+      var I18N = {
+        en: {
+          rv_title: 'Waiting for your review', dl_title: 'Delivered today',
+          dl_sub: 'accepted and ruled on', ip_title: 'In progress', ip_sub: 'still being written',
+          hl_delivered_label: 'delivered today', hl_waiting_label: 'waiting for your review',
+          hl_credits_label: 'credits this week',
+          unit_item: 'item', unit_items: 'items', unit_draft: 'draft', unit_drafts: 'drafts',
+          unit_hour: 'hour', unit_hours: 'hours', unit_board: 'board', unit_boards: 'boards',
+          unit_workstream: 'workstream', unit_workstreams: 'workstreams',
+          credits_unit: 'credits', credits_suffix: ' credits',
+          no_board_sub: 'the fold carries no board', waiting_sub_some: 'each one is a draft below',
+          waiting_sub_none: 'nothing is waiting on you', with_spend: ' with spend',
+          at_least: ', at least', credits_week_none: 'no hour in the last seven days carries spend',
+          floor_note: 'The record keeps {cap} hours with spend and is holding {cap}, so the week figure is a floor: older hours were dropped.',
+          all_time_across: 'All time across ', report_no_cost: ' board(s) report no cost',
+          all_time_none: 'No board reports a cost, so there is no all-time figure to compare the week to.',
+          each_one_says: ', each one says what to do',
+          review_empty_boards: 'No draft is waiting on you. Every open piece of work is still being written.',
+          review_empty_noboard: 'The record carries no board for this crewmate yet, so there is nothing to review.',
+          meta_no_report_time: 'no report time on the record', reported_prefix: 'reported ',
+          just_now: 'just now',
+          file_unreadable: 'the crewmate wrote a file name here this page cannot read',
+          no_file: 'No file name written', in_chat_box: 'In your chat box:', undo: 'Undo',
+          answer_it: 'Answer it', approve_it: 'Approve it', revise: 'Revise', say_revise: 'revise it',
+          this_draft: 'this draft',
+          drafts_unreadable_note: 'The crewmate published a drafts value this page cannot read, so every row above is drawn from the record alone.',
+          delivered_empty_boards: 'Nothing has been accepted today. The In progress list below is what is moving.',
+          noboard_short: 'The record carries no board for this crewmate yet.',
+          inprogress_empty_boards: 'Every board on the record is closed out. Nothing is being written.',
+          step_unreadable: 'The crewmate wrote a step here this page cannot read.',
+          no_step_open: 'No step written. Open: ', and_prefix: ' and ', more_suffix: ' more',
+          no_step_none: 'No step written, and the record names no open task on this board.',
+          not_counted: 'the record does not count this board',
+          needs_you_one: 'needs you', needs_you_many: 'need you',
+          no_activity_time: 'no activity time on the record',
+          worker_blocked_one: 'worker blocked', worker_blocked_many: 'workers blocked',
+          draft_written_one: 'draft written', draft_written_many: 'drafts written',
+          drafts_value_unreadable: 'a drafts value this page cannot read',
+          no_draft_written: 'no draft written',
+          step_written_one: 'step written', step_written_many: 'steps written',
+          steps_value_unreadable: 'a steps value this page cannot read',
+          no_step_written: 'no step written',
+          under_a_minute: 'under a minute ago', m_ago: 'm ago', h_sep: 'h ', d_ago: 'd ago'
+        },
+        'zh-CN': {
+          rv_title: '\u7b49\u5f85\u4f60\u5ba1\u6838', dl_title: '\u4eca\u65e5\u5df2\u4ea4\u4ed8',
+          dl_sub: '\u5df2\u63a5\u53d7\u5e76\u88c1\u5b9a', ip_title: '\u8fdb\u884c\u4e2d', ip_sub: '\u4ecd\u5728\u64b0\u5199',
+          hl_delivered_label: '\u4eca\u65e5\u5df2\u4ea4\u4ed8', hl_waiting_label: '\u7b49\u5f85\u4f60\u5ba1\u6838',
+          hl_credits_label: '\u672c\u5468\u82b1\u8d39',
+          unit_item: '\u9879', unit_items: '\u9879', unit_draft: '\u4efd\u8349\u7a3f', unit_drafts: '\u4efd\u8349\u7a3f',
+          unit_hour: '\u5c0f\u65f6', unit_hours: '\u5c0f\u65f6', unit_board: '\u4e2a\u770b\u677f', unit_boards: '\u4e2a\u770b\u677f',
+          unit_workstream: '\u6761\u5de5\u4f5c\u6d41', unit_workstreams: '\u6761\u5de5\u4f5c\u6d41',
+          credits_unit: '\u70b9\u82b1\u8d39', credits_suffix: ' \u70b9\u82b1\u8d39',
+          no_board_sub: '\u8bb0\u5f55\u4e2d\u8fd8\u6ca1\u6709\u770b\u677f', waiting_sub_some: '\u4e0b\u9762\u6bcf\u4e00\u9879\u90fd\u662f\u8349\u7a3f',
+          waiting_sub_none: '\u6ca1\u6709\u9700\u8981\u4f60\u5904\u7406\u7684\u4e8b\u9879', with_spend: ' \u6709\u82b1\u8d39',
+          at_least: '\uff08\u81f3\u5c11\uff09', credits_week_none: '\u6700\u8fd1\u4e03\u5929\u6ca1\u6709\u4efb\u4f55\u5c0f\u65f6\u6709\u82b1\u8d39',
+          floor_note: '\u8bb0\u5f55\u6700\u591a\u4fdd\u7559 {cap} \u4e2a\u6709\u82b1\u8d39\u7684\u5c0f\u65f6\uff0c\u5f53\u524d\u5df2\u6ee1 {cap} \u4e2a\uff0c\u6240\u4ee5\u672c\u5468\u6570\u5b57\u662f\u4e0b\u9650\uff1a\u66f4\u65e9\u7684\u5c0f\u65f6\u5df2\u88ab\u4e22\u5f03\u3002',
+          all_time_across: '\u6240\u6709\u65f6\u95f4\u5185\uff0c\u5171 ', report_no_cost: ' \u4e2a\u770b\u677f\u672a\u62a5\u544a\u82b1\u8d39',
+          all_time_none: '\u6ca1\u6709\u770b\u677f\u62a5\u544a\u82b1\u8d39\uff0c\u56e0\u6b64\u6ca1\u6709\u53ef\u4e0e\u672c\u5468\u5bf9\u6bd4\u7684\u603b\u82b1\u8d39\u3002',
+          each_one_says: '\uff0c\u6bcf\u4e00\u9879\u90fd\u8bf4\u660e\u4e86\u8be5\u505a\u4ec0\u4e48',
+          review_empty_boards: '\u6ca1\u6709\u8349\u7a3f\u7b49\u5f85\u4f60\u5904\u7406\u3002\u6bcf\u4e00\u9879\u8fdb\u884c\u4e2d\u7684\u5de5\u4f5c\u90fd\u4ecd\u5728\u64b0\u5199\u3002',
+          review_empty_noboard: '\u8fd9\u4f4d\u961f\u53cb\u7684\u8bb0\u5f55\u4e2d\u8fd8\u6ca1\u6709\u770b\u677f\uff0c\u56e0\u6b64\u6ca1\u6709\u53ef\u5ba1\u6838\u7684\u5185\u5bb9\u3002',
+          meta_no_report_time: '\u8bb0\u5f55\u4e2d\u6ca1\u6709\u6c47\u62a5\u65f6\u95f4', reported_prefix: '\u6c47\u62a5\u4e8e ',
+          just_now: '\u521a\u521a',
+          file_unreadable: '\u8fd9\u4f4d\u961f\u53cb\u5728\u6b64\u5199\u4e86\u672c\u9875\u65e0\u6cd5\u8bfb\u53d6\u7684\u6587\u4ef6\u540d',
+          no_file: '\u672a\u5199\u660e\u6587\u4ef6\u540d', in_chat_box: '\u5df2\u586b\u5165\u4f60\u7684\u804a\u5929\u6846\uff1a', undo: '\u64a4\u9500',
+          answer_it: '\u56de\u590d\u5b83', approve_it: '\u6279\u51c6\u5b83', revise: '\u8981\u6c42\u4fee\u6539', say_revise: '\u4fee\u6539\u5b83',
+          this_draft: '\u8fd9\u4efd\u8349\u7a3f',
+          drafts_unreadable_note: '\u8fd9\u4f4d\u961f\u53cb\u53d1\u5e03\u4e86\u672c\u9875\u65e0\u6cd5\u8bfb\u53d6\u7684\u8349\u7a3f\u6570\u636e\uff0c\u56e0\u6b64\u4e0a\u9762\u6bcf\u4e00\u884c\u90fd\u4ec5\u4f9d\u636e\u8bb0\u5f55\u7ed8\u5236\u3002',
+          delivered_empty_boards: '\u4eca\u5929\u8fd8\u6ca1\u6709\u4efb\u4f55\u5185\u5bb9\u88ab\u63a5\u53d7\u3002\u4e0b\u65b9\u7684\u8fdb\u884c\u4e2d\u5217\u8868\u662f\u6b63\u5728\u63a8\u8fdb\u7684\u5de5\u4f5c\u3002',
+          noboard_short: '\u8fd9\u4f4d\u961f\u53cb\u7684\u8bb0\u5f55\u4e2d\u8fd8\u6ca1\u6709\u770b\u677f\u3002',
+          inprogress_empty_boards: '\u8bb0\u5f55\u4e2d\u7684\u6bcf\u4e2a\u770b\u677f\u90fd\u5df2\u7ed3\u6e05\u3002\u6ca1\u6709\u6b63\u5728\u64b0\u5199\u7684\u5185\u5bb9\u3002',
+          step_unreadable: '\u8fd9\u4f4d\u961f\u53cb\u5728\u6b64\u5199\u4e86\u672c\u9875\u65e0\u6cd5\u8bfb\u53d6\u7684\u6b65\u9aa4\u3002',
+          no_step_open: '\u672a\u5199\u660e\u6b65\u9aa4\u3002\u8fdb\u884c\u4e2d\uff1a', and_prefix: '\uff0c\u53e6\u6709 ', more_suffix: ' \u9879',
+          no_step_none: '\u672a\u5199\u660e\u6b65\u9aa4\uff0c\u4e14\u8bb0\u5f55\u4e2d\u6ca1\u6709\u6b64\u770b\u677f\u4e0a\u7684\u8fdb\u884c\u4e2d\u4efb\u52a1\u3002',
+          not_counted: '\u8bb0\u5f55\u672a\u7edf\u8ba1\u6b64\u770b\u677f',
+          needs_you_one: '\u9879\u9700\u8981\u4f60\u5904\u7406', needs_you_many: '\u9879\u9700\u8981\u4f60\u5904\u7406',
+          no_activity_time: '\u8bb0\u5f55\u4e2d\u6ca1\u6709\u6d3b\u52a8\u65f6\u95f4',
+          worker_blocked_one: '\u4e2a\u6267\u884c\u8005\u53d7\u963b', worker_blocked_many: '\u4e2a\u6267\u884c\u8005\u53d7\u963b',
+          draft_written_one: '\u4efd\u8349\u7a3f\u5df2\u5199', draft_written_many: '\u4efd\u8349\u7a3f\u5df2\u5199',
+          drafts_value_unreadable: '\u4e00\u4efd\u672c\u9875\u65e0\u6cd5\u8bfb\u53d6\u7684\u8349\u7a3f\u6570\u636e',
+          no_draft_written: '\u672a\u5199\u8349\u7a3f',
+          step_written_one: '\u4e2a\u6b65\u9aa4\u5df2\u5199', step_written_many: '\u4e2a\u6b65\u9aa4\u5df2\u5199',
+          steps_value_unreadable: '\u4e00\u4efd\u672c\u9875\u65e0\u6cd5\u8bfb\u53d6\u7684\u6b65\u9aa4\u6570\u636e',
+          no_step_written: '\u672a\u5199\u6b65\u9aa4',
+          under_a_minute: '\u4e0d\u5230\u4e00\u5206\u949f\u524d', m_ago: '\u5206\u949f\u524d', h_sep: '\u5c0f\u65f6', d_ago: '\u5929\u524d'
+        }
+      };
+      function locale() {
+        var l = (window.kirocrew || {}).locale;
+        return typeof l === 'string' && Object.prototype.hasOwnProperty.call(I18N, l) ? l : 'en';
+      }
+      function has(key) {
+        return Object.prototype.hasOwnProperty.call(I18N.en, key);
+      }
+      function i18n(key, vars) {
+        var table = I18N[locale()];
+        var s = Object.prototype.hasOwnProperty.call(table, key) ? table[key] : I18N.en[key];
+        if (s === undefined) s = key;
+        if (vars) {
+          s = s.replace(/\{(\w+)\}/g, function (m, k) {
+            return Object.prototype.hasOwnProperty.call(vars, k) ? String(vars[k]) : m;
+          });
+        }
+        return s;
+      }
+      function applyStatic() {
+        var nodes = document.querySelectorAll('[data-i18n]');
+        for (var i = 0; i < nodes.length; i++) nodes[i].textContent = i18n(nodes[i].getAttribute('data-i18n'));
+      }
 
       //: The series cap in the fold itself (WORKSTREAMS_SERIES_LIMIT). The week figure is
       //: a sum over these buckets, so a series sitting ON the cap may have dropped older
@@ -263,11 +377,11 @@
       function ago(ms) {
         if (ms === null || ms < 0) return null;
         var m = Math.floor(ms / 60000);
-        if (m < 1) return 'under a minute ago';
-        if (m < 60) return m + 'm ago';
+        if (m < 1) return i18n('under_a_minute');
+        if (m < 60) return m + i18n('m_ago');
         var h = Math.floor(m / 60);
-        if (h < 24) return h + 'h ' + (m % 60) + 'm ago';
-        return Math.floor(h / 24) + 'd ago';
+        if (h < 24) return h + i18n('h_sep') + (m % 60) + i18n('m_ago');
+        return Math.floor(h / 24) + i18n('d_ago');
       }
       function clock(t) {
         var d = new Date(t);
@@ -457,7 +571,7 @@
       var picked = {};
 
       function ref(task) {
-        var t = clip(task.title, 70) || txt(task.item_id) || 'this draft';
+        var t = clip(task.title, 70) || txt(task.item_id) || i18n('this_draft');
         var id = txt(task.item_id);
         return '"' + t + '"' + (id ? ' (' + id + ')' : '');
       }
@@ -488,31 +602,30 @@
         var wk = weekCredits(now);
         var all = allTimeCredits();
         var tiles = [
-          { label: 'delivered today', big: bs.length ? String(dn) : DASH,
-            unit: bs.length ? (dn === 1 ? 'item' : 'items') : '',
-            sub: bs.length ? 'accepted and ruled on' : 'the fold carries no board' },
-          { label: 'waiting for your review', big: bs.length ? String(wt) : DASH,
-            unit: bs.length ? (wt === 1 ? 'draft' : 'drafts') : '',
-            sub: wt ? 'each one is a draft below' : 'nothing is waiting on you' },
-          { label: 'credits this week', big: wk.hours ? wk.total.toFixed(2) : DASH,
-            unit: wk.hours ? 'credits' : '',
+          { label: i18n('hl_delivered_label'), big: bs.length ? String(dn) : DASH,
+            unit: bs.length ? i18n(dn === 1 ? 'unit_item' : 'unit_items') : '',
+            sub: bs.length ? i18n('dl_sub') : i18n('no_board_sub') },
+          { label: i18n('hl_waiting_label'), big: bs.length ? String(wt) : DASH,
+            unit: bs.length ? i18n(wt === 1 ? 'unit_draft' : 'unit_drafts') : '',
+            sub: wt ? i18n('waiting_sub_some') : i18n('waiting_sub_none') },
+          { label: i18n('hl_credits_label'), big: wk.hours ? wk.total.toFixed(2) : DASH,
+            unit: wk.hours ? i18n('credits_unit') : '',
             sub: wk.hours
-              ? plural(wk.hours, 'hour', 'hours') + ' with spend' + (wk.atCap ? ', at least' : '')
-              : 'no hour in the last seven days carries spend' }
+              ? plural(wk.hours, i18n('unit_hour'), i18n('unit_hours')) + i18n('with_spend') + (wk.atCap ? i18n('at_least') : '')
+              : i18n('credits_week_none') }
         ];
         for (var i = 0; i < tiles.length; i++) {
           host.appendChild(kpi(tiles[i].label, tiles[i].big, tiles[i].unit, tiles[i].sub));
         }
         var said = [];
         if (wk.atCap) {
-          said.push('The record keeps ' + SERIES_CAP + ' hours with spend and is holding '
-            + SERIES_CAP + ', so the week figure is a floor: older hours were dropped.');
+          said.push(i18n('floor_note', { cap: SERIES_CAP }));
         }
         said.push(all.known
-          ? 'All time across ' + plural(all.of, 'board', 'boards') + ': ' + all.total.toFixed(2)
-            + ' credits' + (all.known < all.of
-              ? ' (' + (all.of - all.known) + ' board(s) report no cost)' : '') + '.'
-          : 'No board reports a cost, so there is no all-time figure to compare the week to.');
+          ? i18n('all_time_across') + plural(all.of, i18n('unit_board'), i18n('unit_boards')) + ': ' + all.total.toFixed(2)
+            + i18n('credits_suffix') + (all.known < all.of
+              ? ' (' + (all.of - all.known) + i18n('report_no_cost') + ')' : '') + '.'
+          : i18n('all_time_none'));
         note.textContent = said.join(' ');
       }
 
@@ -523,13 +636,13 @@
         host.textContent = '';
         var rows = waiting();
         head.textContent = rows.length
-          ? plural(rows.length, 'draft', 'drafts') + ', each one says what to do'
-          : 'nothing is waiting on you';
+          ? plural(rows.length, i18n('unit_draft'), i18n('unit_drafts')) + i18n('each_one_says')
+          : i18n('waiting_sub_none');
         var w = written('drafts');
         if (!rows.length) {
           host.appendChild(el('div', 'of-empty', boards().length
-            ? 'No draft is waiting on you. Every open piece of work is still being written.'
-            : 'The record carries no board for this crewmate yet, so there is nothing to review.'));
+            ? i18n('review_empty_boards')
+            : i18n('review_empty_noboard')));
           return;
         }
         rows.forEach(function (r) {
@@ -567,10 +680,10 @@
           if (said) bits.push(said);
           var at = stamp(task.last_report_at);
           bits.push(at === null
-            ? 'no report time on the record'
-            : 'reported ' + clock(at) + ', ' + (ago(now - at) || 'just now'));
+            ? i18n('meta_no_report_time')
+            : i18n('reported_prefix') + clock(at) + ', ' + (ago(now - at) || i18n('just_now')));
           var cr = num(task.credits);
-          if (cr !== null && task.credits_reported !== false) bits.push(cr.toFixed(2) + ' credits');
+          if (cr !== null && task.credits_reported !== false) bits.push(cr.toFixed(2) + i18n('credits_suffix'));
           //: THE FILE, and the three answers its absence can have. A crewmate that wrote
           //: nothing and a crewmate whose write this page cannot read are different
           //: facts, and only one of them is anybody's fault. Both go on the SAME meta
@@ -581,17 +694,17 @@
           if (file) {
             bits.push(file);
           } else if (got.state === 'unreadable') {
-            bits.push('the crewmate wrote a file name here this page cannot read');
+            bits.push(i18n('file_unreadable'));
           } else {
-            bits.push('No file name written');
+            bits.push(i18n('no_file'));
           }
           x.appendChild(el('div', 'of-todo-m', bits.join(' \u00b7 ')));
 
           if (picked[id]) {
             var sent = el('div', 'of-todo-sent');
-            sent.appendChild(el('b', null, 'In your chat box:'));
+            sent.appendChild(el('b', null, i18n('in_chat_box')));
             sent.appendChild(el('span', null, '\u2192 ' + picked[id]));
-            var undo = el('button', null, 'Undo');
+            var undo = el('button', null, i18n('undo'));
             undo.type = 'button';
             undo.addEventListener('click', function () { delete picked[id]; render(); });
             sent.appendChild(undo);
@@ -606,10 +719,10 @@
           //: may name the label itself in its drafts entry, which is how a page that
           //: speaks English ends up offering a button in the person's own language.
           var primary = clip(draft ? draft.action : null, 40)
-            || (asking ? 'Answer it' : 'Approve it');
+            || (asking ? i18n('answer_it') : i18n('approve_it'));
           var acts = el('div', 'of-todo-opts');
           [{ label: primary, say: ref(task) + ': ' + primary, rec: true },
-            { label: 'Revise', say: ref(task) + ': revise it', rec: false }
+            { label: i18n('revise'), say: ref(task) + ': ' + i18n('say_revise'), rec: false }
           ].forEach(function (c) {
             var b = el('button', 'of-todo-opt' + (c.rec ? ' of-rec' : ''), c.label);
             b.type = 'button';
@@ -627,9 +740,7 @@
           host.appendChild(card);
         });
         if (w.state === 'unreadable') {
-          host.appendChild(el('div', 'of-empty',
-            'The crewmate published a drafts value this page cannot read, so every row '
-            + 'above is drawn from the record alone.'));
+          host.appendChild(el('div', 'of-empty', i18n('drafts_unreadable_note')));
         }
       }
 
@@ -640,8 +751,8 @@
         var rows = delivered(now);
         if (!rows.length) {
           host.appendChild(el('div', 'of-empty', boards().length
-            ? 'Nothing has been accepted today. The In progress list below is what is moving.'
-            : 'The record carries no board for this crewmate yet.'));
+            ? i18n('delivered_empty_boards')
+            : i18n('noboard_short')));
           return;
         }
         rows.forEach(function (r) {
@@ -683,8 +794,8 @@
         var rows = inFlight();
         if (!rows.length) {
           host.appendChild(el('div', 'of-empty', boards().length
-            ? 'Every board on the record is closed out. Nothing is being written.'
-            : 'The record carries no board for this crewmate yet.'));
+            ? i18n('inprogress_empty_boards')
+            : i18n('noboard_short')));
           return;
         }
         rows.forEach(function (board) {
@@ -703,15 +814,15 @@
           if (got.state === 'ok') {
             s.textContent = clip(got.value, 150);
           } else if (got.state === 'unreadable') {
-            s.textContent = 'The crewmate wrote a step here this page cannot read.';
+            s.textContent = i18n('step_unreadable');
           } else {
             var open = tasksOf(board).filter(function (t) { return txt(t.state) === 'open'; })
               .map(function (t) { return clip(t.title, 60); })
               .filter(function (t) { return t; });
             s.textContent = open.length
-              ? 'No step written. Open: ' + open.slice(0, 2).join('; ')
-                + (open.length > 2 ? ' and ' + (open.length - 2) + ' more' : '')
-              : 'No step written, and the record names no open task on this board.';
+              ? i18n('no_step_open') + open.slice(0, 2).join('; ')
+                + (open.length > 2 ? i18n('and_prefix') + (open.length - 2) + i18n('more_suffix') : '')
+              : i18n('no_step_none');
           }
           x.appendChild(s);
 
@@ -726,15 +837,15 @@
           var total = num(board.total), done = num(board.accepted);
           var line = [];
           if (total === null || done === null) {
-            line.push('the record does not count this board');
+            line.push(i18n('not_counted'));
           }
           var needs = num(board.needs_you);
-          if (needs) line.push(plural(needs, 'needs you', 'need you'));
+          if (needs) line.push(plural(needs, i18n('needs_you_one'), i18n('needs_you_many')));
           var last = stamp(board.last_activity_at);
-          line.push(last === null ? 'no activity time on the record' : (ago(now - last) || 'just now'));
+          line.push(last === null ? i18n('no_activity_time') : (ago(now - last) || i18n('just_now')));
           if (blocked) {
             meta.appendChild(el('span', 'of-blk',
-              plural(blocked, 'worker blocked', 'workers blocked')));
+              plural(blocked, i18n('worker_blocked_one'), i18n('worker_blocked_many'))));
             meta.appendChild(document.createTextNode(' \u00b7 ' + line.join(' \u00b7 ')));
           } else {
             meta.textContent = line.join(' \u00b7 ');
@@ -763,6 +874,7 @@
       }
 
       function render() {
+        applyStatic();
         //: ONE clock read for the whole render. Four sections compare stamps against
         //: "now", and reading it per section lets two of them disagree about which day
         //: it is -- which is how a row can be delivered today in one list and not in
@@ -776,18 +888,18 @@
         //: The host fills each bound cell with the raw JSON of the value, which is
         //: unreadable in a sentence, so each is overwritten with the count it stands for.
         var bs = boards();
-        put('items', plural(bs.length, 'workstream', 'workstreams'));
+        put('items', plural(bs.length, i18n('unit_workstream'), i18n('unit_workstreams')));
         put('omitted', num(fields().omitted));
-        put('series', plural(list('series').length, 'hour', 'hours'));
+        put('series', plural(list('series').length, i18n('unit_hour'), i18n('unit_hours')));
         var dw = written('drafts'), sw = written('steps');
         put('drafts', dw.state === 'ok'
-          ? plural(Object.keys(dw.map).length, 'draft written', 'drafts written')
-          : (dw.state === 'unreadable' ? 'a drafts value this page cannot read'
-            : 'no draft written'));
+          ? plural(Object.keys(dw.map).length, i18n('draft_written_one'), i18n('draft_written_many'))
+          : (dw.state === 'unreadable' ? i18n('drafts_value_unreadable')
+            : i18n('no_draft_written')));
         put('steps', sw.state === 'ok'
-          ? plural(Object.keys(sw.map).length, 'step written', 'steps written')
-          : (sw.state === 'unreadable' ? 'a steps value this page cannot read'
-            : 'no step written'));
+          ? plural(Object.keys(sw.map).length, i18n('step_written_one'), i18n('step_written_many'))
+          : (sw.state === 'unreadable' ? i18n('steps_value_unreadable')
+            : i18n('no_step_written')));
         var since = stamp(fields().last_entry_at);
         put('last_entry_at', since === null ? null : ago(now - since));
       }
