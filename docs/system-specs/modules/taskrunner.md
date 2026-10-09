@@ -1074,6 +1074,7 @@ Only fires when there is truly ZERO activity for the stall period.
   - Returns `{"steps": [...]}` (or `{"tasks": [...]}`) or a bare JSON array of steps
 - Self-review: `taskrunner:{task_id}:review` (separate session, reset in finally) (owned by `task_executor.py`)
 - Context compaction between steps routes through `SessionManager.compact_if_needed(key)`, preserving the gateway's deduplication, cooldown, turn-semaphore exclusion, and skills reinjection. A `"busy"` decline is retried later with no direct `provider.compact()` fallback. Its shared post-check uses the attempt's immediate effect verdict (`_POST_COMPACT_RESET_PCT`) and awaits a reset before the next step cold-starts; deferred readings only damp later growth, while the mid-stream overflow guard covers the interim.
+- The mid-stream overflow handler compacts in place and resets the session if that does not complete. On a backend `messaging.commands.compact_unsupported_backend(client)` names, it skips the `/compact` call and its wait and resets the session straight away, since the wait could only time out.
 
 Every step gets `is_new=True` on its first message, which triggers full `ContextBuilder` injection: user preferences, active projects, recent history, semantic memory, lessons, episodic memory queried by the step prompt, and triggered skills. The budget matches a normal chat session.
 

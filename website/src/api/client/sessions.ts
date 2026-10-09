@@ -9,7 +9,7 @@ import type { CrewBoardAction, CrewBoardActionResult, WorkBoardResponse } from '
 
 export const SEARCH_MIN_CHARS = 2  // backend session search threshold (must match kiro_crew.history.SEARCH_MIN_CHARS)
 
-export function createSessionsEndpoints({ get, post, del, j, jfetch: fetch }: ClientTransport) {
+export function createSessionsEndpoints({ get, post, del, j, jfetch: fetch, jCrewBoard }: ClientTransport) {
   const runtimes = {
     restartSessions: () =>
       post('/api/sessions/restart').then(j) as Promise<{
@@ -39,8 +39,13 @@ export function createSessionsEndpoints({ get, post, del, j, jfetch: fetch }: Cl
          * own crew log records it; null for a session nobody created. `key` is the
          * creator's live session key when it is running (the edge the table nests
          * on) and null when it is not, so the citation outlives the creator.
+         *
+         * `ancestor` is true when `key` is the nearest OPEN ancestor instead of the
+         * creator in `slot`, which happens once the creator itself closes: the row
+         * nests under the session that owns the run and the citation still names the
+         * creator that is gone.
          */
-        parent: { slot: string; key: string | null } | null
+        parent: { slot: string; key: string | null; ancestor?: boolean } | null
       }[]
       tasks: {
         id: string; task: string; agent: string; parent: string
@@ -97,7 +102,7 @@ export function createSessionsEndpoints({ get, post, del, j, jfetch: fetch }: Cl
      * silently inherit MCP-only auth and 403 every call from here.
      */
     crewBoard: (conductor: string) =>
-      get(`/api/crew-board?conductor=${encodeURIComponent(conductor)}`).then(j) as Promise<WorkBoardResponse>,
+      get(`/api/crew-board?conductor=${encodeURIComponent(conductor)}`).then(jCrewBoard) as Promise<WorkBoardResponse>,
     /**
      * Act on one ORPHANED item. The worker session key is never sent and never
      * returned: the server resolves it from the store, which is what lets this call

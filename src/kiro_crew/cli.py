@@ -945,8 +945,8 @@ _LOG_FATAL_ERRNOS = frozenset({errno.ENOSYS, errno.EPERM, errno.EACCES, errno.ER
 _LOG_ERROR_STREAK_LIMIT = 3
 
 
-class _OwnerOnlyRotatingFileHandler(RotatingFileHandler):
-    """RotatingFileHandler whose log files are created ``0600``.
+def _open_owner_only(handler: logging.FileHandler):  # type: ignore[no-untyped-def]
+    """Open *handler*'s log file the way ``FileHandler._open`` does, but ``0600``.
 
     The stdlib opens the log with the builtin ``open``, so ``gateway.log`` -- and
     the fresh file every rollover creates -- would come out at the umask default
@@ -955,18 +955,72 @@ class _OwnerOnlyRotatingFileHandler(RotatingFileHandler):
     owner-only policy. Only the creation mode changes; an existing file keeps its
     mode (the startup sweep tightens one an older version created).
     """
+    # The stdlib's own handle on ``open`` (it survives interpreter teardown),
+    # read through getattr because typeshed does not declare it.
+    open_func = getattr(handler, "_builtin_open", open)
+    return open_func(
+        handler.baseFilename,
+        handler.mode,
+        encoding=handler.encoding,
+        errors=handler.errors,
+        opener=owner_only_opener,
+    )
+
+
+class _OwnerOnlyRotatingFileHandler(RotatingFileHandler):
+    """RotatingFileHandler whose log files are created ``0600`` (see
+    :func:`_open_owner_only`)."""
 
     def _open(self):  # type: ignore[no-untyped-def]
-        # The stdlib's own handle on ``open`` (it survives interpreter teardown),
-        # read through getattr because typeshed does not declare it.
-        open_func = getattr(self, "_builtin_open", open)
-        return open_func(
-            self.baseFilename,
-            self.mode,
-            encoding=self.encoding,
-            errors=self.errors,
-            opener=owner_only_opener,
-        )
+        return _open_owner_only(self)
+
+
+class _AppendOnlyLogFileHandler(logging.FileHandler):
+    """Appends each record to ``gateway.log`` and closes the file again.
+
+    Every process that is not the gateway (the ``mcp-*`` stdio servers,
+    ``kirocrew chat``, short CLI verbs) writes through this handler. It never
+    rotates and holds no open handle between records. Windows refuses to rename
+    a file while any other process has it open, so a child that kept its own
+    handle on ``gateway.log`` for its whole lifetime made every one of the
+    gateway's size rollovers fail, and the gateway's file log then dropped
+    every later record until restart. The gateway is the only rotator, and the
+    only window in which a child can block a rename is the write of one record.
+
+    The constructor opens the file once and closes it, so a log path the
+    process may not write (a sandbox deny) still raises at setup, where
+    ``_setup_cli_logging`` falls back to console-only logging.
+    """
+
+    def __init__(self, filename: Path, encoding: str = "utf-8") -> None:
+        super().__init__(filename, mode="a", encoding=encoding)
+        self._close_stream()
+
+    def _open(self):  # type: ignore[no-untyped-def]
+        return _open_owner_only(self)
+
+    def _close_stream(self) -> None:
+        stream, self.stream = self.stream, None  # type: ignore[assignment]
+        if stream is not None:
+            try:
+                stream.close()
+            except OSError:
+                pass  # the record was already written or reported
+
+    def emit(self, record: logging.LogRecord) -> None:
+        # ``Handler.handle`` holds the handler lock around emit, so the
+        # open/write/close below is atomic with respect to this handler.
+        # ``FileHandler.emit`` opens the file outside its own error handling,
+        # so a failed open is routed to ``handleError`` here instead of
+        # raising into the code that logged.
+        try:
+            super().emit(record)
+        except RecursionError:
+            raise
+        except Exception:
+            self.handleError(record)
+        finally:
+            self._close_stream()
 
 
 class _FdTrackingRotatingFileHandler(_OwnerOnlyRotatingFileHandler):
@@ -1154,6 +1208,10 @@ def _setup_cli_logging(command: str | None, verbose: int) -> None:
     handler and the queue handler carry no level of their own, so a runtime
     ``agent.log_level`` change (``handlers/updates.py::apply_log_level``) that
     moves the logger reaches ``gateway.log`` with nothing else to update.
+
+    Only the ``gateway`` command rotates ``gateway.log``. Every other process
+    writes through ``_AppendOnlyLogFileHandler``, which never rotates and holds
+    no handle between records, so it cannot block the gateway's rename on Windows.
     """
     if verbose >= 2:
         level = logging.DEBUG
@@ -1200,20 +1258,30 @@ def _setup_cli_logging(command: str | None, verbose: int) -> None:
     # swallows it, but it spams "--- Logging error ---" tracebacks and drops the
     # line). ensure_utf8_console() only fixes the console streams, not this file
     # handler.
+    boot_rotation_error: OSError | None = None
     if command == "gateway":
         prev_log = log_file.with_suffix(".log.prev")
         if log_file.exists() and log_file.stat().st_size > 0:
             try:
                 log_file.replace(prev_log)
-            except OSError:
-                pass  # race or permission — keep going
+            except OSError as exc:
+                # Keep going on the old file; reported once the handler exists.
+                boot_rotation_error = exc
         if detached:
             _redirect_fds_to(log_file)
     # Detached mode uses the fd-tracking subclass: a size-based rollover
     # renames gateway.log, and without re-pointing, the redirected raw fds
     # would follow the renamed inode through .1 → .2 → .3 → unlink, losing
     # later raw stderr from all retained logs.
-    handler_cls = _FdTrackingRotatingFileHandler if detached else _OwnerOnlyRotatingFileHandler
+    #
+    # Only the gateway rotates gateway.log. Every other process appends one
+    # record at a time and holds no handle in between, because on Windows a
+    # handle held by any other process makes the gateway's rename fail.
+    rotates = detached or command == "gateway"
+    if detached:
+        rotating_cls: type[RotatingFileHandler] = _FdTrackingRotatingFileHandler
+    else:
+        rotating_cls = _OwnerOnlyRotatingFileHandler
     # Seatbelt/sandbox children (e.g. ``kirocrew mcp-core`` under a sandboxed
     # agent profile) inherit a deny on ``gateway.log``. For those, opening the
     # file handler must not abort the process: the console handler
@@ -1226,7 +1294,11 @@ def _setup_cli_logging(command: str | None, verbose: int) -> None:
     # soft-failing here would boot a long-lived gateway with no persistent log
     # AND no destination for the warning saying so. Let the OSError propagate.
     try:
-        fh = handler_cls(log_file, maxBytes=2 * 1024 * 1024, backupCount=3, encoding="utf-8")
+        fh: logging.FileHandler
+        if rotates:
+            fh = rotating_cls(log_file, maxBytes=2 * 1024 * 1024, backupCount=3, encoding="utf-8")
+        else:
+            fh = _AppendOnlyLogFileHandler(log_file, encoding="utf-8")
     except OSError as exc:
         if detached:
             raise
@@ -1300,6 +1372,12 @@ def _setup_cli_logging(command: str | None, verbose: int) -> None:
     else:
         target_logger.addHandler(fh)
 
+    if boot_rotation_error is not None:
+        logging.getLogger("kiro_crew").warning(
+            "could not move %s aside at boot (%s); appending to the previous run's log",
+            log_file,
+            boot_rotation_error,
+        )
     # Install secret redaction filter — scrubs Bearer tokens from all kiro_crew
     # log output before it reaches any handler. The filter also accepts literal
     # secret values to redact, but none are passed here: wiring resolved vault
@@ -2536,6 +2614,8 @@ Examples:
   kirocrew cloud launch --size power     # non-interactive size
   kirocrew cloud launch --new            # create a separate new instance
   kirocrew cloud launch --subnet subnet-0abc…  # pin the launch to an exact subnet
+  kirocrew cloud launch --extra-packages gh,jq # also install these dnf packages
+  kirocrew cloud launch --ami ami-0abc…  # launch from your own AL2023-based image
   kirocrew cloud list                    # list your cloud instances
   kirocrew cloud connect                 # reopen the dashboard over SSM
   kirocrew cloud stop | start            # pause / resume (save cost)
@@ -2598,6 +2678,20 @@ Examples:
         "auto-discovery — required to target a dedicated/private-subnet VPC "
         "when a default VPC exists. The subnet must have internet egress "
         "(NAT or IGW route).",
+    )
+    _c_launch.add_argument(
+        "--ami",
+        default="",
+        metavar="AMI_ID",
+        help="Launch from this AMI (ami-xxxx) instead of the latest Amazon Linux 2023 "
+        "image. It must match the size tier's architecture and be AL2023-compatible.",
+    )
+    _c_launch.add_argument(
+        "--extra-packages",
+        default="",
+        metavar="PKGS",
+        help='Extra dnf packages to install on the box, comma-separated (e.g. "gh,jq"). '
+        "A package dnf cannot find is skipped with a warning in the setup log.",
     )
     _c_launch.add_argument("-y", "--yes", action="store_true", help="Accept defaults, no prompts")
     _c_launch.add_argument(
@@ -3269,6 +3363,15 @@ env var overrides it.
     cli_help.hide_internal_commands(sub)
 
     args = parser.parse_args()
+
+    # The mcp-* stdio servers run one per agent session, so a gateway hosts
+    # dozens. If any import reaches numpy, OpenBLAS/OpenMP start one spinning
+    # thread per core. Cap both at one before anything below imports the
+    # server; an operator's own value wins. Set in-process rather than in the
+    # managed MCP spec env so every spec writer and builtin app server gets it.
+    if (args.command or "").startswith("mcp-"):
+        for _var in ("OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS"):
+            os.environ.setdefault(_var, "1")
 
     # MCP servers and CLI commands hold their managed-venv tree for the process
     # lifetime, so another process's update cannot prune it underneath them.

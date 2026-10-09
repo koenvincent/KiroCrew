@@ -30,6 +30,7 @@ from kiro_crew.hooks import (
     mcp_identity_ref,
     target_paths,
 )
+from kiro_crew.messaging.commands import compact_unsupported_backend
 from kiro_crew.permission_floor import (
     OUTCOME_PENDING_APPROVAL,
     OUTCOME_REJECTED_TRANSPORT_FLOOR,
@@ -1129,10 +1130,13 @@ async def _interactive(
         if needs_compact:
             reason = f"context at {pct:.0f}%"
             print(f"\n🔄 Compacting — {reason}", file=sys.stderr)
-            try:
-                await provider.compact()
-            except Exception:
-                pass
+            # The restart below is what frees the context; a backend that cannot
+            # serve /compact would only read the command as text first.
+            if not compact_unsupported_backend(provider):
+                try:
+                    await provider.compact()
+                except Exception:
+                    pass
             await provider.shutdown()
             await provider.start()
         elif warn_at > 0 and pct >= warn_at:

@@ -544,6 +544,61 @@ def test_the_epoch_moves_when_an_item_reports_and_holds_when_nothing_does():
     assert _observe(_probe(), _ctx()).epoch != first
 
 
+def test_the_probe_publishes_a_worker_report_revision_and_none_when_it_read_nothing():
+    # The AutoNudge gate compares this value across delivered turns to stretch a
+    # quiet floor, so a blind read must leave it unset rather than empty.
+    probe = _probe()
+    _observe(probe, _ctx())
+    assert probe.revision is None
+
+    _open_ledger()
+    item = _create()
+    _observe(probe, _ctx())
+    no_reports = probe.revision
+    assert no_reports, "a read board with no report yet still gets a token"
+
+    _report(item, "progress")
+    _observe(probe, _ctx())
+    reported = probe.revision
+    assert reported and reported != no_reports, "a worker report moves it"
+
+
+def test_the_conductors_own_writes_do_not_move_the_floor_revision():
+    # A verdict or a new item is something the conductor already knows. Counting
+    # it would spend the next floor turn reading the conductor's own write back.
+    _open_ledger()
+    item = _create()
+    _report(item, "progress")
+    probe = _probe()
+    before = _observe(probe, _ctx())
+    revision = probe.revision
+    work_ledger.apply_conductor_action(CONDUCTOR, "verdict", item_id=item, verdict="fail", fails=1)
+    _create("a second item")
+    after = _observe(probe, _ctx())
+    assert probe.revision == revision
+    assert after.epoch != before.epoch, "the kernel epoch still moves on every event"
+
+
+def test_a_report_evicted_from_the_event_tail_does_not_move_the_floor_revision(monkeypatch):
+    # The probe reads only a short event tail, so enough conductor writes push the
+    # last worker report out of it. A revision built from that tail would move with
+    # no worker saying anything; the item's worker-owned fields do not.
+    _open_ledger()
+    item = _create()
+    _report(item, "progress")
+    probe = _probe()
+    _observe(probe, _ctx())
+    revision = probe.revision
+    real_read = work_ledger.read_events
+
+    def _tail_without_reports(*args, **kwargs):
+        return [event for event in real_read(*args, **kwargs) if event.kind != "report"]
+
+    monkeypatch.setattr(work_ledger, "read_events", _tail_without_reports)
+    _observe(probe, _ctx())
+    assert probe.revision == revision
+
+
 def test_each_waking_status_produces_one_observation():
     from kiro_crew import irq
 

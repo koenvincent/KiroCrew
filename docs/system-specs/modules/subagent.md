@@ -4016,13 +4016,10 @@ task text leaves the hub, a run with a privacy mode or a floor reads the peer's
 `/api/version`, whose `spawn_enforces` list names the fields that gateway
 applies; a peer that does not list them is refused with
 `409 remote_peer_unenforced` and gets no request at all, since a peer that drops
-`memory_mode` would already have written the task to its queue row. A current
-peer's `/api/spawn` reply also echoes what it enforced as
-`applied: {memory_mode, approval_floor}`. When the hub sent a privacy mode or a
-floor, it requires that echo, at least as strict as what it sent; otherwise it
-cancels the peer run and refuses with the same code, before any
-local mapping exists. A persistent run without a floor asks for nothing an
-older peer could drop, so it needs neither check.
+`memory_mode` would already have written the task to its queue row. Both halves
+ship together, so a peer that advertises the fields applies them. A persistent
+run without a floor asks for nothing an older peer could drop, so it skips the
+check.
 Two gates decide whether remote placement is allowed at all, and the model
 alone never does. The operator opt-in `instances.remote_subagents` (default
 `false`; `403 remote_subagents_disabled` otherwise) is the first. The policy
@@ -4084,12 +4081,20 @@ traversal, backslashes, NULs, hardlinks, devices and FIFOs are rejected, and
 symlink members (the hub no longer sends any; an older hub's builder did) are skipped,
 never created. The upload body is read to EOF under the compressed cap. Ownership
 is scrubbed, modes are normalized while executable bits survive (on POSIX), and
-reuse requires a marker matching the full digest and restarts the snapshot's age.
+every install gets a fresh directory with its own marker; no snapshot is reused.
+The gateway extracts outside the sandbox into a staging directory that agents of
+the same user can see, so it never writes by path: each directory is opened
+`O_NOFOLLOW` relative to its parent's descriptor, each file is created
+`O_CREAT | O_EXCL | O_NOFOLLOW`, and the staging tree is renamed into place only
+while its name still points at the directory the gateway holds. A link planted
+in staging fails the install instead of redirecting a write. A platform without
+descriptor-relative creates refuses the install rather than extract by path.
 Valid marked snapshots older than seven days are pruned on a later upload, except
 any snapshot a live or queued run on that peer works in; install and prune are
 serialized. A queued run is read from the queued-run listing (dispatch window and
 task-store rows, each carrying its `cwd`), since it is not in `all_agents` yet;
-when that listing is partial or cannot be read, nothing is pruned on that upload.
+the live runs are read after that listing, so a run admitted while it is read is
+still seen; when that listing is partial or cannot be read, nothing is pruned on that upload.
 Unsafe or unmarked directories are not deleted.
 An explicit `cwd` is already a path on the selected remote executor and suppresses
 snapshot upload.

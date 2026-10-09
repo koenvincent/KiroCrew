@@ -397,7 +397,16 @@ class TestRunSessionsBackup:
         pushed: dict[str, str] = {}
 
         def fake_put(
-            profile, region, bucket, section, key, local_path, *, account=None, timeout=None
+            profile,
+            region,
+            bucket,
+            section,
+            key,
+            local_path,
+            *,
+            account=None,
+            timeout=None,
+            body_fd=None,
         ):
             if key.endswith(backup.LABEL_OBJECT_NAME):
                 # The label sidecar rides along on the same push path; it is not
@@ -545,7 +554,16 @@ class TestSessionsArchiveLayerBGate:
         captured: dict[str, Any] = {}
 
         def fake_put(
-            profile, region, bucket, section, key, local_path, *, account=None, timeout=None
+            profile,
+            region,
+            bucket,
+            section,
+            key,
+            local_path,
+            *,
+            account=None,
+            timeout=None,
+            body_fd=None,
         ):
             if key.endswith(backup.LABEL_OBJECT_NAME):
                 return
@@ -842,7 +860,16 @@ class TestSessionsArchiveLayerBGate:
         uploaded: dict[str, int] = {}
 
         def fake_put(
-            profile, region, bucket, section, key, local_path, *, account=None, timeout=None
+            profile,
+            region,
+            bucket,
+            section,
+            key,
+            local_path,
+            *,
+            account=None,
+            timeout=None,
+            body_fd=None,
         ):
             if key.endswith(backup.LABEL_OBJECT_NAME):
                 return None
@@ -1708,7 +1735,16 @@ class TestSessionsArchiveLayerBGate:
         uploaded: list[str] = []
 
         def fake_put(
-            profile, region, bucket, section, key, local_path, *, account=None, timeout=None
+            profile,
+            region,
+            bucket,
+            section,
+            key,
+            local_path,
+            *,
+            account=None,
+            timeout=None,
+            body_fd=None,
         ):
             uploaded.append(key)
 
@@ -1867,7 +1903,16 @@ class TestSessionsArchiveLayerBGate:
             return answer["free"]
 
         def fake_put(
-            profile, region, bucket, section, key, local_path, *, account=None, timeout=None
+            profile,
+            region,
+            bucket,
+            section,
+            key,
+            local_path,
+            *,
+            account=None,
+            timeout=None,
+            body_fd=None,
         ):
             # Keyed by which object is being written. The label is uploaded after
             # the lock is released, on purpose -- a caption must not hold the
@@ -1938,7 +1983,16 @@ class TestSessionsArchiveLayerBGate:
             return answer["free"]
 
         def fake_put(
-            profile, region, bucket, section, key, local_path, *, account=None, timeout=None
+            profile,
+            region,
+            bucket,
+            section,
+            key,
+            local_path,
+            *,
+            account=None,
+            timeout=None,
+            body_fd=None,
         ):
             # Keyed the same way as the sibling: the label is uploaded after the
             # block, so reading "the last put" would pass with any lock at all.
@@ -2001,7 +2055,16 @@ class TestSessionsArchiveLayerBGate:
             return answer["free"]
 
         def fake_put(
-            profile, region, bucket, section, key, local_path, *, account=None, timeout=None
+            profile,
+            region,
+            bucket,
+            section,
+            key,
+            local_path,
+            *,
+            account=None,
+            timeout=None,
+            body_fd=None,
         ):
             which = "label" if key.endswith(backup.LABEL_OBJECT_NAME) else "archive"
             seen[which] = _file_lock_is_free_to_another_thread()
@@ -2050,7 +2113,16 @@ class TestSessionsArchiveLayerBGate:
             return not thread.is_alive() and answer.get("done", False)
 
         def fake_put(
-            profile, region, bucket, section, key, local_path, *, account=None, timeout=None
+            profile,
+            region,
+            bucket,
+            section,
+            key,
+            local_path,
+            *,
+            account=None,
+            timeout=None,
+            body_fd=None,
         ):
             if key.endswith(backup.LABEL_OBJECT_NAME):
                 return
@@ -2117,7 +2189,16 @@ class TestSessionsArchiveLayerBGate:
                 parked.set()
 
         def fake_put(
-            profile, region, bucket, section, key, local_path, *, account=None, timeout=None
+            profile,
+            region,
+            bucket,
+            section,
+            key,
+            local_path,
+            *,
+            account=None,
+            timeout=None,
+            body_fd=None,
         ):
             if key.endswith(backup.LABEL_OBJECT_NAME):
                 return

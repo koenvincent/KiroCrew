@@ -65,7 +65,7 @@ from kiro_crew.mcp_shared import (
     spawned_without_gateway_identity,
 )
 from kiro_crew.mcp_tool_titles import with_titles
-from kiro_crew.mcp_tools import build_tool_list, dispatch
+from kiro_crew.mcp_tools import build_tool_list, build_tool_names, dispatch
 from kiro_crew.members import record_activity
 from kiro_crew.memory_stores import UnknownMemoryStore
 from kiro_crew.messaging.link import is_legacy_slack_key, legacy_key
@@ -89,6 +89,7 @@ from kiro_crew.skills import SkillsLoader
 from kiro_crew.trigger_match import rank_triggered
 from kiro_crew.validation import (
     MCP_CORE_SCHEMAS,
+    coerce_mcp_tool_args,
     validate_tool_args,
 )
 
@@ -492,6 +493,21 @@ def _list_tools() -> list[dict[str, Any]]:
     entry point kiro-cli and in-process discovery both read.
     """
     return with_titles(CORE_MCP_SERVER, build_tool_list())
+
+
+def _list_tool_names() -> list[str]:
+    """Tool NAMES only, without assembling descriptions.
+
+    The names-only read path ``mcp_discovery._managed_tools_in_process`` prefers
+    when it keeps only names. It returns exactly the names ``_list_tools`` would,
+    in the same order, but ``build_tool_names`` takes the ``names_only`` path so
+    the two descriptions that reach for a live value (the sub-agent cap and
+    agents-directory scan in ``mcp_tools.spawn``, the config reads in
+    ``mcp_tools.control``) are never performed. ``with_titles`` is intentionally
+    not applied: it only decorates descriptions, which a names-only caller
+    discards.
+    """
+    return build_tool_names()
 
 
 def _internal_secret() -> str:
@@ -1928,7 +1944,12 @@ def _validate_args(name: str, args: dict[str, Any]) -> dict[str, Any]:
     """Validate tool arguments against schema. Returns cleaned args."""
     schema = MCP_CORE_SCHEMAS.get(name)
     if schema:
-        return validate_tool_args(args, schema)
+        # Repair an int that an upstream deferred-schema runtime re-typed from a
+        # numeric-looking string ("42" -> 42) back to its string form on a
+        # string field, BEFORE validation. This lives at the MCP entry point —
+        # not in the shared validate_field — so the dashboard HTTP endpoints
+        # keep their original contract (see coerce_mcp_tool_args).
+        return validate_tool_args(coerce_mcp_tool_args(args, schema), schema)
     return args  # tools without schemas pass through
 
 

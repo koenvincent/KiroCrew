@@ -190,6 +190,7 @@ from kiro_crew.service import controller as service_controller  # noqa: F401
 from kiro_crew.service import linux as service_linux  # noqa: F401
 from kiro_crew.session_pid_sig import signing_health  # noqa: F401
 from kiro_crew.stall_attribution import attribute_dump, describe  # noqa: F401
+from kiro_crew.stt.decoder import bundle_carries_decoder  # noqa: F401
 from kiro_crew.subprocess_utf8 import UTF8_TEXT
 from kiro_crew.transcribe import (  # noqa: F401
     _find_ffmpeg,

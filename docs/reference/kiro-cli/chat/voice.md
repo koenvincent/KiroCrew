@@ -51,7 +51,8 @@ pip install 'pywhispercpp>=1.5,<2'
 ```
 
 Compressed input still needs an authenticated FFmpeg decoder for WebM, M4A, and
-ogg/Opus. Desktop releases carry and verify a pinned decoder. A source install
+ogg/Opus. Desktop releases carry and verify a pinned decoder, except on Intel
+Macs, which use a system FFmpeg (`brew install ffmpeg`). A source install
 first checks fixed system locations and, if no usable binary exists, **Settings >
 Voice** offers a one-click download of the pinned `imageio-ffmpeg==0.6.0` artifact
 into `<data home>/models/ffmpeg/`; its SHA-256 is verified before every execution.

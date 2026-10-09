@@ -217,6 +217,25 @@ class TestTelegramOutboundAuthz:
         t = self._transport(allow_forum=True, allowed_forum_chat_ids=[-100123])
         assert t.may_send_to(bad, "7") is False
 
+    def test_a_private_chat_topic_is_permitted_on_the_dm_roster(self) -> None:
+        """A threaded link whose chat_id is an allow-listed (positive)
+        user is a forum Topic INSIDE that 1:1 DM, not a group Topic, so a
+        proactive send (cron, subagent completion, monitor wake) is authorized on
+        the same roster test as a threadless DM -- even with forums disabled."""
+        t = self._transport(allowed_user_ids=[111], allow_forum=False)
+        assert t.may_send_to("111", "9") is True
+
+    def test_a_private_topic_for_a_revoked_user_is_refused(self) -> None:
+        t = self._transport(allowed_user_ids=[222], allow_forum=False)
+        assert t.may_send_to("111", "9") is False
+
+    def test_a_negative_chat_id_with_a_thread_never_waves_through_as_a_dm(self) -> None:
+        """A supergroup chat_id is NEGATIVE; pasting one into the user allow-list
+        must not let a group Topic read as a private topic -- it still goes to the
+        fail-closed forum gate."""
+        t = self._transport(allowed_user_ids=[-100123], allow_forum=False)
+        assert t.may_send_to("-100123", "7") is False
+
 
 class TestOtherTransportsThatCanAnswer:
     def test_imessage_matches_the_handle_roster(self) -> None:

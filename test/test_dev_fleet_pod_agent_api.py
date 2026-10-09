@@ -138,7 +138,7 @@ async def test_non_git_source_install_discovers_checkout_before_pod_op(
     monkeypatch.delenv("KIROCREW_PROJECT_DIR", raising=False)
     monkeypatch.setattr(repository, "_own_source_checkout", lambda: str(installed_source))
     monkeypatch.setattr(repository, "_candidate_checkouts", lambda: [str(checkout)])
-    monkeypatch.setattr(repository, "_configured_main_repo_checked", lambda: ("", True))
+    monkeypatch.setattr(repository, "_configured_main_repo_checked", lambda failed=None: ("", True))
     monkeypatch.setattr(repository, "_resolve_primary_checkout", lambda path: path)
     monkeypatch.setattr(repository, "_repo_source_hint", lambda: "unused")
     monkeypatch.setattr(repository, "_DISCOVERY_DONE", False)

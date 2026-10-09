@@ -2247,8 +2247,13 @@ def _declared_app_skill_dirs(resolved: Path) -> list[Path]:
     mutable installed metadata. Empty — admitting nothing — when *resolved* names
     no app, the app declares no skills, or its manifest cannot be read.
     """
-    app_name = ""
-    for root in _trusted_skill_roots():
+    from kiro_crew.apps.execution import shipped_builtin_app_name_at
+
+    # A shipped builtin is found by the package root it resolves into: its
+    # directory name need not match its manifest name.
+    app_name = shipped_builtin_app_name_at(resolved) or ""
+    roots = [] if app_name else _trusted_skill_roots()
+    for root in roots:
         try:
             rel = resolved.relative_to(root)
         except ValueError:

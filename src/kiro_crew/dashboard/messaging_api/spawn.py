@@ -474,10 +474,6 @@ async def api_spawn(request: web.Request) -> web.Response:
         "task": task,
         "status": "spawned",
         "parent_work_supported": can_work,
-        # What this gateway enforces for the run. A remote hub refuses a peer
-        # that does not echo a tightening it sent: an older peer silently drops
-        # unknown keys, which would turn a privacy or approval floor into a no-op.
-        "applied": {"memory_mode": admitted_mode, "approval_floor": approval_floor},
     }
     # A row the gate DEFERRED or HELD (memory floor, critical posture, adaptive
     # cap at 0, macOS kernel memory pressure) is accepted and keyed like any

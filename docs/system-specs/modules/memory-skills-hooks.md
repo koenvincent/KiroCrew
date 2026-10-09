@@ -3522,6 +3522,29 @@ surface, the seams and these placement rules.
 
 **Source precedence** (project-level wins): `$KIROCREW_PROJECT_DIR/skills/` → `builtin_skills/` (bundled). Auto-copied to `~/.kiro/crew/skills/` on first run. Copies entire skill directories (scripts, assets, etc.).
 
+**The Context-budget switch survives updates.** `inject_on_trigger: false` is the
+one user-mutable setting on a built-in skill, written into the installed
+`SKILL.md` by `set_inject_on_trigger`. A packaged `SKILL.md` never carries it, so
+`_ensure_builtin_skills` reads the opt-out off the destination before it claims the
+diverged tree for replacement, then applies it to the PACKAGED `SKILL.md` bytes
+through the same frontmatter rewrite the toggle uses
+(`skill_runtime.authoring.rewrite_inject_on_trigger`) and has `copytree` publish
+those bytes as the installed `SKILL.md`, with the packaged file's mode and
+timestamps. The installed file is written once and never read back and
+rewritten, so a dashboard save cannot be lost between a read and a write, and
+its mode matches the packaged file the fingerprint compares against. The provenance marker
+still records the PACKAGED tree's fingerprint, never one taken of the live
+destination, so a concurrent write cannot be blessed as sync-owned. The ownership
+and currency checks (`_verified_unchanged_fingerprint`, `_skill_currency_state`)
+tolerate exactly the carried line: when the straight comparison fails they
+fingerprint the tree again with that top-level `SKILL.md` line stripped, so a
+carried install is unchanged and in sync for `kirocrew doctor`, while any other
+edit still diverges. Without this carry an update turns full-body injection back
+on behind the user's back,
+the same reversion the auto-skill refine (`skill_runtime.auto_skills`)
+and update-approval (`skill_runtime.versions._rewrite_update_frontmatter`) paths
+already guard against on their own rewrites.
+
 **Retired generated skill cleanup.** `skills.remove_retired_conductor_skill()`
 removes `skills/conductor/SKILL.md` only when a descriptor-pinned, capped read has
 a CRLF-normalized SHA-256 matching one of the static generator outputs. Linked
@@ -3652,6 +3675,16 @@ initiate SMB authentication through a raced UNC junction. This is intentionally 
 capability check, not a best-effort `lstat` sequence; a pre-check followed by a path-based
 scan leaves the same swap window. Project skills remain available on macOS and Linux,
 where every traversed component stays pinned to a no-follow directory descriptor.
+
+Neither refusal is silent. On an unsupported platform the loader logs one WARNING per
+process (unless `skills.project_skills_enabled` is off) naming the platform limit, and
+the enforcement audit's reason says the platform lacks the traversal rather than "no
+grant"; the warning names no project, because checking whether `.kiro/skills` exists
+would be the path lookup the gate refuses to make. On POSIX, a component the no-follow
+chain refuses is logged as a WARNING naming that component (a symlinked directory and a
+file both read as "a symlink or not a directory", since Linux reports both with
+the same errno), once per (base, component, errno) per process; a missing component,
+the ordinary no-`.kiro/skills` case, stays at DEBUG.
 
 **One enforcement point for every enumerated read.** Enumeration is cached, and now
 also PERSISTED across processes (see *The catalog snapshot*), so a path vetted while
@@ -5988,6 +6021,17 @@ journals `resolve` without changing content, provenance or vectors. Single-set
 previews bind pending proposal IDs; a newly arriving proposal forces a fresh
 review instead of being silently dismissed.
 
+Any earlier accepted snapshot the history still keeps can be restored. The
+`restore` operation names a `memory_revisions.id`; the server reads that
+snapshot's stored content itself, so a value the scrubbed history displays never
+reaches the store. The restore runs through the same preview/apply path as a
+correction, applies to exactly one record, and appends a new accepted revision
+journaled `restore`: nothing it goes back past is removed. A snapshot no longer
+kept for that record (another record's, or one V1 retention dropped)
+is refused with 404 `memory_revision_missing`. The restore id must fit a SQLite
+integer; a larger one is refused as invalid input. A kept snapshot whose stored value no
+longer parses is refused with 409 `memory_revision_unreadable`.
+
 The records API answers display-safe content: a credential is a tag, an
 unscannable JSON payload egresses as `"[REDACTED: unscannable JSON payload]"`, and
 the scrub (`handlers/_shared._scrub_text`) re-runs after control-character stripping
@@ -6003,7 +6047,7 @@ value server side and only the matched span changes.
 Owner-only `POST /api/memory/bulk/preview` accepts one store and either explicit
 record identities with revisions (up to 500), or an all-matching filter with
 exclusions. Operations are literal text replacement, single-record correction,
-and forgetting. Replacement walks JSON string values; it never rewrites object
+restoring one record to a kept version, and forgetting. Replacement walks JSON string values; it never rewrites object
 keys, repository scope, provenance or classification. Preview validates the
 entire selection, returns counts and the first 25 changed before/after pairs,
 and signs the selector, operation, store and full selection digest. A selection

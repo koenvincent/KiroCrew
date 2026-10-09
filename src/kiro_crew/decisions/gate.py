@@ -991,13 +991,26 @@ async def decide(
         logger.debug("decisions: %s config read failed (%s)", point, type(exc).__name__)
         return None
 
-    async def _write(*, latency_ms: int, answers: Answers | None, error: str | None) -> None:
+    async def _write(
+        *,
+        latency_ms: int,
+        answers: Answers | None,
+        error: str | None,
+        meta: dict[str, Any] | None = None,
+    ) -> None:
         # Guarded here as well as inside ``log.append``: ``append`` protects the
         # WRITE, this protects BUILDING the row, which renders values an
         # implementation supplied. The class only, never a message, for the same
         # reason.
         row_written: bool | None = False
         try:
+            # Provider-stamped metadata (model, usage, request id) is merged
+            # UNDER the caller's extra, so a point's own field always wins a name
+            # collision and the metadata only ever adds fields. Both are bounded
+            # again by the log's own ``extra`` handling.
+            row_extra = extra
+            if meta:
+                row_extra = {**meta, **(extra or {})}
             row = _log.build_row(
                 point=point,
                 session_key=session_key,
@@ -1005,7 +1018,7 @@ async def decide(
                 answers=answers,
                 scrubbed=error in SCRUB_ERRORS,
                 error=error,
-                extra=extra,
+                extra=row_extra,
             )
             # A caller that asked for no receipt observes nothing about commitment, so
             # it gets the bare call this seam has always made: no event to set, no
@@ -1055,10 +1068,14 @@ async def decide(
         return None
 
     started = time.monotonic()
+    oracle: Any = None
     try:
-        answers = await asyncio.wait_for(
-            _oracle(lane, provider, model).ask(state, questions), timeout=budget
-        )
+        # Constructed inside the guard so a lane import or constructor failure is
+        # the same never-raise ERROR_PROVIDER as a call failure, not an exception
+        # out of ``decide``. Bound to a name so its response metadata can be read
+        # after a successful call.
+        oracle = _oracle(lane, provider, model)
+        answers = await asyncio.wait_for(oracle.ask(state, questions), timeout=budget)
     except asyncio.TimeoutError:
         # Named apart from the generic branch: "timeout" is the one failure an
         # operator can act on mechanically (raise timeout_ms, or accept the rate).
@@ -1085,7 +1102,12 @@ async def decide(
     # Written with the answers in hand, outside ``budget`` and under
     # ``_LOG_BUDGET_SECS``: the write cannot spend the provider deadline, cannot
     # hold the caller longer than that budget, and cannot cost it the result.
-    await _write(latency_ms=latency_ms, answers=answers, error=None)
+    # The lane's provider-stamped metadata (model, usage, request id) rides onto
+    # this row only -- an error row never carries it, because an oracle sets it
+    # only on a fully-valid response. A lane that stamps none (the LLM judge)
+    # leaves the attribute unset and the row simply has no metadata.
+    meta = getattr(oracle, "last_response_meta", None)
+    await _write(latency_ms=latency_ms, answers=answers, error=None, meta=meta)
     return answers
 
 

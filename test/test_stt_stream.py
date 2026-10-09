@@ -2496,6 +2496,30 @@ class TestLocalStreamingSession:
         assert outcomes == ["error"], outcomes
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("module", ["kiro_crew.stt.engine", "kiro_crew.stt.vad"])
+    async def test_a_deferred_numpy_import_failure_still_emits_the_end_audit(
+        self, monkeypatch, module
+    ):
+        """The numpy-backed helpers are imported inside the session, not at module scope.
+
+        That keeps numpy off the mcp-dashboard import path, but it also means a
+        numpy that is installed and fails to load raises here, after
+        ``stt_stream_start`` was logged. The import has to sit inside the audited
+        setup block, or the trail shows a voice session that never ended.
+        """
+        from kiro_crew.dashboard import stt_stream
+
+        outcomes = self._record_end_audits(monkeypatch)
+        # Scoped so conftest teardowns that import the stt modules still find them.
+        with monkeypatch.context() as m:
+            m.setitem(sys.modules, module, None)
+            with pytest.raises(ImportError):
+                await stt_stream._run_local_session(
+                    _RecordingWS(), _cfg(provider="local"), MagicMock(), "test-caller"
+                )
+        assert outcomes == ["error"], outcomes
+
+    @pytest.mark.asyncio
     async def test_a_failing_decode_reports_a_code_and_is_audited_once(self, monkeypatch):
         """A recogniser that raises mid-session is an exit path like any other.
 

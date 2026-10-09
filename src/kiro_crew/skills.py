@@ -20,6 +20,7 @@ import asyncio
 import base64
 import csv
 import difflib
+import errno
 import functools
 import hashlib
 import hmac
@@ -981,6 +982,48 @@ _PROJECT_DIR_OPEN_FLAGS = (
 )
 
 
+#: (base, refused component, errno) triples already warned about, so a project
+#: whose chain is refused is named once per process rather than on every catalog
+#: build. Bounded: past the cap the warning is still emitted, just not recorded.
+_CHAIN_REFUSALS_WARNED: set[tuple[str, str, int]] = set()
+_CHAIN_REFUSALS_WARNED_CAP = 256
+
+
+def _note_chain_refusal(base: Path, component: str, exc: OSError) -> None:
+    """Say which component of a project skills path the no-follow walk refused.
+
+    A missing component is the ordinary case (most projects have no
+    ``.kiro/skills``) and stays at DEBUG. Anything else -- a symlinked
+    directory (refused by ``O_NOFOLLOW``), a file where a directory was
+    expected, a permission denial -- means the operator's skills exist but will
+    never load, and the remedy is to inspect that one path, so it is a WARNING
+    naming it.
+    """
+    err = exc.errno or 0
+    if err == errno.ENOENT:
+        logger.debug("project skills path has no %r component: %s", component, base)
+        return
+    marker = (str(base), component, err)
+    if marker in _CHAIN_REFUSALS_WARNED:
+        return
+    if len(_CHAIN_REFUSALS_WARNED) < _CHAIN_REFUSALS_WARNED_CAP:
+        _CHAIN_REFUSALS_WARNED.add(marker)
+    # O_DIRECTORY | O_NOFOLLOW reports a symlink as ELOOP or ENOTDIR depending
+    # on the kernel, the same ENOTDIR a regular file gets, so name both.
+    if err in (errno.ELOOP, errno.ENOTDIR):
+        reason = "is a symlink or not a directory"
+    else:
+        reason = f"could not be opened ({exc.strerror or f'errno {err}'})"
+    logger.warning(
+        "project skills under %s are not loaded: path component %r %s; project "
+        "skills are walked without following links, so this component must be "
+        "a real, readable directory",
+        base,
+        component,
+        reason,
+    )
+
+
 def _open_project_dir_chain(base: Path) -> int | None:
     """Open every absolute path component through the prior no-follow handle."""
     if not skill_trust.project_skill_traversal_supported():
@@ -988,13 +1031,15 @@ def _open_project_dir_chain(base: Path) -> int | None:
     parts = Path(os.path.abspath(base)).parts
     try:
         fd = os.open(parts[0], _PROJECT_DIR_OPEN_FLAGS)
-    except OSError:
+    except OSError as exc:
+        _note_chain_refusal(base, parts[0], exc)
         return None
     for part in parts[1:]:
         try:
             next_fd = os.open(part, _PROJECT_DIR_OPEN_FLAGS, dir_fd=fd)
-        except OSError:
+        except OSError as exc:
             os.close(fd)
+            _note_chain_refusal(base, part, exc)
             return None
         os.close(fd)
         fd = next_fd
@@ -1352,7 +1397,29 @@ def _trees_stat_equal(a: Path, b: Path) -> bool:
     return True
 
 
-def _skill_tree_fingerprint(root: Path, *, assume_owner_rwx_dirs: bool = False) -> str | None:
+def _strip_carried_opt_out(data: bytes) -> bytes | None:
+    """Return the SKILL.md bytes *data* minus a carried ``inject_on_trigger: false``.
+
+    Only the exact form the builtin sync writes is recognised: *data* must be
+    what the shared rewrite produces when it applies the opt-out to the
+    returned bytes. Anything else (no line, a ``true`` value, an indented
+    occurrence, a hand-placed line elsewhere in the block, undecodable bytes)
+    returns None, so the caller treats the tree as unprovable rather than
+    tolerating an edit.
+    """
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+    stripped = _authoring.rewrite_inject_on_trigger(text, True)
+    if stripped is None or _authoring.rewrite_inject_on_trigger(stripped, False) != text:
+        return None
+    return stripped.encode("utf-8")
+
+
+def _skill_tree_fingerprint(
+    root: Path, *, assume_owner_rwx_dirs: bool = False, strip_carried_opt_out: bool = False
+) -> str | None:
     """Stable content hash of the whole skill tree under *root*.
 
     Covers every entry ``_tree_entries`` yields — file bytes, symlink targets,
@@ -1371,6 +1438,13 @@ def _skill_tree_fingerprint(root: Path, *, assume_owner_rwx_dirs: bool = False) 
     the root — so a component swapped between the walk and the open (or a
     hardlink planted at a walked name) reads as unprovable instead of leaking
     outside bytes (e.g. credentials) into the hash.
+
+    ``strip_carried_opt_out`` hashes the tree as it was before the sync carried
+    the user's Context-budget opt-out onto it: the top-level ``SKILL.md`` bytes
+    already read through the hardened path above are passed through
+    ``_strip_carried_opt_out`` and hashed with their stripped size. Every
+    other entry, and every guard, is unchanged. A ``SKILL.md`` that does not
+    hold exactly the carried line makes the tree unprovable (None).
     """
     if is_link_or_junction(root):
         return None
@@ -1397,8 +1471,8 @@ def _skill_tree_fingerprint(root: Path, *, assume_owner_rwx_dirs: bool = False) 
         entries += 1
         if entries > _FINGERPRINT_MAX_ENTRIES:
             return None
-        digest.update(f"{kind}\0{rel}\0{detail}\0".encode("utf-8", "surrogatepass"))
         if kind != "file":
+            digest.update(f"{kind}\0{rel}\0{detail}\0".encode("utf-8", "surrogatepass"))
             continue
         try:
             data = safe_read_file_bytes_nolink(
@@ -1411,6 +1485,15 @@ def _skill_tree_fingerprint(root: Path, *, assume_owner_rwx_dirs: bool = False) 
         if data is None:
             return None
         budget -= len(data)
+        if strip_carried_opt_out and rel == "SKILL.md":
+            # The bytes come from the descriptor-pinned read above; only
+            # their content and the size recorded for them are substituted.
+            stripped = _strip_carried_opt_out(data)
+            if stripped is None:
+                return None
+            data = stripped
+            detail = f"{len(data)}:{detail.split(':', 1)[1]}"
+        digest.update(f"{kind}\0{rel}\0{detail}\0".encode("utf-8", "surrogatepass"))
         digest.update(data)
     return digest.hexdigest()
 
@@ -1482,12 +1565,30 @@ def _record_builtin_provenance(dest_dir: Path) -> None:
     _write_provenance_marker(dest_dir, fingerprint)
 
 
+def _matches_recorded(root: Path, recorded: str, current: str | None) -> bool:
+    """Does the tree at *root* (fingerprinted as *current*) match *recorded*?
+
+    The marker records the PACKAGED tree's fingerprint. A tree the sync
+    installed while carrying the user's Context-budget opt-out differs from
+    that by the one ``inject_on_trigger: false`` line on ``SKILL.md``, so when
+    the straight comparison fails the tree is fingerprinted again with that
+    line stripped. Any other difference still fails both comparisons.
+    """
+    if current is None:
+        return False
+    if current == recorded:
+        return True
+    return _skill_tree_fingerprint(root, strip_carried_opt_out=True) == recorded
+
+
 def _verified_unchanged_fingerprint(dest_dir: Path, src_dir: Path | None) -> str | None:
     """Return *dest_dir*'s fingerprint iff it is verifiably an unchanged copy
     this sync installed, else None.
 
     Two ways to prove ownership:
-    - The recorded provenance fingerprint still matches the tree on disk.
+    - The recorded provenance fingerprint still matches the tree on disk,
+      allowing for a carried Context-budget opt-out (``_matches_recorded``).
+      The value returned is the tree's own fingerprint either way.
     - First-install migration rule: installs that predate provenance recording
       carry no marker, and a naive "no marker means user-authored" rule would
       freeze every already-installed builtin at its current version forever.
@@ -1508,7 +1609,7 @@ def _verified_unchanged_fingerprint(dest_dir: Path, src_dir: Path | None) -> str
     recorded = _recorded_fingerprint(dest_dir)
     if recorded is not None:
         current = _skill_tree_fingerprint(dest_dir)
-        return current if current == recorded else None
+        return current if _matches_recorded(dest_dir, recorded, current) else None
     if src_dir is None:
         return None
     if not _trees_stat_equal(dest_dir, src_dir):
@@ -1578,7 +1679,12 @@ def installed_skill_currency() -> list[InstalledSkillCurrency]:
     The recorded value is therefore a portable content identity of the package
     the install came from, and comparing it against a fresh fingerprint of the
     packaged tree needs no version constant inside any shipped file, no marker
-    format change, and no network call.
+    format change, and no network call. One install differs from the tree the
+    marker records: a builtin the sync reinstalled while carrying the user's
+    Context-budget opt-out holds one extra ``inject_on_trigger: false`` line in
+    ``SKILL.md``. The marker still records the PACKAGED fingerprint, and the
+    ownership check tolerates exactly that line (``_matches_recorded``), so
+    such an install reads as in sync rather than edited or behind.
 
     What makes staleness silent today is the update gate, not the marker: it
     compares mtimes, so an installed copy carrying an mtime newer than anything
@@ -1723,7 +1829,7 @@ def _skill_currency_state(dest_dir: Path, src_dir: Path) -> str:
     installed = _skill_tree_fingerprint(dest_dir)
     if installed is None:
         return SKILL_INSTALL_UNVERIFIABLE
-    if installed != recorded:
+    if not _matches_recorded(dest_dir, recorded, installed):
         return SKILL_INSTALL_EDITED
     packaged = _skill_tree_fingerprint(src_dir, assume_owner_rwx_dirs=True)
     if packaged is None:
@@ -2124,6 +2230,105 @@ def _linked_component(base: Path, name: str) -> Path | None:
     return None
 
 
+def _dest_opted_out_of_injection(dest_dir: Path) -> bool:
+    """Did the user flip the Context-budget switch OFF on this installed builtin?
+
+    The switch writes ``inject_on_trigger: false`` into the installed
+    ``SKILL.md`` frontmatter (``skill_runtime.authoring.set_inject_on_trigger``),
+    the one user-mutable setting on a built-in skill. Read it from the
+    destination BEFORE the update claims the directory, so the opt-out can be
+    carried onto the freshly installed packaged copy.
+
+    Returns False on any read/parse failure: a carry is a best-effort
+    convenience, never a reason to abort an install. Only a top-level
+    ``inject_on_trigger: false`` counts, matching the writer and
+    ``_parse_frontmatter`` (an indented occurrence is prose, not the setting).
+    """
+    skill_file = dest_dir / "SKILL.md"
+    try:
+        content = safe_read_file(str(skill_file))
+    except (OSError, PermissionError, ValueError):
+        return False
+    try:
+        meta = parse_frontmatter(content, SKILL_LOADER)
+    except (OSError, ValueError):
+        return False
+    return str(meta.get("inject_on_trigger", "")).strip().lower() == "false"
+
+
+def _carried_skill_md(src_dir: Path) -> bytes | None:
+    """Return the packaged ``SKILL.md`` bytes with ``inject_on_trigger: false`` applied.
+
+    Mirrors ``skill_runtime.versions._rewrite_update_frontmatter`` and the
+    auto-skill refine path: a packaged ``SKILL.md`` never carries the switch, so
+    an update that reinstalls it would silently turn full-body injection back on
+    for a skill the user had made pointer-only — the setting reverting itself
+    behind an unrelated app update. Append the one frontmatter
+    line the user set, leaving the rest of the packaged body authoritative.
+
+    The input is the PACKAGED file, never the installed one: the carried bytes
+    are staged before anything is published, so no installed file is read and
+    then rewritten while a concurrent writer could replace it.
+
+    Returns None (install the packaged file verbatim) when the packaged copy
+    already opts out, so the install still equals the packaged tree the marker
+    records, and on any read/decode/parse failure: a carry is best-effort,
+    never a reason to fail the sync.
+    """
+    try:
+        data = safe_read_file_bytes_nolink(str(src_dir / "SKILL.md"), within_root=str(src_dir))
+    except (OSError, ValueError, FileTooLargeError):
+        return None
+    if data is None:
+        return None
+    try:
+        content = data.decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+    try:
+        packaged_meta = parse_frontmatter(content, SKILL_LOADER)
+    except (OSError, ValueError):
+        return None
+    if str(packaged_meta.get("inject_on_trigger", "")).strip().lower() == "false":
+        return None
+    new_content = _authoring.rewrite_inject_on_trigger(content, False)
+    if new_content is None:
+        return None
+    return new_content.encode("utf-8")
+
+
+def _copy_with_carried_skill_md(dest_dir: Path, carried: bytes) -> Callable[[str, str], str]:
+    """``copytree`` copy function that publishes *carried* as the top-level ``SKILL.md``.
+
+    Every other file is copied with ``shutil.copy2``. The top-level
+    ``SKILL.md`` is created exclusively with the carried bytes and then given
+    the packaged file's mode and timestamps (``shutil.copystat``), exactly as
+    ``copy2`` would, so the published file differs from the packaged one only
+    by the carried line. The fingerprint hashes file modes, and the carried-line
+    tolerance substitutes only the size, so a mode that differed (an
+    owner-only temp file, say) would read as an edit and be quarantined.
+
+    The file is written once, as it is published. If something else created it
+    first, that file is left alone rather than overwritten; the marker records
+    the packaged fingerprint, so it reads as a divergence and is preserved.
+    """
+    target = os.path.normcase(os.path.join(os.fspath(dest_dir), "SKILL.md"))
+
+    def _copy(src: str, dst: str) -> str:
+        if os.path.normcase(os.fspath(dst)) != target:
+            return shutil.copy2(src, dst)
+        try:
+            with open(dst, "xb") as fh:
+                fh.write(carried)
+        except FileExistsError:
+            logger.info("%s appeared before the sync published it; keeping it", dst)
+            return dst
+        shutil.copystat(src, dst)
+        return dst
+
+    return _copy
+
+
 def _ensure_builtin_skills(base: Path) -> None:
     """Sync built-in skills: copy new/updated, remove known-stale ones.
 
@@ -2167,6 +2372,9 @@ def _ensure_builtin_skills(base: Path) -> None:
             src_dir = src_file.parent
             dest_dir = base / name
             dest_file = dest_dir / "SKILL.md"
+            # Set only when a diverged destination carried the user's
+            # Context-budget opt-out; applied as the packaged copy is written.
+            carry_opt_out = False
             # The manifest's own mtime is not a proxy for the skill's: a
             # release that only changes ``scripts/`` leaves ``SKILL.md``
             # byte-identical with its packaged mtime, so a manifest-only
@@ -2210,6 +2418,13 @@ def _ensure_builtin_skills(base: Path) -> None:
                 verified: str | None = None
                 if not is_link_or_junction(claim):
                     verified = _verified_unchanged_fingerprint(claim, src_dir)
+                    # The Context-budget switch is the one user-mutable setting
+                    # on a built-in skill. Read it from the CLAIMED tree, after
+                    # the atomic rename aside, not from dest_dir before the
+                    # claim: the claim fixes which tree is verified and retired,
+                    # so a dashboard toggle landing in that window is reflected
+                    # here instead of being read stale and then discarded.
+                    carry_opt_out = _dest_opted_out_of_injection(claim)
                 if not is_link_or_junction(claim) and not _tree_has_content(claim):
                     # A placeholder holding nothing but (at most) our own
                     # provenance marker has no user bytes to preserve; the
@@ -2253,8 +2468,19 @@ def _ensure_builtin_skills(base: Path) -> None:
             # copy equals the source (the package ships only regular files and
             # directories), so the source fingerprint is the copy's.
             src_fingerprint = _skill_tree_fingerprint(src_dir, assume_owner_rwx_dirs=True)
+            # The carried opt-out is staged from the PACKAGED SKILL.md and
+            # written by the copy itself, so the published file is created
+            # once, with the packaged mode, and never read back and rewritten.
+            carried = _carried_skill_md(src_dir) if carry_opt_out else None
             try:
-                shutil.copytree(src_dir, dest_dir)
+                if carried is None:
+                    shutil.copytree(src_dir, dest_dir)
+                else:
+                    shutil.copytree(
+                        src_dir,
+                        dest_dir,
+                        copy_function=_copy_with_carried_skill_md(dest_dir, carried),
+                    )
             except FileExistsError:
                 # Another process (gateway + CLI syncing the same home) won
                 # the install race after our claim; its copy of the same
@@ -2714,6 +2940,9 @@ class SkillsLoader:
         # (canonical key, allowed) pairs already audited, so the enforcement
         # record is written on first use rather than once per message.
         self._audited_projects: set[tuple[str, bool]] = set()
+        # Whether the unsupported-platform warning has been considered, so it
+        # is logged at most once per loader rather than once per message.
+        self._project_skills_unsupported_warned = False
         # Extra skill paths from config (config injectable for testing)
         cfg = config or KiroCrewConfig.load()
         # The per-message trigger cap is resolved at USE from the live snapshot
@@ -2931,6 +3160,26 @@ class SkillsLoader:
             return ""
         key = skill_trust.canonical_key(project_dir)
         allowed = key is not None and skill_trust.is_key_trusted(key)
+        if (
+            not allowed
+            and not self._project_skills_unsupported_warned
+            and not skill_trust.project_skill_traversal_supported()
+        ):
+            # Without the no-follow directory-descriptor walk (Windows) the gate
+            # refuses every project before touching its path, so the operator
+            # otherwise sees no skills, no trust prompt and no reason. Name the
+            # platform limit, not a project: probing whether `.kiro/skills`
+            # exists would be the very path lookup the gate refuses to make.
+            # Once per loader, and silent when the operator switched it off.
+            self._project_skills_unsupported_warned = True
+            if skill_trust.project_skills_enabled():
+                logger.warning(
+                    "project skills (<project>/.kiro/skills) are not loaded on this "
+                    "platform: it lacks the no-follow directory-descriptor traversal "
+                    "the project-skill trust gate requires, so no project can be "
+                    "trusted here and no trust prompt is offered; global skills are "
+                    "unaffected"
+                )
         self._audit_project_skill_enforcement(project_dir, key, allowed)
         if not allowed:
             return ""
@@ -2972,7 +3221,12 @@ class SkillsLoader:
                 reason=(
                     "project skills admitted for a granted directory"
                     if allowed
-                    else "project skills withheld: no grant, or the feature is off"
+                    else (
+                        "project skills withheld: this platform lacks no-follow "
+                        "directory traversal"
+                        if not skill_trust.project_skill_traversal_supported()
+                        else "project skills withheld: no grant, or the feature is off"
+                    )
                 ),
                 critical=False,
             )

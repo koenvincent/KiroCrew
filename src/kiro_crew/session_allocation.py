@@ -80,8 +80,8 @@ class SessionEndingError(RuntimeError):
     :data:`ENDING_FENCE_WAIT_SECS` (a fence held far past the bounded kill
     passes it exists for -- a defect to surface, not to hang every caller of the
     key on), and a per-step task session (``open_task_session``) under a fenced
-    key, which reserves nothing and has no hard-kill path for a session already
-    created on the shared runtime.
+    key, which reserves only around its create and has no hard-kill path for a
+    session already created on the shared runtime.
     """
 
 
@@ -743,7 +743,7 @@ class SessionAllocationService:
         turns that refusal into a wait for the lift and a fresh allocation, so
         the request is held, not dropped. And at the entry of
         ``open_task_session``, the other publication door, with no token and
-        no retry: that path reserves nothing and creates on a shared runtime,
+        no retry: that path reserves only around its create on a shared runtime,
         so it is refused while the fence is up. The front door of
         ``get_or_create`` does not call this: it holds the caller instead
         (:meth:`wait_for_ending_fence`).
@@ -1251,9 +1251,9 @@ class SessionAllocationService:
             # The other publication door: a key whose run is being ended
             # (``begin_ending``) admits no per-step session either. Refused here
             # -- not held like ``get_or_create``'s front door -- before anything
-            # is created for it, because this path holds no allocation
-            # reservation to invalidate and has no hard-kill handler for a
-            # session already created on the shared runtime. A create already in
+            # is created for it, because this path reserves only around its
+            # create, never refuses at registration, and has no hard-kill handler
+            # for a session already created on the shared runtime. A create already in
             # flight when the fence goes up publishes under the task runner's own
             # ``taskrunner:`` key, which no cron reap ends; the ending caller's
             # post-pass read of its key names whatever else lands there.
@@ -1282,6 +1282,14 @@ class SessionAllocationService:
         runtime = await owner._get_or_bootstrap_run_runtime(
             parent_session_key, agent=agent, cwd=cwd, start_priority=start_priority
         )
+        # Reserve the key for the create-and-register window, as
+        # ``get_or_create`` does, so ``has_allocation_reservation`` and
+        # ``session_keys`` see a per-step session that is still being created.
+        token = object()
+        async with self._lock:
+            self._refuse_if_ending(key, None)
+            self._allocation_reservations.setdefault(key, set()).add(token)
+            self.advance_ownership_generation(key)
         try:
             handle = await runtime.create_session(
                 cwd=cwd or None,
@@ -1295,6 +1303,7 @@ class SessionAllocationService:
                 start_priority=start_priority,
             )
         except AcpWorkspaceBindingError:
+            self._remove_reservation_now(key, token)
             return await owner.get_or_create(
                 key,
                 agent=agent,
@@ -1302,52 +1311,58 @@ class SessionAllocationService:
                 cwd=cwd,
                 start_priority=start_priority,
             )
-        provider = self._deps.session_provider_type()(handle, runtime)
-        setattr(
-            provider,
-            "memory_mode",
-            execution.memory_mode if execution is not None else "persistent",
-        )
+        except BaseException:
+            self._remove_reservation_now(key, token)
+            raise
+        try:
+            provider = self._deps.session_provider_type()(handle, runtime)
+            setattr(
+                provider,
+                "memory_mode",
+                execution.memory_mode if execution is not None else "persistent",
+            )
 
-        duplicate: LLMProvider | None = None
-        won_race_session: Any | None = None
-        async with self._lock:
-            current = self._sessions.get(key)
-            if current is not None:
-                session = current
-                session.last_used = time.monotonic()
-                if approval_policy:
-                    session.approval_policy = approval_policy
-                duplicate = provider
-            else:
-                session = self._deps.session_factory(
-                    provider=provider,
-                    first_turn=self._deps.first_turn_fresh,
-                    approval_policy=approval_policy,
-                    agent=agent or "",
-                )
-                session.capability_member = prepared.member
-                self._install_work_dir_claim_probe(key, provider)
-                self._sessions[key] = session
-                self.advance_ownership_generation(key)
-                won_race_session = session
-                try:
-                    await record_session_started(key)
-                except BaseException:
-                    # This await is the only suspension point between registering
-                    # the session and returning it. Cancelled here, the caller
-                    # hard-kills the provider while the entry stays visible, so a
-                    # claimant can be handed a session whose process is already
-                    # dying -- and the crumb would outlive it into a false crash.
-                    if self._sessions.get(key) is session:
-                        del self._sessions[key]
-                        self.advance_ownership_generation(key)
-                    await discard_session_start(key)
-                    raise
-                # After the registration has committed: the rollback above is
-                # behind us, so a cancelled start cannot take parked entries
-                # down with the session it removes.
-                adopt_parked_queue(session, key)
+            duplicate: LLMProvider | None = None
+            won_race_session: Any | None = None
+            async with self._lock:
+                current = self._sessions.get(key)
+                if current is not None:
+                    session = current
+                    session.last_used = time.monotonic()
+                    if approval_policy:
+                        session.approval_policy = approval_policy
+                    duplicate = provider
+                else:
+                    session = self._deps.session_factory(
+                        provider=provider,
+                        first_turn=self._deps.first_turn_fresh,
+                        approval_policy=approval_policy,
+                        agent=agent or "",
+                    )
+                    session.capability_member = prepared.member
+                    self._install_work_dir_claim_probe(key, provider)
+                    self._sessions[key] = session
+                    self.advance_ownership_generation(key)
+                    won_race_session = session
+                    try:
+                        await record_session_started(key)
+                    except BaseException:
+                        # This await is the only suspension point between registering
+                        # the session and returning it. Cancelled here, the caller
+                        # hard-kills the provider while the entry stays visible, so a
+                        # claimant can be handed a session whose process is already
+                        # dying -- and the crumb would outlive it into a false crash.
+                        if self._sessions.get(key) is session:
+                            del self._sessions[key]
+                            self.advance_ownership_generation(key)
+                        await discard_session_start(key)
+                        raise
+                    # After the registration has committed: the rollback above is
+                    # behind us, so a cancelled start cannot take parked entries
+                    # down with the session it removes.
+                    adopt_parked_queue(session, key)
+        finally:
+            self._remove_reservation_now(key, token)
         if duplicate is not None:
             # ``current`` holds this key and runs in the directory this
             # provider derived from it; the loser must not reclaim it.

@@ -222,19 +222,6 @@ class TestApiSpawn:
         resp = _run(mod.api_spawn, _Req(_state(subagents=mgr), body))
         assert resp.status == 200
         assert mgr.spawn.call_args.kwargs["approval_floor"] == "interactive"
-        # The hub refuses a peer that does not echo the tightening it sent.
-        assert _payload(resp)["applied"] == {
-            "memory_mode": "persistent",
-            "approval_floor": "interactive",
-        }
-
-    def test_the_reply_echoes_the_stricter_memory_mode(self) -> None:
-        mgr = _mgr()
-        mgr.spawn.return_value = _info()
-        body = {"task": "x", "memory_mode": "incognito"}
-        resp = _run(mod.api_spawn, _Req(_state(subagents=mgr), body))
-        assert resp.status == 200
-        assert _payload(resp)["applied"] == {"memory_mode": "incognito", "approval_floor": ""}
 
     def test_400_on_non_alphanumeric_batch_id(self) -> None:
         req = _Req(_state(subagents=_mgr()), {"task": "x", "batch_id": "wave-1"})
@@ -301,7 +288,6 @@ class TestApiSpawn:
             "status": "spawned",
             "conversation": "a9",
             "parent_work_supported": False,
-            "applied": {"memory_mode": "persistent", "approval_floor": ""},
         }
         kwargs = mgr.spawn.call_args.kwargs
         assert kwargs["silent"] is True

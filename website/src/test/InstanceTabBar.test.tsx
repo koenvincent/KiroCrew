@@ -26,7 +26,7 @@ vi.mock('../api/client', () => {
     },
   }
 })
-import { api } from '../api/client'
+import { api, ApiError } from '../api/client'
 vi.mock('../lib/embedded', () => ({ isEmbeddedPane: vi.fn(() => false) }))
 import { isEmbeddedPane } from '../lib/embedded'
 
@@ -522,6 +522,27 @@ describe('InstanceTabBar', () => {
     renderWithProviders(<InstanceTabBar variant="inline" />)
     const notice = await screen.findByTestId('instance-tab-bar-list-error')
     expect(within(notice).getByText(failure)).toHaveAttribute('title', failure)
+  })
+
+  it('stays hidden on the gateway\'s own instances_disabled 403, since the feature is simply off', async () => {
+    const off = Object.assign(new ApiError(403, 'instances feature is disabled'), {
+      body: JSON.stringify({ error: 'instances feature is disabled', code: 'instances_disabled' }),
+    })
+    vi.mocked(api.listInstances).mockRejectedValue(off)
+    const { container } = renderWithProviders(<InstanceTabBar variant="inline" />)
+    await waitFor(() => expect(api.listInstances).toHaveBeenCalled())
+    await waitFor(() => expect(container).toBeEmptyDOMElement())
+    expect(screen.queryByTestId('instance-tab-bar-list-error')).toBeNull()
+  })
+
+  it('reports an owner-only 403, which is a real authorization failure and not the feature being off', async () => {
+    const denied = Object.assign(new ApiError(403, 'owner only'), {
+      body: JSON.stringify({ error: 'owner only', code: 'owner_only' }),
+    })
+    vi.mocked(api.listInstances).mockRejectedValue(denied)
+    renderWithProviders(<InstanceTabBar variant="inline" />)
+    const notice = await screen.findByTestId('instance-tab-bar-list-error')
+    expect(within(notice).getByText('owner only')).toBeInTheDocument()
   })
 
 })

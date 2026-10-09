@@ -245,9 +245,12 @@ def embeddings_disabled(env_data: dict[str, str]) -> bool:
 def _parse_env_text(text: str) -> dict[str, str]:
     """Parse ``KEY='value'`` lines. Split out so a caller that must open the file
     itself -- see ``runtime_ports._read_peer_env``, which needs no-follow semantics -- can
-    reuse this exact grammar instead of carrying a second copy that would drift."""
+    reuse this exact grammar instead of carrying a second copy that would drift.
+
+    A leading UTF-8 byte-order mark is dropped here, not only in the decode, so a
+    caller that decodes the bytes itself still reads the first key without it."""
     out: dict[str, str] = {}
-    for ln in text.splitlines():
+    for ln in strip_utf8_bom(text).splitlines():
         ln = ln.strip()
         if not ln or ln.startswith("#") or "=" not in ln:
             continue
@@ -276,11 +279,28 @@ def read_env_file(cfg: PodConfig, name: str) -> dict[str, str]:
     paths from directory contents rather than from an operator, which is a different
     trust posture -- ``runtime_ports._read_peer_env`` is that caller and does not
     come through here.
+
+    Decoded through the data home's ``.env`` decoder, so a file a Windows editor
+    saved as UTF-8 with a byte-order mark reads as UTF-8 with the mark dropped. A
+    UTF-16 or UTF-32 file raises :class:`PodError` naming the file and the fix:
+    reading it as ``{}`` would launch the pod without the operator's variables,
+    and :func:`write_env_file` would then overwrite the file it could not read.
     """
+    # Imported here: the config loader is a heavy import the pod CLI does not
+    # otherwise need at module load.
+    from kiro_crew.config.loader import EnvFileWideEncodingError, decode_env_bytes
+
+    path = cfg.env_file(name)
     try:
-        text = cfg.env_file(name).read_text()
+        raw = path.read_bytes()
     except OSError:
         return {}
+    try:
+        text = decode_env_bytes(raw)
+    except EnvFileWideEncodingError as exc:
+        raise PodError(
+            f"pod env file {path} is saved with a {exc.reason}; save it as UTF-8"
+        ) from exc
     return _parse_env_text(text)
 
 
@@ -318,7 +338,12 @@ def write_env_file(cfg: PodConfig, name: str, updates: dict[str, str]) -> None:
             if "\n" in val or "\r" in val:
                 raise PodError(f"pod env value for {key!r} must be single-line")
         cfg.pods_dir.mkdir(parents=True, exist_ok=True)
-        body = "".join(f"{k}='{v}'\n" for k, v in data.items())
+        # Keep a UTF-8 byte-order mark the file was saved with: it is what makes
+        # read_env_file decode the file as UTF-8, and dropping it would leave a
+        # non-ASCII value to the locale decode on the next read.
+        from kiro_crew.config.loader import env_bom_prefix
+
+        body = env_bom_prefix(cfg.env_file(name)) + "".join(f"{k}='{v}'\n" for k, v in data.items())
         atomic_write(cfg.env_file(name), body, newline="")
 
 

@@ -32,7 +32,11 @@ from typing import Any
 from kiro_crew import pinned_fs, platform_compat
 from kiro_crew.acp import session_mcp
 from kiro_crew.agent_discovery import SCOPE_PROJECT, _read_agent_spec, list_agents
-from kiro_crew.agent_spec_format import NATIVE_SKILL_ALIAS_PREFIX, SKILL_VIEW_PROJECTION_CEILING
+from kiro_crew.agent_spec_format import (
+    NATIVE_SKILL_ALIAS_PREFIX,
+    SKILL_VIEW_PROJECTION_CEILING,
+    volatile_env_keys,
+)
 from kiro_crew.atomic_write import atomic_write, on_event_loop
 from kiro_crew.config.paths import data_home, kiro_agents_dir, kiro_home, project_agents_dir
 from kiro_crew.hooks import FileTooLargeError, safe_read_file_bytes
@@ -2834,21 +2838,6 @@ def announce_alias(alias: str) -> None:
         return
     if data:
         _announce_publication(path, data)
-
-
-# MCP env keys whose VALUE a launcher re-stamps on every launch (a per-launch
-# nonce, not a credential the agent's grants depend on), so a changed value is no
-# change. Every other env value counts: a rotated credential is a different grant.
-# Extended, never narrowed, by ``KIROCREW_SKILL_VIEW_VOLATILE_ENV`` (comma-separated
-# key names), for a launcher this list does not know yet.
-_VOLATILE_ENV_KEYS_DEFAULT = frozenset({"AIM_CREDS_AGENT_INJECTION"})
-_VOLATILE_ENV_VAR = "KIROCREW_SKILL_VIEW_VOLATILE_ENV"
-
-
-def volatile_env_keys() -> frozenset[str]:
-    """The MCP env keys whose values identity digests ignore (see above)."""
-    extra = os.environ.get(_VOLATILE_ENV_VAR, "")
-    return _VOLATILE_ENV_KEYS_DEFAULT | {k.strip() for k in extra.split(",") if k.strip()}
 
 
 def _env_identity(env: dict[Any, Any], volatile: frozenset[str]) -> dict[str, str | None]:

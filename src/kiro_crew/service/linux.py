@@ -773,6 +773,64 @@ def _unit_state(*, user: bool) -> _UnitState:
     )
 
 
+def _loaded_restart_prevent(*, user: bool) -> str | None:
+    """The ``RestartPreventExitStatus`` value the scope's manager has LOADED for
+    our unit -- the merged unit, drop-ins included, as of the last daemon-reload
+    -- or ``None`` when ``systemctl`` answered with no such property line.
+
+    ``--all`` so an unset property still prints as ``RestartPreventExitStatus=``
+    (empty) rather than being omitted, which keeps "not set" apart from "this
+    systemctl did not answer".
+    """
+    res = _systemctl(
+        "show",
+        "--all",
+        "-p",
+        "RestartPreventExitStatus",
+        f"{SERVICE_NAME}.service",
+        sudo=False,
+        user=user,
+    )
+    for line in (res.stdout or "").splitlines():
+        key, sep, value = line.partition("=")
+        if sep and key.strip() == "RestartPreventExitStatus":
+            return value.strip()
+    return None
+
+
+def _stale_unit_line(state: _UnitState) -> str | None:
+    """One line saying the LOADED unit does not exempt
+    :data:`LIVE_HOLDER_EXIT_CODE` from ``Restart=``, with the command that fixes
+    it, or ``None`` when there is nothing to say.
+
+    ``service install`` writes the unit once and no upgrade re-renders it, so a
+    unit written before the exemption existed keeps relaunching into the
+    live-holder refusal. The manager's loaded value is what is asked, not the
+    file on disk: it is what systemd acts on, it includes drop-ins, and a file
+    edited without a daemon-reload still reads as missing. Read-only on purpose:
+    no sudo, no rewrite, no reload. Only a loaded unit that is ours
+    (:attr:`_UnitState.ours`) is asked; a property ``systemctl`` did not report
+    makes no claim.
+    """
+    if state.load != "loaded" or not state.ours:
+        return None
+    value = _loaded_restart_prevent(user=state.scope == "user")
+    if value is None or str(LIVE_HOLDER_EXIT_CODE) in value.split():
+        return None
+    directive = f"RestartPreventExitStatus={LIVE_HOLDER_EXIT_CODE}"
+    if state.scope == "system":
+        remedy = "re-run `sudo kirocrew service install` to re-render it"
+    else:
+        where = f" in {state.fragment}" if state.fragment else ""
+        remedy = (
+            f"add it under [Service]{where}, then run `systemctl --user daemon-reload`"
+        )
+    return (
+        f"  ⚠️  the loaded unit lacks `{directive}`, which this build's unit carries "
+        f"(no upgrade re-renders an installed unit): {remedy}."
+    )
+
+
 def _write_unit_via_sudo(contents: str) -> subprocess.CompletedProcess[str]:
     """Write the unit file at ``UNIT_PATH`` atomically via ``sudo install``.
 
@@ -2108,7 +2166,11 @@ def status() -> str:
     ``ActiveState (SubState)``, followed by the ``systemctl status`` block for
     each scope that actually has a unit. A scope with no unit never shows
     systemd's ``inactive (dead)`` for it: that line, printed for the system
-    scope alone, is what makes a running user-scope gateway read as dead.
+    scope alone, is what makes a running user-scope gateway read as dead. A
+    loaded unit of ours whose manager-loaded ``RestartPreventExitStatus`` does
+    not name :data:`LIVE_HOLDER_EXIT_CODE` gets one more line under its headline
+    naming the directive and the command that adds it (:func:`_stale_unit_line`);
+    nothing is rewritten.
 
     Status is queryable without sudo. We avoid sudo here so
     ``kirocrew service status`` doesn't prompt for a password just to
@@ -2118,6 +2180,9 @@ def status() -> str:
     for user in (False, True):
         state = _unit_state(user=user)
         lines = [state.headline()]
+        stale = _stale_unit_line(state)
+        if stale is not None:
+            lines.append(stale)
         if state.installed:
             res = _systemctl(
                 "status", f"{SERVICE_NAME}.service", "--no-pager", sudo=False, user=user

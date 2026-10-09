@@ -626,7 +626,7 @@ def select_tool_title(
     *,
     is_shell: bool | None = None,
 ) -> str | None:
-    """Pick the pill label, preferring a human-readable ``description`` when present.
+    """Pick the pill label, using ``description`` for shell and sub-agent calls.
 
     Some backends' Bash tool emits a ``description`` field alongside ``command``
     (e.g. "List KiroCrew ACP module files" rather than ``ls /workplace/...``).
@@ -647,17 +647,18 @@ def select_tool_title(
     reading that absence as non-shell would put the generic title back on a
     pill the initial ``tool_call`` had already labelled with its command.
     """
-    if isinstance(raw_input, dict):
-        desc = raw_input.get("description")
-        if isinstance(desc, str) and desc.strip():
-            return desc
     kind_str = kind if isinstance(kind, str) else None
     shell = is_shell_kind(kind_str) if is_shell is None else is_shell
-    # Shell kinds only, so an fs tool's operation name ("strReplace") is never
-    # mistaken for a command.
-    if shell and isinstance(raw_input, dict):
+    if isinstance(raw_input, dict):
+        # Sub-agent calls label their task; other non-shell tools can use
+        # description as a functional argument such as an issue body.
+        subagent_type = raw_input.get("subagent_type")
+        subagent = isinstance(subagent_type, str) and bool(subagent_type.strip())
+        desc = raw_input.get("description")
+        if (shell or subagent) and isinstance(desc, str) and desc.strip():
+            return desc
         cmd = raw_input.get("command")
-        if isinstance(cmd, str) and cmd.strip():
+        if shell and isinstance(cmd, str) and cmd.strip():
             return cmd
     # The flat title field defaults to an "unknown" sentinel when a backend
     # omits it; treat that (and blanks) as absent rather than surfacing it.
@@ -955,6 +956,72 @@ def parse_background_launch(update: dict[str, Any]) -> str | None:
     return None
 
 
+#: Words that mark a ``toolResponse`` key, or its ``status`` value, as reporting
+#: work that outlives the call. Matched case-insensitively as substrings, so a
+#: rename such as ``backgroundTaskId`` -> ``background_task_id`` or
+#: ``async_launched`` -> ``asyncLaunched`` still trips the drift check.
+_LAUNCH_SHAPED_WORDS = ("background", "async")
+
+#: Most key names a drift line lists, so a huge response cannot flood the log.
+_DRIFT_KEYS_MAX = 5
+
+
+def _is_launch_shaped(text: str) -> bool:
+    lowered = text.lower()
+    return any(word in lowered for word in _LAUNCH_SHAPED_WORDS)
+
+
+def unrecognised_background_launch(update: dict[str, Any]) -> str | None:
+    """Describe a launch-shaped tool response ``parse_background_launch`` missed.
+
+    The two shapes that parse reads were captured from one claude-agent-acp
+    release, and Kiro Crew does not pin the adapter. If a later release renames
+    or reshapes them, the parse silently returns None and the watchdog goes back
+    to recycling sessions mid-workflow, with nothing failing. This is the
+    tripwire for that: it fires only on a ``tool_call_update`` whose
+    ``_meta.claudeCode.toolResponse`` has a key, or a string ``status``, that
+    contains ``background`` or ``async`` (case-insensitive), from a tool other
+    than a held ``Agent``/``Task`` launch, when the parse recognised nothing.
+    An ordinary foreground result carries no such word, so the check is silent
+    on every frame the parse already understands or rightly ignores.
+
+    Returns a one-line description of the offending keys (and the status, when
+    it is the match) for a log line, or ``None``. Every name is folded to
+    printable text and bounded, since the response is adapter-authored.
+    """
+    if parse_background_launch(update) is not None:
+        return None
+    if update.get("sessionUpdate") != UPDATE_TOOL_CALL_UPDATE:
+        return None
+    meta = update.get("_meta")
+    claude = meta.get("claudeCode") if isinstance(meta, dict) else None
+    if not isinstance(claude, dict) or claude.get("toolName") in _HELD_ASYNC_LAUNCH_TOOLS:
+        return None
+    response = claude.get("toolResponse")
+    if not isinstance(response, dict):
+        return None
+    keys = sorted(
+        _printable_launch_label(key)[:40]
+        for key in response
+        if isinstance(key, str) and _is_launch_shaped(key)
+    )
+    status = response.get("status")
+    status_hit = isinstance(status, str) and _is_launch_shaped(status)
+    if not keys and not status_hit:
+        return None
+    parts = []
+    if keys:
+        shown = ", ".join(keys[:_DRIFT_KEYS_MAX])
+        extra = len(keys) - _DRIFT_KEYS_MAX
+        parts.append(f"keys {shown}" + (f" (and {extra} more)" if extra > 0 else ""))
+    if status_hit:
+        parts.append(f'status "{redact_text(_printable_launch_label(cast(str, status)))[:40]}"')
+    tool = claude.get("toolName")
+    if isinstance(tool, str) and tool:
+        parts.append(f"tool {_printable_launch_label(tool)[:40]}")
+    return "; ".join(parts)
+
+
 @dataclass
 class BackgroundLaunchRecord:
     """When a session's harness last launched background work, and what it was.
@@ -971,6 +1038,17 @@ class BackgroundLaunchRecord:
     launched_at: float | None = None
     labels: list[str] = field(default_factory=list)
     omitted: int = 0
+    #: Set by ``note`` the first time a frame looks like a launch the parse
+    #: does not recognise (``unrecognised_background_launch``) and handed out
+    #: once by ``take_drift``, so the caller logs that drift once per record
+    #: rather than once per frame.
+    drift: str | None = None
+    drift_reported: bool = False
+
+    def take_drift(self) -> str | None:
+        """The pending drift description, at most once per record."""
+        drift, self.drift = self.drift, None
+        return drift
 
     def note(self, update: object, now: float) -> bool:
         """Record *update* if it reports a background launch; True when it did."""
@@ -978,6 +1056,9 @@ class BackgroundLaunchRecord:
             return False
         label = parse_background_launch(update)
         if label is None:
+            if not self.drift_reported:
+                self.drift = unrecognised_background_launch(update)
+                self.drift_reported = self.drift is not None
             return False
         self.launched_at = now
         if label in self.labels:

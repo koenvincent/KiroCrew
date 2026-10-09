@@ -33,7 +33,7 @@ from kiro_crew import platform_compat
 from kiro_crew.code_fingerprint import code_fingerprint, warm_code_fingerprint
 from kiro_crew.config.paths import config_dir
 from kiro_crew.env import mcp_runtime_path, resolve_krb5_ccname
-from kiro_crew.mcp_gateway import transport
+from kiro_crew.mcp_gateway import backend_record, transport
 from kiro_crew.mcp_gateway.pool import READ_BUFFER_LIMIT_BYTES
 from kiro_crew.mcp_gateway.shutdown_budget import TOTAL_SHUTDOWN_BUDGET_SECS
 from kiro_crew.metrics.events import (
@@ -1667,31 +1667,13 @@ class GatewayManager:
 
     async def _reap_orphaned_backends(self) -> None:
         """Best-effort tree-kill of pooled backends left orphaned by a SIGKILLed
-        gatewayd, read from the ``<socket>.backends`` sidecar the daemon
-        maintains. Each recorded pid is a session leader (pid == pgid) on POSIX;
-        on Windows there is no process group (spawn's ``start_new_session`` is
-        inert there), so the recorded pid is treated as a tree root instead."""
-        pidfile = Path(f"{self._spec.socket_path}.backends")
-        try:
-            raw = pidfile.read_text(encoding="utf-8")
-        except OSError:
-            return
-        for token in raw.split():
-            try:
-                pid = int(token)
-            except ValueError:
-                continue
-            # platform_compat rather than os.killpg: that name is absent on
-            # Windows and the handler below would not catch the AttributeError.
-            # Async variant required — this is awaited from
-            # _terminate_process, and the Windows branch spawns taskkill with a
-            # 5s timeout once per recorded pid, which would stall the loop.
-            with contextlib.suppress(
-                ProcessLookupError, PermissionError, OSError, ValueError
-            ):
-                await platform_compat.kill_process_tree_async(pid, platform_compat.SIGKILL)
-        with contextlib.suppress(OSError):
-            pidfile.unlink()
+        gatewayd, read from the ``<socket>.backends`` record the daemon
+        maintains. Only entries whose start id still matches the live process
+        are signalled (:mod:`~kiro_crew.mcp_gateway.backend_record`)."""
+        await backend_record.reap(
+            backend_record.record_path(self._spec.socket_path),
+            reason="supervisor SIGKILLed a wedged gatewayd",
+        )
 
     async def _clear_stale_socket(self) -> None:
         """Remove an endpoint left behind by a prior crash.

@@ -75,6 +75,7 @@ BASE_NAMES = frozenset(
         "Any",
         "CHAT_TYPE_DIRECT",
         "CHAT_TYPE_FORUM",
+        "CHAT_TYPE_PRIVATE_TOPIC",
         "ChannelLink",
         "ConversationOwnershipConflict",
         "ConversationState",
@@ -417,6 +418,7 @@ BASE_MEMBERS = {
         "thread: 'int | None' = None) -> 'None'",
     ),
     "_installed_agent_names": ("staticmethod", "() -> 'list[str]'"),
+    "_is_private_route": ("staticmethod", "(route: 'tuple[str, str]') -> 'bool'"),
     "_live_cfg": ("function", "(self) -> \"'KiroCrewConfig'\""),
     "_maybe_notice": (
         "function",

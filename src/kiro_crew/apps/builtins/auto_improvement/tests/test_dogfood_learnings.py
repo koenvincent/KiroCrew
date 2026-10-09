@@ -2332,6 +2332,43 @@ class TestTheStoredPushDestinationIsValidated:
             cfg["target_url"] = "https://github.com/owner/repo"
         assert clone_setup.resolve_origin_url(cfg) == url
 
+    @pytest.mark.parametrize(
+        "url",
+        [
+            r"C:\work\mirror\repo.git",
+            "C:/work/mirror/repo.git",
+            r"d:\repo.git",
+        ],
+    )
+    def test_a_windows_drive_path_is_a_local_origin_on_windows(self, monkeypatch, url) -> None:
+        """urlparse reads `C:` as a one-letter scheme; git on Windows reads it as a local path."""
+        monkeypatch.setattr(clone_setup, "IS_WINDOWS", True)
+        assert clone_setup.resolve_origin_url({"origin_url": url}) == url
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            r"C:\work\mirror\repo.git",
+            "C:/work/mirror/repo.git",
+            "C:repo.git",  # drive-relative: not accepted, needs an explicit separator
+            "C:/",  # no path after the drive
+            "x:attacker/repo",  # scp-like host `x`, not a drive path
+        ],
+    )
+    def test_a_drive_shaped_origin_stays_refused_where_git_reads_it_as_ssh(
+        self, monkeypatch, url
+    ) -> None:
+        """On POSIX git parses `C:path` as ssh to host `C`, so the drive form must stay refused.
+
+        The Windows-only cases above and these POSIX cases differ only in ``IS_WINDOWS``;
+        the drive-relative and bare-drive rows stay refused on Windows too.
+        """
+        monkeypatch.setattr(clone_setup, "IS_WINDOWS", False)
+        assert clone_setup.resolve_origin_url({"origin_url": url}) == ""
+        if url in ("C:repo.git", "C:/", "x:attacker/repo"):
+            monkeypatch.setattr(clone_setup, "IS_WINDOWS", True)
+            assert clone_setup.resolve_origin_url({"origin_url": url}) == ""
+
 
 class TestTheAddressDecisionItself:
     """The SSRF screen the class above stubs out gets its own direct coverage.

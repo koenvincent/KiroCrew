@@ -314,6 +314,21 @@ _STRICT_IDENTITY_SERVERS = (
 )
 
 
+#: How Doctor names a probe that could not verify the daemon. "unreachable"
+#: is a transport that did not answer; "unverified" is an answer that could not
+#: be trusted or read. Only ``absent`` prints "not running".
+_DAEMON_PROBE_REASONS: dict[str, tuple[str, str]] = {
+    "connect_timeout": ("unreachable", "connect timed out"),
+    "connect_error": ("unreachable", "connect failed"),
+    "response_timeout": ("unreachable", "no reply in time"),
+    "connection_lost": ("unreachable", "connection closed before a reply"),
+    "refused_principal": ("unverified", "endpoint owner not confirmed"),
+    "malformed_response": ("unverified", "malformed reply"),
+    "not_pong": ("unverified", "reply was not a pong"),
+    "invalid_context": ("unverified", "probe ran inside an event loop"),
+}
+
+
 def _doctor_mcp_gateway_daemon(issues: list[str]) -> None:
     """Report the MCP gateway daemon's code revision next to this one.
 
@@ -327,13 +342,20 @@ def _doctor_mcp_gateway_daemon(issues: list[str]) -> None:
     """
     try:
         from kiro_crew.code_fingerprint import code_fingerprint
-        from kiro_crew.mcp_gateway.daemon_control import describe_daemon
+        from kiro_crew.mcp_gateway import daemon_control as dc
 
-        info = describe_daemon()
+        probe = dc.describe_daemon_detailed()
     except Exception:
         return
+    info = probe.info
     if info is None:
-        print("  mcp gateway daemon: ⏹ not running (pooling off, or no session has started one)")
+        if probe.outcome == dc.PROBE_ABSENT:
+            print(
+                "  mcp gateway daemon: ⏹ not running (pooling off, or no session has started one)"
+            )
+            return
+        label, reason = _DAEMON_PROBE_REASONS.get(probe.outcome, ("unverified", probe.outcome))
+        print(f"  mcp gateway daemon: ⚠ {label}: {reason} after {probe.elapsed_secs:.1f}s")
         return
     mine = code_fingerprint()
     owner = (

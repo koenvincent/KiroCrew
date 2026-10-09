@@ -4711,6 +4711,25 @@ class TestSpawnBackend:
         await backend._stderr_task
 
     @pytest.mark.asyncio
+    async def test_spawn_captures_the_start_id_before_any_await(
+        self, fake_spawn: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The backend record publishes this id; it is read once at spawn,
+        before the loop can run the child watcher, never at heartbeat time."""
+        seen: list[int] = []
+
+        def _start_id(pid: int) -> str:
+            seen.append(pid)
+            return f"spawn-{pid}"
+
+        monkeypatch.setattr(backend_mod.platform_compat, "get_process_start_id", _start_id)
+        backend = await spawn_backend(_pool_key(), "cmd", [], {}, "/nonexistent-work-dir")
+        assert backend.start_id == "spawn-5150"
+        assert seen == [5150]
+        if backend._stderr_task is not None:
+            await backend._stderr_task
+
+    @pytest.mark.asyncio
     async def test_no_stderr_pipe_means_no_drain_task(
         self, fake_spawn: dict[str, Any]
     ) -> None:

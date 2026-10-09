@@ -198,6 +198,7 @@ function ChatInput({
   quickSend,
   followUpLayout,
   followUpSourceKey,
+  followUpMulti = true,
   followUpPendingOptions,
   followUpRefusedOptions,
   followUpError,
@@ -372,7 +373,7 @@ function ChatInput({
       : `${base}\n${i18nT('components.chatInput.branch', { branch: projectBranch })}`
   }, [project, projectBranch, projectDetached])
   const { ctxPopoverOpen, setCtxPopoverOpen, ctxWrapRef } = useContextPopover()
-  const plus = usePlusMenu({ pickers, value, onChange, composerControl })
+  const plus = usePlusMenu({ pickers, value, onChange, composerControl, fileInputRef })
   const { setPlusOpen, sketchOpen, setSketchOpen } = plus
   // Client-side `accept` is a UX hint only (input-validation guidance: server enforces type via
   // magic bytes, size, and malware scanning — never trust the extension/MIME here).
@@ -636,7 +637,7 @@ function ChatInput({
 
       {/* Ghost follow-up bubbles floating above input */}
       {!showGhost && followUpOptions && followUpOptions.length > 0 && onFollowUpSelect && (
-          <FollowUpBar options={followUpOptions} picked={followUpPicked ?? new Set()} onSelect={selectFollowUp} onSend={fireFollowUp} quickSend={quickSend} layout={followUpLayout} sourceKey={followUpSourceKey} pendingOptions={followUpPendingOptions} refusedOptions={followUpRefusedOptions} error={followUpError} />
+          <FollowUpBar options={followUpOptions} picked={followUpPicked ?? new Set()} onSelect={selectFollowUp} onSend={fireFollowUp} quickSend={quickSend} multi={followUpMulti} layout={followUpLayout} sourceKey={followUpSourceKey} pendingOptions={followUpPendingOptions} refusedOptions={followUpRefusedOptions} error={followUpError} />
       )}
 
       {/* Tip / folder-suggestion band — LAST above the composer so it always

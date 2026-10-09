@@ -59,6 +59,7 @@ from kiro_crew.security import (
     is_sensitive_path,
     redact_with_findings,
 )
+from kiro_crew.user_json import strip_json_comments as _strip_json5_comments
 from kiro_crew.user_json import strip_utf8_bom
 
 
@@ -519,40 +520,6 @@ def _leaf_count(value: Any) -> int:
     if isinstance(value, list):
         return sum(max(1, _leaf_count(child)) for child in value)
     return 1
-
-
-def _strip_json5_comments(text: str) -> str:
-    output: list[str] = []
-    index = 0
-    quote = ""
-    while index < len(text):
-        char = text[index]
-        if quote:
-            output.append(char)
-            if char == "\\" and index + 1 < len(text):
-                index += 1
-                output.append(text[index])
-            elif char == quote:
-                quote = ""
-            index += 1
-            continue
-        if char in ('"', "'"):
-            quote = char
-            output.append(char)
-            index += 1
-            continue
-        if text[index : index + 2] == "//":
-            index += 2
-            while index < len(text) and text[index] not in "\r\n":
-                index += 1
-            continue
-        if text[index : index + 2] == "/*":
-            end = text.find("*/", index + 2)
-            index = len(text) if end < 0 else end + 2
-            continue
-        output.append(char)
-        index += 1
-    return "".join(output)
 
 
 def _parse_json5(text: str) -> Any:

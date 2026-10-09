@@ -101,6 +101,7 @@ from kiro_crew.mcp_cleanup import (
     KIROCREW_BIN_MCP_SERVERS,
     mcp_entry_is_muted,
 )
+from kiro_crew.user_json import loads_user_jsonc
 
 logger = logging.getLogger(__name__)
 
@@ -353,7 +354,9 @@ def _read_mcp_settings(path: Path) -> dict[str, Any]:
         # and refuse every search agent's session over a file with nothing in it.
         return {}
     try:
-        settings = json.loads(raw.decode("utf-8"))
+        # JSONC-tolerant, like discovery: a commented file's restrictions
+        # (``disabledTools``, muted servers) must still be enforced.
+        settings = loads_user_jsonc(raw.decode("utf-8"))
     except RecursionError as exc:
         raise ValueError("MCP settings exceed the JSON nesting limit") from exc
     if not isinstance(settings, dict) or not isinstance(settings.get("mcpServers", {}), dict):

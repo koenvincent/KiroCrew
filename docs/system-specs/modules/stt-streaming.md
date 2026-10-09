@@ -41,6 +41,22 @@ environments do not read their own site-packages, because a project venv is
 agent-writable executable storage; they resolve a system FFmpeg from the fixed
 platform paths, and failing that the digest-verified decoder store below.
 
+**macOS Intel ships no decoder, on purpose.** `macos-x86_64` has no pin in
+`stt.decoder.ARTIFACTS`, the Intel half of the universal app installs no
+`imageio-ffmpeg` (`desktop_decoder_requirement` in `packaging/build-desktop.sh`),
+and the store reports that platform `unsupported`. Every branch that means "a
+desktop release owns its decoder" asks `stt.decoder.bundle_carries_decoder()` —
+a bundled interpreter that is not the decoderless backend
+(`DECODERLESS_BUNDLE_PLATFORM`) — rather than `is_bundled_interpreter()` alone:
+the transcode resolver, `ffmpeg_source`, the doctor's remedy, the settings page's
+prerequisite commands and `auto_fetch`. The exception is named, not looked up in
+the pins: on Windows `platform.machine()` reports the physical CPU, so the x64
+release on an ARM64 PC would key to an unpinned platform and skip the decoder it
+carries. So an
+Intel desktop release resolves exactly like a source install (fixed system paths,
+e.g. Homebrew's), is told to install FFmpeg rather than to reinstall, and the
+fail-closed rule below still holds on every platform whose release does ship one.
+
 **The store is a third location, not a third rule.** A source or Toolbox install on
 a distribution that packages no FFmpeg (Amazon Linux, RHEL without EPEL) previously
 had no decoder it could ever reach, so batch voice was permanently broken with a
@@ -64,7 +80,7 @@ FILENAME whose bytes match its pinned digest, re-verified on every open and kept
 bound to the descriptor that is spawned. A store file that fails is ignored and
 logged. The directory is user-writable and vouches for nothing; it is also inside
 the `models/` tree the agent's file and shell gates already write-protect.
-Platforms with no pinned artifact (32-bit ARM Linux, Windows on ARM, win32) report
+Platforms with no pinned artifact (macOS Intel, 32-bit ARM Linux, Windows on ARM, win32) report
 `unsupported` and start no download.
 
 That gate reports **two independent verdicts** and the build treats them

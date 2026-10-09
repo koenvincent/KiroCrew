@@ -16,6 +16,8 @@ allowance (hooks.py's write-only tier comment) stays allowed.
 
 from __future__ import annotations
 
+import os
+
 import pytest
 
 from kiro_crew.hooks import TOOL_DENY, HookManager, HooksConfig
@@ -290,7 +292,8 @@ class TestTheTwoGatesJudgeTheSameSet:
         )
 
     def test_patch_text_protected_target_reaches_the_hook(self) -> None:
-        patch = "*** Begin Patch\n*** Add File: ~/.kiro/crew/config.json\n+x\n*** End Patch"
+        target = os.path.expanduser(_WRITE_ONLY)
+        patch = f"*** Begin Patch\n*** Add File: {target}\n+x\n*** End Patch"
         decision = _call(raw_params={"patchText": patch})
         assert decision.action == TOOL_DENY
         assert "config.json" in decision.reason
@@ -298,8 +301,8 @@ class TestTheTwoGatesJudgeTheSameSet:
     @pytest.mark.parametrize(
         "patch",
         [
-            "*** Begin Patch\n*** Delete File: ~/.kiro/crew/config.json\n*** End Patch",
-            "*** Begin Patch\n*** Update File: /tmp/ok.md\n*** Move to: ~/.kiro/crew/config.json\n@@\n-old\n+new\n*** End Patch",
+            f"*** Begin Patch\n*** Delete File: {os.path.expanduser(_WRITE_ONLY)}\n*** End Patch",
+            f"*** Begin Patch\n*** Update File: /tmp/ok.md\n*** Move to: {os.path.expanduser(_WRITE_ONLY)}\n@@\n-old\n+new\n*** End Patch",
         ],
     )
     def test_delete_and_move_destination_reach_the_hook(self, patch: str) -> None:

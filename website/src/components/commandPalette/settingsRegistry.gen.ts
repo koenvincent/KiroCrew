@@ -1784,6 +1784,18 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "configKey": "dashboard.terminal.completion.enabled"
   },
   {
+    "id": "display.cursor-style",
+    "label": "Cursor style",
+    "labelKey": "pages.settings.displayPanel.terminal_cursor_style",
+    "description": "Shape of the terminal cursor. Bar and underline leave the character under it visible.",
+    "tab": "display",
+    "type": "buttonGroup",
+    "occurrence": 1,
+    "params": {
+      "sub": "terminal"
+    }
+  },
+  {
     "id": "display.custom-font",
     "label": "Custom font",
     "labelKey": "pages.settings.displayPanel.custom_font_family",
@@ -2612,6 +2624,15 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "type": "toggle",
     "occurrence": 1,
     "configKey": "stt.polish"
+  },
+  {
+    "id": "voice.use-a-key-to-start-dictation",
+    "label": "Use a key to start dictation",
+    "labelKey": "pages.settings.sttSettings.ptt_enabled",
+    "description": "Turn this off to stop a key from starting dictation — you can still dictate from the microphone button.",
+    "tab": "voice",
+    "type": "toggle",
+    "occurrence": 1
   },
   {
     "id": "voice.voice",

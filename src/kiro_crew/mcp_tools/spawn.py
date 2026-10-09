@@ -16,7 +16,6 @@ every existing patch site.
 
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
 import os
@@ -158,22 +157,7 @@ def _agent_roster_hint() -> str:
     pass it straight into every session's tool list. The same grammar already
     gates the ``agent`` parameter in ``SPAWN_RUN_SCHEMA``, so a name that fails it
     is one no caller could pass here anyway.
-
-    Skipped entirely when an event loop is running, because then this is NOT the
-    stdio server: ``mcp_discovery._managed_tools_in_process`` imports this package
-    and calls ``_list_tools()`` from ``async def probe_server`` on the gateway's
-    loop, on hosts where the probe spawn is refused. A directory scan there would
-    stall the loop -- and that caller keeps only tool NAMES, discarding every
-    description, so it loses nothing. ``mcp_shared.run_mcp_stdio_loop`` is a plain
-    select/readline loop that never imports asyncio, so the process that actually
-    serves ``tools/list`` to a model still gets the roster.
     """
-    try:
-        asyncio.get_running_loop()
-    except RuntimeError:
-        pass  # no loop: the stdio server, where a bounded cached scan is fine
-    else:
-        return ""
     try:
         # Sorted by DECLARED name, before redaction, so the order matches the
         # refusal roster's and a credential-shaped name is rewritten in place
@@ -207,8 +191,18 @@ def _agent_roster_hint() -> str:
     return hint + "."
 
 
-def schemas() -> list[dict[str, Any]]:
-    """Descriptors for the spawn tools."""
+def schemas(*, names_only: bool = False) -> list[dict[str, Any]]:
+    """Descriptors for the spawn tools.
+
+    ``names_only`` is set by the in-process discovery read (via
+    ``mcp_tools.build_tool_names``), which keeps only tool NAMES and discards
+    every description. Under it the two reads that exist solely to fill a
+    description -- the live sub-agent cap and the agents-directory roster scan --
+    are skipped, so a names-only caller never performs on-loop work for text it
+    throws away. The returned names and their order are unchanged; only the two
+    descriptions that would have carried those values are left without them.
+    This is why neither read needs a ``get_running_loop`` guard of its own.
+    """
     # Advertise the concurrent sub-agent cap so the model fans out with
     # confidence instead of self-limiting. The cap IN FORCE is preferred:
     # ``agent.max_subagents`` is a ceiling the adaptive controller may have cut
@@ -234,27 +228,34 @@ def schemas() -> list[dict[str, Any]]:
         "queues automatically; capacity is a ceiling, not a target. Keep dependent "
         "tasks for a later batch."
     )
-    _live_cap = host_status.adaptive_exec_cap()
-    if _live_cap > 0:
-        _cap_hint = (
-            f" You can run up to {_live_cap} sub-agents concurrently right now (the "
-            "cap in force, at most your configured max)" + _queue_note
-        )
-    else:
-        try:
-            _max_sub = resolve_max_subagents(KiroCrewConfig.load())
-        except Exception:
-            _max_sub = 0
-        _cap_hint = (
-            f" Your configured sub-agent ceiling is {_max_sub}; the cap actually in "
-            "force may be lower (the adaptive controller is not readable from this "
-            "process -- resource_status reports it)" + _queue_note
-            if _max_sub > 0
-            else ""
-        )
-    # The valid agent names, read once and shared by every agent-taking field
-    # below, so a caller that never called spawn_list still sees them.
-    _agent_hint = _agent_roster_hint()
+    # A names-only caller discards every description, so neither the live cap
+    # nor the roster scan below runs for it: the two values exist only to fill
+    # text it throws away. This is the whole reason those reads need no
+    # running-loop skip -- the names path never reaches them.
+    _cap_hint = ""
+    _agent_hint = ""
+    if not names_only:
+        _live_cap = host_status.adaptive_exec_cap()
+        if _live_cap > 0:
+            _cap_hint = (
+                f" You can run up to {_live_cap} sub-agents concurrently right now (the "
+                "cap in force, at most your configured max)" + _queue_note
+            )
+        else:
+            try:
+                _max_sub = resolve_max_subagents(KiroCrewConfig.load())
+            except Exception:
+                _max_sub = 0
+            _cap_hint = (
+                f" Your configured sub-agent ceiling is {_max_sub}; the cap actually in "
+                "force may be lower (the adaptive controller is not readable from this "
+                "process -- resource_status reports it)" + _queue_note
+                if _max_sub > 0
+                else ""
+            )
+        # The valid agent names, read once and shared by every agent-taking field
+        # below, so a caller that never called spawn_list still sees them.
+        _agent_hint = _agent_roster_hint()
     # Context-scope switches, shared by spawn_run and spawn_sub_agents so the
     # rule cannot drift between them. The model reads these descriptions at
     # call time, which is why the rule lives here and not only in the prompt.

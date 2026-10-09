@@ -355,6 +355,271 @@ describe('pasteTokens', () => {
     })
   })
 
+  // The scroll-position chip flip (#15996): a resolved paste chip must not
+  // revert to raw text when a later reconcile can no longer re-collapse it via
+  // the FIFO queue (consumed) or the localStorage side table (evicted). Once an
+  // existing row carries meta.pastes AND a stable meta.sendId, carry the pastes
+  // forward to any incoming row with the same sendId, independent of both.
+  describe('mergePreservedPastes — id-keyed carry-forward', () => {
+    beforeEach(() => { localStorage.clear() })
+
+    it('re-collapses a redacted echo by sendId instead of leaving it expanded', () => {
+      const b = block({ id: 'x', seq: 1, content: 'line1\nline2\nline3' })
+      // Existing row already resolved to a chip, tagged with its sendId.
+      const existing = [
+        { role: 'user', content: `prefix ${formatToken(b)} suffix`, meta: { pastes: [b], sendId: 's1' } },
+      ]
+      // Backend re-serves the SAME send expanded, no pastes — and the content
+      // does NOT match fallback 2's expansion key verbatim (trailing redaction),
+      // so only the id path can save it. No localStorage entry exists. The paste
+      // body is still present as a substring, so the id branch MUST re-collapse
+      // it to a token rather than return the raw expanded text (which would
+      // leave the paste permanently expanded in state and preempt the side
+      // table). Verifies the Opus-5 finding is fixed.
+      const incoming = [
+        { role: 'user', content: 'prefix line1\nline2\nline3 suffix REDACTED', meta: { sendId: 's1' } },
+      ]
+      const out = mergePreservedPastes(existing, incoming)
+      expect((out[0].meta as { pastes: PasteBlock[] }).pastes).toEqual([b])
+      // Re-collapsed in place: the chip token replaces the paste body, trailing
+      // redaction preserved — never the raw expanded body.
+      expect(out[0].content).toBe(`prefix ${formatToken(b)} suffix REDACTED`)
+      expect(out[0].content).not.toContain('line1\nline2\nline3')
+    })
+
+    it('restores the collapsed token content when the echo is the plain expansion', () => {
+      const b = block({ id: 'x', seq: 1, content: 'line1\nline2\nline3' })
+      const existing = [
+        { role: 'user', content: `prefix ${formatToken(b)} suffix`, meta: { pastes: [b], sendId: 's2' } },
+      ]
+      // Expanded equivalent of the held content (trailing whitespace stripped
+      // by the backend), same sendId, no side-table entry.
+      const incoming = [
+        { role: 'user', content: 'prefix line1\nline2\nline3 suffix', meta: { sendId: 's2' } },
+      ]
+      const out = mergePreservedPastes(existing, incoming)
+      expect(out[0].content).toBe(existing[0].content) // kept collapsed → chip
+      expect((out[0].meta as { pastes: PasteBlock[] }).pastes).toEqual([b])
+    })
+
+    it('is stable across repeated reconciles (no flip on remount/refresh)', () => {
+      const b = block({ id: 'x', seq: 1, content: 'l1\nl2\nl3' })
+      const first = [
+        { role: 'user', content: `${formatToken(b)}`, meta: { pastes: [b], sendId: 's3' } },
+      ]
+      const server = [{ role: 'user', content: 'l1\nl2\nl3', meta: { sendId: 's3' } }]
+      // Reconcile once (optimistic → server), then AGAIN against the resolved
+      // state (what a scroll-driven refresh/slot-switch does). The second pass
+      // must keep the pastes.
+      const once = mergePreservedPastes(first, server)
+      const twice = mergePreservedPastes(once, server)
+      expect((twice[0].meta as { pastes: PasteBlock[] }).pastes).toEqual([b])
+      expect(twice[0].content).toBe(formatToken(b))
+    })
+
+    it('FAILS ON BASE: keeps the chip across a reconcile the FIFO cannot match (the real scroll flip)', () => {
+      // Reproduces the flip the PR fixes with a row shaped the way the server
+      // actually serves it, in a case ONLY the id route can carry. The server
+      // row's content DIVERGES from expandAll(display, pastes) — a server-side
+      // reshape of the echo (here a trailing " [edited]" the backend appends),
+      // so FIFO expansion-equality CANNOT match it. There is no side-table
+      // entry and the incoming row carries no own meta.pastes, so routes 2, 3
+      // and 4 all miss. On base (no id route) the chip is dropped and the raw
+      // text surfaces — the exact scroll flip. The id route (meta.sendId) is
+      // the only thing that re-collapses it.
+      const b = block({ id: 'flip', seq: 1, content: 'line1\nline2\nline3' })
+      // First reconcile already resolved the chip, tagged with its sendId.
+      const resolved = [
+        { role: 'user', content: `${formatToken(b)}`, meta: { pastes: [b], sendId: 'sflip' } },
+      ]
+      // Scroll remount re-serves the row from the server: fully expanded,
+      // reshaped so it is NOT the plain expansion (FIFO miss), same sendId,
+      // NO meta.pastes (the backend never persists it).
+      const server = [
+        { role: 'user', content: 'line1\nline2\nline3 [edited]', meta: { sendId: 'sflip' } },
+      ]
+      const out = mergePreservedPastes(resolved, server)
+      // Chip preserved: pastes carried and the body re-collapsed to its token,
+      // with the reshaped suffix kept. On base this is the raw expanded text.
+      expect((out[0].meta as { pastes: PasteBlock[] }).pastes).toEqual([b])
+      expect(out[0].content).toBe(`${formatToken(b)} [edited]`)
+      expect(out[0].content).not.toContain('line1\nline2\nline3')
+    })
+
+    it('carries meta.files forward alongside pastes by sendId', () => {
+      const b = block({ id: 'x', seq: 1, content: 'line1\nline2\nline3' })
+      const existing = [
+        { role: 'user', content: `${formatToken(b)}`, meta: { pastes: [b], files: ['/a b.png'], sendId: 's4' } },
+      ]
+      const incoming = [
+        { role: 'user', content: 'line1\nline2\nline3 X', meta: { sendId: 's4' } },
+      ]
+      const out = mergePreservedPastes(existing, incoming)
+      expect((out[0].meta as { files: string[] }).files).toEqual(['/a b.png'])
+    })
+
+    it('does not carry forward without a matching sendId', () => {
+      const b = block({ id: 'x', seq: 1, content: 'line1\nline2\nline3' })
+      const existing = [
+        { role: 'user', content: `${formatToken(b)}`, meta: { pastes: [b], sendId: 's5' } },
+      ]
+      // Different sendId, non-matching content, no side table → stays raw.
+      const incoming = [
+        { role: 'user', content: 'line1\nline2\nline3 Z', meta: { sendId: 'OTHER' } },
+      ]
+      const out = mergePreservedPastes(existing, incoming)
+      expect(out[0].meta?.pastes).toBeUndefined()
+      expect(out[0].content).toBe('line1\nline2\nline3 Z')
+    })
+
+    it('matches by sendId BEFORE FIFO so a repeated paste keeps its own files', () => {
+      // Same paste text sent twice, each with a DIFFERENT file. The two
+      // optimistic rows expand to byte-identical text, so the FIFO (expansion
+      // equality) match is ambiguous and would consume the FIRST row's entry
+      // for the SECOND send — surfacing the older send's attachment. The id
+      // path must win so each send keeps its own files. Verifies the GPT-5.6
+      // finding (identity matching running after ambiguous FIFO) is fixed.
+      const body = 'line1\nline2\nline3'
+      const b1 = block({ id: 'p1', seq: 1, content: body })
+      const b2 = block({ id: 'p2', seq: 2, content: body })
+      const existing = [
+        { role: 'user', content: `${formatToken(b1)}`, meta: { pastes: [b1], files: ['/first.png'], sendId: 'sa' } },
+        { role: 'user', content: `${formatToken(b2)}`, meta: { pastes: [b2], files: ['/second.png'], sendId: 'sb' } },
+      ]
+      // Backend re-serves both, expanded, no pastes/files — distinguished only
+      // by sendId (the expanded bodies are identical).
+      const incoming = [
+        { role: 'user', content: body, meta: { sendId: 'sa' } },
+        { role: 'user', content: body, meta: { sendId: 'sb' } },
+      ]
+      const out = mergePreservedPastes(existing, incoming)
+      expect((out[0].meta as { files: string[] }).files).toEqual(['/first.png'])
+      expect((out[1].meta as { files: string[] }).files).toEqual(['/second.png'])
+      expect((out[0].meta as { pastes: PasteBlock[] }).pastes).toEqual([b1])
+      expect((out[1].meta as { pastes: PasteBlock[] }).pastes).toEqual([b2])
+    })
+
+    it('re-collapses when the wire text carries attached-file markers the bubble lacks', () => {
+      // A paste sent together with a file: the LLM-facing wire text appends an
+      // `[attached_file N] path` marker that the display bubble never had, so
+      // the wire text diverges from expandAll(displayContent). FIFO misses, the
+      // side table is keyed on the wire text (not yet present here), and the id
+      // branch must re-collapse the paste body in the wire text — NOT return it
+      // raw and leave the paste permanently expanded. Verifies the Opus-5
+      // permanent-expansion finding is fixed.
+      const b = block({ id: 'f', seq: 1, content: 'line1\nline2\nline3' })
+      const existing = [
+        { role: 'user', content: `${formatToken(b)}`, meta: { pastes: [b], files: ['/doc.pdf'], sendId: 'sf' } },
+      ]
+      const incoming = [
+        { role: 'user', content: 'line1\nline2\nline3\n[attached_file 1] /doc.pdf', meta: { sendId: 'sf' } },
+      ]
+      const out = mergePreservedPastes(existing, incoming)
+      expect((out[0].meta as { pastes: PasteBlock[] }).pastes).toEqual([b])
+      expect((out[0].meta as { files: string[] }).files).toEqual(['/doc.pdf'])
+      // Paste body folded to a token; the attached-file marker is preserved and
+      // the raw body is gone (no permanent expansion in state).
+      expect(out[0].content).toBe(`${formatToken(b)}\n[attached_file 1] /doc.pdf`)
+      expect(out[0].content).not.toContain('line1\nline2\nline3')
+    })
+
+    it('consumes the held entry on an id hit so a later id-less row cannot inherit it', () => {
+      // GPT-5.6 finding: an id-bearing paste row, then an id-LESS channel/echo
+      // row with IDENTICAL expanded content. The id row is matched by sendId;
+      // its entry must be removed from the FIFO queue so the id-less row does
+      // NOT then match it by expansion-equality (fallback 2) and inherit the
+      // first send's pastes/files. The id-less row must stay raw.
+      const b = block({ id: 'g', seq: 1, content: 'line1\nline2\nline3' })
+      const existing = [
+        { role: 'user', content: `${formatToken(b)}`, meta: { pastes: [b], files: ['/leak.png'], sendId: 'sg' } },
+      ]
+      const body = 'line1\nline2\nline3'
+      const incoming = [
+        // The id-bearing send, re-served expanded (plain expansion of the chip).
+        { role: 'user', content: body, meta: { sendId: 'sg' } },
+        // A SEPARATE id-less row with the same expanded content (e.g. a channel
+        // echo / a different message that happens to match). Must NOT inherit.
+        { role: 'user', content: body },
+      ]
+      const out = mergePreservedPastes(existing, incoming)
+      // First row: carried by id, chip restored.
+      expect((out[0].meta as { pastes: PasteBlock[] }).pastes).toEqual([b])
+      expect((out[0].meta as { files: string[] }).files).toEqual(['/leak.png'])
+      // Second row: NO leak — no pastes, no files, content untouched.
+      expect(out[1].meta?.pastes).toBeUndefined()
+      expect(out[1].meta?.files).toBeUndefined()
+      expect(out[1].content).toBe(body)
+    })
+
+    it('skips id carry-forward when both rows have different server mids (reused sendId)', () => {
+      // GPT-5.6 finding: a reused client-supplied sendId naming two DIFFERENT
+      // persisted rows (distinct server mids) must not let one row inherit the
+      // other's pastes/files. The incoming content is the PLAIN EXPANSION of the
+      // held pastes, so WITHOUT the mid guard the id branch would carry forward
+      // (leak); WITH it the differing mids prove distinct rows and the id path
+      // is skipped, and no other route matches (empty side table), so the row
+      // stays raw.
+      const b = block({ id: 'm', seq: 1, content: 'line1\nline2\nline3' })
+      const existing = [
+        { role: 'user', content: `${formatToken(b)}`, meta: { pastes: [b], files: ['/owner.png'], sendId: 'dup', mid: 'MID-A' } },
+      ]
+      const incoming = [
+        // Same (reused) sendId, DIFFERENT server mid, content == expansion of b.
+        { role: 'user', content: 'line1\nline2\nline3', meta: { sendId: 'dup', mid: 'MID-B' } },
+      ]
+      const out = mergePreservedPastes(existing, incoming)
+      expect(out[0].meta?.pastes).toBeUndefined()
+      expect(out[0].meta?.files).toBeUndefined()
+      expect(out[0].content).toBe('line1\nline2\nline3')
+    })
+
+    it('still carries forward by sendId when the incoming row has no mid yet (optimistic window)', () => {
+      // The mid guard must NOT disable the carry-forward in the pre-confirm
+      // window where the server mid has not landed on the incoming row yet —
+      // that window is exactly where the chip-flip bug lives. A missing mid on
+      // either side leaves the sendId match intact.
+      const b = block({ id: 'n', seq: 1, content: 'l1\nl2\nl3' })
+      const existing = [
+        { role: 'user', content: `${formatToken(b)}`, meta: { pastes: [b], sendId: 'opt', mid: 'MID-X' } },
+      ]
+      const incoming = [
+        { role: 'user', content: 'l1\nl2\nl3', meta: { sendId: 'opt' } }, // no mid yet
+      ]
+      const out = mergePreservedPastes(existing, incoming)
+      expect((out[0].meta as { pastes: PasteBlock[] }).pastes).toEqual([b])
+      expect(out[0].content).toBe(formatToken(b))
+    })
+
+    it('does not strand the held entry on a mid-conflict: the true owner row still gets its pastes', () => {
+      // GPT-5.6 UPHELD finding (pasteTokens.ts mid-conflict branch): on a
+      // reused sendId with differing mids, the conflicting row must NOT evict
+      // the held entry — the entry's TRUE owner (a later row carrying the
+      // matching mid) must still receive its pastes. Here the conflicting row
+      // (MID-B) is reconciled BEFORE the owner row (MID-A). The old eviction
+      // dropped the entry, so the owner rendered expanded; now the owner keeps
+      // its chip. The conflicting row must also NOT inherit the entry (no FIFO
+      // leak) even though its content equals the held expansion.
+      const b = block({ id: 'o', seq: 1, content: 'line1\nline2\nline3' })
+      const existing = [
+        { role: 'user', content: `${formatToken(b)}`, meta: { pastes: [b], files: ['/owner.png'], sendId: 'dup', mid: 'MID-A' } },
+      ]
+      const incoming = [
+        // Conflicting row first (reused sendId, different mid), content == expansion.
+        { role: 'user', content: 'line1\nline2\nline3', meta: { sendId: 'dup', mid: 'MID-B' } },
+        // The true owner row (matching mid), served expanded by the backend.
+        { role: 'user', content: 'line1\nline2\nline3', meta: { sendId: 'dup', mid: 'MID-A' } },
+      ]
+      const out = mergePreservedPastes(existing, incoming)
+      // Conflicting row did NOT inherit the entry.
+      expect(out[0].meta?.pastes).toBeUndefined()
+      expect(out[0].content).toBe('line1\nline2\nline3')
+      // Owner row DID get its pastes/files back (chip, not expanded).
+      expect((out[1].meta as { pastes: PasteBlock[] }).pastes).toEqual([b])
+      expect((out[1].meta as { files: string[] }).files).toEqual(['/owner.png'])
+      expect(out[1].content).toBe(formatToken(b))
+    })
+  })
+
   // mc-paste-store-v1 localStorage side table: byte/entry/TTL bounding so it
   // cannot grow unbounded and exhaust the localStorage quota.
   describe('saveStoredPaste / readStoredPaste store bounding', () => {

@@ -20,6 +20,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from copy import deepcopy
 from typing import TYPE_CHECKING, Any
 
 from kiro_crew import shutdown_event
@@ -148,10 +149,11 @@ async def _record_approval_hold(svc: AutoNudgeService, slot_key: str) -> None:
     """Set *slot_key*'s approval hold durably, then announce it.
 
     Persist before publishing, the same shape as ``release_approval_hold``: the
-    flag and its start time are written under ``_lock`` and the write is AWAITED
+    flag and its start time are staged on a copy of the loop, written under
+    ``_lock``, and applied to the live loop only once the AWAITED write returns,
     before the WARNING, the ``updated`` event and the one-time ``held`` notice.
-    A write that fails restores
-    both fields, so a hold the store never accepted is never shown or acted on.
+    A write that fails leaves the live loop untouched, so a hold the store never
+    accepted is never shown or acted on -- not even during the write.
     A ``CancelledError`` from the writer arrives only after the write settled, so
     the hold is kept; only the announcement is skipped.
     """
@@ -164,16 +166,22 @@ async def _record_approval_hold(svc: AutoNudgeService, slot_key: str) -> None:
         # to settle the monitor as an ``approval_stall`` stop, so the flag is
         # still recorded for it -- with no hold time and no hold notice.
         structured = is_structured_monitor_loop(loop)
-        loop.approval_stalled = True
-        loop.approval_stalled_at = 0.0 if structured else time.time()
+        stalled_at = 0.0 if structured else time.time()
+        staged = deepcopy(loop)
+        staged.approval_stalled = True
+        staged.approval_stalled_at = stalled_at
         try:
-            await svc._write_monitor_snapshot_locked()
+            await svc._write_monitor_snapshot_locked(
+                svc._monitor_snapshot_with_replacement(loop, staged)
+            )
         except asyncio.CancelledError:
+            # The writer re-raises only after the write settled: the hold is on
+            # disk, so memory takes it too, and only the announcement is skipped.
+            loop.approval_stalled, loop.approval_stalled_at = True, stalled_at
             raise
-        except Exception:
-            loop.approval_stalled = False
-            loop.approval_stalled_at = 0.0
-            raise
+        # Only the two hold fields are applied: a lock-free writer (the
+        # turn-completion path) may have moved another field during the await.
+        loop.approval_stalled, loop.approval_stalled_at = True, stalled_at
     if structured:
         return
     logger.warning(
@@ -209,10 +217,11 @@ async def release_approval_hold(
     ``arm=False``: its own turn-complete hook arms the loop when that turn ends,
     which is the "user wins" rule ``notify_user_input`` already keeps.
 
-    Persist before publishing: the cleared hold and the moved clock are written
-    under ``_lock`` and the write is AWAITED before anything is emitted, armed or
-    reported. A write that fails restores all three fields, so the loop stays
-    held exactly as the store says. A ``CancelledError`` from the writer arrives
+    Persist before publishing: the cleared hold and the moved clock are staged on
+    a copy of the loop, written under ``_lock``, and only applied to the live loop
+    once the AWAITED write returns -- so no reader sees a release the store has
+    not accepted. A write that fails leaves the live loop untouched, held exactly
+    as the store says. A ``CancelledError`` from the writer arrives
     only after the write settled, so the release is durable and kept; the arm is
     skipped then, and the reconciler re-arms the loop, which is not held any more.
     A structured monitor never holds (its tick path does not read the flag), so
@@ -232,7 +241,6 @@ async def release_approval_hold(
         held = 0.0
         if isinstance(since, (int, float)) and not isinstance(since, bool) and 0 < since <= now:
             held = now - since
-        prior = (loop.approval_stalled, loop.approval_stalled_at, loop.created_ts)
         created = loop.created_ts
         if (
             held
@@ -240,16 +248,20 @@ async def release_approval_hold(
             and not isinstance(created, bool)
             and created > 0
         ):
-            loop.created_ts = created + held
-        loop.approval_stalled = False
-        loop.approval_stalled_at = 0.0
+            created = created + held
+        staged = deepcopy(loop)
+        staged.approval_stalled = False
+        staged.approval_stalled_at = 0.0
+        staged.created_ts = created
         try:
-            await self._write_monitor_snapshot_locked()
+            await self._write_monitor_snapshot_locked(
+                self._monitor_snapshot_with_replacement(loop, staged)
+            )
         except asyncio.CancelledError:
+            # Settled before the re-raise: the release is durable, so keep it.
+            loop.approval_stalled, loop.approval_stalled_at, loop.created_ts = False, 0.0, created
             raise
-        except Exception:
-            loop.approval_stalled, loop.approval_stalled_at, loop.created_ts = prior
-            raise
+        loop.approval_stalled, loop.approval_stalled_at, loop.created_ts = False, 0.0, created
     logger.warning(
         "AutoNudge: loop %s resumed after %.0fs paused for approval (%s)",
         loop.id,

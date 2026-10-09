@@ -133,6 +133,7 @@ from pathlib import Path
 from kiro_crew import platform_compat, session_pid
 from kiro_crew.apps.backend import running_spawned_backend_pids
 from kiro_crew.config.paths import data_home
+from kiro_crew.mcp_gateway import backend_record
 from kiro_crew.mcp_gateway.daemon_control import configured_socket_path
 from kiro_crew.process_identity import audit_kill_decision
 from kiro_crew.runtime_ownership import (
@@ -1379,15 +1380,10 @@ def _mcp_backend_pids() -> set[int]:
         raw = path.read_text(encoding="utf-8")
     except FileNotFoundError:
         return set()
-    pids: set[int] = set()
-    for token in raw.split():
-        try:
-            pid = int(token)
-        except ValueError:
-            continue
-        if pid > 1:
-            pids.add(pid)
-    return pids
+    # One ``<pid> <start-id>`` line per backend (a bare pid from an older
+    # daemon). Only the pid answers "is this hosted"; splitting on whitespace
+    # alone would read every start id as a pid too.
+    return {pid for pid, _start in backend_record.parse(raw)}
 
 
 def build_reconciler(

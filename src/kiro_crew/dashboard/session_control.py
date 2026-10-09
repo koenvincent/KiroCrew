@@ -50,6 +50,7 @@ from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any
 
 from kiro_crew import model_registry
+from kiro_crew.agent_sdk.backends import ACP_BACKENDS_MODEL_EFFORT_PAIR_IDS
 from kiro_crew.agent_sdk.capabilities import MODEL_NAMESPACE_ACP, capabilities_for
 from kiro_crew.agent_sdk.provider_identity import is_claude_code
 from kiro_crew.config.loader import (
@@ -79,6 +80,7 @@ from kiro_crew.dashboard.chat_fork import (
 from kiro_crew.dashboard.chat_persistence import _TRANSIENT_ROLES as _PERSISTENCE_TRANSIENT_ROLES
 from kiro_crew.dashboard.chat_persistence import (
     _recent_session_slot_name,
+    _remember_reasoning_effort_for_restore,
     save_slot_off_loop,
 )
 from kiro_crew.dashboard.chat_utils import (
@@ -106,6 +108,7 @@ from kiro_crew.dashboard.state import (
     _safe_folder_tree,
 )
 from kiro_crew.dashboard.stop_retry import allow_escalation
+from kiro_crew.effort import EFFORT_LEVELS, is_valid_effort
 from kiro_crew.execution_context import (
     ExecutionContext,
     MemoryStoreRef,
@@ -117,6 +120,7 @@ from kiro_crew.execution_context import (
     revouch_at_verified_admission,
 )
 from kiro_crew.history import metadata_now_iso, transcript_stem
+from kiro_crew.llm_helpers import slot_switch_session_lock
 from kiro_crew.members import select_provider_backend
 from kiro_crew.memory_stores import named_store_or_empty
 from kiro_crew.messaging.link import CHAT_TYPE_DIRECT, ChannelLink, parse_session_key
@@ -4272,6 +4276,34 @@ def _slot_object(state: "DashboardState", slot_key: str) -> "object | None":
         return None
 
 
+def _target_replaced(state: "DashboardState", slot_key: str, observed: "object | None") -> bool:
+    """Whether the slot under *slot_key* differs from *observed*, the captured session.
+
+    The identity read-back that a tree verb runs after its final authorization. *observed*
+    is the target slot object captured BEFORE the verb's first suspension; this re-reads
+    the object under the same key and reports whether it has changed. A close plus a
+    reopen under the SAME key inside the suspensions between capture and append puts a
+    different session's object there -- open, passing every fence, with a log of its own
+    -- which no key-only check can tell from the original. A verb that finds this true
+    refuses rather than appending an adoption or release against a session that never took
+    part, in an entry nothing later corrects.
+
+    Encapsulated rather than inlined for the reason :func:`_freshest_sid` is: the slot
+    captures a verb takes before its resolutions are what the capture-ordering invariant
+    rests on, and a bare :func:`_slot_object` read in the verb body AFTER the suspending
+    resolution would read as a late capture. The read-back lives here, where it is a
+    comparison and not a capture.
+
+    ``True`` when nothing is there now and something was (the target simply closed), which
+    is a refusal too -- a verb cannot record a change to a session that is gone. The pure
+    close is also caught earlier by the gate's own re-resolve, which is why the close
+    tests assert ``target_not_found``; this guard's own case is the reopen the gate admits.
+    A ``None`` capture (the target was never a held object) can only become non-``None``,
+    which is still a change, so the comparison stays correct at the edges.
+    """
+    return _slot_object(state, slot_key) is not observed
+
+
 def _freshest_sid(
     state: "DashboardState", slot_key: str, resolved: str, observed: "object | None"
 ) -> str:
@@ -4413,6 +4445,18 @@ async def adopt_target(
         caller_key = caller_slot_key(state, caller_session_key)
         from kiro_crew.crew_log import emit as crew_log_emit
 
+        # The TARGET's object, captured before the first suspension, so the final
+        # authorization can tell the session it admitted apart from a same-key
+        # replacement. Everything about the target below -- the gate's re-resolve, the
+        # ``_live_sid_of`` mapping read -- is keyed by ``slot.key``, and a key is not an
+        # identity: the target can close and a NEW session can open under the same slot
+        # key in the awaits ahead (the gate's warm, the lock wait, the id resolution's
+        # store read), and every key-only check then answers for the replacement. The
+        # adoption would be appended against a conversation that was never adopted, in an
+        # entry nothing later corrects. The object itself does not move, so comparing it
+        # after the gate is what makes the refusal below possible.
+        target_at_resolve = _slot_object(state, slot.key)
+
         target_sid = _live_sid_of(state, slot.key)
         if not crew_log_emit.enabled() or not target_sid:
             # Checked FIRST because it is the PERMANENT one of the two refusals below: with
@@ -4492,6 +4536,25 @@ async def adopt_target(
                     "cannot be adopted",
                     status=409,
                     code="tree_unavailable",
+                )
+            # REFUSED -- not silently re-resolved -- when the slot under the target key is a
+            # different session from the one the pre-lock gate admitted. The gate re-resolves BY
+            # KEY and ``_live_sid_of`` reads the mapping BY KEY, so a close plus a same-key
+            # reopen inside the awaits above leaves both answering for the replacement: an
+            # open session that passes every fence, whose log ``target_sid`` now names. The
+            # adoption would then be appended against a conversation that was never
+            # adopted, and the entry is append-only -- there is no later write that
+            # corrects it. The captured object is this process's identity for the admitted
+            # session; the replacement is a different object under the same key, so the
+            # ``is`` comparison is what the key-only checks cannot do. A caller may retry:
+            # a fresh attempt resolves the current session honestly.
+            if _target_replaced(state, slot.key, target_at_resolve):
+                raise SessionControlError(
+                    f"{target!r} was replaced by a new session under the same key, so the "
+                    "adoption would name a session that was never adopted -- retry to act "
+                    "on the current one",
+                    status=409,
+                    code="target_replaced",
                 )
             # REFRESHED here, synchronously, for the same reason the resolutions happen
             # before the gate: the gate's own warm suspends, and either of these slots can
@@ -4577,6 +4640,16 @@ async def release_target(
         releasing_self = slot.key == caller_key
         from kiro_crew.crew_log import emit as crew_log_emit
 
+        # The TARGET's object, captured before the first suspension, for the reason the
+        # adoption captures it: the gate re-resolves and ``_live_sid_of`` reads BY KEY, so
+        # a close plus a same-key reopen inside the awaits ahead would leave both naming a
+        # replacement session, and the release would be appended against a conversation
+        # that was never released -- append-only, so nothing later corrects it. The
+        # ``allow_self`` case is covered too: when the caller IS the target, this just
+        # captures the caller's own live object, and a same-key reopen there means a
+        # different session is now calling, which the final gate should likewise refuse.
+        target_at_resolve = _slot_object(state, slot.key)
+
         target_sid = _live_sid_of(state, slot.key)
         if not crew_log_emit.enabled() or not target_sid:
             # The permanent refusal first, for the reason the adoption checks it first.
@@ -4636,6 +4709,21 @@ async def release_target(
                     "cannot be released",
                     status=409,
                     code="tree_unavailable",
+                )
+            # REFUSED -- not silently re-resolved -- when the slot under the target key is a
+            # different session from the one the pre-lock gate admitted, for the reason the adoption
+            # refuses: the gate and ``_live_sid_of`` both resolve BY KEY, so a same-key
+            # reopen inside the awaits above leaves them answering for a replacement, and
+            # the release would be appended against a session that was never released. The
+            # captured object is this process's identity for the admitted session; a caller
+            # may retry to act on the current one.
+            if _target_replaced(state, slot.key, target_at_resolve):
+                raise SessionControlError(
+                    f"{target!r} was replaced by a new session under the same key, so the "
+                    "release would name a session that was never released -- retry to act "
+                    "on the current one",
+                    status=409,
+                    code="target_replaced",
                 )
             # Refreshed here, synchronously, for the reason the adoption refreshes: the
             # gate's warm suspends, and the parent can open its next store inside it.
@@ -5025,6 +5113,111 @@ async def stop_target(
     return {"ok": True, "target": slot.key, **result}
 
 
+async def retry_target(
+    state: "DashboardState",
+    *,
+    caller_session_key: str,
+    target: str,
+    caller_fenced: bool | None = None,
+) -> dict[str, Any]:
+    """Re-run *target*'s failed last turn, via the same path as the Resume button.
+
+    Reuses ``chat_handlers.continue_slot_turn``, the mechanism behind
+    ``POST /api/chat/slots/{slot}/continue``: the recovery continuation is queued
+    at the head and dispatched, so the transcript gains the same recovery row a
+    Resume press leaves and no second copy of the user's message. Every refusal
+    Continue makes applies unchanged, including ``session_start_repeat`` after
+    two identical failed starts.
+
+    One refusal is this verb's own: ``turn_not_failed`` when
+    ``is_turn_interrupted`` says the last turn finished or was ended with Stop.
+    Continue carries on from a finished turn; a retry must not, or one session
+    could make another produce a fresh answer on top of a good one.
+
+    Not readiness-gated, for the reason ``api_chat_slot_continue`` gives: it
+    mutates nothing durable before dispatch, so the turn's own start is the
+    authority and a signed-out install reports in the transcript.
+
+    ``caller_fenced`` has the meaning :func:`stop_target` documents.
+    """
+    # Same prewarm ordering as `close_target`: the SEL and config reads must be
+    # warm before the synchronous gate, and the fence verdict is resolved once so
+    # the re-check under the slot lock never loads config on the loop.
+    try:
+        await asyncio.to_thread(sel)
+    except Exception:  # noqa: BLE001 - a prewarm failure must not fail the retry
+        logger.warning("session-control SEL prewarm failed", exc_info=True)
+    await prewarm_enabled_check()
+
+    caller_key = caller_slot_key(state, caller_session_key)
+    if caller_fenced is None:
+        caller_fenced = bool(caller_key) and _caller_is_ownership_fenced(state, caller_key)
+
+    slot = authorize_target(
+        state,
+        caller_session_key=caller_session_key,
+        target=target,
+        operation="retry",
+        precomputed_ownership_fenced=caller_fenced,
+    )
+    slot_key = slot.key
+    # Deferred for the same import cycle `stop_target` documents.
+    from kiro_crew.dashboard.chat_handlers import SlotContinueRefusal, continue_slot_turn
+
+    def _reassert_retryable() -> None:
+        # The slot lock `continue_slot_turn` takes, and its sub-agent probe, are
+        # awaits: a target that was reachable at the gate above can become
+        # channel-linked or mirrored, or be replaced under the same key, before
+        # the continuation is queued. Re-run the same gate here, synchronously
+        # and with no config read, as `close_target` does at its point of no
+        # return.
+        try:
+            live = authorize_target(
+                state,
+                caller_session_key=caller_session_key,
+                target=slot_key,
+                operation="retry",
+                skip_enabled_check=True,
+                precomputed_ownership_fenced=caller_fenced,
+            )
+        except SessionControlError as exc:
+            raise SlotContinueRefusal(exc.message, exc.code, status=exc.status) from exc
+        if live is not slot:
+            raise SlotContinueRefusal(
+                "the target session was replaced during the retry", "target_replaced"
+            )
+
+    with _audit_denials(
+        caller_session_key=caller_session_key, operation="retry", slot_key=slot_key
+    ):
+        # The same predicate the Continue endpoint refuses on, so the button and
+        # the verb cannot drift: a relay archive would run the crew's old turn on
+        # this machine.
+        if is_relay_archive(slot):
+            raise SessionControlError(RELAY_ARCHIVE_ERROR, code=RELAY_ARCHIVE_CODE, status=409)
+        try:
+            await continue_slot_turn(
+                state,
+                slot,
+                # An agent asked for this, not the person at the keyboard: the
+                # turn must not gain the authenticated-human flag.
+                directive_user_origin=False,
+                via="session_control",
+                require_interrupted=True,
+                before_dispatch=_reassert_retryable,
+                extra_meta=send_origin_meta(state, caller_key),
+            )
+        except SlotContinueRefusal as exc:
+            raise SessionControlError(exc.message, status=exc.status, code=exc.code) from exc
+    _audit(
+        caller_session_key=caller_session_key,
+        operation="retry",
+        slot_key=slot_key,
+        outcome="allowed",
+    )
+    return {"ok": True, "target": slot_key}
+
+
 async def end_wait_target(
     state: "DashboardState",
     *,
@@ -5106,10 +5299,14 @@ async def set_model_target(
     *,
     caller_session_key: str,
     target: str,
-    model: str,
+    model: str | None = None,
+    reasoning_effort: str | None = None,
     caller_fenced: bool | None = None,
 ) -> dict[str, Any]:
-    """Record *model* as *target*'s pending pick, applied when its next turn starts.
+    """Record *model* and/or *reasoning_effort* as *target*'s pending pick.
+
+    ``None`` for either means "keep what the target has"; at least one must be
+    given. The pick is applied when the target's next turn starts.
 
     Nothing about the target changes now. The pick is committed by
     :func:`apply_pending_model_pick` at the start of the target's next turn,
@@ -5128,6 +5325,14 @@ async def set_model_target(
     routing, which the model route keeps owner-only. A crew-bound (remote)
     target runs its turns on the peer, where this pick would never be applied.
 
+    A reasoning effort must be one of the five canonical levels (``low``,
+    ``medium``, ``high``, ``xhigh``, ``max``), which every backend accepts;
+    any other level, including ``""``, is refused here and is set from the
+    effort dropdown instead. It is committed with the model in the same step. It is NOT pushed live the way that route pushes it: the
+    turn-start reset makes the cold start apply it through the same
+    ``reasoning_effort_override`` the route's reset fallback relies on, with no
+    provider await after the gate.
+
     ``caller_fenced`` has the meaning :func:`stop_target` documents.
     """
     # Deferred for the same import cycle `stop_target` documents.
@@ -5142,35 +5347,61 @@ async def set_model_target(
 
     # Validated before any gate: a malformed pick needs no target lookup, and
     # refusing it first keeps a bad argument from reading as an access decision.
-    # Stripped once, so every check and the stored pick see the same spelling.
-    model = model.strip()
-    # "auto" is refused with the Jev sentinel: with the Jev preview on, a slot
-    # on "auto" hands each turn's model choice to Jev routing, which only the
-    # owner may arm. The picker's display label and any case of the sentinel
-    # are refused the same way, so no spelling of the Jev entry is stored.
-    # An empty name is the absence of a pick, not a model.
-    folded = model.lower()
-    if (
-        _is_jev_route_pick(model)
-        or folded in _JEV_ROUTE_AUTO_MODELS
-        or folded in _JEV_ROUTE_SPELLINGS
-    ):
+    if model is None and reasoning_effort is None:
         raise SessionControlError(
-            "Auto and Auto (Jev) can only be picked by the owner from the model picker",
-            code="model_owner_only",
-            status=403,
+            "pass a model, a reasoning_effort, or both", code="bad_request", status=400
         )
-    if not model:
-        raise SessionControlError("model is required", code="model_rejected", status=400)
-    if redact(model) != model:
-        # The pick is stored on the slot and broadcast to every dashboard, so a
-        # credential-shaped argument is refused rather than persisted.
-        raise SessionControlError(
-            "model looks like it contains a credential; model not changed",
-            code="model_rejected",
-            status=400,
-        )
-    model_name = _normalize_model(model)
+    if reasoning_effort is not None:
+        if not is_valid_effort(reasoning_effort):
+            # Only the five standard levels: each folds onto every backend's
+            # cold start, so a level checked here cannot go stale before the
+            # target's next turn applies it. A level only one harness advertises
+            # (Pi's ``minimal``, Claude's ``default``) is set from that session's
+            # effort dropdown, which reads its live list.
+            #
+            # "" (back to the model default) is refused too: on a kiro-family
+            # backend the default only takes once the workspace effort overlay
+            # is cleared, which only the dropdown route's live clear_effort does.
+            # Committed here, the cold start would recover the old level from
+            # the overlay while every surface said "default".
+            raise SessionControlError(
+                f"reasoning_effort must be one of: {', '.join(EFFORT_LEVELS)}. "
+                "Other levels, and returning a session to its model's default, are "
+                "set from its effort dropdown.",
+                code="effort_rejected",
+                status=400,
+            )
+    model_name: str | None = None
+    if model is not None:
+        # Stripped once, so every check and the stored pick see the same spelling.
+        model = model.strip()
+        # "auto" is refused with the Jev sentinel: with the Jev preview on, a slot
+        # on "auto" hands each turn's model choice to Jev routing, which only the
+        # owner may arm. The picker's display label and any case of the sentinel
+        # are refused the same way, so no spelling of the Jev entry is stored.
+        # An empty name is the absence of a pick, not a model.
+        folded = model.lower()
+        if (
+            _is_jev_route_pick(model)
+            or folded in _JEV_ROUTE_AUTO_MODELS
+            or folded in _JEV_ROUTE_SPELLINGS
+        ):
+            raise SessionControlError(
+                "Auto and Auto (Jev) can only be picked by the owner from the model picker",
+                code="model_owner_only",
+                status=403,
+            )
+        if not model:
+            raise SessionControlError("model is required", code="model_rejected", status=400)
+        if redact(model) != model:
+            # The pick is stored on the slot and broadcast to every dashboard, so a
+            # credential-shaped argument is refused rather than persisted.
+            raise SessionControlError(
+                "model looks like it contains a credential; model not changed",
+                code="model_rejected",
+                status=400,
+            )
+        model_name = _normalize_model(model)
     try:
         agent_cfg = (await asyncio.to_thread(KiroCrewConfig.load)).agent
         provider = agent_cfg.provider
@@ -5205,11 +5436,16 @@ async def set_model_target(
     target_provider = (
         provider if is_claude_code(provider) else capabilities_for(backend).provider_seam
     )
-    rejected = _model_rejected_reason(model_name, provider=target_provider)
+    rejected = (
+        _model_rejected_reason(model_name, provider=target_provider)
+        if model_name is not None
+        else ""
+    )
     if rejected:
         raise SessionControlError(rejected, code="model_rejected", status=400)
     if (
-        not is_claude_code(target_provider)
+        model_name is not None
+        and not is_claude_code(target_provider)
         and capabilities_for(backend).model_id_namespace == MODEL_NAMESPACE_ACP
     ):
         # On a kiro-cli backend an alias such as "sonnet" is not a wire id: stored
@@ -5222,6 +5458,20 @@ async def set_model_target(
     ):
         if is_relay_archive(slot):
             raise SessionControlError(RELAY_ARCHIVE_ERROR, code=RELAY_ARCHIVE_CODE, status=409)
+        if reasoning_effort is not None:
+            # The restore allowlist marker the effort route writes before it
+            # commits a level: without it a reloaded transcript cannot bring the
+            # level back. Written here, off the loop and before the synchronous
+            # re-check below, because the turn-start commit must not do file IO.
+            try:
+                await asyncio.to_thread(_remember_reasoning_effort_for_restore, reasoning_effort)
+            except (OSError, ValueError) as exc:
+                logger.warning("session-control set_model: cannot retain effort: %s", exc)
+                raise SessionControlError(
+                    "reasoning effort persistence unavailable; nothing changed",
+                    code="effort_marker_unavailable",
+                    status=503,
+                ) from exc
         session_key = effective_session_key(slot)
         if _switch_target_busy(state, slot, session_key, state.sessions.get_provider(session_key)):
             raise _target_busy_error()
@@ -5241,6 +5491,12 @@ async def set_model_target(
         # Nothing awaits between here and the store below, so this check
         # holds until the pick is recorded.
         if slot._model_pick_lock.locked():
+            raise _target_busy_error()
+        # The effort dropdown holds the per-session switch lock across its
+        # commit, its live push and any rollback. A level captured inside that
+        # window would record a generation the rollback then bumps, and the
+        # next turn would silently drop the pick, so refuse it the same way.
+        if reasoning_effort is not None and slot_switch_session_lock(session_key).locked():
             raise _target_busy_error()
         live = authorize_target(
             state,
@@ -5269,16 +5525,40 @@ async def set_model_target(
             caller_tab_id=caller_tab_id,
             caller_fenced=caller_fenced,
             pick_gen=slot._model_pick_gen,
+            reasoning_effort=reasoning_effort,
+            effort_gen=slot._effort_pick_gen,
+            pair_id_backend=backend in ACP_BACKENDS_MODEL_EFFORT_PAIR_IDS,
         )
 
+    requested = _pick_fields(model_name, reasoning_effort)
     _audit(
         caller_session_key=caller_session_key,
         operation="set_model",
         slot_key=slot_key,
         outcome="allowed",
-        detail={"model": model_name or "auto", "stage": "pending"},
+        detail={**_pick_audit_fields(model_name, reasoning_effort), "stage": "pending"},
     )
-    return {"ok": True, "target": slot_key, "model": model_name, "pending": True}
+    return {"ok": True, "target": slot_key, **requested, "pending": True}
+
+
+def _pick_fields(model: str | None, reasoning_effort: str | None) -> dict[str, str]:
+    """The pick's requested fields, omitting the ones the caller left alone."""
+    fields: dict[str, str] = {}
+    if model is not None:
+        fields["model"] = model
+    if reasoning_effort is not None:
+        fields["reasoning_effort"] = reasoning_effort
+    return fields
+
+
+def _pick_audit_fields(model: str | None, reasoning_effort: str | None) -> dict[str, str]:
+    """:func:`_pick_fields` spelled for the audit trail, where "" reads as a default."""
+    fields: dict[str, str] = {}
+    if model is not None:
+        fields["model"] = model or "auto"
+    if reasoning_effort is not None:
+        fields["reasoning_effort"] = reasoning_effort or "default"
+    return fields
 
 
 @dataclass(frozen=True)
@@ -5290,13 +5570,40 @@ class PendingModelPick:
     in the meantime wins over this one. The tab identity is what ties the pick
     to the calling session: a slot key can be handed to a new occupant after
     the caller closes, and that occupant must not inherit the pick.
+
+    ``model`` or ``reasoning_effort`` is ``None`` when the caller left that
+    setting alone. ``effort_gen`` is the target's effort write generation at
+    call time: any write since (the effort dropdown, a fork, a restore) means
+    a newer choice landed, and it wins over this one even when it returned to
+    the level the caller saw. ``pair_id_backend`` records that the target's
+    backend spells effort into the model id (``gpt-6-astra[max]``), so a
+    committed level must also fold a legacy suffix off the pin, as the effort
+    dropdown route does.
     """
 
-    model: str
+    model: str | None
     caller_session_key: str
     caller_tab_id: str
     caller_fenced: bool
     pick_gen: int
+    reasoning_effort: str | None = None
+    effort_gen: int = 0
+    pair_id_backend: bool = False
+
+
+def _pending_pick_view(pick: PendingModelPick | None) -> dict[str, str]:
+    """The ``pending_*`` fields ``session_read_message`` reports for *pick*.
+
+    Redacted: the owner's picker stores whatever string it is given.
+    """
+    if pick is None:
+        return {}
+    view: dict[str, str] = {}
+    if pick.model is not None:
+        view["pending_model"] = redact(pick.model)
+    if pick.reasoning_effort is not None:
+        view["pending_reasoning_effort"] = pick.reasoning_effort
+    return view
 
 
 def _caller_tab_id(state: "DashboardState", caller_session_key: str) -> str:
@@ -5335,18 +5642,21 @@ def apply_pending_model_pick(state: "DashboardState", slot: "_ChatSlot") -> bool
 
     Called at the start of the slot's turn, before a session is acquired, after
     :func:`prewarm_enabled_check` so the fence re-read below is a cache hit.
-    SYNCHRONOUS on purpose: the gate and the write to ``slot.model`` run with no
-    suspension between them, so nothing can link or mirror the target after it
-    was authorized and before the model changed. A pick the gate now refuses is
-    dropped and audited, and the turn runs on the model it already had. So is a
-    pick the user has overtaken with a newer picker choice.
+    SYNCHRONOUS on purpose: the gate and the writes to ``slot.model`` and
+    ``slot.reasoning_effort`` run with no suspension between them, so nothing
+    can link or mirror the target after it was authorized and before either
+    changed. A pick the gate now refuses is dropped and audited, and the turn
+    runs on the model and effort it already had. So is each half of a pick the
+    user has overtaken with a newer choice from that half's own control.
 
     The ownership fence only tightens: a caller fenced at call time stays
     fenced, and one that was not is re-checked now, since it may have become a
     fenced crew member while the pick waited.
 
-    Returns True when ``slot.model`` changed, meaning a live session still runs
-    the old model and must be reset before this turn uses it.
+    Returns True when the live session must be reset before this turn uses it:
+    ``slot.model`` changed (or a fallback serves the session), a codex pin's
+    legacy ``[level]`` suffix was folded away, or ``slot.reasoning_effort``
+    changed.
     """
     pick = slot._pending_model_pick
     if pick is None:
@@ -5368,7 +5678,13 @@ def apply_pending_model_pick(state: "DashboardState", slot: "_ChatSlot") -> bool
         logger.info("session-control set_model: pick on %s deferred, alias mid-turn", slot.key)
         return False
     slot._pending_model_pick = None
-    if slot._model_pick_gen != pick.pick_gen:
+    # Each half of the pick yields separately to a newer choice the user made
+    # from its own control, so a dropdown effort pick does not throw away the
+    # caller's model, nor a picker model pick the caller's effort.
+    model = pick.model
+    effort = pick.reasoning_effort
+    if model is not None and slot._model_pick_gen != pick.pick_gen:
+        model = None
         _audit(
             caller_session_key=pick.caller_session_key,
             operation="set_model",
@@ -5376,6 +5692,22 @@ def apply_pending_model_pick(state: "DashboardState", slot: "_ChatSlot") -> bool
             outcome="denied",
             detail={"code": "superseded_by_newer_pick", "stage": "turn_start"},
         )
+    # On a pair-id backend (codex) the model picker IS the effort control: a
+    # user picking ``gpt-6-astra[max]`` bumps only the model generation, so a
+    # newer model pick supersedes the effort half as well.
+    if effort is not None and (
+        slot._effort_pick_gen != pick.effort_gen
+        or (pick.pair_id_backend and slot._model_pick_gen != pick.pick_gen)
+    ):
+        effort = None
+        _audit(
+            caller_session_key=pick.caller_session_key,
+            operation="set_model",
+            slot_key=slot.key,
+            outcome="denied",
+            detail={"code": "superseded_by_newer_effort", "stage": "turn_start"},
+        )
+    if model is None and effort is None:
         return False
     if _caller_tab_id(state, pick.caller_session_key) != pick.caller_tab_id:
         _audit(
@@ -5420,24 +5752,40 @@ def apply_pending_model_pick(state: "DashboardState", slot: "_ChatSlot") -> bool
             detail={"code": "target_replaced", "stage": "turn_start"},
         )
         return False
-    # A fallback serving the session means the wire model differs from the pin,
-    # so an equal pin still needs the session reset, as the picker treats it.
-    changed = (
-        (slot.model or "") != pick.model
-        or bool(slot._active_fallback_model)
-        or bool(slot._refusal_fallback_primary)
-    )
-    slot.model = pick.model
-    # A concrete pick answers the routing question, as it does from the picker.
-    slot.jev_route = False
-    # Recorded as an explicit pick so the model-fallback restore never undoes it.
-    slot._model_pick_gen += 1
+    changed = False
+    if model is not None:
+        # A fallback serving the session means the wire model differs from the
+        # pin, so an equal pin still needs the session reset, as the picker
+        # treats it.
+        changed = (
+            (slot.model or "") != model
+            or bool(slot._active_fallback_model)
+            or bool(slot._refusal_fallback_primary)
+        )
+        slot.model = model
+        # A concrete pick answers the routing question, as it does from the picker.
+        slot.jev_route = False
+        # Recorded as an explicit pick so the model-fallback restore never undoes it.
+        slot._model_pick_gen += 1
+    if effort is not None:
+        if pick.pair_id_backend:
+            # The dropdown route's legacy fold: a pin still spelled
+            # ``<model>[<level>]`` would keep claiming the old level.
+            base, legacy_level = model_registry.split_effort_suffix(slot.model or "")
+            if legacy_level:
+                slot.model = base
+                changed = True
+        if (slot.reasoning_effort or "") != effort:
+            # A live session keeps the level it started with; the reset the
+            # caller arms on True makes the cold start read this one.
+            changed = True
+        slot.reasoning_effort = effort
     _audit(
         caller_session_key=pick.caller_session_key,
         operation="set_model",
         slot_key=slot.key,
         outcome="allowed",
-        detail={"model": pick.model or "auto", "stage": "turn_start"},
+        detail={**_pick_audit_fields(model, effort), "stage": "turn_start"},
     )
     return changed
 
@@ -8042,11 +8390,8 @@ def read_messages(
         # The served model when the backend has reported one (it reflects an
         # inherited default or an active fallback), otherwise the pin.
         "model": redact(slot.served_model or slot.model or ""),
-        **(
-            {"pending_model": redact(slot._pending_model_pick.model)}
-            if slot._pending_model_pick is not None
-            else {}
-        ),
+        **_pending_pick_view(slot._pending_model_pick),
+        "reasoning_effort": slot.reasoning_effort or "",
         "total": total,
         # The cursor to poll with next. This is NOT `total`: when more than
         # `limit` rows are new, the window stops short of the end, and a caller

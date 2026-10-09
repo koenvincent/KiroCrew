@@ -59,6 +59,10 @@ _PRUNE_INTERVAL_SECONDS = 60.0
 # A peer that stays unreachable this long ends the shadow run with an error, so
 # a deleted or dead crew cannot keep its parent busy forever.
 _UNREACHABLE_DEADLINE_SECONDS = 30 * 60.0
+_RESULT_NOT_RETAINED = (
+    "The run finished, but its incognito/temporary result was held only in memory "
+    "and did not survive a gateway restart."
+)
 
 
 # Mapping writes run on worker threads (``asyncio.to_thread``), so a per-run
@@ -69,30 +73,6 @@ _MAPPING_LOCKS = tuple(threading.Lock() for _ in range(32))
 
 def _mapping_lock(run_id: str) -> threading.Lock:
     return _MAPPING_LOCKS[int(hashlib.sha256(run_id.encode("utf-8")).hexdigest(), 16) % 32]
-
-
-def _peer_enforces(payload: dict[str, Any], *, memory_mode: str, approval_floor: str) -> bool:
-    """Whether the peer's /api/spawn reply confirms it applied this run's tightening.
-
-    Only a tightening needs confirming: a persistent run without a floor asks the
-    peer for nothing an older peer would drop. Otherwise the reply must echo an
-    ``applied`` memory mode at least as strict as the one sent, and the floor.
-    """
-    if memory_mode in ("", "persistent") and not approval_floor:
-        return True
-    applied = payload.get("applied")
-    if not isinstance(applied, dict):
-        return False
-    from kiro_crew.messaging.privacy_mode import strictest
-
-    applied_mode = str(applied.get("memory_mode") or "")
-    if applied_mode not in ("persistent", "incognito", "temporary"):
-        return False
-    wanted = memory_mode or "persistent"
-    # strictest() ranks only the privacy modes and answers "" for persistent.
-    if (strictest((applied_mode, wanted)) or "persistent") != applied_mode:
-        return False
-    return not approval_floor or applied.get("approval_floor") == approval_floor
 
 
 class _SnapshotRefused(Exception):
@@ -727,6 +707,16 @@ class RemoteSubagentService:
                 info.result_path = str(result_path)
                 info.result = full_result
                 info.result_truncated = False
+            elif (
+                info.done
+                and not info.error
+                and memory_mode != "persistent"
+                and not raw.get("delivered")
+            ):
+                # An incognito/temporary result lives only in memory, so a
+                # restart loses it; redelivering an empty success would read
+                # as a run that answered nothing.
+                info.error = _RESULT_NOT_RETAINED
             records.append((info, bool(raw.get("delivered"))))
         return records
 
@@ -1109,26 +1099,6 @@ class RemoteSubagentService:
                 "The remote crew accepted the run but returned an invalid identifier.",
                 code="remote_run_id_invalid",
             )
-        if not _peer_enforces(payload, memory_mode=memory_mode, approval_floor=approval_floor):
-            # Version parity is major.minor only, so a peer without this change
-            # can accept the run while ignoring the fields that tighten it. Stop
-            # the peer run before refusing; it never gets a local mapping.
-            try:
-                await self._request_json(selected, "DELETE", f"api/spawn/{remote_id}")
-            except Exception:
-                logger.warning(
-                    "Could not cancel unenforced remote run %s on %s",
-                    remote_id,
-                    selected,
-                    exc_info=True,
-                )
-            raise RemoteSubagentError(
-                "The remote crew did not confirm it enforces this run's memory mode "
-                "and approval floor; update it to this gateway's version.",
-                code="remote_peer_unenforced",
-                status=409,
-            )
-
         local_id = uuid.uuid4().hex[:8]
         info = SubagentInfo(
             id=local_id,

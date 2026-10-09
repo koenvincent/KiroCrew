@@ -1155,9 +1155,6 @@ export interface ChatSlot {
   row_identity?: string
   /** Provider session identity when it differs from the dashboard slot key. */
   linked_session_key?: string
-  /** The transcript filename stem the server resolved for this slot: the key the
-   *  Older sessions list gives the same session, sent verbatim to reopen it. */
-  history_key?: string
   /** Prompts held for a later turn on this slot. */
   queue_depth?: number
   key: string; title?: string; messages: number; running: boolean; stopping?: boolean; pending_approval?: boolean; created?: string; last_ts?: string; last_turn_ts?: string; last_message?: string; agent?: string; model?: string; reasoning_effort?: string; mode?: string; surface?: string; workspace?: string; trust?: boolean; trust_scope?: string; trust_reads?: boolean; folder_id?: string; pinned?: boolean; tags?: string[]; tags_revision?: string; links?: SessionLink[]; slack_linked?: boolean; slack_channel?: string; slack_thread_ts?: string; color_index?: number | null; color_hex?: string | null; memory_mode?: 'persistent' | 'incognito' | 'temporary'; project?: string; forked_from?: string | null; source_links?: { provider: SourceProviderId; number: number; url: string; label?: string; repo?: string; ci?: 'running' | 'passed' | 'failed' | null; state?: 'open' | 'draft' | 'merged' | 'closed'; mergeable?: string; mergeStateStatus?: string; kind?: 'change' | 'issue'; identity?: string }[]; source_links_total?: number
@@ -1189,8 +1186,13 @@ export interface ChatSlot {
    * Distinct from `created_by`, and both are needed to know whether a slot is a
    * root: `created_by` is the birth-time edge, written once, while this one
    * carries the edge an adopt or release moves later. An adopted session has an
-   * empty `created_by` and a parent here. */
-  parent?: { slot: string; key: string | null } | null
+   * empty `created_by` and a parent here.
+   *
+   * `ancestor` is present and true only when `key` names an open ANCESTOR instead of
+   * the creator in `slot`, which the backend resolves when the creator itself has
+   * closed: the row nests where the run is owned and keeps citing its closed
+   * creator. */
+  parent?: { slot: string; key: string | null; ancestor?: boolean } | null
   /** Artifact companion binding: slug of the artifact this slot is a companion
    * chat for. Set at slot create and persisted in the history meta line, so the
    * binding survives a gateway restart and a History-page resume. */

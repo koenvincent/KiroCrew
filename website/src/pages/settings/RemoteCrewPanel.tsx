@@ -89,6 +89,7 @@ import { readPersistedString, usePersistedString } from '../../hooks/usePersiste
 import { usePersistedBool } from '../../hooks/usePersistedBool'
 import { AUTO_CONNECT_KEY } from '../../hooks/useAutoConnectInstances'
 import { copyToClipboard } from '../../utils/clipboard'
+import { useScrollEdges } from '../../hooks/useScrollEdges'
 import { useAppDispatch, useAppSelector } from '../../store'
 import { removeWarm, setCrewEditForm } from '../../store/instancesSlice'
 import { i18nT } from '../../i18n/t'
@@ -128,9 +129,13 @@ const connectionTypeHint = (inst: InstanceView): string =>
  * it is a wall of text, and a button that promised a dashboard would be the
  * defect this field replaces.
  */
-function TurnUrlField({ url, crewName }: { url: string; crewName: string }) {
+export function TurnUrlField({ url, crewName }: { url: string; crewName: string }) {
   const [copied, setCopied] = useState(false)
   const [copyFailed, setCopyFailed] = useState(false)
+  // Same scrollbar-none field as WebhooksPage's CopyField: a hidden scrollbar
+  // leaves a long URL's clipped tail unsignalled, so paint the edge cue. #4074.
+  const [attachEdges, edges, remeasure] = useScrollEdges<HTMLElement>()
+  useEffect(() => { remeasure() }, [url, remeasure])
   const label = i18nT('pages.settings.remoteCrewPanel.copy_turn_url', { name: crewName })
   const handleCopy = async () => {
     if (await copyToClipboard(url)) {
@@ -147,9 +152,20 @@ function TurnUrlField({ url, crewName }: { url: string; crewName: string }) {
         {i18nT('pages.settings.remoteCrewPanel.turn_api')}
       </div>
       <div className="flex items-center gap-2 bg-bg-elevated border border-border rounded-md pl-3 pr-1.5 py-1.5">
-        <code className="flex-1 min-w-0 font-mono text-[12px] overflow-x-auto whitespace-nowrap scrollbar-none text-card-fg">
-          {url}
-        </code>
+        {/* Wrapper for the edge cues: the fades anchor to this non-scrolling
+            parent, not the scrolled code element. from-bg-elevated matches the
+            field surface. */}
+        <div className="relative flex-1 min-w-0">
+          <code ref={attachEdges} className="block min-w-0 font-mono text-[12px] overflow-x-auto whitespace-nowrap scrollbar-none text-card-fg">
+            {url}
+          </code>
+          {edges.left && (
+            <div aria-hidden="true" data-testid="turn-url-cue-left" className="pointer-events-none absolute left-0 top-0 bottom-0 w-4 z-10 bg-gradient-to-r from-bg-elevated to-transparent" />
+          )}
+          {edges.right && (
+            <div aria-hidden="true" data-testid="turn-url-cue-right" className="pointer-events-none absolute right-0 top-0 bottom-0 w-4 z-10 bg-gradient-to-l from-bg-elevated to-transparent" />
+          )}
+        </div>
         <IconButton aria-label={label} onClick={handleCopy} title={label}>
           {copied ? <Check size={14} className="text-ok" /> : <Copy size={14} />}
         </IconButton>
@@ -511,7 +527,11 @@ function SigninPromptBlock({ job, onRestart, restarting, onFetch, fetching, noti
         {starting
           ? i18nT('pages.settings.remoteCrewPanel.sign_in_starting')
           : stale
-            ? i18nT('pages.settings.remoteCrewPanel.sign_in_unconfirmed')
+            // The "start over" sentence names the link below, so it is shown
+            // only where that link is: a crew that never registered has none.
+            ? canRestart
+              ? `${i18nT('pages.settings.remoteCrewPanel.sign_in_unconfirmed')} ${i18nT('pages.settings.remoteCrewPanel.sign_in_unconfirmed_expired')}`
+              : i18nT('pages.settings.remoteCrewPanel.sign_in_unconfirmed')
             : awaiting
               // Names the two sign-ins as ONE act. The reader could not tell
               // whether the Kiro sign-in step and the company SSO approval were

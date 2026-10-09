@@ -1468,7 +1468,7 @@ BENIGN_SPAWNS: frozenset[str] = frozenset(
         # exchanges two frames with a daemon that is already running; no child
         # process is created and there is no argv to sandbox. Same classification
         # as the other ``asyncio.run`` sites in this list.
-        "mcp_gateway/daemon_control.py::_ping",
+        "mcp_gateway/daemon_control.py::_ping_detailed",
         "mcp_gateway/gatewayd.py::main",
         "mcp_gateway/manager.py::_spawn_once",
         "mcp_gateway/stub.py::main",

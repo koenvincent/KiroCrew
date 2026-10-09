@@ -67,7 +67,7 @@ from kiro_crew.sandbox import (
     sandboxed_spawn_argv_async,
 )
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
-from kiro_crew.user_json import loads_user_json
+from kiro_crew.user_json import has_json_comments, loads_user_json, loads_user_jsonc
 
 logger = logging.getLogger(__name__)
 
@@ -1085,7 +1085,7 @@ def _mcp_names_from_file(path: Path) -> set[str]:
     if not path.is_file():
         return set()
     try:
-        data = loads_user_json(safe_read_file(str(path)))
+        data = loads_user_jsonc(safe_read_file(str(path)))
     except (json.JSONDecodeError, OSError, TypeError):
         return set()
     servers = data.get("mcpServers") if isinstance(data, dict) else None
@@ -1150,7 +1150,9 @@ def _load_mcp_json_by_source() -> dict[str, dict[str, Any]]:
         if not p.is_file():
             continue
         try:
-            data = loads_user_json(safe_read_file(str(p)))
+            # JSONC-tolerant: Kiro itself reads these files with comments, so a
+            # commented-out server must not drop every other server in the file.
+            data = loads_user_jsonc(safe_read_file(str(p)))
         except (json.JSONDecodeError, OSError) as exc:
             # PermissionError (subclass of OSError) is raised by
             # safe_read_file when is_sensitive_path() blocks the read.
@@ -1400,10 +1402,20 @@ def _managed_tools_in_process(name: str) -> list[str] | None:
     ``agent.sandbox_allow_unsandboxed_exec`` opt-in for a read-only listing, or
     exempt an agent-writable package from the sandbox. This needs neither.
 
+    This caller keeps only NAMES, so it prefers a module's ``_list_tool_names()``
+    when it offers one: a names-only read that never assembles descriptions, so a
+    description reaching for a live value (a directory scan, a config read) never
+    runs here. That is what replaced the per-builder ``get_running_loop`` skips —
+    the names-only path simply does not reach those reads, rather than each
+    builder detecting this caller and opting out. A module without the names-only
+    entry point falls back to extracting names from its full ``_list_tools()``;
+    among the managed set only ``kirocrew-core`` carries live-valued
+    descriptions, and it provides ``_list_tool_names()``.
+
     Imported lazily: these modules pull in the validation/artifacts graph, which
-    cannot be imported at this module's import time (circular). ``_list_tools`` is
-    a pure read of schemas plus config — no I/O of its own, no side effects, and
-    cheap enough for a discovery cycle.
+    cannot be imported at this module's import time (circular). The names-only
+    read is a pure read of the static tool set — no I/O of its own, no side
+    effects, and cheap enough for a discovery cycle.
 
     Returns ``None`` when *name* is not managed or the read fails, so the caller
     falls back to the ordinary spawn-and-handshake path rather than reporting a
@@ -1416,6 +1428,12 @@ def _managed_tools_in_process(name: str) -> list[str] | None:
         return None
     try:
         module = importlib.import_module(module_name)
+        names_only = getattr(module, "_list_tool_names", None)
+        if callable(names_only):
+            tool_names = names_only()
+            if isinstance(tool_names, list):
+                return [n for n in tool_names if isinstance(n, str) and n]
+            return None
         tools = module._list_tools()
     except Exception:
         logger.debug("in-process tool read failed for %s; will probe", name, exc_info=True)
@@ -3611,8 +3629,19 @@ def register_servers_for_cc(
     existing: dict = {}
     if mcp_json_path.is_file():
         try:
-            existing = loads_user_json(mcp_json_path.read_text(encoding="utf-8"))
-        except (json.JSONDecodeError, OSError):
+            text = mcp_json_path.read_text(encoding="utf-8")
+        except OSError:
+            text = ""
+        if has_json_comments(text):
+            # Written back as plain JSON below, which would drop the comments.
+            logger.warning(
+                "Not registering MCP servers in %s: it has comments or trailing commas",
+                mcp_json_path,
+            )
+            return False
+        try:
+            existing = loads_user_json(text)
+        except json.JSONDecodeError:
             existing = {}
 
     mcp = existing.setdefault("mcpServers", {})

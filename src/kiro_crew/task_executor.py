@@ -46,6 +46,7 @@ from kiro_crew.llm_helpers import (
     provider_last_turn_usage,
     stream_and_collect_json,
 )
+from kiro_crew.messaging.commands import compact_unsupported_backend
 from kiro_crew.messaging.dispatch import (
     consume_reinjection,
     rearm_reinjection,
@@ -1097,26 +1098,35 @@ async def execute_task(
                 f"⚠️ Context window {pct:.0f}% full — compressing conversation history. "
                 "Accuracy may degrade due to summarized context.\n\n"
             )
-            try:
-                await client.compact()
-                # The manager's budget, the one resolver every caller uses; it
-                # holds in a standalone `kirocrew run`, which arms no
-                # live-config watcher.
-                compact_result = await client.wait_for_compaction(
-                    timeout=sessions.compact_wait_budget_secs()
+            unsupported = compact_unsupported_backend(client)
+            if unsupported:
+                # This backend never answers /compact, so the wait would only
+                # run out its budget before ending in this same reset.
+                logger.info(
+                    "Task %d: %s cannot compact, resetting session", task.index, unsupported
                 )
-                if compact_result.get("type") == "completed":
-                    logger.info("Task %d: compaction succeeded", task.index)
-                else:
-                    logger.warning(
-                        "Task %d: compaction %s, resetting session",
-                        task.index,
-                        compact_result.get("type", "unknown"),
-                    )
-                    await sessions.reset(session_key)
-            except Exception:
-                logger.debug("Mid-stream compaction failed, resetting", exc_info=True)
                 await sessions.reset(session_key)
+            else:
+                try:
+                    await client.compact()
+                    # The manager's budget, the one resolver every caller uses; it
+                    # holds in a standalone `kirocrew run`, which arms no
+                    # live-config watcher.
+                    compact_result = await client.wait_for_compaction(
+                        timeout=sessions.compact_wait_budget_secs()
+                    )
+                    if compact_result.get("type") == "completed":
+                        logger.info("Task %d: compaction succeeded", task.index)
+                    else:
+                        logger.warning(
+                            "Task %d: compaction %s, resetting session",
+                            task.index,
+                            compact_result.get("type", "unknown"),
+                        )
+                        await sessions.reset(session_key)
+                except Exception:
+                    logger.debug("Mid-stream compaction failed, resetting", exc_info=True)
+                    await sessions.reset(session_key)
             await on_notify(
                 f"🗜️ Task {task.index}: context compressed",
                 f"Context was {pct:.0f}% full — compacted to continue.",

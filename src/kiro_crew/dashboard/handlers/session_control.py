@@ -333,6 +333,26 @@ async def api_session_control_stop(request: web.Request) -> web.Response:
     return web.json_response(result)
 
 
+async def api_session_control_retry(request: web.Request) -> web.Response:
+    """POST /api/session-control/retry — re-run another session's failed last turn."""
+    refused = await _require_internal(request)
+    if refused is not None:
+        return refused
+    # No prewarm here, for the reason `api_session_control_stop` gives.
+    state: DashboardState = request.app["state"]
+    try:
+        body = await _body(request)
+        result = await sc.retry_target(
+            state,
+            caller_session_key=_read_session_key(request),
+            target=_target(body),
+            caller_fenced=_carried_fence(request),
+        )
+    except sc.SessionControlError as exc:
+        return _refusal(exc)
+    return web.json_response(result)
+
+
 async def api_session_control_end_wait(request: web.Request) -> web.Response:
     """POST /api/session-control/end-wait — wake another session from `wait` early."""
     refused = await _require_internal(request)
@@ -354,7 +374,7 @@ async def api_session_control_end_wait(request: web.Request) -> web.Response:
 
 
 async def api_session_control_set_model(request: web.Request) -> web.Response:
-    """POST /api/session-control/set-model — change an idle session's model."""
+    """POST /api/session-control/set-model — change an idle session's model and/or effort."""
     refused = await _require_internal(request)
     if refused is not None:
         return refused
@@ -362,14 +382,21 @@ async def api_session_control_set_model(request: web.Request) -> web.Response:
     state: DashboardState = request.app["state"]
     try:
         body = await _body(request)
+        # Absent means "leave it alone"; present must be a string (an explicit
+        # null is refused, not read as absent), and the verb judges its value
+        # (it refuses an empty one of either).
         model = body.get("model")
-        if not isinstance(model, str):
+        if "model" in body and not isinstance(model, str):
             raise sc.SessionControlError("model must be a string", code="bad_request")
+        effort = body.get("reasoning_effort")
+        if "reasoning_effort" in body and not isinstance(effort, str):
+            raise sc.SessionControlError("reasoning_effort must be a string", code="bad_request")
         result = await sc.set_model_target(
             state,
             caller_session_key=_read_session_key(request),
             target=_target(body),
             model=model,
+            reasoning_effort=effort,
             caller_fenced=_carried_fence(request),
         )
     except sc.SessionControlError as exc:

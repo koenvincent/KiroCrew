@@ -4492,7 +4492,7 @@ class AcpSessionHandle:
                         _tool_idle = max(0.0, (now - last_own_data_ts) - _own_parked)
                         if _tool_idle <= wd.check_after_secs:
                             continue
-                        # F2 — TOCTOU guard: two complementary signals cover
+                        # TOCTOU guard: two complementary signals cover
                         # the two delivery paths for a frame that arrives DURING
                         # the oracle await (up to 10 s in an executor, event
                         # loop yielded).
@@ -4557,21 +4557,24 @@ class AcpSessionHandle:
                         # established backend socket: a model turn riding inside
                         # a tool, e.g. kiro-cli use_subagent) narrows to the
                         # model-silent budget, because its longest legitimate
-                        # silent gap is minutes, not hours. Keyed STRICTLY on
-                        # the oracle's evidence TAGS — established_flat, or
-                        # shell_child_absent for a shell command with no process
-                        # to its name. Untagged evidence (a quiet build's
-                        # unmatched-but-live tree, a quiet MCP tool) keeps the
-                        # full window.
-                        # F3 — hard cap: watchdog_tool_stall_hard_cap_secs is
+                        # silent gap is minutes, not hours. Every narrowing below
+                        # is keyed STRICTLY on an oracle evidence TAG:
+                        # established_flat; shell_child_absent, a shell command
+                        # with no process to its name; platform_limited, only
+                        # when the tool layer classified the command
+                        # prompt-shaped; remote_flat, only while
+                        # remote_flat_probe_secs is on. Evidence matching none
+                        # of them (a quiet build's unmatched-but-live tree, for
+                        # one) keeps the full window.
+                        # Hard cap: watchdog_tool_stall_hard_cap_secs is
                         # the absolute ceiling for UNKNOWN forbearance. Apply
                         # min(suspect_window, hard_cap) so the configured cap
                         # always bounds the effective window. WORKING deferred
                         # above, except an opaque-MCP reading past the hard
                         # cap; DEAD/STUCK_INPUT act immediately regardless of
                         # the window.
-                        # The action below is the existing non-lethal
-                        # tool-stall recovery.
+                        # The action below is the non-lethal tool-stall
+                        # recovery.
                         _suspect = wd.tool_stall_suspect_secs
                         _full_suspect = min(_suspect, wd.tool_stall_hard_cap_secs)
                         # Idle measure the chosen window is compared against. Only
@@ -4666,16 +4669,18 @@ class AcpSessionHandle:
                             # task's deadline — is the bound. Never a cancel,
                             # never an auto-answer.
                             continue
+                        if verdict == VERDICT_WORKING:
+                            _cancel_window = "working_cap"
+                        elif _narrowed:
+                            _cancel_window = "narrowed"
+                        else:
+                            _cancel_window = "standard"
                         self._emit_watchdog_metric(
                             "cancel",
                             verdict,
                             evidence,
                             _tool_idle,
-                            window=(
-                                "working_cap"
-                                if verdict == VERDICT_WORKING
-                                else "narrowed" if _narrowed else "standard"
-                            ),
+                            window=_cancel_window,
                         )
                         async for ev in self._end_stalled_tool(
                             verdict, evidence, _tool_idle, status=_input_wait
@@ -5546,8 +5551,9 @@ class AcpSessionHandle:
         bucketed by :func:`_watchdog_evidence_class`; ``window`` is one of:
         "standard" (default), "narrowed" (a tool-branch tag reduces the
         build-scale suspect window — established_flat to the model-silent budget,
-        shell_child_absent to the ordinary silence window), "extended"
-        (model-wait established_flat extends the 600s stale window to the
+        shell_child_absent and a prompt-shaped command's platform_limited to the
+        ordinary silence window, remote_flat to the opt-in remote-call budget),
+        "extended" (model-wait established_flat extends the 600s stale window to the
         model-silent probe window for a non-streamed server-side think), or
         "working_cap" (an opaque-MCP WORKING reading ran past the hard cap).
         ``agent_override`` is the per-agent-override BOOLEAN from the settings

@@ -181,12 +181,26 @@ is_macos_intel_backend() {
   }
 }
 
+# The audio decoder wheel a backend installs, or nothing.
+#
+# The macOS Intel backend installs NONE and resolves a system FFmpeg the way a
+# source install does (kiro_crew.stt.decoder.bundle_carries_decoder). Do not add
+# the wheel back for it: the runtime carries no pin for that platform, so a
+# bundled copy would never be authenticated or used.
+#   $1 = target arch, as build_backend receives it
+desktop_decoder_requirement() {
+  if is_macos_intel_backend "$1"; then
+    return 0
+  fi
+  printf '%s\n' "imageio-ffmpeg==0.6.0"
+}
+
 # NOTE ON THE APPLE-SILICON DECODER -- do NOT re-introduce a compressed payload.
 #
 # The arm64 imageio-ffmpeg executable ships as a PLAIN Mach-O under
-# Contents/Resources, exactly like its x86_64 sibling, so the app signer signs it
-# with Developer ID + hardened runtime + secure timestamp along with every other
-# nested binary (packaging/signing/generate-manifest.py enumerates it).
+# Contents/Resources, so the app signer signs it with Developer ID + hardened
+# runtime + secure timestamp along with every other nested binary
+# (packaging/signing/generate-manifest.py enumerates it).
 #
 # #6746 instead stored it as inert gzip data, to keep the bytes byte-identical to
 # the pinned upstream wheel across signing. The Apple notary service DECOMPRESSES
@@ -194,8 +208,8 @@ is_macos_intel_backend() {
 # closed on the whole release (submission 3dbd3c7d, three `error` issues on
 # .../binaries/ffmpeg-macos-aarch64-v7.1.gz/ffmpeg-macos-aarch64-v7.1: not signed
 # with a valid Developer ID certificate / no secure timestamp / hardened runtime
-# not enabled). The x86_64 copy of the same wheel, shipped raw in the same
-# submission, drew no issue at all -- that is the working shape.
+# not enabled). A raw Mach-O in the same submission drew no issue at all -- that
+# is the working shape.
 #
 # The runtime consequence is handled in kiro_crew.transcribe: the packaged decoder
 # is accepted either at the pinned upstream digest (local builds and the build gate
@@ -491,10 +505,12 @@ build_backend() {
   # installs from this checkout) prevents a surprise CMake/C++ source build. Missing
   # recogniser wheels fail every supported desktop build: local dictation is the
   # default and must be usable immediately. macOS Intel is the sole legacy exception.
+  local decoder_req
+  decoder_req="$(desktop_decoder_requirement "$want_arch")"
   env PYTHONNOUSERSITE=1 PYTHONPATH= KIROCREW_SKIP_FRONTEND=1 \
     "$out/bin/python3.12" -m pip install --prefer-binary \
     --no-warn-script-location --disable-pip-version-check \
-    "$ROOT[voice-aws]" "imageio-ffmpeg==0.6.0"
+    "$ROOT[voice-aws]" ${decoder_req:+"$decoder_req"}
   if ! env PYTHONNOUSERSITE=1 PYTHONPATH= KIROCREW_SKIP_FRONTEND=1 \
       "$out/bin/python3.12" -m pip install --prefer-binary \
       --only-binary pywhispercpp \

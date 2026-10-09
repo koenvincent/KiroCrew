@@ -57,7 +57,8 @@ need no display and never call Bedrock.
    Chromium's cold start on the hosted runner image has ranged from under 2 s to
    over 30 s between nights with nothing else different.
 3. `harness.py` navigates to each scenario's `start_url` through the omnibox (the
-   token has become the `mc_token` cookie by then), takes a screenshot, and loops:
+   token has become the `mc_token` cookie by then; the URL is typed a second after
+   `ctrl+l`, so none of it can land in a chat composer the page had focused), takes a screenshot, and loops:
    the model returns one action, the harness executes it, waits about a second, and
    returns a fresh screenshot as the tool result. The conversation keeps the newest
    three screenshots; older ones become a one-line placeholder.

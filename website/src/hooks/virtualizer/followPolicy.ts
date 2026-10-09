@@ -1003,10 +1003,42 @@ export function usePinning<T>(ctx: {
         // hold the gate open past it rather than pinning into its tail.
         pinCascadeUntilRef.current = now + SCROLL_SETTLE_MS
       } else {
+        // kirodotdev/KiroCrew#17320. A tail APPEND under a still, followed
+        // reader whose scrollTop was displaced DOWN off our last write by our
+        // OWN layout — the composer dock shrinking as the run ends drops the
+        // scroller's `paddingBottom` reserve, and the engine clamps scrollTop
+        // to the smaller max — then grows further when the reply's per-message
+        // footer (model/clock/duration, ~108px) renders. evaluateAutoPin's
+        // resting rule carries a reader who is on our write to the pixel, but
+        // this clamp lands them a few px BELOW it with no scroll event to
+        // re-baseline onto (the footer-grow RO beat it), so the reader falls to
+        // the idle-release branch and the footer is stranded under the dock.
+        //
+        // Re-baseline onto the clamped position here, exactly as the scroll
+        // handler does for a clamp it DID see ("resting on a re-baselined write
+        // counts as resting"), so pinAuto reads the append as content under a
+        // resting reader and carries them. Gated hard: a tail APPEND only
+        // (`genuineResize && tailRowResized` — never a mid-transcript
+        // disclosure), `stick` still armed, and the reader at or BELOW our write
+        // (`scrollTop <= lastWriteTop` — a clamp or a content push). A genuine
+        // scroll-up lowers scrollTop too, but it stamps `lastUserScrollAtRef`,
+        // so pinSuppressedNow above already held it out of this branch. This
+        // only re-anchors a reader this branch would otherwise strand; it
+        // writes no scroll of its own — pinAuto owns the write.
+        const el = scrollerRef.current
+        if (
+          el
+          && genuineResize && tailRowResized && stickRef.current
+          && lastWriteTopRef.current >= 0
+          && el.scrollTop <= lastWriteTopRef.current
+        ) {
+          lastWriteTopRef.current = el.scrollTop
+          lastWriteClientHRef.current = el.clientHeight
+        }
         pinAuto()
       }
     }
-  }, [pinAuto, stickRef, lastUserScrollAtRef, pinCascadeUntilRef])
+  }, [pinAuto, stickRef, lastUserScrollAtRef, pinCascadeUntilRef, scrollerRef, lastWriteTopRef, lastWriteClientHRef])
 
   // ---- scrollToIndex / scrollToBottom imperative APIs ----
 

@@ -1204,8 +1204,8 @@ Before author, source run, intent run, saved-definition run or subtree rerun
 calls the service, ordinary transport authentication applies, and then a split by
 caller class:
 
-- **Source, intent and saved-definition runs** (`POST /api/workflows/run`,
-  `/run_intent`, `/definitions/{ref}/run`): a dashboard-user request (no
+- **Source, intent, saved-definition and rerun launches** (`POST /api/workflows/run`,
+  `/run_intent`, `/definitions/{ref}/run`, `/runs/{run_id}/rerun`): a dashboard-user request (no
   `internal_auth`, `app == ""`) must be the dashboard owner
   (`require_owner_dashboard_request`, 403 `owner_only`). An `X-Internal-Secret`
   loopback caller (the chat `workflow_*` MCP tools) and a manifest-scoped app token
@@ -1213,13 +1213,19 @@ caller class:
   `POST /api/crons` gate the dashboard-user class the same way.
 - **Definition create, update and run promotion** are owner-only for every caller.
 - **Run list, detail, cancel and rerun** go through `workflow_memory.authorize_run`
-  (the list keeps only the runs it admits).
+  (the list keeps only the runs it admits); rerun does so after the owner check above.
 
 The session's canonical execution record is captured before asynchronous
 dispatch; missing or malformed member identity refuses instead of selecting Global.
-Run list/detail/cancel/rerun keep ordinary execution permissions. A permitted
-rerun retains the original run's member/store and strictest privacy mode, even
-when requested from another member. Member stores add no separate cross-member ACL.
+Run list/detail/cancel keep ordinary execution permissions. A permitted rerun
+retains the original run's member/store and strictest privacy mode, even when an
+internal-secret caller requests it from another member. Member stores add no separate cross-member ACL.
+The rerun's `author` and `session_key` are a different matter: they name the session
+whose Trust the new run's spawns borrow (`slack.gateway._spawn_parent_slot`). The
+dashboard owner's rerun keeps the prior run's origin. Every other caller's rerun,
+edited or not, is bound to the caller's own `X-Session-Key` (blank when it sends
+none), exactly as a fresh run from that session would be. So another session cannot
+launch a script under a trusted chat's identity.
 
 | Route | Body / params | Response |
 |-------|---------------|----------|

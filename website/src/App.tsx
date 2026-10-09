@@ -1344,9 +1344,13 @@ export default function App() {
   // `mc:app:badge`-driven dynamic app counts. Secretary's badge flows through
   // the surface registry.
   const totalAttention = builtinAttention + Object.values(appBadges).reduce((a, b) => a + b, 0)
-  useEffect(() => {
-    document.title = totalAttention > 0 ? `(${totalAttention}) ${botName}` : botName
-  }, [totalAttention, botName])
+  // The active session's title, for the tab title below. A slot whose title
+  // is still its key has no real title yet (same rule as the chat popout).
+  const activeSessionTitle = useAppSelector(s => {
+    const key = s.chat.activeSlot
+    const title = key ? s.dashboard.slots.find(x => x.key === key)?.title : undefined
+    return title && title !== key ? title : ''
+  })
 
   // Browser push notification on new notification — see src/hooks/useNativeNotification.ts
   useNativeNotification(botName, avatar)
@@ -1401,6 +1405,21 @@ export default function App() {
   const closeMobileNav = isMobile ? closeMobileNavDrawer : undefined
   const { activePath, libraryNavActive, discoverNavActive, isChat, needsFixedHeight, navRowActive } =
     useRouteActiveModel(location.pathname, location.search, advertisedNavItems)
+  // Browser tab title, detail first like the popout windows
+  // (`{{label}} — {{productName}}`): `[(N) ]<session> — Chat — <bot>` on chat,
+  // `[(N) ]<panel> — <bot>` on any other rail destination, bare `<bot>` when
+  // the route matches no row. The count stays in front so it survives tab
+  // truncation. Labels are resolved here, at render, so a language switch
+  // re-titles the tab.
+  const chatPanelLabel = i18nT('app.tab_title_chat')
+  const titlePanelRow = isChat ? null : [...advertisedNavItems, ...sortedAppGroup].find(n => navRowActive(n.path))
+  const titleLabel = isChat
+    ? (activeSessionTitle ? i18nT('app.tab_title_session', { session: activeSessionTitle, panel: chatPanelLabel }) : chatPanelLabel)
+    : (titlePanelRow ? surfaceLabel(titlePanelRow) : '')
+  useEffect(() => {
+    const base = titleLabel ? i18nT('app.tab_title', { label: titleLabel, productName: botName }) : botName
+    document.title = totalAttention > 0 ? `(${totalAttention}) ${base}` : base
+  }, [totalAttention, botName, titleLabel])
   // Phone chat page: the header is ONE bar for both the shell and the
   // conversation. The chat page fills `#mobile-topbar-slot` (sessions toggle,
   // session title + menu) and `#mobile-topbar-trail-slot` (its overflow menu)

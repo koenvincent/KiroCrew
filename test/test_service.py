@@ -7535,3 +7535,125 @@ class TestAppArmorLauncherUninstall:
 
         assert calls == [("rm", "-f", str(path))]
         assert outcome.changed is True
+
+
+class TestLinuxStatusNamesAStaleLoadedUnit:
+    """``service status`` asks each scope's manager for the LOADED
+    ``RestartPreventExitStatus`` of our unit and, when it does not name
+    ``LIVE_HOLDER_EXIT_CODE``, prints one line naming the directive and the
+    command that adds it. Nothing is rewritten, reloaded or run under sudo."""
+
+    @pytest.fixture(autouse=True)
+    def _not_root(self, _floor_monkeypatch, tmp_path):
+        from kiro_crew.service import linux as svc_linux
+
+        _floor_monkeypatch.setattr(svc_linux.os, "geteuid", lambda: 1000, raising=False)
+        _floor_monkeypatch.setenv("USER", "tester")
+        _floor_monkeypatch.setattr(svc_linux, "UNIT_PATH", tmp_path / "system" / _UNIT)
+        user_unit = tmp_path / ".config" / "systemd" / "user" / _UNIT
+        _floor_monkeypatch.setattr(svc_linux, "user_unit_file_path", lambda: user_unit)
+
+    @staticmethod
+    def _with_loaded(run, *, system=None, user=None):
+        """Wrap a ``_fake_systemctl`` so the ``RestartPreventExitStatus`` query
+        answers ``system`` / ``user`` per scope (``None``: no property line).
+
+        The values the tests pass are the strings live managers print (systemd
+        245 and 252): ``78``, ``1 78``, ``78 TERM`` (a signal prints without its
+        ``SIG`` prefix), and an empty value for a unit without the directive."""
+
+        def wrapped(argv, *a, **k):
+            tokens = list(argv)
+            if "show" in tokens and "RestartPreventExitStatus" in tokens:
+                wrapped.calls.append(tokens)
+                value = user if "--user" in tokens else system
+                body = "" if value is None else f"RestartPreventExitStatus={value}\n"
+                return subprocess.CompletedProcess(tokens, 0, body, "")
+            result = run(argv, *a, **k)
+            wrapped.calls.append(tokens)
+            return result
+
+        wrapped.calls = []
+        return wrapped
+
+    @staticmethod
+    def _status(run):
+        from kiro_crew.service import linux as svc_linux
+
+        with patch("kiro_crew.service.linux.subprocess.run", side_effect=run):
+            return svc_linux.status()
+
+    def test_a_system_unit_loaded_without_the_exemption_is_named_with_the_reinstall_remedy(self):
+        run = self._with_loaded(_fake_systemctl(system=_RUNNING, user=None), system="")
+        out = self._status(run)
+
+        lines = out.splitlines()
+        idx = next(i for i, line in enumerate(lines) if "lacks" in line)
+        assert "`RestartPreventExitStatus=78`" in lines[idx], out
+        assert "`sudo kirocrew service install`" in lines[idx], out
+        assert lines[idx - 1].startswith("system scope: active (running)"), out
+        assert all("sudo" not in c for c in run.calls), run.calls
+        assert not any("daemon-reload" in c for c in run.calls), run.calls
+
+    def test_a_user_unit_loaded_without_the_exemption_gets_a_no_sudo_remedy(self, tmp_path):
+        fragment = str(tmp_path / "u" / _UNIT)
+        run = self._with_loaded(
+            _fake_systemctl(system=None, user=_RUNNING, user_fragment=fragment), user=""
+        )
+        out = self._status(run)
+
+        stale = [line for line in out.splitlines() if "lacks" in line]
+        assert len(stale) == 1, out
+        assert fragment in stale[0]
+        assert "`systemctl --user daemon-reload`" in stale[0]
+        assert "sudo" not in stale[0]
+        assert not any("daemon-reload" in c for c in run.calls), run.calls
+
+    @pytest.mark.parametrize("loaded", ["78", "78 TERM", "1 78"])
+    def test_a_loaded_exemption_in_either_scope_reads_clean(self, loaded):
+        run = self._with_loaded(
+            _fake_systemctl(system=_RUNNING, user=_RUNNING), system=loaded, user=loaded
+        )
+        assert "lacks" not in self._status(run)
+
+    def test_a_loaded_value_that_does_not_name_the_live_holder_code_is_reported(self):
+        run = self._with_loaded(_fake_systemctl(system=_RUNNING, user=None), system="1 TERM")
+        assert "lacks `RestartPreventExitStatus=78`" in self._status(run)
+
+    def test_no_property_line_makes_no_claim(self):
+        run = self._with_loaded(_fake_systemctl(system=_RUNNING, user=None), system=None)
+        assert "lacks" not in self._status(run)
+
+    @pytest.mark.parametrize(
+        "kwargs",
+        [{"system_load": "masked"}, {"system_id": "shared.service"}],
+        ids=["masked", "alias"],
+    )
+    def test_a_unit_that_is_not_loaded_or_not_ours_is_not_asked(self, kwargs):
+        run = self._with_loaded(_fake_systemctl(system=_RUNNING, user=None, **kwargs), system="")
+        out = self._status(run)
+
+        assert "lacks" not in out, out
+        assert not any("RestartPreventExitStatus" in c for c in run.calls), run.calls
+
+    def test_the_query_asks_for_empty_properties_too(self):
+        """``--all`` keeps an unset property printed as ``Key=`` rather than
+        omitted, so "unset" is not read as "systemctl did not answer"."""
+        run = self._with_loaded(_fake_systemctl(system=_RUNNING, user=None), system="78")
+        self._status(run)
+
+        query = next(c for c in run.calls if "RestartPreventExitStatus" in c)
+        assert query[:3] == ["systemctl", "show", "--all"], query
+
+    def test_the_freshly_rendered_unit_carries_the_exemption(self):
+        """The renderer and the check name the same code: a unit this build
+        writes carries the value the check looks for."""
+        from kiro_crew.service import linux as svc_linux
+
+        with (
+            patch.object(svc_linux, "_current_group", lambda _u: "tester"),
+            patch.object(svc_linux.selinux, "installer_context", lambda _b: None),
+        ):
+            for user_scope in (False, True):
+                rendered = svc_linux.render_unit(user_scope=user_scope).splitlines()
+                assert f"RestartPreventExitStatus={svc_linux.LIVE_HOLDER_EXIT_CODE}" in rendered

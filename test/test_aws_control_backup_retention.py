@@ -1564,6 +1564,30 @@ class TestEveryVersionUnderAKeyMustBeOurs:
         )
         assert drive.deleted == []
 
+    def test_a_null_recorded_id_from_suspended_versioning_is_not_ours(self):
+        # "null" is the id S3 gives EVERY object written to a key while the bucket's
+        # versioning is suspended, and an overwrite there REPLACES that version rather
+        # than adding one. So a recorded "null" names no single version: a co-writer's
+        # overwrite of the same key is "null" too. It must read as not-ours -- the same
+        # fail-closed end as the empty id -- rather than letting two "null" ids compare
+        # equal and pass a foreign object as our archive.
+        row = _version("k", "2026-01-01T00:00:00Z", version_id="null")
+        assert backup._current_version_is_ours([row], "null") is False
+
+    def test_a_provable_recorded_id_against_a_null_current_version_is_not_ours(self):
+        # The other side of the comparison. Our record proves one version by id, but
+        # the current object under the key reports "null", which identifies nothing we
+        # can match against. Routing the current id through the predicate too means an
+        # unprovable current version reads as not-ours regardless of what we recorded.
+        row = _version("k", "2026-01-01T00:00:00Z", version_id="null")
+        assert backup._current_version_is_ours([row], "v-ours") is False
+
+    def test_a_provable_matching_current_version_is_still_ours(self):
+        # The control: the routing must not refuse a legitimate match. A current
+        # version whose id both is provable and equals the record is ours.
+        row = _version("k", "2026-01-01T00:00:00Z", version_id="v-ours")
+        assert backup._current_version_is_ours([row], "v-ours") is True
+
     def test_put_file_reports_the_version_s3_assigned(self, monkeypatch):
         # Retention's whole ownership proof starts here: the id the uploader is
         # handed is the only value it owns outright, so it must survive the call.

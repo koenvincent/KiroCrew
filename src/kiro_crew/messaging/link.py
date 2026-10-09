@@ -542,8 +542,16 @@ def split_dm_session_key(key: str) -> tuple[str, int] | None:
 
 #: ``direct`` (1:1 DM) is the baseline; ``forum`` keys a Telegram supergroup
 #: forum Topic ``(chat_id, thread_id)`` to its own session (Slack-thread style).
+#: ``direct_topic`` keys a Telegram *private-chat* forum Topic
+#: ``(chat_id, thread_id)`` to its own session: it is still a 1:1 DM with one
+#: allow-listed user (so it keeps the owner/token-guard side of ``direct``), but
+#: it is per-topic isolated and must never collapse under ``dm_scope=unified``
+#: -- the same isolation ``forum`` has, for a different reason (not a shared
+#: space, but still several parallel conversations the user split apart). See
+#: ``docs/system-specs/modules/messaging.md`` and ``session.md``.
 CHAT_TYPE_DIRECT = "direct"
 CHAT_TYPE_FORUM = "forum"
+CHAT_TYPE_PRIVATE_TOPIC = "direct_topic"
 
 
 def build_dm_session_key(
@@ -569,10 +577,16 @@ def build_dm_session_key(
         the same person on Telegram vs WeCom stays isolated.
       * ``unified`` -- direct (1:1) DMs collapse into a single ``unified:{agent}``
         bucket for cross-surface continuity (channel and user drop out of the
-        key). Applies ONLY to direct DMs: a forum route (``chat_type ==
-        CHAT_TYPE_FORUM``) ALWAYS keeps its full
-        ``{channel}:{agent}:{chat_type}:{user}`` bucket regardless of dm_scope,
-        so private DM content can never collapse into a shared group Topic.
+        key). Applies ONLY to the baseline ``direct`` chat_type: an *isolated*
+        route -- a group forum Topic (``CHAT_TYPE_FORUM``) or a private-chat
+        forum Topic (``CHAT_TYPE_PRIVATE_TOPIC``) -- ALWAYS keeps its full
+        ``{channel}:{agent}:{chat_type}:{user}`` bucket regardless of dm_scope.
+        For ``forum`` the reason is exposure: private DM content can never
+        collapse into a shared group Topic. For ``direct_topic`` the reason is
+        different -- a private topic is NOT a shared space, it is still a 1:1 DM
+        -- but the outcome must be the same: collapsing it would merge every
+        topic back into one bucket and undo the per-topic split the user asked
+        for. Only ``CHAT_TYPE_DIRECT`` (the threadless General DM) collapses.
 
     An unrecognized ``dm_scope`` falls back to per-channel-peer (safe isolation)
     rather than raising, so a hand-edited config can never crash dispatch.

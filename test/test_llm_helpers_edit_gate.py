@@ -14,6 +14,7 @@ keeps the document scan byte for byte.
 from __future__ import annotations
 
 import json
+import os
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -264,7 +265,7 @@ class TestPatchTextTargets:
             "*** Update File: /tmp/proj/notes.md\n"
             "*** Move to: /tmp/proj/renamed.md\n"
             "@@\n-old\n+new\n"
-            "*** Add File: ~/.kiro/crew/config.json\n+x\n"
+            f"*** Add File: {os.path.expanduser('~/.kiro/crew/config.json')}\n+x\n"
             "*** End Patch"
         )
         approved, provider, rows = await _resolve(
@@ -291,6 +292,137 @@ class TestPatchTextTargets:
         )
         assert approved is False
         assert "verify" in _error(rows)
+
+
+class TestPatchHeadersAreReadAsTheApplierReadsThem:
+    """The applier splits a patch on ``\\n`` only and resolves each header path
+    as a literal string, collapsing ``..`` without the dirs existing. The gate
+    must judge that same file. Every attack below names a protected or
+    out-of-tree file the gate would otherwise have read as a safe one."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("brk", ["\r", "\x1c", "\x85", "\u2028"])
+    async def test_a_header_hiding_a_second_break_is_unverifiable(self, brk: str) -> None:
+        # Split on that break, the header reads /tmp/ok plus a context line.
+        # To the applier it is one path whose ``..`` lands in the real home.
+        home = os.path.expanduser("~")
+        header = f"*** Update File: /tmp/ok{brk} /../..{home}/.ssh/authorized_keys"
+        patch = f"*** Begin Patch\n{header}\n@@\n-old\n+new\n*** End Patch"
+        approved, provider, rows = await _resolve(
+            _edit_event("/tmp/ok", params={"patchText": patch})
+        )
+        assert approved is False, "a header hiding a second line break was approved"
+        assert provider.rejected == ["r1"]
+        assert "verify" in _error(rows)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "path",
+        [
+            "$TMPDIR/../.git/hooks/pre-commit",
+            "~/../proj/.git/hooks/pre-commit",
+            "/tmp/$TMPDIR/x.md",
+        ],
+    )
+    async def test_a_tilde_or_var_path_is_unanchored(
+        self, path: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Expanded, each reads as an absolute path. The applier expands
+        # nothing, so the file it writes sits under its own cwd instead.
+        monkeypatch.setenv("TMPDIR", "/tmp")
+        patch = f"*** Begin Patch\n*** Update File: {path}\n@@\n-old\n+new\n*** End Patch"
+        approved, provider, rows = await _resolve(
+            _edit_event("/tmp/ok.md", params={"patchText": patch})
+        )
+        assert approved is False, f"{path!r} was judged as an expanded absolute path"
+        assert provider.rejected == ["r1"]
+        assert "relative target path" in _error(rows)
+
+    @pytest.mark.asyncio
+    async def test_a_plain_absolute_patch_with_a_final_newline_passes(self) -> None:
+        patch = "*** Begin Patch\n*** Update File: /tmp/proj/a.md\n@@\n-old\n+new\n*** End Patch\n"
+        approved, provider, rows = await _resolve(
+            _edit_event("/tmp/proj/a.md", params={"patchText": patch})
+        )
+        assert approved is True, _error(rows)
+        assert provider.approved == ["r1"]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "patch",
+        [
+            # Two files, a move and an end-of-file marker.
+            "*** Begin Patch\n"
+            "*** Add File: /tmp/proj/new.md\n+x\n"
+            "*** Update File: /tmp/proj/a.md\n"
+            "*** Move to: /tmp/proj/b.md\n"
+            "@@\n-old\n+new\n*** End of File\n"
+            "*** Delete File: /tmp/proj/gone.md\n"
+            "*** End Patch",
+            # CRLF line ends: the applier trims each header path.
+            "*** Begin Patch\r\n*** Update File: /tmp/proj/a.md\r\n@@\r\n-old\r\n+new\r\n*** End Patch\r\n",
+            # A ``$`` that names no set variable is part of the file name.
+            "*** Begin Patch\n*** Update File: /tmp/proj/routes/users.$id.tsx\n"
+            "@@\n-old\n+new\n*** End Patch",
+            # Non-ASCII file names that hold no line break.
+            "*** Begin Patch\n*** Add File: /tmp/proj/caf\u00e9 \u6587\u4ef6 \U0001f600.md\n+x\n*** End Patch",
+        ],
+    )
+    async def test_legit_patch_shapes_still_pass(
+        self, patch: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv("id", raising=False)
+        approved, provider, rows = await _resolve(
+            _edit_event("/tmp/proj/a.md", params={"patchText": patch})
+        )
+        assert approved is True, _error(rows)
+        assert provider.approved == ["r1"]
+
+    @pytest.mark.asyncio
+    async def test_a_dotdot_header_is_judged_on_the_file_it_lands_on(self) -> None:
+        target = os.path.join(os.path.expanduser("~"), "missing", "..", ".ssh", "authorized_keys")
+        patch = f"*** Begin Patch\n*** Add File: {target}\n+x\n*** End Patch"
+        approved, _provider, rows = await _resolve(
+            _edit_event("/tmp/a", params={"patchText": patch})
+        )
+        assert approved is False
+        assert "protected path" in _error(rows)
+
+    @staticmethod
+    def _bom_patches() -> list[str]:
+        # JS ``.trim()`` drops a trailing U+FEFF, so the applier writes the
+        # real config.json. Python's ``str.strip`` keeps it.
+        target = os.path.expanduser("~/.kiro/crew/config.json") + "\ufeff"
+        return [
+            f"*** Begin Patch\n*** Add File: {target}\n+x\n*** End Patch",
+            f"*** Begin Patch\n*** Delete File: {target}\n*** End Patch",
+            "*** Begin Patch\n*** Update File: /tmp/ok.md\n"
+            f"*** Move to: {target}\n@@\n-old\n+new\n*** End Patch",
+        ]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("which", ["add", "delete", "move"])
+    async def test_a_trailing_bom_header_is_denied_by_the_permission_gate(self, which: str) -> None:
+        patch = dict(zip(["add", "delete", "move"], self._bom_patches()))[which]
+        approved, provider, _rows = await _resolve(
+            _edit_event("/tmp/ok.md", params={"patchText": patch})
+        )
+        assert approved is False, f"a {which} header ending in U+FEFF was approved"
+        assert provider.rejected == ["r1"]
+
+    @pytest.mark.parametrize("which", ["add", "delete", "move"])
+    def test_a_trailing_bom_header_is_denied_by_the_hook(self, which: str) -> None:
+        from kiro_crew.hooks import TOOL_DENY, HookManager, HooksConfig
+
+        patch = dict(zip(["add", "delete", "move"], self._bom_patches()))[which]
+        decision = HookManager(HooksConfig.from_dict({})).on_tool_call(
+            "Editing the notes",
+            session_key="cli_chat",
+            tool_kind="edit",
+            raw_params={"patchText": patch},
+            diff_path="",
+        )
+        assert decision.action == TOOL_DENY, f"a {which} header ending in U+FEFF passed the hook"
 
 
 class TestTheClientCarriesTheDiffPathOntoThePermissionEvent:

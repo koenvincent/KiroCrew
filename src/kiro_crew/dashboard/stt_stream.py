@@ -37,9 +37,7 @@ from kiro_crew.llm_helpers import run_bg_oneliner
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
 from kiro_crew.sel import sel
 from kiro_crew.start_priority import StartPriority
-from kiro_crew.stt.engine import pcm_from_int16
 from kiro_crew.stt.limits import DECODE_ABORT_GRACE_SECS
-from kiro_crew.stt.vad import Endpointer as AudioEndpointer
 from kiro_crew.transcribe import _ProfileCredentialResolver, _whisper_language, availability_detail
 
 logger = logging.getLogger(__name__)
@@ -567,6 +565,13 @@ async def _run_local_session(
     latest_speech_audio_end = 0
     received_samples = 0
     with _audited_setup(caller):
+        # Imported here, not at module scope: both modules import numpy, and this
+        # module is on the import path of every ``kirocrew mcp-dashboard`` server.
+        # Inside the audited block so a numpy that fails to load still emits the
+        # end audit matching the already-logged ``stt_stream_start``.
+        from kiro_crew.stt.engine import pcm_from_int16
+        from kiro_crew.stt.vad import Endpointer as AudioEndpointer
+
         endpointer = _build_endpointer(
             ws, cfg, request, can_submit=lambda: acknowledged_audio_end >= latest_speech_audio_end
         )

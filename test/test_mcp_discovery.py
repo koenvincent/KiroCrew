@@ -6865,3 +6865,73 @@ class TestProtocolVersionNegotiation:
 
         assert (result.status, result.error) == ("error", "boom")
         assert session.post.call_count == 1
+
+
+class TestManagedToolsInProcessNamesOnly:
+    """The in-process managed-tool read keeps only NAMES, so it must take a
+    names-only path that never assembles descriptions — so neither builder
+    needs a ``get_running_loop`` skip.
+    """
+
+    def test_core_names_are_correct_and_complete(self) -> None:
+        """The names returned match a full ``_list_tools`` build exactly, in order."""
+        import kiro_crew.mcp_core as core
+        from kiro_crew.mcp_discovery import _managed_tools_in_process
+
+        full = [t["name"] for t in core._list_tools()]
+        got = _managed_tools_in_process("kirocrew-core")
+        assert got == full
+        assert len(got) == len(set(got))  # no duplicates
+
+    def test_the_live_value_builders_are_not_invoked(self) -> None:
+        """The two descriptions that reach for a live value — the agents-directory
+        scan in ``spawn`` and the config read in ``control`` — must NOT run on the
+        names-only path, because that caller discards every description.
+
+        Spying the expensive step directly (per the issue's acceptance): the
+        directory scan (``spawn.mcp_core.list_agents``) and the config read
+        (``control.KiroCrewConfig.load``) are asserted to receive zero calls.
+        """
+        import kiro_crew.mcp_tools.control as control
+        import kiro_crew.mcp_tools.spawn as spawn
+        from kiro_crew.mcp_discovery import _managed_tools_in_process
+
+        scan = MagicMock(return_value=[])
+        cfg_load = MagicMock(side_effect=AssertionError("config read ran on names-only path"))
+        with (
+            patch.object(spawn.mcp_core, "list_agents", scan),
+            patch.object(control.KiroCrewConfig, "load", classmethod(lambda cls: cfg_load())),
+        ):
+            got = _managed_tools_in_process("kirocrew-core")
+
+        assert got, "names-only read returned nothing"
+        scan.assert_not_called()
+        cfg_load.assert_not_called()
+
+    def test_all_managed_servers_resolve_in_process(self) -> None:
+        """Every managed server still resolves to a name list (or [] by design for
+        kirocrew-computer while its keystone is off) without spawning."""
+        from kiro_crew.mcp_discovery import (
+            _MANAGED_SERVER_TOOL_MODULES,
+            _managed_tools_in_process,
+        )
+
+        for name in _MANAGED_SERVER_TOOL_MODULES:
+            result = _managed_tools_in_process(name)
+            assert result is not None, f"{name} failed to resolve in-process"
+            assert all(isinstance(n, str) and n for n in result)
+
+    def test_no_running_loop_skip_remains_in_the_two_builders(self) -> None:
+        """Static guard: the ``get_running_loop`` skips the names-only path
+        replaced must not creep back into either builder's code (docstring prose
+        is allowed; executable ``get_running_loop(`` calls are not)."""
+        import kiro_crew.mcp_tools.control as control
+        import kiro_crew.mcp_tools.spawn as spawn
+
+        for mod in (spawn, control):
+            source = Path(mod.__file__).read_text(encoding="utf-8")
+            assert "get_running_loop(" not in source, (
+                f"{mod.__name__} reintroduced a get_running_loop skip; the names-only "
+                "read path (build_tool_names / schemas(names_only=True)) is what keeps "
+                "the live reads off the gateway loop now"
+            )

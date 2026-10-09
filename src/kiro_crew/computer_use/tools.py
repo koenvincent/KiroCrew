@@ -154,7 +154,12 @@ from kiro_crew.computer_use.types import (
 from kiro_crew.executors import subprocess_executor
 from kiro_crew.platform.context import PlatformCompositionError
 from kiro_crew.sel import sel
-from kiro_crew.validation import MCP_COMPUTER_SCHEMAS, ValidationError, validate_tool_args
+from kiro_crew.validation import (
+    MCP_COMPUTER_SCHEMAS,
+    ValidationError,
+    coerce_mcp_tool_args,
+    validate_tool_args,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -401,7 +406,10 @@ def _dispatch(
             agent=agent,
             tool_name=tool_name,
         )
-    clean = validate_tool_args(dict(args), MCP_COMPUTER_SCHEMAS[tool_name])
+    clean = validate_tool_args(
+        coerce_mcp_tool_args(dict(args), MCP_COMPUTER_SCHEMAS[tool_name]),
+        MCP_COMPUTER_SCHEMAS[tool_name],
+    )
 
     svc = service.get_shared_service()
 

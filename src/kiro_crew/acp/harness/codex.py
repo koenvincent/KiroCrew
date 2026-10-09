@@ -286,9 +286,12 @@ class CodexHarness(MembershipHarness):
         # CODEX_SQLITE_HOME (the runtime's per-process scratch dir). Only the
         # databases move: config, auth and the thread rollouts stay in CODEX_HOME,
         # and a thread resumes from its rollout (measured on codex 0.159), so
-        # spawn_continue still works across runtimes. A fresh home rebuilds its
-        # index on first start -- an accepted cost. An operator who set the
-        # variable chose that location; it reaches the child as set.
+        # spawn_continue still works across runtimes. The scratch dir dies with
+        # the process, so EVERY runtime start rebuilds codex's index from the
+        # rollouts in CODEX_HOME, and that cost grows with the user's history
+        # (about a minute for a few thousand threads). An operator who set the
+        # variable chose that location; it reaches the child as set, which is
+        # the workaround for a large history.
         return SpawnPlan(
             argv=list(argv),
             rss_depth=self.CORE_RSS_DEPTH + wrapper_generations,

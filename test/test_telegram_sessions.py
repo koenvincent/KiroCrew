@@ -382,6 +382,90 @@ async def _bind(
     await dispatcher.on_callback(_callback(data, message_id=message_id))
 
 
+def _private_topic(text: str, thread: int, *, chat_id: int = 7, user_id: int = 7):
+    """A message in a forum Topic INSIDE a 1:1 private chat.
+
+    Telegram carries ``message_thread_id`` in a private chat once direct-message
+    topics are on; the chat is still ``private`` and its chat_id still equals the
+    user id. The threadless General topic carries no ``thread_id`` and routes as
+    an ordinary DM.
+    """
+    return TelegramInboundMessage(
+        channel_type="telegram",
+        user_id=str(user_id),
+        conversation_id=str(chat_id),
+        text=text,
+        chat_type="private",
+        thread_id=str(thread),
+    )
+
+
+class TestTelegramPrivateChatTopicRouting:
+    """Each forum Topic in a private DM is its own session, keyed by
+    ``(chat_id, thread)`` the way a supergroup Topic already is -- while staying
+    'private' for the DM-only audience guards."""
+
+    def test_threadless_private_dm_keeps_the_pre_topic_identity(self, tmp_path: Any) -> None:
+        dispatcher, _, _, _ = _dispatcher(tmp_path)
+        route = dispatcher._route_key(chat_type="private", user_id=7, chat_id=7, thread=None)
+        assert route == ("direct", "7")
+        assert dispatcher._route_thread(route) is None
+        # Byte-identical to the pre-forum DM key: users who never enable topics
+        # see no change.
+        assert dispatcher._session_key(route) == "telegram:kirocrew:direct:7"
+
+    def test_a_private_topic_folds_chat_id_and_thread(self, tmp_path: Any) -> None:
+        dispatcher, _, _, _ = _dispatcher(tmp_path)
+        route = dispatcher._route_key(chat_type="private", user_id=7, chat_id=7, thread=11)
+        assert route == ("direct_topic", "7:11")
+        assert dispatcher._route_thread(route) == 11
+        assert dispatcher._session_key(route) == "telegram:kirocrew:direct_topic:7:11"
+
+    def test_two_private_topics_resolve_to_distinct_sessions(self, tmp_path: Any) -> None:
+        dispatcher, _, _, _ = _dispatcher(tmp_path)
+        a = dispatcher._session_key(
+            dispatcher._route_key(chat_type="private", user_id=7, chat_id=7, thread=11)
+        )
+        b = dispatcher._session_key(
+            dispatcher._route_key(chat_type="private", user_id=7, chat_id=7, thread=12)
+        )
+        general = dispatcher._session_key(
+            dispatcher._route_key(chat_type="private", user_id=7, chat_id=7, thread=None)
+        )
+        assert len({a, b, general}) == 3
+
+    def test_private_topic_is_private_for_audience_guards(self, tmp_path: Any) -> None:
+        dispatcher, _, _, _ = _dispatcher(tmp_path)
+        topic = dispatcher._route_key(chat_type="private", user_id=7, chat_id=7, thread=11)
+        general = dispatcher._route_key(chat_type="private", user_id=7, chat_id=7, thread=None)
+        group = dispatcher._route_key(chat_type="supergroup", user_id=7, chat_id=-100, thread=11)
+        # A private topic is a 1:1 DM: it keeps /kirocrew dashboard and the
+        # host-wide listings; a supergroup Topic (group-readable) does not.
+        assert dispatcher._is_private_route(topic) is True
+        assert dispatcher._is_private_route(general) is True
+        assert dispatcher._is_private_route(group) is False
+
+    def test_private_topic_does_not_collapse_under_unified_dm_scope(self, tmp_path: Any) -> None:
+        dispatcher, _, _, _ = _dispatcher(tmp_path)
+        dispatcher.cfg.messaging.dm_scope = "unified"
+        general = dispatcher._session_key(
+            dispatcher._route_key(chat_type="private", user_id=7, chat_id=7, thread=None)
+        )
+        topic = dispatcher._session_key(
+            dispatcher._route_key(chat_type="private", user_id=7, chat_id=7, thread=11)
+        )
+        # The threadless DM collapses into the shared unified bucket; the topic
+        # keeps its own full bucket, or the fix would be a no-op.
+        assert general.startswith("unified:")
+        assert topic == "telegram:kirocrew:direct_topic:7:11"
+
+    @pytest.mark.asyncio
+    async def test_a_private_topic_turn_runs_under_its_own_session(self, tmp_path: Any) -> None:
+        dispatcher, _, sessions, _ = _dispatcher(tmp_path)
+        await dispatcher.handle_message(_private_topic("in topic 11", thread=11))
+        assert sessions.last_key == "telegram:kirocrew:direct_topic:7:11"
+
+
 class TestTelegramSessionPicker:
     @pytest.mark.asyncio
     async def test_keyboard_payload_owner_message_index_and_double_press(
@@ -1546,11 +1630,15 @@ class TestTelegramResumeIntegration:
         owner = TelegramTransport(_Client(), allowed_user_ids={7})
         assert owner.may_resume_from("7", None) is True
         assert owner.may_resume_from("8", None) is False
+        # A threaded link never resumes a dashboard session: the one caller
+        # (chat_mirror) only ever passes a threadless Telegram target, so inbound
+        # resume stays scoped to the sole owner's threadless General DM.
         assert owner.may_resume_from("7", "11") is False
 
         shared = TelegramTransport(_Client(), allowed_user_ids={7, 8})
         assert shared.may_resume_from("7", None) is False
         assert shared.may_resume_from("8", None) is False
+        assert shared.may_resume_from("7", "11") is False
 
 
 class TestTelegramRestrictedResumedSession:

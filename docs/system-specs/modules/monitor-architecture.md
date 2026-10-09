@@ -157,6 +157,24 @@ replacement starts its own cycle count. As a backstop, `work_ledger_read` flags 
 read included -- a loop watching something else reads no ledger, so it does not
 count. The Crew page board does not show the flag yet.
 
+A `work-ledger` watch waits longer for its quiet floor while no worker has
+reported. Every gated loop is delivered anyway after `_MAX_QUIET_STREAK` (10)
+quiet ticks, and for this kind that turn re-read a long conductor chat to find
+the board as the conductor left it. The probe publishes `WorkLedgerProbe.revision`,
+a digest of each item's worker-owned report fields (`last_report_at`,
+`status`, `summary`; `no-reports` for a board read with none yet). The conductor's own writes -- a verdict, a new item -- do not
+move it, though they still move the kernel epoch. The gate keeps it on the
+monitor as `ledger_revision`, and every delivered turn copies it to
+`ledger_delivered_revision`. While the two match, the floor is
+`_IDLE_LEDGER_QUIET_FLOOR` (40) ticks instead of 10, and it still delivers
+there, which also bounds a stall the probe's rate limit folded forward without
+waking. A new worker report puts the floor back to 10 at once. Report and stall
+wakes are untouched: they are `WAKE` verdicts and never reach the floor branch.
+The longer floor never applies while the loop's recent turns failed to start or
+errored (`consecutive_start_failures`, `consecutive_failed_cycles`), or when the
+revision is unknown (empty, or unreadable on load). Other kinds keep the
+shipped floor.
+
 The `monitoring/` package now has a different extension point:
 `models.MonitorProbe`, a structural Protocol with no behaviour inheritance, plus
 the data-only kind registry. The four source-provider adapters and the workflow

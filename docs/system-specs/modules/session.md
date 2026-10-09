@@ -744,12 +744,58 @@ against sweep completeness, and are torn down at `close_all`.
   boundaries: steer cut, compaction, clear, agent switch) is load-bearing for the
   promise-only guard.
 
-  A successfully delivered non-blocking `ask_question` directive is different
-  from a generic productive tool-only turn: its card is the intended terminal
-  output, and the tool explicitly tells the model to end until the user's answer
-  arrives as a new message. The runner therefore records the successful card
-  outcome and skips the entire empty-response ladder. Delivery failures keep the
-  normal behavior so the model can fall back to a plain-text question.
+  **A terminal directive is not an empty turn.** Two directives are a turn's
+  intended last act (`session_directive_apply.TERMINAL_DIRECTIVES`): a delivered
+  non-blocking `ask_question` card, whose answer arrives as the next user message,
+  and a `nothing_to_do` quiet end, the sanctioned way for a turn that ran tools
+  and found nothing the user needs to read (a patrol cycle with no change, a
+  cron wake with nothing to report) to end without a reply. The runner reads the
+  applier's structured `DirectiveOutcome.ends_turn` — set only where the effect
+  landed, never derived from the outcome prose — into
+  `_terminal_directive_applied`, and the empty-response branch is skipped for
+  such a turn: no notice card, no synthetic continuation, no recovery budget
+  spent. The tool card's applied outcome (`QUIET_END_OUTCOME_PREFIX` plus the
+  model's optional `note`) is the low-key, inspectable record that the turn
+  ended on purpose; nothing is rendered as an assistant bubble. Delivery failures
+  (a card no client saw, a refused directive) leave the flag unset so the model
+  falls back to a plain-text reply. The turn-end contract the base prompt states
+  — a closing text, or `nothing_to_do`, never a bare stop after an ordinary tool
+  — is enforced by exactly this asymmetry: the bare stop keeps the ladder.
+  Model activity AFTER the terminal directive (a text chunk, another tool call)
+  is a contract violation the runner counts and reports once at turn end as a
+  privacy-safe WARNING (`Turn-end contract violation`, counts and the directive
+  kind only); it does not fail the turn and does not re-arm recovery, because
+  re-arming would turn the quiet end the model asked for into a notice card.
+  **Who may end quietly.** The applier's one gate is who opened the turn: a
+  monitor wake (`_directive_self_wake`) or a headless producer (cron, crew, app,
+  task runner — `_directive_user_origin` False) may; a turn a person opened
+  (`_directive_user_origin` True, or any channel turn) is REFUSED
+  (`QUIET_END_REFUSED_USER_TURN`), so the ladder, Resume and the channel notice
+  run as before and a model that dodged a question fails VISIBLY, not silently.
+  A quiet end is also a FINISHED turn for the interrupted-turn scan: its tail
+  (`[nudge, tool…]`) is shape-identical to a gateway that died mid-turn, so
+  `state.is_turn_interrupted` and its mirror `selectTurnInterrupted` treat the
+  applied directive's tool row (`is_quiet_end_row` / `isQuietEndRow`) as a
+  terminator like the Stop card — otherwise every quiet patrol cycle would offer
+  Resume and flag the session as interrupted. Two structured facts, both
+  required: the row's persisted TRUSTED identity (`meta.tool_name` +
+  `meta.mcp_server`, never its title), and `meta.ends_turn = True`, which the
+  runner stamps only on the rows of a directive whose `DirectiveOutcome.ends_turn`
+  was True (persisted, and patched live over `chat_message_update`) — a refused
+  call carries the identity and no flag. And only when it is the turn's LAST
+  tool row: a tool row later than it means the model kept working past the
+  directive, and a gateway that died in that work must not hide behind it.
+  `test_nothing_to_do_directive.py` pins the two constants against the
+  selectors mirror. The Crewmate chat draws nothing for it: tool rows are
+  machinery there
+  (`crewmateBubbles.MACHINERY_ROLES`), so the quiet turn leaves that surface
+  exactly as it was. The ladder's own cards — the continue and give-up rungs
+  and the post-compaction resume — carry `meta.kind = "empty_turn"`
+  (`chat_utils.EMPTY_TURN_NOTICE_KIND`), and the Crewmate chat drops a `notice`
+  row by that tag (`crewmateBubbles.isCrewmateChatRow`), never by its words: a
+  person reading a crewmate has nothing to do with the runner's recovery, while
+  an untagged notice (an automation arm refusal) still draws because it names
+  something they may have to act on. The Sessions page keeps drawing them.
 
   **Turn-end diagnostics.** The branch emits ONE privacy-safe WARNING per empty
   verdict, after the rung is chosen, naming a closed `cause` and `rung` plus
@@ -1438,7 +1484,14 @@ against sweep completeness, and are torn down at `close_all`.
   `status: "async_launched"` with a `taskId` (Workflow);
   `_dispatch.parse_background_launch` reads exactly those structured fields, and
   skips an `Agent`/`Task` launch because the adapter holds the prompt open until
-  such a sub-agent settles. Only `AcpClient` — the transport that serves claude,
+  such a sub-agent settles. Those two shapes were captured from claude-agent-acp
+  0.84.0 and Kiro Crew does not pin the adapter, so a rename would silently stop
+  the hold. `_dispatch.unrecognised_background_launch` is the tripwire: a
+  `toolResponse` from a non-held tool whose key, or string `status`, contains
+  `background` or `async` (case-insensitive) while the parse recognised nothing
+  is logged at INFO once per `BackgroundLaunchRecord` (`take_drift`), naming the
+  offending keys. A rename that drops both words (`bgTaskId`) is not caught.
+  Only `AcpClient` — the transport that serves claude,
   the one harness whose adapter stamps the marker — keeps a per-session
   `BackgroundLaunchRecord` today (the `AcpSessionHandle` runtime serves only
   backends that never stamp `_meta.claudeCode`), never reset per turn, exposed as
@@ -2756,8 +2809,12 @@ gen, dm_scope)`:
 - **Shape** (channel-first): `{channel}:{agent}:{chatType}:{user}` plus an
   optional `:gen{N}` suffix. The part before the suffix is a durable **bucket**
   (history and channel links hang off it); the **generation** rotates to start a
-  fresh transcript within the bucket. `chatType` is `direct` today; `group` is
-  reserved.
+  fresh transcript within the bucket. `chatType` is a free string segment each
+  channel owns (§9 pins only the grammar, not the vocabulary): `direct` is the
+  baseline 1:1 DM; `forum` keys a group forum Topic to `(chat_id, thread_id)`;
+  `direct_topic` keys a **private-chat** forum Topic to `(chat_id, thread_id)`
+  (Telegram — still a 1:1 DM, but per-topic isolated); Discord also uses
+  `group` for a guild thread.
 - **`dm_scope`** (`MessagingConfig.dm_scope`): `per-channel-peer` (default) —
   one bucket per `(channel, user)`; `unified` — all DMs collapse into a single
   `unified:{agent}` bucket for cross-surface continuity. `agent` is part of the
@@ -3575,7 +3632,9 @@ but is NOT named: it started nothing, is woken or held, and lands after the reco
 (naming it recorded a kill failure over a clean reap). A caller held at the front
 door holds no reservation at all. `open_task_session`, the other
 publication door, is refused at its entry while the fence is up rather than held:
-it holds no reservation and creates on a shared runtime with no hard-kill path, so
+it reserves the key only around its create (so `has_allocation_reservation` and
+`session_keys()` see the window) but is never refused at registration and has no
+hard-kill path on the shared runtime, so
 a per-step create already in flight is what the ending caller's post-pass read of
 the key remains the net for. Additive to the allocation-boundary predecessor
 capture: new state fields, new methods, and door checks as separate statements.

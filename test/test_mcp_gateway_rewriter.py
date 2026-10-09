@@ -1509,6 +1509,61 @@ def _unencoded_json_reads(source: str) -> list[int]:
     return found
 
 
+# Parsers fed straight from ``read_text``: the stdlib pair plus the module's
+# user-JSON reader used on the global settings file.
+_JSON_TEXT_PARSERS = ("json.loads", "json.load", "loads_user_json")
+
+# An ``except`` naming any of these catches ``UnicodeDecodeError``.
+_CATCHES_DECODE_ERROR = frozenset(
+    {"UnicodeDecodeError", "UnicodeError", "ValueError", "Exception", "BaseException"}
+)
+
+
+def _json_text_reads(source: str) -> list[tuple[int, bool]]:
+    """``(line, guarded)`` for each JSON parse of a ``<path>.read_text(...)``.
+
+    ``guarded`` is True when the call sits in the body of some enclosing
+    ``try`` whose handlers catch ``UnicodeDecodeError`` (by name or through a
+    base class). A handler or ``finally`` block does not count as guarded.
+    """
+    import ast
+
+    tree = ast.parse(source)
+    parents: dict[ast.AST, ast.AST] = {}
+    for parent in ast.walk(tree):
+        for child in ast.iter_child_nodes(parent):
+            parents[child] = parent
+
+    def _catches(handler: ast.ExceptHandler) -> bool:
+        if handler.type is None:
+            return True
+        types = handler.type.elts if isinstance(handler.type, ast.Tuple) else [handler.type]
+        return any(ast.unparse(t).rsplit(".", 1)[-1] in _CATCHES_DECODE_ERROR for t in types)
+
+    def _guarded(node: ast.AST) -> bool:
+        child, parent = node, parents.get(node)
+        while parent is not None:
+            if isinstance(parent, ast.Try) and child in parent.body:
+                if any(_catches(h) for h in parent.handlers):
+                    return True
+            child, parent = parent, parents.get(parent)
+        return False
+
+    found: list[tuple[int, bool]] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call) or not node.args:
+            continue
+        if ast.unparse(node.func) not in _JSON_TEXT_PARSERS:
+            continue
+        inner = node.args[0]
+        if not isinstance(inner, ast.Call):
+            continue
+        if not ast.unparse(inner.func).endswith(".read_text"):
+            continue
+        found.append((inner.lineno, _guarded(node)))
+    return sorted(found)
+
+
 class TestRewriterDecodesJsonAsUtf8:
     """Agent specs and the global settings file are UTF-8 JSON written by
     somebody else -- a user, an editor, the Kiro IDE -- so the rewriter decodes
@@ -1666,3 +1721,59 @@ class TestRewriterDecodesJsonAsUtf8:
             )
             == []
         )
+
+    def test_every_json_read_catches_a_decode_error(self) -> None:
+        """Pins the other half of the UTF-8 fix: the except arm.
+
+        ``encoding="utf-8"`` makes a non-UTF-8 file raise
+        ``UnicodeDecodeError``, a ``ValueError`` the old
+        ``(OSError, json.JSONDecodeError)`` tuples let through. The corrupt-file
+        behaviour test reaches the strict spec reader, not these arms, so
+        dropping ``UnicodeDecodeError`` from one of them would leave every other
+        test green. This scan fails instead.
+        """
+        from kiro_crew.mcp_gateway import rewriter as rw
+
+        source = Path(rw.__file__).read_text(encoding="utf-8")
+        reads = _json_text_reads(source)
+        assert len(reads) >= 3, (
+            f"the scan found only {reads}; rewriter.py has at least three "
+            "JSON reads of a file, so the matcher has stopped seeing them"
+        )
+        unguarded = [line for line, guarded in reads if not guarded]
+        assert unguarded == [], (
+            "rewriter.py parses JSON from read_text at line(s) "
+            f"{unguarded} with no enclosing except that catches "
+            "UnicodeDecodeError; one non-UTF-8 file would then abort the "
+            "rewrite pass instead of being skipped"
+        )
+
+    def test_the_decode_error_ratchet_can_actually_fail(self) -> None:
+        """Each shape the scan must reject, and each it must accept."""
+        head = "import json\nfrom pathlib import Path\n"
+        read = "    x = json.loads(Path('a').read_text(encoding='utf-8'))\n"
+
+        def scan(body: str) -> list[tuple[int, bool]]:
+            return _json_text_reads(head + body)
+
+        assert scan("x = json.loads(Path('a').read_text(encoding='utf-8'))\n") == [(3, False)]
+        assert scan("try:\n" + read + "except (OSError, json.JSONDecodeError):\n    pass\n") == [
+            (4, False)
+        ]
+        assert scan("try:\n    pass\nexcept OSError:\n" + read) == [
+            (6, False)
+        ], "a read inside the handler is not guarded by it"
+        assert scan(
+            "try:\n"
+            + read
+            + "except (OSError, json.JSONDecodeError, UnicodeDecodeError):\n    pass\n"
+        ) == [(4, True)]
+        assert scan("try:\n" + read + "except Exception:\n    pass\n") == [(4, True)]
+        assert scan(
+            "try:\n    try:\n    " + read + "    except OSError:\n        pass\n"
+            "except ValueError:\n    pass\n"
+        ) == [(5, True)], "an outer try that catches it still guards the read"
+        assert scan(
+            "try:\n    y = loads_user_json(Path('a').read_text(encoding='utf-8'))\n"
+            "except OSError:\n    pass\n"
+        ) == [(4, False)]

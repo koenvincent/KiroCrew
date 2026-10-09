@@ -18,10 +18,11 @@ first-class, and neither may add a step to the local path:
 
 Compressed input still needs ffmpeg: a Slack voice memo arrives as ogg/Opus and
 the dashboard records webm. Desktop releases carry a pinned imageio-ffmpeg wheel
-with that executable, so desktop users never install a system binary separately;
-source installs use a system FFmpeg from fixed platform paths, or the
-digest-verified store :mod:`kiro_crew.stt.decoder` fetches the same pinned upstream
-bytes into. A 16 kHz mono WAV and live PCM skip the executable entirely.
+with that executable, so desktop users never install a system binary separately --
+except on macOS Intel, whose release ships no decoder and resolves exactly like a
+source install. Source installs use a system FFmpeg from fixed platform paths, or
+the digest-verified store :mod:`kiro_crew.stt.decoder` fetches the same pinned
+upstream bytes into. A 16 kHz mono WAV and live PCM skip the executable entirely.
 
 Two guards here are deliberately provider-independent, because a per-branch copy
 is a copy that will be missing from the next branch someone adds:
@@ -155,12 +156,15 @@ _PACKAGED_FFMPEG_ARTIFACTS: dict[str, tuple[int, str]] = decoder.PACKAGED_FFMPEG
 # filenames, so this module imports no imageio_ffmpeg at all (not a core dependency).
 #
 # Each key ties to the build leg that ships it:
-#   macos-aarch64 + macos-x86_64 = the ONE universal DMG from the macos-15 leg of
-#       .github/workflows/build-desktop.yml; the Makefile's `desktop` target builds
-#       that single DMG covering arm64 AND x86_64, so both slices ship together.
+#   macos-aarch64 = the arm64 half of the ONE universal DMG from the macos-15 leg
+#       of .github/workflows/build-desktop.yml (the Makefile's `desktop` target).
 #   linux-x86_64  = ubuntu-22.04 leg of build-desktop.yml.
 #   linux-aarch64 = ubuntu-22.04-arm leg of build-desktop.yml.
 #   windows-x86_64 = .github/workflows/build-windows.yml.
+#
+# macos-x86_64 (the x86_64 half of that same DMG) is DELIBERATELY excluded: the
+# Intel backend ships no decoder and resolves a system FFmpeg instead
+# (stt.decoder.bundle_carries_decoder).
 #
 # windows-i686 (upstream ffmpeg-win32-v4.2.2.exe) is DELIBERATELY excluded: no
 # 32-bit Windows target exists in any build workflow or the Electron config.
@@ -169,7 +173,6 @@ _PACKAGED_FFMPEG_ARTIFACTS: dict[str, tuple[int, str]] = decoder.PACKAGED_FFMPEG
 _SHIPPED_FFMPEG_PLATFORMS: frozenset[str] = frozenset(
     {
         "macos-aarch64",
-        "macos-x86_64",
         "linux-x86_64",
         "linux-aarch64",
         "windows-x86_64",
@@ -192,20 +195,17 @@ _SHIPPED_FFMPEG_PLATFORMS: frozenset[str] = frozenset(
 #   - a valid Developer ID signature from our own team on the exact bytes staged
 #     for execution, which is what a released app carries.
 # Neither anchor is a path or a filesystem-permission claim.
-# BOTH macOS slices are here: build-desktop.sh ships the arm64 AND x86_64
-# imageio-ffmpeg executables as plain Mach-O under Contents/Resources, and the app
-# signer signs every nested binary with Developer ID + hardened runtime + secure
-# timestamp (generate-manifest.py enumerates them). So the released Intel-Mac slice
-# authenticates via its signature anchor exactly like the arm64 slice, its bytes
-# having been rewritten by signing away from the pinned upstream digest.
+# The arm64 slice is here because build-desktop.sh ships its imageio-ffmpeg
+# executable as a plain Mach-O under Contents/Resources, and the app signer signs
+# every nested binary with Developer ID + hardened runtime + secure timestamp
+# (generate-manifest.py enumerates them), so the released bytes authenticate via
+# the signature anchor, having been rewritten by signing away from the pin.
 #
 # The set is therefore exactly the macos-* members of _SHIPPED_FFMPEG_PLATFORMS, and
 # test_transcribe.py asserts that equality rather than a subset: a macOS slice added
 # above but forgotten here has no anchor left once signing has rewritten its bytes,
 # so a SIGNED release would refuse its own decoder.
-_SIGNER_REWRITTEN_FFMPEG_ARTIFACTS: frozenset[str] = frozenset(
-    {"ffmpeg-macos-aarch64-v7.1", "ffmpeg-macos-x86_64-v7.1"}
-)
+_SIGNER_REWRITTEN_FFMPEG_ARTIFACTS: frozenset[str] = frozenset({"ffmpeg-macos-aarch64-v7.1"})
 
 # Upper bound on a signer-rewritten payload, whose exact size is unknowable in
 # source. Signing appends a code-signature superblob to a ~50 MB executable, so
@@ -910,17 +910,19 @@ def _packaged_ffmpeg_version_probe() -> PackagedDecoderProbe:
 
 def _bundled_ffmpeg() -> str | None:
     """Return the authenticated decoder carried by a bundled interpreter."""
-    if not platform_compat.is_bundled_interpreter():
+    if not decoder.bundle_carries_decoder():
         return None
     return _packaged_ffmpeg_resource()
 
 
 def _open_ffmpeg_for_execution() -> str | _AuthenticatedFfmpeg | None:
     """Resolve FFmpeg, retaining authenticated bundled bytes until spawn."""
-    if platform_compat.is_bundled_interpreter():
-        # A desktop release is self-contained. If its authenticated decoder is
-        # missing or damaged, fail closed instead of executing a fixed-path
-        # binary that was never authenticated as part of this installation.
+    if decoder.bundle_carries_decoder():
+        # A desktop release that ships a decoder is self-contained. If its
+        # authenticated decoder is missing or damaged, fail closed instead of
+        # executing a fixed-path binary that was never authenticated as part of
+        # this installation. A release that ships none (macOS Intel) has nothing
+        # to be damaged, so it falls through to the source-install order below.
         return _open_packaged_ffmpeg_resource()
     system = _find_system_ffmpeg()
     if system is not None:
@@ -1196,7 +1198,7 @@ def _find_ffmpeg() -> str | None:
     to `which`'s default (the ambient PATH) and the candidate list already carries the
     package-manager directories.
     """
-    if platform_compat.is_bundled_interpreter():
+    if decoder.bundle_carries_decoder():
         return _bundled_ffmpeg()
     system = _find_system_ffmpeg()
     if system is not None:
@@ -1222,7 +1224,7 @@ def ffmpeg_source() -> str | None:
     settings panel names the decoder that would actually run rather than the first
     one that happens to exist.
     """
-    if platform_compat.is_bundled_interpreter():
+    if decoder.bundle_carries_decoder():
         return FFMPEG_SOURCE_BUNDLED if _bundled_ffmpeg() is not None else None
     if _find_system_ffmpeg() is not None:
         return FFMPEG_SOURCE_SYSTEM

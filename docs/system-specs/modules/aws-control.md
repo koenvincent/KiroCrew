@@ -462,6 +462,45 @@ an archive-level comparison reports "changed" every night. Reading it from the p
 rather than by a second walk of the source also means it cannot disagree with what would
 actually be sent, and that a redaction switch changes the fingerprint.
 
+**Every read of the finished archive comes from ONE descriptor, and so does the
+upload.** On `main` the archive was staged by name and then re-resolved from that name
+four times -- the entry-set digest, the recorded size, the AWS CLI `--body` open, and
+the body digest -- so a same-UID process that replaced the file between any two of those
+resolutions made the upload carry bytes nothing checked, off-host and unrecallable
+(#13259). The fix opens the finished archive ONCE through a checked descriptor and reads
+the size, both fingerprints and the upload body all from it, so no step re-resolves the
+name.
+
+Both kinds build the archive BY NAME in a private staging directory this app cuts and
+PINS (`storage.pinned_staging`: `mkdtemp` 0700 under the masked staging root, then a
+pinned directory handle), then take hold of it with `backup._open_pinned_archive_fd` --
+an `O_NOFOLLOW` open relative to that directory handle, plus an `fstat` requiring a
+singly-named regular file this process owns (`S_ISREG` + `st_nlink == 1` + owner), and a
+deny-write open on Windows. From that descriptor `backup._read_at` reads the archive by
+EXPLICIT OFFSET (`os.pread` where the platform has it, otherwise a seek that restores the
+caller's position in a `finally`, since Windows has no `pread`), so the two fingerprints
+and the upload share one descriptor without an `os.dup` sharing the file offset.
+
+`storage.put_file` carries the other half. The archive callers hand it `body_fd` -- the
+checked descriptor -- and it streams THAT descriptor to the AWS CLI as `--body
+/dev/stdin` with the descriptor passed as the child's stdin (`engine.run_aws`'s
+`stdin_fd`), so the child resolves no path at all. Windows has no `/dev/stdin`, so it
+passes the name held by the pinned directory handle and re-verifies the inode against the
+held descriptor afterwards (`_assert_same_file`, a detect-not-prevent backstop). A caller
+with no descriptor of its own (the label sidecar, the library push, the drive spool)
+still passes a bare name exactly as before -- those bodies are not re-hardened by #13259.
+
+This is the whole fix: the archive bytes that are CHECKED are the bytes that are
+UPLOADED, on every platform the backup already ran on -- Linux, macOS, the BSDs, Windows.
+The inode pin fixes WHICH file the descriptor reaches; it does not hold the file's CONTENT
+unrewritable in place against a same-UID writer for the whole (minutes-long) transfer. A
+producer that writes the body into a descriptor it never lets a name reach -- so the
+content is held from creation -- is the larger follow-up tracked in #13550, for both the
+sessions and the snapshot producers. The sessions kind keeps its pre-existing
+descriptor-pinned-traversal requirement (`run_sessions_backup` refuses where the traversal
+cannot be pinned, as it did on `main`); no NEW capability gate is added, so no platform
+loses a backup it had.
+
 Two normalizations are part of the digest's definition, each measured against the real
 engine rather than assumed. `_VOLATILE_MANIFEST_FIELDS` drops `created_at` from
 `MANIFEST.json`, the one field `snapshot.py` rewrites on a rebuild of an unchanged tree;

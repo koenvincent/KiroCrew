@@ -181,6 +181,25 @@ describe('useInstanceSessions', () => {
     expect(result.current.rows[0].parent).toEqual({ slot: 'gone' })
   })
 
+  it('forwards ancestor, which is what tells the pair apart on a re-parented peer row', async () => {
+    // Without it the lane gets a key and a slot that disagree and no reason they do,
+    // so it reads the nesting as ordinary and drops the closed-creator glyph: a
+    // peer's crew looks like sessions the lead opened itself, and the cross-gateway
+    // lane answers differently from the local one about the same fact.
+    instanceChatSlotsMock.mockResolvedValue([
+      { key: 'lead', title: 'Lead' },
+      { key: 'w1', title: 'Worker', parent: { slot: 'mid', key: 'lead', ancestor: true } },
+      // Not a literal `true`, so it does not survive the boundary.
+      { key: 'w2', title: 'Other', parent: { slot: 'mid', key: 'lead', ancestor: 'yes' } },
+    ])
+    const { result } = renderInstanceSessions(true, [CONNECTED])
+
+    await waitFor(() => expect(result.current.rows).toHaveLength(3))
+    const byKey = new Map(result.current.rows.map(r => [r.key, r]))
+    expect(byKey.get('w1')?.parent).toEqual({ slot: 'mid', key: 'lead', ancestor: true })
+    expect(byKey.get('w2')?.parent).toEqual({ slot: 'mid', key: 'lead' })
+  })
+
   it('preserves row identity across unrelated rerenders after query data settles', async () => {
     instanceChatSlotsMock.mockResolvedValue([
       { key: 'chat-1', title: 'stable row', last_turn_ts: '2026-08-31T14:00:00Z' },

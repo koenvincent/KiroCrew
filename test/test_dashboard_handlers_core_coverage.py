@@ -563,12 +563,29 @@ class TestSttPrereqCommands:
     def test_bundled_desktop_never_offers_a_system_decoder_command(self, monkeypatch) -> None:
         monkeypatch.setattr(core_mod, "_transcribe_extra_importable", lambda: True)
         monkeypatch.setattr(core_mod.platform_compat, "is_bundled_interpreter", lambda: True)
+        monkeypatch.setattr(
+            core_mod.stt_decoder,
+            "platform_key",
+            lambda *a, **k: core_mod.stt_decoder.ARTIFACTS[0].platform_key,
+        )
 
         def _unexpected_system_install():
             raise AssertionError("desktop tried to make the user install ffmpeg")
 
         monkeypatch.setattr(core_mod, "_ffmpeg_install_commands", _unexpected_system_install)
         assert core_mod._stt_prereq_commands("transcribe") == []
+
+    def test_a_release_with_no_bundled_decoder_offers_the_system_command(self, monkeypatch) -> None:
+        """The macOS Intel release carries no decoder, so a system one is its only route."""
+        monkeypatch.setattr(core_mod, "_transcribe_extra_importable", lambda: True)
+        monkeypatch.setattr(core_mod.platform_compat, "is_bundled_interpreter", lambda: True)
+        monkeypatch.setattr(
+            core_mod.stt_decoder,
+            "platform_key",
+            lambda *a, **k: core_mod.stt_decoder.DECODERLESS_BUNDLE_PLATFORM,
+        )
+        monkeypatch.setattr(core_mod, "_ffmpeg_install_commands", lambda: ["brew install ffmpeg"])
+        assert core_mod._stt_prereq_commands("transcribe") == ["brew install ffmpeg"]
 
     def test_source_install_can_still_offer_the_system_decoder_fallback(self, monkeypatch) -> None:
         monkeypatch.setattr(core_mod, "_transcribe_extra_importable", lambda: True)
@@ -1201,8 +1218,33 @@ class TestSttStatus:
         """A release carries its own authenticated decoder and repairs by reinstall."""
         monkeypatch.setattr(core_mod, "ffmpeg_source", lambda: None)
         monkeypatch.setattr(core_mod.platform_compat, "is_bundled_interpreter", lambda: True)
+        monkeypatch.setattr(
+            core_mod.stt_decoder,
+            "platform_key",
+            lambda *a, **k: core_mod.stt_decoder.ARTIFACTS[0].platform_key,
+        )
         body = json.loads((await core_mod.api_stt_status(_req())).body)["ffmpeg"]
         assert body["auto_fetch"] == core_mod.AUTO_FETCH_BUNDLED
+
+    @pytest.mark.asyncio
+    async def test_status_marks_a_release_with_no_bundled_decoder_unsupported(
+        self, seeded_config, monkeypatch, model_store
+    ) -> None:
+        """The macOS Intel release ships no decoder, so it is not told to reinstall.
+
+        ``unsupported`` is what makes the page offer the system-decoder route there;
+        ``bundled`` would show "the bundled decoder is missing or damaged" for a
+        payload that was never in the app.
+        """
+        monkeypatch.setattr(core_mod, "ffmpeg_source", lambda: None)
+        monkeypatch.setattr(core_mod.platform_compat, "is_bundled_interpreter", lambda: True)
+        monkeypatch.setattr(
+            core_mod.stt_decoder,
+            "platform_key",
+            lambda *a, **k: core_mod.stt_decoder.DECODERLESS_BUNDLE_PLATFORM,
+        )
+        body = json.loads((await core_mod.api_stt_status(_req())).body)["ffmpeg"]
+        assert body["auto_fetch"] == core_mod.AUTO_FETCH_UNSUPPORTED
 
     @pytest.mark.asyncio
     async def test_status_refuses_an_app_token(self, seeded_config, fake_sel, model_store) -> None:

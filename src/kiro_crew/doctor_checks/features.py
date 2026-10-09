@@ -205,7 +205,7 @@ def _doctor_speech_to_text(cfg: KiroCrewConfig, issues: list[str]) -> None:
         # arrives as ogg/Opus and the dashboard records webm, so the only input
         # that reaches a recogniser without ffmpeg is a 16 kHz mono WAV.
         print(f"  ffmpeg:      {stt_mark} not found")
-        if cli_doctor.platform_compat.is_bundled_interpreter():
+        if cli_doctor.bundle_carries_decoder():
             print("               Fix: reinstall Kiro Crew (the bundled audio decoder is missing)")
         else:
             print(

@@ -28,6 +28,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, Protocol
 
+from kiro_crew.messaging.commands import compact_unsupported_backend as _compact_unsupported_backend
 from kiro_crew.messaging.queue_drain import entry_channel, wake_other_drains
 from kiro_crew.metrics.events import CONTEXT_COMPACTIONS, emit_counter
 from kiro_crew.metrics.sessions import (
@@ -208,26 +209,6 @@ class _CompactionOwner(Protocol):
         clear_conversation: bool = False,
         ends_conversation: bool = False,
     ) -> bool: ...
-
-
-def _compact_unsupported_backend(provider: LLMProvider) -> str | None:
-    """Backend id this provider names as unable to serve ``/compact``, else None.
-
-    The same capability the manual entry points read, asked for the
-    automatic one.  The property is spelled ``manual_`` because the manual
-    command was its first consumer, but its ANSWER is a property of the
-    BACKEND -- ``ACP_BACKENDS_COMPACT`` membership -- not of the entry point,
-    so it is the right question here too: a backend that cannot act on the
-    ``/compact`` prompt cannot act on it whoever sent it.
-
-    Read with the consumption contract the ABC declares: only a non-empty
-    ``str`` counts.  That guard is load-bearing rather than defensive -- the
-    compaction suite drives this gate with bare ``object()`` and ``MagicMock``
-    providers, and a truthy attribute read on either must not be mistaken for
-    a positively named unsupported backend.
-    """
-    backend = getattr(provider, "manual_compact_unsupported_backend", None)
-    return backend if isinstance(backend, str) and backend else None
 
 
 def _compaction_unmanaged_backend(provider: LLMProvider) -> str | None:

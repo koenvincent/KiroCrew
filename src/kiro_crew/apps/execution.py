@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+from collections.abc import Iterator
 from pathlib import Path
 
 from kiro_crew.sel import sel
@@ -75,6 +76,28 @@ def shipped_builtin_app_root(app_name: str) -> Path | None:
     deliberately ignored, and a directory without a valid shipped manifest is
     not a builtin even when its name resembles one.
     """
+    for root, name in _shipped_builtin_apps():
+        if name == app_name:
+            return root
+    return None
+
+
+def shipped_builtin_app_name_at(path: Path) -> str | None:
+    """Return the manifest name of the shipped builtin whose root holds *path*.
+
+    *path* must already be resolved. A package directory need not match its
+    manifest name (``auto_improvement`` ships ``auto-improvement``), so a
+    caller holding a path inside a package asks here instead of reading the
+    directory name.
+    """
+    for root, name in _shipped_builtin_apps():
+        if path == root or root in path.parents:
+            return name
+    return None
+
+
+def _shipped_builtin_apps() -> Iterator[tuple[Path, str]]:
+    """Yield ``(resolved root, manifest name)`` for every shipped builtin."""
     for source in _builtin_manifest_sources():
         try:
             entries = sorted(source.iterdir())
@@ -92,9 +115,8 @@ def shipped_builtin_app_root(app_name: str) -> Path | None:
                 manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
             except (OSError, UnicodeError, json.JSONDecodeError):
                 continue
-            if isinstance(manifest, dict) and manifest.get("name") == app_name:
-                return root
-    return None
+            if isinstance(manifest, dict) and isinstance(manifest.get("name"), str):
+                yield root, manifest["name"]
 
 
 def builtin_app_names() -> frozenset[str]:

@@ -19,7 +19,7 @@ from __future__ import annotations
 import logging
 import threading
 import time
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from itertools import chain
 from typing import TYPE_CHECKING
 
@@ -334,8 +334,14 @@ def merge_empty_window(
     closed: bool,
     closed_at: float | None,
     pending_mode_target: _ChatSlot,
-) -> None:
+    refusal_under_lock: Callable[[dict], str | None] | None = None,
+) -> str | None:
     """Commit a forced or closing save of a message-less slot as a metadata merge.
+
+    ``refusal_under_lock`` is evaluated against the line read under the
+    cross-process lock, after the existence check. A non-``None`` reason skips
+    the write and is returned, so the caller can keep the slot owed; ``None``
+    is returned on a commit and on the by-design skip of a line-less tab.
 
     Raises ``OSError`` when the record is unreadable, so a close or an
     acknowledged edit is never reported durable on a merge that did not happen.
@@ -380,12 +386,17 @@ def merge_empty_window(
     # state inside the locked block -- so whichever writer commits last writes
     # the newest slot state.
     merged_fields: dict = {}
-    guard_state = {"ran": False}
+    guard_state: dict = {"ran": False, "refusal": None}
 
     def _refresh_under_lock(meta: dict) -> bool:
         guard_state["ran"] = True
         if not meta:
             return False
+        if refusal_under_lock is not None:
+            refusal = refusal_under_lock(meta)
+            if refusal is not None:
+                guard_state["refusal"] = refusal
+                return False
         merged_fields.clear()
         if slot.reasoning_effort:
             cp._remember_reasoning_effort_for_restore(slot.reasoning_effort)
@@ -422,13 +433,26 @@ def merge_empty_window(
         merged_fields.update(cp._metadata_codec.encode(slot, merge=True, folds=folds))
         return True
 
+    def _after_commit_under_lock() -> None:
+        _record_pending_memory_mode(pending_mode_target, merged_fields["memory_mode"])
+        # The queued prompts this merge committed are now durable, so the
+        # flush's drift check must stop reporting them as owed. Set inside the
+        # lock, like the full save's witness: a writer that commits a newer
+        # queue after this lock is released must not have its witness
+        # overwritten by this merge's older value. Same routing guard as the
+        # full save's witnesses: a slot rebound while the merge was in flight
+        # would otherwise be credited for a value written to the OLD transcript.
+        if slot_history_key(slot) != history_key:
+            return
+        merged_queue = merged_fields.get("queued_prompts")
+        if isinstance(merged_queue, list):
+            slot._queue_persisted_sig = queue_persist_signature(merged_queue)
+
     applied = conv_log.update_metadata_if(
         history_key,
         merged_fields,
         _refresh_under_lock,
-        after_commit_under_lock=lambda: _record_pending_memory_mode(
-            pending_mode_target, merged_fields["memory_mode"]
-        ),
+        after_commit_under_lock=_after_commit_under_lock,
     )
     if not applied and not guard_state["ran"]:
         # `update_metadata_if` fails CLOSED on an unreadable record
@@ -442,15 +466,7 @@ def merge_empty_window(
         # archival callers (close, best_effort=False) roll back and
         # keep the slot.
         raise OSError(f"empty-window metadata merge skipped: record unreadable for {history_key}")
-    if applied and slot_history_key(slot) == history_key:
-        # The queued prompts this merge committed are now durable, so
-        # the flush's drift check must stop reporting them as owed. Same
-        # routing guard as the full save's witnesses: a slot rebound
-        # while the merge was in flight would otherwise be credited for
-        # a value written to the OLD transcript.
-        _merged_queue = merged_fields.get("queued_prompts")
-        if isinstance(_merged_queue, list):
-            slot._queue_persisted_sig = queue_persist_signature(_merged_queue)
+    return guard_state["refusal"]
 
 
 def _full_dismissed_line(slot: _ChatSlot, existing_meta: dict) -> list[str] | None:

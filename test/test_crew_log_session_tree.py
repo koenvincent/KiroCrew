@@ -794,6 +794,149 @@ def test_parent_payload_never_nests_a_cycle_or_a_row_under_itself() -> None:
     assert parent_payload(nodes["S"], live, "dashboard:S")["key"] is None  # type: ignore[index]
 
 
+# ── nesting past a closed creator ──────────────────────────────────────────
+#
+# The chain the fold holds outlives the sessions on it: a closed session's records
+# stay in the projection, so the walk has somewhere to go. These are the cases
+# where the walk must and must not move a row.
+
+
+def _crew() -> dict[str, session_tree.TreeNode]:
+    """lead -> mid -> inner -> worker, the shape the real case came from."""
+    return fold_tree(
+        [
+            _rec("l", "lead", created=1),
+            _rec("m", "mid", created=2, parent="lead"),
+            _rec("i", "inner", created=3, parent="mid"),
+            _rec("w", "worker", created=4, parent="inner"),
+        ]
+    )
+
+
+def test_parent_payload_nests_under_the_nearest_open_ancestor() -> None:
+    nodes = _crew()
+    # ``mid`` is open and ``inner`` is closed, so the worker belongs under ``mid`` --
+    # the NEAREST open ancestor, not the root.
+    live = {"lead": "dashboard:lead", "mid": "dashboard:mid", "worker": "dashboard:worker"}
+    assert parent_payload(nodes["worker"], live, "dashboard:worker", nodes) == {
+        "slot": "inner",
+        "key": "dashboard:mid",
+        "ancestor": True,
+    }
+    # Only ``lead`` left open: the walk runs the whole chain to it.
+    assert parent_payload(
+        nodes["worker"], {"lead": "dashboard:lead"}, "dashboard:worker", nodes
+    ) == {
+        "slot": "inner",
+        "key": "dashboard:lead",
+        "ancestor": True,
+    }
+
+
+def test_parent_payload_marks_the_ancestor_edge_only_when_it_moved_the_row() -> None:
+    nodes = _crew()
+    live = {"inner": "dashboard:inner"}
+    # The creator itself is open: the ordinary edge, and no flag on it.
+    assert parent_payload(nodes["worker"], live, "dashboard:worker", nodes) == {
+        "slot": "inner",
+        "key": "dashboard:inner",
+    }
+
+
+def test_parent_payload_stays_an_orphan_root_when_no_ancestor_is_open() -> None:
+    nodes = _crew()
+    # Every ancestor closed, so there is nothing to nest under and the citation is
+    # the whole answer -- byte-identical to what the surface drew before the walk.
+    assert parent_payload(
+        nodes["worker"], {"worker": "dashboard:worker"}, "dashboard:worker", nodes
+    ) == {
+        "slot": "inner",
+        "key": None,
+    }
+
+
+def test_parent_payload_walk_stops_where_the_fold_stops() -> None:
+    # ``inner``'s own log is not in the fold, so the chain above the closed creator
+    # is unknown rather than closed, and the row stays a root.
+    nodes = fold_tree(
+        [
+            _rec("l", "lead", created=1),
+            _rec("w", "worker", created=4, parent="inner"),
+        ]
+    )
+    live = {"lead": "dashboard:lead", "worker": "dashboard:worker"}
+    assert parent_payload(nodes["worker"], live, "dashboard:worker", nodes) == {
+        "slot": "inner",
+        "key": None,
+    }
+
+
+def test_parent_payload_walk_refuses_a_cycle_and_a_row_above_itself() -> None:
+    # ``mid`` and ``top`` cite each other; the worker hangs off that cycle. The fold
+    # marks the pair, and the walk follows neither, so the worker keeps its citation.
+    nodes = fold_tree(
+        [
+            _rec("t", "top", created=1, parent="mid"),
+            _rec("m", "mid", created=2, parent="top"),
+            _rec("w", "worker", created=3, parent="mid"),
+        ]
+    )
+    assert parent_payload(nodes["worker"], {"top": "dashboard:top"}, "dashboard:worker", nodes) == {
+        "slot": "mid",
+        "key": None,
+    }
+    # And a chain that leads back to the row itself is not an edge either: ``mid``
+    # cites the worker, so nesting the worker on it would invert the tree.
+    own = fold_tree(
+        [
+            _rec("w", "worker", created=1, parent="mid"),
+            _rec("m", "mid", created=2, parent="worker"),
+        ]
+    )
+    assert parent_payload(
+        own["worker"], {"worker": "dashboard:worker"}, "dashboard:worker", own
+    ) == {
+        "slot": "mid",
+        "key": None,
+    }
+
+
+def test_parent_payload_walk_is_bounded_by_the_unit_cap() -> None:
+    # A chain longer than the hop ceiling, every member closed except the very top.
+    # The walk must stop at the cap rather than run the whole thing.
+    length = session_tree.TREE_UNIT_CAP + 50
+    records = [_rec("s0", "s0", created=1)]
+    records += [_rec(f"s{i}", f"s{i}", created=i + 1, parent=f"s{i - 1}") for i in range(1, length)]
+    nodes = fold_tree(records)
+    tail = f"s{length - 1}"
+    assert parent_payload(nodes[tail], {"s0": "dashboard:s0"}, f"dashboard:{tail}", nodes) == {
+        "slot": f"s{length - 2}",
+        "key": None,
+    }
+    # The same chain, with an open ancestor inside the ceiling, still nests.
+    near = f"s{length - 3}"
+    assert parent_payload(nodes[tail], {near: f"dashboard:{near}"}, f"dashboard:{tail}", nodes) == {
+        "slot": f"s{length - 2}",
+        "key": f"dashboard:{near}",
+        "ancestor": True,
+    }
+
+
+def test_parent_payload_leaves_a_released_slot_unnested() -> None:
+    # A release is the one way a parent is taken away, and the walk must not put it
+    # back: the node carries no citation at all, so there is nothing to walk from.
+    nodes = fold_tree(
+        [
+            _rec("l", "lead", created=1),
+            _rec("m", "mid", created=2, parent="lead"),
+            _rec("w", "worker", created=3, parent="mid"),
+        ],
+        [session_tree.EdgeRecord(slot="worker", parent_slot=None, at=9, sid="w", seq=2)],
+    )
+    live = {"lead": "dashboard:lead", "worker": "dashboard:worker"}
+    assert parent_payload(nodes["worker"], live, "dashboard:worker", nodes) is None
+
+
 # --- succession: the slot's own chain of logs, walked through ``previous`` -------
 #
 # The tree above is PARENTHOOD between slots. These are SUCCESSION between logs of

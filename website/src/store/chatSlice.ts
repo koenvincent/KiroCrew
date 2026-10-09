@@ -15,7 +15,7 @@ import { createSlice, createAsyncThunk, type PayloadAction } from '@reduxjs/tool
 import { whenScrollQuiet } from '../lib/scrollQuiet'
 import { nextActiveAfterClose } from '../lib/sessionTabs'
 import { api } from '../api/client'
-import { isNotFoundError } from '../api/apiError'
+import { ApiError, isNotFoundError } from '../api/apiError'
 import { releaseCloseHold, awaitCloseOutcome, expireCloseHold, confirmCloseHold, removeSlotOptimistic, fetchSlots, slotSurfaceKey } from './dashboardSlice'
 import { isChatPageSurface } from '../utils/channelOrigin'
 import { isNoteRow } from '../lib/noteContract'
@@ -559,6 +559,17 @@ function applyActiveFrame(state: ChatState, p: ChatFrame): void {
   state.messages.push(ensureMsgId({ role, content, cls: cls || '', ts, meta: effectiveMeta, kind }))
 }
 
+/** Whether a refused close is the server's "history write still running"
+ *  refusal (`code: history_write_running`), which clears on its own in seconds. */
+function closeRefusalIsHistoryWrite(err: unknown): boolean {
+  if (!(err instanceof ApiError)) return false
+  try {
+    return (JSON.parse(err.body) as { code?: unknown } | null)?.code === 'history_write_running'
+  } catch {
+    return false
+  }
+}
+
 export const deleteSlot = createAsyncThunk<
   string,
   string,
@@ -571,6 +582,8 @@ export const deleteSlot = createAsyncThunk<
   async (key: string, { dispatch, getState, requestId, fulfillWithValue }) => {
     const root = getState() as RootState
     const deletedSlot = root.dashboard.slots.find(s => s.key === key)
+    // A new close press retires the last refusal's notice.
+    if (root.chat.closeRefused) dispatch({ type: 'chat/setCloseRefused', payload: null })
     // Use the surface key (forward-compat alias for `mode`) so a future
     // backend that emits a distinct `slot.surface` keeps "switch to a peer
     // session" pinned to the same nav destination.
@@ -645,12 +658,18 @@ export const deleteSlot = createAsyncThunk<
         dispatch(confirmCloseHold({ key, requestId }))
         gcSessionStorage(key)
       }
-    } catch {
+    } catch (err) {
       // Release the close hold BEFORE refetching: this thunk's `rejected` (which
       // also releases it) fires only after the `await navigation` below, and
       // the refetch reply must not be filtered out by the hold it exists to undo.
       dispatch(releaseCloseHold({ key, requestId }))
       dispatch(fetchSlots())
+      // The row is about to come back; say why, whichever path pressed close.
+      // The title is read from before the optimistic removal took the row away.
+      dispatch({
+        type: 'chat/setCloseRefused',
+        payload: { key, title: deletedSlot?.title || key, reason: closeRefusalIsHistoryWrite(err) ? 'historyWrite' : 'failed' },
+      })
       throw new Error('save failed')
     } finally {
       // Settle the peer navigation before this thunk reports back, on the
@@ -805,6 +824,9 @@ const chatSlice = createSlice({
   name: 'chat',
   initialState,
   reducers: {
+    setCloseRefused(state, action: PayloadAction<ChatState['closeRefused']>) {
+      state.closeRefused = action.payload
+    },
     ...runStateReducers,
     ...slotCacheReducers,
     ...composerCardReducers,
@@ -935,6 +957,7 @@ const chatSlice = createSlice({
 })
 
 export const {
+  setCloseRefused,
   setActiveSlot, clearSlotState, setPendingInput, stageToMainComposer, setAgentSwitchNotice, clearUnresumableResume, clearUndeletableHistory, setQuestionCard, clearQuestionCard, setQuestionDraft, resolveQuestionCard, setFollowupCard, clearFollowupCard, dismissFollowupItem, setFolderSuggestion, clearFolderSuggestion, ageFolderSuggestion, appendMessage, appendSlotMessage, updateStreamingMessage, finalizeAssistant,
   removeThinking, confirmOptimisticSend, markSendUnconfirmed, resolveOptimisticSteer, removeByApprovalId, resolveByApprovalId, clearPendingPermissions, setSlotRunning, setSlotStopping, settleStopNotRunning, startLocalTurn, endLocalTurn, syncSlotRunningFromServer, setSlotState, setSlotStatusDetail, setStopPressedAt, clearMessages, clearSlotCache, truncateAfterIndex, replaceMessages, hydrateSlotMessages, sseChatMessage, sseChatMessageUpdate, sseChatMessagePatchByTs, sseThinkingChunk, removeQueuedMessage, appendQueuedMessage, cancelQueuedMessage, editQueuedMessage, reorderQueuedMessages,
   sseContextUsage, setVoicePlaying, setVoiceAudio,
@@ -968,6 +991,7 @@ export {
   selectActiveSlotProject, selectComposerBusy, selectContinuable, selectSendConfirmed, selectSlotMessages,
   selectSlotPendingApproval, selectSlotRunEpoch, selectSlotStreamState, selectSlotToolLog, selectTrailingSendUnconfirmed,
   selectTurnInterrupted,
+  QUIET_END_SERVER, QUIET_END_TOOL,
 } from './chat/selectors'
 export { clearSwitchSlotGone, switchSlot, switchSlotNoticeCopy, type SwitchSlotArg } from './chat/slotSwitch'
 export { refreshSlot, warmSlotCache } from './chat/slotRefresh'

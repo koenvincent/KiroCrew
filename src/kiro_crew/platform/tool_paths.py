@@ -56,6 +56,14 @@ _TARGET_PATH_MAX_NODES = 10_000
 _PATCH_TEXT_MAX_CHARS = 256_000
 _PATCH_HEADERS = ("*** Add File: ", "*** Update File: ", "*** Delete File: ")
 _PATCH_MOVE_HEADER = "*** Move to: "
+#: The characters JS ``String.prototype.trim()`` strips: ECMAScript WhiteSpace
+#: plus LineTerminator. The applier trims each header path with it. It holds
+#: U+FEFF, which ``str.strip`` keeps, and lacks ``\x1c``-``\x1f`` and ``\x85``,
+#: which ``str.strip`` drops.
+_JS_TRIM_CHARS = (
+    "\t\n\v\f\r \u00a0\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006"
+    "\u2007\u2008\u2009\u200a\u2028\u2029\u202f\u205f\u3000\ufeff"
+)
 
 
 class TargetPaths(list):
@@ -69,7 +77,8 @@ class TargetPaths(list):
     deny, never as "everything present was checked".
 
     ``unanchored`` is True when :func:`edit_target_candidates` was handed a diff
-    content block path that is still relative after ``~``/env expansion. Such a
+    content block path that is still relative after ``~``/env expansion, or a
+    patch header path that is not absolute as written. Such a
     path resolves against the PROCESS working directory — the gateway's, not the
     agent workspace's — so no gate can establish what file it actually names
     (a workspace symlink can point it at a protected file). A security consumer
@@ -159,17 +168,49 @@ def is_edit_call(tool_kind: str, diff_path: str = "") -> bool:
     return tool_kind == "edit" or bool(diff_path)
 
 
+def _is_literal_absolute(path: str) -> bool:
+    """Whether a patch header *path*, read as the literal string the applier
+    resolves, is absolute.
+
+    No ``~`` or ``$VAR`` expansion: the applier does none, so ``~/x`` and
+    ``$HOME/x`` are relative to it. An absolute path that variable expansion
+    would change is refused too, because the sensitivity matcher expands
+    variables and would judge a different file. A ``$`` that names no set
+    variable (``users.$id.tsx``) expands to itself and is judged as written.
+    """
+    return os.path.isabs(path) and os.path.expandvars(path) == path
+
+
 def _patch_targets(text: str, candidates: TargetPaths) -> None:
     """Collect the paths a complete apply_patch envelope can write or remove.
 
     Unknown control lines and incomplete envelopes are unverifiable, even if a
     separate ``path`` argument names a harmless file. No patch body text is
     interpreted as a shell command or as a path.
+
+    Lines are split on ``\n`` only, the one break the applier splits on. One
+    trailing ``\r`` per line is dropped, because the applier trims every marker
+    and header path it reads, so a CRLF patch names the same files. A line that
+    still holds any other break character (``\r``, ``\x1c``, ``\x85``,
+    ``\u2028``, ...) would be one line to the applier but could read as two to
+    any other splitter, so it is unverifiable. Each header path is judged as the
+    literal string the applier resolves: a path that is not absolute as written,
+    or that variable expansion would change, names a file the gate cannot pin,
+    so it is unanchored. A header path that Python's ``str.strip`` or JS
+    ``trim()`` would change (a trailing U+FEFF, which only JS strips) is
+    unverifiable.
     """
     if len(text) > _PATCH_TEXT_MAX_CHARS:
         candidates.truncated = True
         return
-    lines = text.splitlines()
+    lines = text.split("\n")
+    if lines and lines[-1] == "":
+        # The newline that ends the last line, not an empty line of its own.
+        lines.pop()
+    lines = [line[:-1] if line.endswith("\r") else line for line in lines]
+    if any(line and line.splitlines() != [line] for line in lines):
+        candidates.truncated = True
+        return
     if not lines or lines[0] != "*** Begin Patch" or lines[-1] != "*** End Patch":
         candidates.truncated = True
         return
@@ -199,11 +240,11 @@ def _patch_targets(text: str, candidates: TargetPaths) -> None:
                 candidates.truncated = True
                 return
             continue
-        if not path or path != path.strip() or "\x00" in path:
+        # A path either trim would change names a file the gate cannot pin.
+        if not path or path != path.strip() or path != path.strip(_JS_TRIM_CHARS) or "\x00" in path:
             candidates.truncated = True
             return
-        expanded = os.path.expanduser(os.path.expandvars(path))
-        if not os.path.isabs(expanded):
+        if not _is_literal_absolute(path):
             candidates.unanchored = True
             return
         if path not in seen:

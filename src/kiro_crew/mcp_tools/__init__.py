@@ -18,6 +18,7 @@ server shape ``kirocrew-dashboard`` is built on) and ``dashboard_client`` (the
 from __future__ import annotations
 
 import importlib
+import inspect
 from typing import Any
 
 # Descriptor modules, in the order their tools are advertised.
@@ -38,12 +39,22 @@ DOMAIN_MODULES: tuple[str, ...] = (
 )
 
 
-def build_tool_list() -> list[dict[str, Any]]:
+def build_tool_list(*, names_only: bool = False) -> list[dict[str, Any]]:
     """Every ``kirocrew-core`` tool descriptor, concatenated by domain.
 
     Descriptors are rebuilt per call rather than cached: some carry a live
     value (the concurrent sub-agent cap), and a cache would pin the first
     reading for the life of the server process.
+
+    ``names_only`` is the read path for a caller that keeps only tool NAMES and
+    discards every description (``build_tool_names`` / in-process discovery). The
+    two builders that reach for a live value to fill a description --
+    ``spawn.schemas`` (a user-level agents directory scan) and ``control.schemas``
+    (a config read) -- are told not to, so a names-only read never performs that
+    work. The names and their order are identical to a full build; only the
+    descriptions differ (empty under ``names_only``), and the caller discards
+    those anyway. This is what lets those builders carry NO ``get_running_loop``
+    skip of their own: asking for descriptors does not pull in the live reads.
     """
     tools: list[dict[str, Any]] = []
     for name in DOMAIN_MODULES:
@@ -52,8 +63,43 @@ def build_tool_list() -> list[dict[str, Any]]:
         # to the top would close that loop and turn it into an import-time
         # failure on the gateway boot path. The laziness is load-bearing.
         module = importlib.import_module(f"{__name__}.{name}")
-        tools.extend(module.schemas())
+        # Only the two builders with a live-valued description accept the flag;
+        # the rest build static descriptors cheaply and are called unchanged.
+        schemas = module.schemas
+        if names_only and _schemas_accepts_names_only(schemas):
+            tools.extend(schemas(names_only=True))
+        else:
+            tools.extend(schemas())
     return tools
+
+
+def build_tool_names() -> list[str]:
+    """Ordered ``kirocrew-core`` tool names, WITHOUT assembling descriptions.
+
+    Returns exactly the names ``build_tool_list`` would, in the same order, but
+    takes the ``names_only`` path so a names-only caller never triggers the
+    live-value reads some descriptions carry. ``mcp_discovery`` reads this when it
+    wants only names, which is every time it reaches the in-process path.
+    """
+    return [
+        name
+        for tool in build_tool_list(names_only=True)
+        if isinstance(tool, dict) and (name := tool.get("name"))
+    ]
+
+
+def _schemas_accepts_names_only(schemas: Any) -> bool:
+    """True when a domain's ``schemas`` takes a ``names_only`` keyword.
+
+    Only the builders with a live-valued description grow the parameter; the
+    rest keep their zero-argument signature. Detected rather than assumed so a
+    new live-valued builder opts in by adding the keyword, with no registry here
+    to keep in sync.
+    """
+    try:
+        return "names_only" in inspect.signature(schemas).parameters
+    except (TypeError, ValueError):
+        return False
 
 
 def dispatch(name: str, args: dict[str, Any]) -> str:

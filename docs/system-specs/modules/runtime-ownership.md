@@ -65,6 +65,23 @@ is a last release — byte-for-byte the unpooled behaviour, with the claim recor
 Raising it is a behaviour change that needs the eligibility rules deciding which
 sessions may share a process, and those do not live here.
 
+**A founding `spawn()` holds nothing.** The table's bookkeeping — entries, the
+lease index, the last-runtime map, foundings in flight — is only read or written
+in stretches with no `await`, which on one event loop is what keeps it consistent
+and what keeps a cancellation from landing mid-change; there is no registry lock.
+`spawn()` runs outside every such stretch, so a real launch (admission wait,
+subprocess, ACP handshake) never makes an unrelated `acquire` or any `release`
+wait, and founding starts on different keys overlap. A miss registers a per-key
+founding; a same-key arrival waits on it only while the launching runtime will
+still have room for it (founder plus waiters below `cap`), and otherwise founds
+concurrently, because waiting would just serialize two launches. At `cap=1` nobody
+ever waits. A waiter is shielded from the founder's fate: it wakes on success,
+failure or cancellation alike and re-picks, founding itself if it must, so a
+founder's error is never handed to another session. Every exit from the founder
+clears the marker and wakes its waiters; a runtime is published in the same
+synchronous stretch in which `spawn()` returns, so no cancellation point lies
+between a spawned runtime and its entry.
+
 On the **chat** registration path a lease means the same thing as registry
 membership, which is why it is taken there rather than at provider start:
 `session_allocation.SessionAllocationService._get_or_create_impl` calls

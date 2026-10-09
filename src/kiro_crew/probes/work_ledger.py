@@ -84,6 +84,10 @@ ACCEPTED_KEY = "all-accepted"
 CLOSED_KEY = "all-closed"
 
 _ACCEPTED_KEY = ACCEPTED_KEY
+
+#: :attr:`WorkLedgerProbe.revision` for a ledger that was read but holds no worker
+#: report yet. Not empty, because empty means "not known" to the gate.
+_NO_REPORTS = "no-reports"
 _CLOSED_KEY = CLOSED_KEY
 
 
@@ -128,6 +132,16 @@ class WorkLedgerProbe(irq.Probe):
         self._worker_running = worker_running or _always_idle
         self._worker_closed = worker_closed or _always_open
         self._conductor = ""
+        #: A digest of each item's worker-owned report fields (``last_report_at``,
+        #: ``status``, ``summary``), read on the last successful observation, or
+        #: ``None`` when nothing was read. The AutoNudge
+        #: gate lengthens a work-ledger watch's quiet floor while it matches the one
+        #: its last turn was delivered at. Only worker reports count: the
+        #: conductor's own writes (a verdict, a dispatch) are things it already
+        #: knows, and counting them would spend the next floor turn reading them
+        #: back. A ledger read with no worker report yet still gets a token, so an
+        #: early, quiet board is recognised as unchanged too.
+        self.revision: str | None = None
 
     # -- Probe contract ---------------------------------------------------
 
@@ -189,13 +203,22 @@ class WorkLedgerProbe(irq.Probe):
             stored = len(items)
         all_readable = stored <= len(items)
         newest: dict[str, str] = {}
+        newest_report: dict[str, str] = {}
         tails: dict[str, list[work_ledger.WorkEvent]] = {}
         for item in items:
             events = work_ledger.read_events(key, item.item_id, limit=_EVENT_TAIL)
             tails[item.item_id] = events
             if events:
                 newest[item.item_id] = events[-1].id
+            if item.last_report_at:
+                # The item's WORKER-OWNED fields, not the event tail: eight conductor
+                # writes would push the newest report out of a tail and move this
+                # without any worker saying anything.
+                newest_report[item.item_id] = json.dumps(
+                    [item.last_report_at, item.status, item.summary], default=str
+                )
         epoch = ledger_wake.revision(newest)
+        self.revision = ledger_wake.revision(newest_report) or _NO_REPORTS
 
         if items and all_readable and all(item.is_terminal for item in items):
             # Every item closed means the goal this ledger serves is finished, so

@@ -56,6 +56,14 @@ KEEP_IMAGES = 3
 #: Bedrock retry schedule for throttling / transient 5xx (seconds between tries).
 RETRY_BACKOFF = (5.0, 10.0, 20.0)
 
+#: Pause between ``ctrl+l`` and typing the URL. Chromium moves focus to the
+#: omnibox asynchronously; keystrokes sent before it lands go to whatever the
+#: page has focused -- on a chat page that is the composer, which keeps them as
+#: a per-session draft for every later scenario in the run.
+OMNIBOX_FOCUS_SECONDS = 1.0
+#: Pause after ``Return`` for the new page to load before the first screenshot.
+NAVIGATE_LOAD_SECONDS = 3.0
+
 VERDICT_RE = re.compile(r"^\s*VERDICT:\s*(PASS|FAIL)\b", re.IGNORECASE | re.MULTILINE)
 
 SYSTEM_PROMPT = """You are a careful, non-technical person testing a web application for the first time. You are sitting at a Linux desktop with ONE browser window open. You can only see the screen through screenshots and can only act with the mouse and keyboard tools you are given -- there is no DOM, no developer console, no shell, and you cannot read files.
@@ -77,6 +85,19 @@ EXPECTATIONS:
 - <expectation text, shortened> : MET or NOT MET -- one line of evidence from the last screenshot
 UI-ISSUES: none, or one line per visual defect you noticed on the way (overlap, clipped or unreadable text, misaligned elements, unexpected scrollbars, poor contrast, a stuck spinner)
 """
+
+
+def omnibox_navigate(display: Any, url: str, *, sleep=time.sleep) -> None:
+    """Open ``url`` through the browser's address bar.
+
+    ``ctrl+l`` only asks Chromium to focus the omnibox; the URL is typed after
+    ``OMNIBOX_FOCUS_SECONDS`` so none of it lands in the page's focused field.
+    """
+    display.perform("key", {"text": "ctrl+l"})
+    sleep(OMNIBOX_FOCUS_SECONDS)
+    display.perform("type", {"text": url})
+    display.perform("key", {"text": "Return"})
+    sleep(NAVIGATE_LOAD_SECONDS)
 
 
 def system_prompt(scenario: Scenario) -> str:
@@ -434,10 +455,7 @@ class Runner:
     def navigate(self, path: str, log: StepLog) -> None:
         """Point the (already focused) browser at ``base_url + path`` via the omnibox."""
         url = f"{self.base_url}{path}"
-        self.display.perform("key", {"text": "ctrl+l"})
-        self.display.perform("type", {"text": url})
-        self.display.perform("key", {"text": "Return"})
-        time.sleep(3.0)
+        omnibox_navigate(self.display, url)
         log.write("navigate", url=url)
 
     # -- one attempt -------------------------------------------------------
@@ -730,10 +748,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             shots = args.out / sc.name / "attempt-1"
             display.reset(shots)
             log = StepLog(shots / "steps.jsonl")
-            display.perform("key", {"text": "ctrl+l"})
-            display.perform("type", {"text": f"{args.base_url.rstrip('/')}{sc.start_url}"})
-            display.perform("key", {"text": "Return"})
-            time.sleep(3.0)
+            omnibox_navigate(display, f"{args.base_url.rstrip('/')}{sc.start_url}")
             _, path = display.screenshot("dry-run")
             log.write("screenshot", label="dry-run", file=path.name)
             dry = ScenarioResult.for_scenario(sc, "SKIPPED")

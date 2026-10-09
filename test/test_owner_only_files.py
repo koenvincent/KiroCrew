@@ -784,6 +784,20 @@ def test_gateway_log_is_created_and_rolled_over_owner_only(home: Path) -> None:
     assert _readable_by_others(home) == []
 
 
+def test_gateway_log_created_by_a_non_gateway_process_is_owner_only(home: Path) -> None:
+    from kiro_crew.cli import _AppendOnlyLogFileHandler
+
+    handler = _AppendOnlyLogFileHandler(home / "gateway.log", encoding="utf-8")
+    try:
+        handler.handle(
+            logging.LogRecord("kiro_crew.t", logging.WARNING, __file__, 1, "x", (), None)
+        )
+    finally:
+        handler.close()
+    assert (home / "gateway.log").is_file()
+    assert _readable_by_others(home) == []
+
+
 # ── the startup sweep ────────────────────────────────────────────────────────
 
 

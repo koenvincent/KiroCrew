@@ -22,6 +22,7 @@ from kiro_crew.cli_commands import _cron
 from kiro_crew.cli_doctor import _doctor
 from kiro_crew.cli_server import _update
 from kiro_crew.service.common import RestartReport
+from kiro_crew.stt import decoder as stt_decoder
 
 
 def _add_job_kwargs(**overrides):
@@ -5661,6 +5662,9 @@ class TestDoctorStt:
 
         self._stt(monkeypatch, provider="transcribe")
         monkeypatch.setattr(_doc.platform_compat, "is_bundled_interpreter", lambda: True)
+        monkeypatch.setattr(
+            stt_decoder, "platform_key", lambda *a, **k: stt_decoder.ARTIFACTS[0].platform_key
+        )
         out, _code = self._report(
             tmp_path,
             capsys,
@@ -5676,6 +5680,37 @@ class TestDoctorStt:
         assert "reinstall Kiro Crew (the bundled audio decoder is missing)" in section
         assert "brew install ffmpeg" not in section
         assert "winget install" not in section
+
+    def test_doctor_release_without_a_bundled_decoder_points_at_a_system_ffmpeg(
+        self, tmp_path, capsys, monkeypatch
+    ):
+        """The macOS Intel release ships no decoder, so reinstalling cannot fix it.
+
+        Its only decoder is a system one, the same as a source install's, and the
+        remedy line has to say so instead of blaming a payload that never shipped.
+        """
+        import kiro_crew.cli_doctor as _doc
+
+        self._stt(monkeypatch, provider="transcribe")
+        monkeypatch.setattr(_doc.platform_compat, "is_bundled_interpreter", lambda: True)
+        monkeypatch.setattr(
+            stt_decoder, "platform_key", lambda *a, **k: stt_decoder.DECODERLESS_BUNDLE_PLATFORM
+        )
+        out, _code = self._report(
+            tmp_path,
+            capsys,
+            ffmpeg=False,
+            modules={
+                "amazon_transcribe": MagicMock(),
+                "amazon_transcribe.client": MagicMock(),
+                "boto3": MagicMock(),
+            },
+        )
+
+        section = self._stt_section(out)
+        assert "ffmpeg:" in section and "not found" in section
+        assert "reinstall Kiro Crew" not in section
+        assert "Fix: " in section
 
     def test_doctor_stt_transcribe_provider(self, tmp_path, capsys, monkeypatch):
         """The local-only lines belong to the local provider. Printing an engine or

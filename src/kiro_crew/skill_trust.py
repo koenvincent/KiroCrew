@@ -227,6 +227,11 @@ def _project_skills_enabled() -> bool:
         return False
 
 
+def project_skills_enabled() -> bool:
+    """Public read of the operator's off switch (fails closed like the gate)."""
+    return _project_skills_enabled()
+
+
 def _store_signature(path: Path) -> _StoreSignature | None:
     """Detect content, identity, and permission-state changes to the store."""
     try:

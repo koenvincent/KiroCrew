@@ -340,6 +340,9 @@ export interface ChatInputProps {
   /** Identity of the transcript row the follow-up options were derived from.
    *  Forwarded to FollowUpBar so a chip click carries the row it acted on. */
   followUpSourceKey?: string | null
+  /** `false` for a single-select `[OPTION:]` row (a pick replaces the previous
+   *  one). Forwarded to FollowUpBar for the chip tooltip. Defaults to `true`. */
+  followUpMulti?: boolean
   /** Labels whose follow-up dispatch is outstanding. Only a host that actually
    *  dispatches a chip passes this. */
   followUpPendingOptions?: ReadonlySet<string> | null

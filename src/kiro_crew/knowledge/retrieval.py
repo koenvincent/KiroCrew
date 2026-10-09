@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import importlib.util
 import json
 import logging
 import math
@@ -13,15 +14,12 @@ from .._sqlite_compat import fts5_cjk_match_groups, is_cjk_char, sqlite3
 from .embedder import embedder_signature
 from .store import KnowledgeStore
 
-# Optional dep, same guard shape as ``vector_memory.py``: numpy is declared in
-# setup.cfg but the pure-Python path below stays the reference implementation.
-try:
-    import numpy as np
-
-    _HAS_NUMPY = True
-except ImportError:
-    np = None  # type: ignore[assignment]
-    _HAS_NUMPY = False
+# Optional dep: numpy is declared in setup.cfg but the pure-Python path below
+# stays the reference implementation. Probed, not imported: ``mcp_core`` imports
+# this module, and an eager ``import numpy`` would start OpenBLAS's
+# one-thread-per-core pool in every mcp-core / mcp-cron / mcp-dashboard server.
+# The numpy scorers import it on first use.
+_HAS_NUMPY = importlib.util.find_spec("numpy") is not None
 
 logger = logging.getLogger(__name__)
 
@@ -562,8 +560,20 @@ class HybridRetriever:
             params.append(namespace)
         rows = self.store.db.execute(sql, params).fetchall()
 
+        scored_numpy = None
         if _HAS_NUMPY:
-            scored, mismatched = self._score_rows_numpy(rows, query_vec)
+            # ``_HAS_NUMPY`` only proves numpy is on disk. A numpy that is
+            # present but cannot load (a wheel built for another interpreter, a
+            # missing BLAS library) raises here before any row is scored, and
+            # the pure-Python reference path answers instead.
+            try:
+                scored_numpy = self._score_rows_numpy(rows, query_vec)
+            except ImportError:
+                logger.warning(
+                    "Knowledge vector search: numpy failed to import; using the Python scorer"
+                )
+        if scored_numpy is not None:
+            scored, mismatched = scored_numpy
         else:
             scored, mismatched = self._score_rows_python(rows, query_vec)
 
@@ -646,6 +656,8 @@ class HybridRetriever:
         however large the library is and whatever mix of encodings it holds; the
         blobs themselves are already resident in ``rows``.
         """
+        import numpy as np
+
         q_len = len(query_vec)
         q_bytes = q_len * 4
         q = np.asarray(query_vec, dtype=np.float64)
@@ -744,6 +756,8 @@ def _score_batch(
     into one float64 array; each group is scored in a single :func:`_cosine_rows`
     call and the results land back at the rows' own positions.
     """
+    import numpy as np
+
     sims = np.zeros(len(vectors), dtype=np.float64)
     packed_at = [i for i, v in enumerate(vectors) if isinstance(v, bytes)]
     if packed_at:
@@ -770,6 +784,8 @@ def _cosine_rows(mat: Any, q: Any, q_norm: float) -> Any:
     copy of it. A zero-norm row is 0.0 by contract (never divides by zero), and
     0.0 is below the positive-similarity admission bar, so it never ranks.
     """
+    import numpy as np
+
     norms = np.sqrt(np.einsum("ij,ij->i", mat, mat, dtype=np.float64))
     dots = np.einsum("ij,j->i", mat, q, dtype=np.float64)
     with np.errstate(divide="ignore", invalid="ignore"):

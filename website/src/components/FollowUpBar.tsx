@@ -26,6 +26,13 @@ interface FollowUpBarProps {
    */
   onSend?: (text?: string, sourceKeyAtClick?: string | null) => void
   quickSend?: boolean
+  /**
+   * `false` for a single-select `[OPTION:]` row, where a new pick replaces the
+   * previous one; the chip tooltip then says "add to the message without
+   * sending" / "replace selection"
+   * instead of promising multi-select. Defaults to `true` (`[OPTIONS:]`).
+   */
+  multi?: boolean
   /** 'multiline' (default) wraps onto multiple rows; 'scroll' is a single-line horizontally-scrollable view. */
   layout?: FollowUpLayout
   /**
@@ -332,14 +339,30 @@ function sendSegmentClassName(isPicked: boolean, pending: boolean) {
   }`
 }
 
-function chipTitle(isPicked: boolean, quickSend: boolean | undefined, picked: ReadonlySet<string>, hasOnSend: boolean) {
+function chipTitle(isPicked: boolean, quickSend: boolean | undefined, picked: ReadonlySet<string>, hasOnSend: boolean, multi: boolean) {
   if (isPicked) {
     return hasOnSend
       ? i18nT('components.followUpBar.click_to_remove_from_input_double_click_to_send')
       : i18nT('components.followUpBar.click_to_remove_from_input')
   }
-  if (quickSend && picked.size === 0) return i18nT('components.followUpBar.click_to_send_instantly_shift_click_to_select_mu')
-  if (quickSend) return i18nT('components.followUpBar.click_to_add_to_selection')
+  // Single-select ([OPTION:]) rows: a new pick REPLACES the previous one, so
+  // the hint must not promise multi-select (see followUpChips.ts). With Quick
+  // Send off the same replace applies once a chip is picked, so "add" is wrong.
+  if (quickSend && picked.size === 0) {
+    return multi
+      ? i18nT('components.followUpBar.click_to_send_instantly_shift_click_to_select_mu')
+      : i18nT('components.followUpBar.click_to_send_instantly_shift_click_to_add_without_sending')
+  }
+  if (quickSend) {
+    return multi
+      ? i18nT('components.followUpBar.click_to_add_to_selection')
+      : i18nT('components.followUpBar.click_to_replace_selection')
+  }
+  if (!multi && picked.size > 0) {
+    return hasOnSend
+      ? i18nT('components.followUpBar.click_to_replace_selection_double_click_to_send')
+      : i18nT('components.followUpBar.click_to_replace_selection')
+  }
   return hasOnSend
     ? i18nT('components.followUpBar.click_to_add_to_input_double_click_to_select_and')
     : i18nT('components.followUpBar.click_to_add_to_input_editable_before_sending')
@@ -350,6 +373,8 @@ interface ChipProps {
   isPicked: boolean
   picked: ReadonlySet<string>
   quickSend: boolean | undefined
+  /** Multi-select row (`[OPTIONS:]`) vs single-select (`[OPTION:]`); drives the tooltip wording. */
+  multi: boolean
   onSelect: (option: string, event: React.MouseEvent, sourceKeyAtClick?: string | null) => void
   onSend?: (text?: string, sourceKeyAtClick?: string | null) => void
   className: string
@@ -377,7 +402,7 @@ interface ChipProps {
  *   double-click to fire `onSend(text)` directly without going through setInput (which would
  *   race with the React state update and cause send() to read a stale inputRef.current).
  */
-function Chip({ option, isPicked, picked, quickSend, onSelect, onSend, className, index, animating, sourceKey, pending, dimmed }: ChipProps) {
+function Chip({ option, isPicked, picked, quickSend, multi, onSelect, onSend, className, index, animating, sourceKey, pending, dimmed }: ChipProps) {
   const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   // First-click row identity for the in-flight gesture. A double-click is
   // click(detail=1) then dblclick; the footer can be replaced on the reused
@@ -392,7 +417,7 @@ function Chip({ option, isPicked, picked, quickSend, onSelect, onSend, className
   // "could not tell where the safe click ends and the send click begins". The
   // fragment exists only when the segment does (same condition, see
   // showSendSegment below).
-  const hint = chipTitle(isPicked, quickSend, picked, !!onSend)
+  const hint = chipTitle(isPicked, quickSend, picked, !!onSend, multi)
     + (useDebouncedClick ? ` · ${i18nT('components.followUpBar.tooltip_arrow_sends_now')}` : '')
   const { tipHandlers, tipNode } = useInstantTip(option, hint)
   // The entrance belongs on whichever element is this chip's flex item — the
@@ -544,9 +569,9 @@ function Chip({ option, isPicked, picked, quickSend, onSelect, onSend, className
 
 /** Both layouts render the same chips; `animating` is owned by the parent so a
  *  layout switch cannot restart an entrance that already played. */
-type LayoutProps = Omit<FollowUpBarProps, 'layout'> & { animating: boolean }
+type LayoutProps = Omit<FollowUpBarProps, 'layout' | 'multi'> & { animating: boolean, multi: boolean }
 
-function ScrollLayout({ options, picked, onSelect, onSend, quickSend, animating, sourceKey, pendingOptions, refusedOptions, error }: LayoutProps) {
+function ScrollLayout({ options, picked, onSelect, onSend, quickSend, multi, animating, sourceKey, pendingOptions, refusedOptions, error }: LayoutProps) {
   const scrollRef = useRef<HTMLDivElement | null>(null)
   const [attachEdges, edges, remeasure] = useScrollEdges<HTMLDivElement>()
 
@@ -641,6 +666,7 @@ function ScrollLayout({ options, picked, onSelect, onSend, quickSend, animating,
               isPicked={isPicked}
               picked={picked}
               quickSend={quickSend}
+              multi={multi}
               onSelect={onSelect}
               onSend={onSend}
               className={chipClassName(isPicked, { shrink0: true })}
@@ -659,7 +685,7 @@ function ScrollLayout({ options, picked, onSelect, onSend, quickSend, animating,
   )
 }
 
-function MultilineLayout({ options, picked, onSelect, onSend, quickSend, animating, sourceKey, pendingOptions, refusedOptions, error }: LayoutProps) {
+function MultilineLayout({ options, picked, onSelect, onSend, quickSend, multi, animating, sourceKey, pendingOptions, refusedOptions, error }: LayoutProps) {
   return (
     // Bottom-aligned for the same reason as the scroll layout: with the
     // one-line clamp every chip is already the same height, so this only
@@ -681,6 +707,7 @@ function MultilineLayout({ options, picked, onSelect, onSend, quickSend, animati
             isPicked={isPicked}
             picked={picked}
             quickSend={quickSend}
+            multi={multi}
             onSelect={onSelect}
             onSend={onSend}
             className={chipClassName(isPicked)}
@@ -698,16 +725,16 @@ function MultilineLayout({ options, picked, onSelect, onSend, quickSend, animati
   )
 }
 
-function FollowUpBar({ options, picked, onSelect, onSend, quickSend, layout = 'multiline', sourceKey, pendingOptions, refusedOptions, error }: FollowUpBarProps) {
+function FollowUpBar({ options, picked, onSelect, onSend, quickSend, multi = true, layout = 'multiline', sourceKey, pendingOptions, refusedOptions, error }: FollowUpBarProps) {
   useLanguageGeneration() // memo() bails out of the provider-level repaint; subscribe directly
   // Content-keyed, not identity-keyed: the caller rebuilds the array on every
   // render, so an identity comparison would restart the entrance constantly.
   // \u0000 cannot occur inside an option label.
   const animating = useChipEntrance(options.join('\u0000'))
   if (layout === 'scroll') {
-    return <ScrollLayout options={options} picked={picked} onSelect={onSelect} onSend={onSend} quickSend={quickSend} animating={animating} sourceKey={sourceKey} pendingOptions={pendingOptions} refusedOptions={refusedOptions} error={error} />
+    return <ScrollLayout options={options} picked={picked} onSelect={onSelect} onSend={onSend} quickSend={quickSend} multi={multi} animating={animating} sourceKey={sourceKey} pendingOptions={pendingOptions} refusedOptions={refusedOptions} error={error} />
   }
-  return <MultilineLayout options={options} picked={picked} onSelect={onSelect} onSend={onSend} quickSend={quickSend} animating={animating} sourceKey={sourceKey} pendingOptions={pendingOptions} refusedOptions={refusedOptions} error={error} />
+  return <MultilineLayout options={options} picked={picked} onSelect={onSelect} onSend={onSend} quickSend={quickSend} multi={multi} animating={animating} sourceKey={sourceKey} pendingOptions={pendingOptions} refusedOptions={refusedOptions} error={error} />
 }
 
 export default memo(FollowUpBar)

@@ -88,6 +88,7 @@ from kiro_crew.agent_sdk.spec_hooks import (
 )
 from kiro_crew.agent_sdk.tool_search import resume_takes_tool_search_replay
 from kiro_crew.agent_spec_format import NATIVE_SKILL_ALIAS_PREFIX
+from kiro_crew.agent_switch_command import agent_switch_target, switch_announcement
 from kiro_crew.autonudge import FINISHED_LOOP_REASONS, get_instance, reason_in
 from kiro_crew.autonudge_authz import normalize_banner
 from kiro_crew.config.loader import (  # noqa: F401
@@ -365,9 +366,17 @@ from kiro_crew.dashboard.recovery_replays import (
     cancel_notice,
     replays_of,
 )
-from kiro_crew.dashboard.session_directive_apply import (
+
+# ``QUESTION_CARD_SHOWN_PREFIX`` and ``apply_session_directive`` are part of the
+# runner's base-names surface (``_BASE_NAMES`` in
+# test_chat_runner_composition_contract.py), which callers and tests read off
+# ``chat_runner`` directly; the ratchet keeps them bound here even though the
+# turn loop itself consumes the structured outcome.
+from kiro_crew.dashboard.session_directive_apply import (  # noqa: F401
     QUESTION_CARD_SHOWN_PREFIX,
+    DirectiveOutcome,
     apply_session_directive,
+    apply_session_directive_outcome,
 )
 from kiro_crew.dashboard.slot_queue_repository import RESTORED_QUEUE_KEY
 from kiro_crew.dashboard.state import (  # noqa: F401
@@ -494,7 +503,7 @@ from kiro_crew.members import (
     select_provider_backend,
 )
 from kiro_crew.memory_stores import UnknownMemoryStore
-from kiro_crew.messaging.commands import compact_unsupported_reply
+from kiro_crew.messaging.commands import compact_unsupported_backend, compact_unsupported_reply
 from kiro_crew.messaging.dispatch import (
     consume_reinjection,
     rearm_reinjection,
@@ -641,6 +650,7 @@ from kiro_crew.dashboard.chat_utils import (  # noqa: E402, F401
     EMPTY_RUNG_CONTINUE,
     EMPTY_RUNG_GIVE_UP,
     EMPTY_RUNG_REPLAY,
+    EMPTY_TURN_NOTICE_KIND,
     FALSE_TOOL_BLOCKER_REPLAY_KIND,
     MCP_APP_MESSAGE_KIND,
     MODEL_UNENTITLED_KIND,
@@ -6239,6 +6249,52 @@ async def _handle_workflow_command(
     state.push_slots_update()
 
 
+async def _handle_agent_command(
+    state: "DashboardState", slot: "_ChatSlot", agent: str, session_key: str
+) -> None:
+    """Handle ``/agent <name>`` through the same transaction as the agent picker.
+
+    Runs inside the slot's own turn, before it acquires a session, so the
+    switch is told it is that turn (``own_turn``) rather than refusing on the
+    slot's own ``running`` flag. ``template`` because kiro-cli's ``/agent``
+    names agent specs, and a stated kind refuses a name nothing answers rather
+    than committing it with the default agent answering the next turn. The
+    caller is never treated as the owner: the text can come from any allowed
+    channel user.
+    """
+    # Call-time import: chat_handlers imports this module.
+    from kiro_crew.dashboard.chat_handlers import (
+        SlotAgentSwitchCaller,
+        agent_switch_outcome,
+        switch_slot_agent,
+    )
+
+    resp = await switch_slot_agent(
+        state, slot, slot.key, agent, "template", SlotAgentSwitchCaller.for_turn(slot)
+    )
+    ok, body = agent_switch_outcome(resp)
+    if ok:
+        text = switch_announcement(str(body.get("agent") or agent), str(body.get("warning") or ""))
+    else:
+        reason = str(body.get("error") or "the switch was refused")
+        text = f"⚠️ Could not switch to agent `{agent}`: {reason}"
+    text, _ = redact_credentials(text)
+    text, _ = redact_exfiltration_urls(text)
+    slot.append("assistant", text, "msg msg-a")
+    sel().log_tool_invocation(
+        session_key=session_key,
+        agent=slot.agent or "kirocrew",
+        source="dashboard",
+        tool_name="/agent",
+        tool_kind="slash_command",
+        outcome="ok" if ok else "error",
+        metadata={"slot": slot.key, "agent": agent, "status": resp.status},
+    )
+    if ok:
+        state.broadcast_ws("slot_agent_switch", {"slot": slot.key, "agent": str(slot.agent)})
+    state.push_slots_update()
+
+
 async def _handle_goal_command(state: "DashboardState", slot: "_ChatSlot", message: str) -> None:
     """Handle the ``/goal`` slash command (v0 self-verdict loop).
 
@@ -9227,15 +9283,33 @@ async def _run_chat(
     # text and overwrite the applied outcome in the transcript. Replaying the
     # stored output keeps every frame consistent and marker-free.
     _dir_consumed_out: dict[str, str] = {}
-    # A successfully posted non-blocking question card is the intended terminal
-    # output of this turn. The tool tells the model to end without assistant
-    # text, so empty-response recovery must not inject a closing continuation.
-    _terminal_question_posted = False
+    # A terminal directive APPLIED this turn (a shown question card, a recorded
+    # quiet end — ``session_directive_apply.TERMINAL_DIRECTIVES``) is the turn's
+    # intended output. The tool tells the model to end without assistant text,
+    # so empty-response recovery must not inject a closing continuation. The
+    # signal is the applier's structured ``DirectiveOutcome.ends_turn``, never a
+    # match on the outcome prose.
+    _terminal_directive_applied = False
+    _terminal_directive_kind = ""
+    # The tool_call_ids whose directive ENDED the turn. The matching tool rows
+    # get ``meta.ends_turn = True`` (persisted and patched live), which is what
+    # the interrupted-turn scan reads to tell an applied quiet end from a
+    # refused one — both carry the same trusted tool identity.
+    _terminal_directive_tcids: set[str] = set()
+    # Model activity (text or a tool call) observed AFTER the terminal directive
+    # applied: a turn-end contract violation. Only counted, then reported once
+    # at turn end — it never fails the turn and never re-arms recovery.
+    _activity_after_terminal = 0
 
-    def _record_terminal_question(kind: str, outcome: str) -> None:
-        nonlocal _terminal_question_posted
-        if kind == "ask_question" and outcome.startswith(QUESTION_CARD_SHOWN_PREFIX):
-            _terminal_question_posted = True
+    def _record_terminal_directive(kind: str, outcome: DirectiveOutcome, tcid: str) -> None:
+        nonlocal _terminal_directive_applied, _terminal_directive_kind
+        if not outcome.ends_turn:
+            return
+        if tcid:
+            _terminal_directive_tcids.add(_redact_tool_field(tcid))
+        if not _terminal_directive_applied:
+            _terminal_directive_applied = True
+            _terminal_directive_kind = kind
 
     # When this turn began, for bounding an out-of-band directive claim to it.
     # A directive belongs to the turn that asked for it: a record parked by a turn
@@ -9514,6 +9588,17 @@ async def _run_chat(
         await _handle_workflow_command(state, slot, message, session_key)
         return
 
+    # ── /agent <name>: Crew's own agent switch, never kiro-cli's ──
+    # Every surface that reaches a slot through this runner (the split pane,
+    # a Slack thread linked to a dashboard chat) gets the switch the agent
+    # picker makes. The main composer already sends it there before the
+    # message is ever posted.
+    _agent_target = agent_switch_target(message) if first_word == "/agent" else None
+    if _agent_target is not None:
+        turn_exit.local_command = first_word
+        await _handle_agent_command(state, slot, _agent_target, session_key)
+        return
+
     # ── /prompts: handle locally instead of forwarding to kiro-cli ──
     if first_word == "/prompts":
         turn_exit.local_command = first_word
@@ -9701,11 +9786,8 @@ async def _run_chat(
             else None
         )
         if _live_provider is not None and _live_provider_alive is True:
-            # Declared on the LLMProvider ABC with a None default (H14); the
-            # ACP implementations answer from ACP_BACKENDS_COMPACT membership.
-            _compact_unsupported = getattr(
-                _live_provider, "manual_compact_unsupported_backend", None
-            )
+            # The same predicate every channel's /compact gate asks.
+            _compact_unsupported = compact_unsupported_backend(_live_provider)
         elif _is_cc_provider:
             # Claude Code compacts natively in-prompt (cc_managed).
             _compact_unsupported = None
@@ -12029,6 +12111,8 @@ async def _run_chat(
                 # test_subagent_delivery_ttl_anchor), so a diagnostic flag goes
                 # above it rather than between the two.
                 _saw_text_chunk = True
+                if _terminal_directive_applied:
+                    _activity_after_terminal += 1
                 _turn_emitted = True  # tokens delivered — transient retry now unsafe
                 await _report_consumed(irreversible=True)
                 # Stream to the wire through the rolling buffer so a credential
@@ -12092,6 +12176,8 @@ async def _run_chat(
                 _repeat_loop.note_call(
                     event.tool_call_id, event.tool_name or "", event.tool_input, event.title
                 )
+                if _terminal_directive_applied:
+                    _activity_after_terminal += 1
                 if (
                     event.is_shell
                     and event.tool_call_id
@@ -12859,7 +12945,7 @@ async def _run_chat(
                         _pending_dir_tool.pop(event.tool_call_id, None)
                         _dir_tool = ""
                         _applied_kind = str(_oob.get("kind") or "")
-                        _applied_one = await apply_session_directive(
+                        _applied_outcome = await apply_session_directive_outcome(
                             state,
                             slot,
                             session_key,
@@ -12870,7 +12956,10 @@ async def _run_chat(
                             producer_is_channel=_directive_producer_is_channel(),
                             producer_wake_loop_id=_directive_loop_id,
                         )
-                        _record_terminal_question(_applied_kind, _applied_one)
+                        _applied_one = _applied_outcome.text
+                        _record_terminal_directive(
+                            _applied_kind, _applied_outcome, event.tool_call_id or ""
+                        )
                         logger.info(
                             "session-directive applied OUT OF BAND for %s "
                             "(tool_call_id=%s, kind=%s): the marker was unavailable; "
@@ -13072,7 +13161,7 @@ async def _run_chat(
                             # arm two loops or render two cards, so retire the
                             # twin now that the marker path has taken it.
                             directive_queue.discard(session_key)
-                            _applied_one = await apply_session_directive(
+                            _applied_outcome = await apply_session_directive_outcome(
                                 state,
                                 slot,
                                 session_key,
@@ -13083,7 +13172,10 @@ async def _run_chat(
                                 producer_is_channel=_directive_producer_is_channel(),
                                 producer_wake_loop_id=_directive_loop_id,
                             )
-                            _record_terminal_question(_dir_tool, _applied_one)
+                            _applied_one = _applied_outcome.text
+                            _record_terminal_directive(
+                                _dir_tool, _applied_outcome, event.tool_call_id or ""
+                            )
                             _out = _redact_tool_field(_applied_one)
                             _dir_consumed_out[event.tool_call_id] = _out
                         else:
@@ -13146,6 +13238,40 @@ async def _run_chat(
                         ):
                             _meta = m.setdefault("meta", {})
                             _meta["done"] = True
+                            if (
+                                _tcid in _terminal_directive_tcids
+                                and _tcid_identifies
+                                and str(m.get("ts") or "") not in _rows_before_turn
+                                and not _meta.get("ends_turn")
+                            ):
+                                # Structured, never prose: the applied terminal
+                                # directive's row is what closes the turn for the
+                                # interrupted-turn scan (``is_quiet_end_row``). A
+                                # REFUSED call carries the same trusted identity
+                                # and no flag, so it reads as an unanswered turn.
+                                # Scoped like the app flag above: only a row THIS
+                                # turn wrote, and only when the id names one call
+                                # -- a transcript-preserving reset can reuse an
+                                # earlier turn's tool_call_id, and stamping that
+                                # older (refused) row would record it as applied.
+                                # Patched live too, or the open client would offer
+                                # Resume until its next transcript fetch.
+                                _meta["ends_turn"] = True
+                                _ends_ts = str(m.get("ts") or "")
+                                if _ends_ts:
+                                    try:
+                                        state.broadcast_ws(
+                                            "chat_message_update",
+                                            {
+                                                "slot": slot.key,
+                                                "ts": _ends_ts,
+                                                "meta": {"ends_turn": True},
+                                            },
+                                        )
+                                    except Exception:
+                                        logger.debug(
+                                            "ends_turn flag broadcast failed", exc_info=True
+                                        )
                             # Written only when this row HAD an app record, and
                             # never written False: absent means "no app", which
                             # is also what every row predating this field says.
@@ -16056,6 +16182,21 @@ async def _run_chat(
             _flush_text_stream()
             _flush_segment(state, slot, assistant_text, broadcast=False)
 
+        if _terminal_directive_applied and _activity_after_terminal:
+            # Turn-end contract: a terminal directive is the LAST thing in its
+            # turn. Text or a tool call after it is the model's violation, not
+            # the runner's — the turn still ends cleanly and recovery stays
+            # off (re-arming it would turn a quiet end into a notice card),
+            # so this is reported once and nowhere else. Counts only, by
+            # contract: no text, no tool names.
+            logger.warning(
+                "Turn-end contract violation for slot %s: %d model event(s) "
+                "(text chunks or tool calls) after the terminal directive %r applied.",
+                slot.key,
+                _activity_after_terminal,
+                _terminal_directive_kind,
+            )
+
         if _answer_text:
             _flush_text_stream()
             _flush_segment(state, slot, assistant_text, broadcast=False)
@@ -16212,6 +16353,7 @@ async def _run_chat(
                 "ℹ️ The context was compacted mid-turn and the response stopped "
                 "there — continuing automatically.",
                 "msg msg-info",
+                meta={"kind": EMPTY_TURN_NOTICE_KIND},
             )
             _queue_recovery(
                 0,
@@ -16233,7 +16375,7 @@ async def _run_chat(
         elif (
             _stop_reason != STOP_REASON_CANCELLED
             and not _produced_visible_output
-            and not _terminal_question_posted
+            and not _terminal_directive_applied
             and not _refusal_reasons
         ):
             _had_empty_response_verdict = True
@@ -16356,6 +16498,7 @@ async def _run_chat(
                             f"(recovery {_continue_no} of {_max_continues})."
                         ),
                         "msg msg-info",
+                        meta={"kind": EMPTY_TURN_NOTICE_KIND},
                     )
                     _empty_continue_msg = _ACTIVITY_NO_REPLY_CONTINUE_MSG
                 else:
@@ -16368,6 +16511,7 @@ async def _run_chat(
                             f"(recovery {_continue_no} of {_max_continues})."
                         ),
                         "msg msg-info",
+                        meta={"kind": EMPTY_TURN_NOTICE_KIND},
                     )
                     _empty_continue_msg = _EMPTY_AUTO_CONTINUE_MSG
                 _queue_recovery(
@@ -16405,7 +16549,9 @@ async def _run_chat(
                     _empty_msg = EMPTY_TURN_NOTICE_AFTER_RECOVERY
                 else:
                     _empty_msg = EMPTY_TURN_NOTICE
-                slot.append("notice", _empty_msg, "msg msg-info")
+                slot.append(
+                    "notice", _empty_msg, "msg msg-info", meta={"kind": EMPTY_TURN_NOTICE_KIND}
+                )
             # ONE warning per empty verdict, emitted AFTER the rung is chosen so
             # the log line carries the decision rather than only the symptom. The
             # predecessor logged just "Empty model response (attempt N)", which

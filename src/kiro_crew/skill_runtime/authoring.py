@@ -359,6 +359,41 @@ def set_pinned(loader: SkillsLoader, name: str, pinned: bool) -> bool:
     return True
 
 
+def rewrite_inject_on_trigger(content: str, inject: bool) -> str | None:
+    """Return *content* with its ``inject_on_trigger`` setting rewritten.
+
+    The pure frontmatter core shared by :func:`set_inject_on_trigger` (the
+    dashboard toggle) and the builtin-skill sync, which carries the opt-out
+    across a packaged reinstall and recognises the carried line when it
+    verifies an installed tree. Every top-level ``inject_on_trigger:`` line is
+    dropped; ``inject=False`` then appends ``inject_on_trigger: false``.
+
+    The rewritten block keeps the line ending of the opening fence: a CRLF
+    file (a Windows checkout of a packaged skill) stays CRLF and an LF file
+    stays LF, and the body after the block is returned byte-for-byte. The
+    input is expected untranslated (decoded bytes, not a universal-newline
+    read), so the output is what lands on disk.
+
+    Returns None when *content* has no frontmatter block to edit.
+    """
+    m = re.match(r"^---(\r?\n)(.*?)\r?\n---(?:\r?\n)?(.*)$", content, re.DOTALL)
+    if not m:
+        return None
+    nl = m.group(1)
+    fm_lines = [
+        ln.removesuffix("\r")
+        for ln in m.group(2).split("\n")
+        # Only a TOP-LEVEL key, matched without stripping: an indented
+        # `inject_on_trigger:` belongs to a block scalar (a description that
+        # documents the flag, say), and deleting that line would silently
+        # rewrite the skill's prose while toggling a setting.
+        if not ln.lower().startswith("inject_on_trigger:")
+    ]
+    if not inject:
+        fm_lines.append("inject_on_trigger: false")
+    return f"---{nl}" + nl.join(fm_lines) + f"{nl}---{nl}" + m.group(3)
+
+
 def set_inject_on_trigger(loader: SkillsLoader, name: str, inject: bool) -> bool:
     """Opt a skill in or out of full-body injection on a trigger match.
 
@@ -379,8 +414,6 @@ def set_inject_on_trigger(loader: SkillsLoader, name: str, inject: bool) -> bool
     frontmatter block to edit — the caller surfaces that as a failed toggle
     rather than silently reporting success on a no-op.
     """
-    from kiro_crew import skills as sk  # circular import: the facade imports this module
-
     if not loader._safe_name(name):
         return False
     skill_file = loader._resolve_path(name)
@@ -394,27 +427,22 @@ def set_inject_on_trigger(loader: SkillsLoader, name: str, inject: bool) -> bool
     except OSError:
         return False
     try:
-        content = skill_file.read_text(encoding="utf-8")
+        # Bytes, not read_text: a universal-newline read folds CRLF to LF, and
+        # the verbatim write below would then rewrite every line ending of a
+        # CRLF file while toggling one setting.
+        content = skill_file.read_bytes().decode("utf-8")
     except (OSError, UnicodeDecodeError):
         return False
-    m = re.match(r"^---\n(.*?)\n---\n?(.*)$", content, re.DOTALL)
-    if not m:
+    new_content = rewrite_inject_on_trigger(content, inject)
+    if new_content is None:
         return False
-    fm_lines = [
-        ln
-        for ln in m.group(1).split("\n")
-        # Only a TOP-LEVEL key, matched without stripping: an indented
-        # `inject_on_trigger:` belongs to a block scalar (a description that
-        # documents the flag, say), and deleting that line would silently
-        # rewrite the skill's prose while toggling a setting.
-        if not ln.lower().startswith("inject_on_trigger:")
-    ]
-    if not inject:
-        fm_lines.append("inject_on_trigger: false")
-    new_content = "---\n" + "\n".join(fm_lines) + "\n---\n" + m.group(2)
-    # Atomic write (temp + rename), for the same reason set_pinned uses it:
-    # a partial write must never truncate the live SKILL.md.
-    sk.atomic_write(skill_file, new_content)
+    # The same atomic, access-control-carrying replace update_skill uses: the
+    # file's mode AND its named ACL entries are taken from the inode being
+    # replaced. Mode bits alone would keep 0644 but drop a named-user deny, and
+    # a built-in SKILL.md must keep its packaged mode because the builtin-sync
+    # fingerprint hashes it. A rejected target is a failed toggle.
+    if not loader._write_skill_md(skill_file, new_content, dir_fd=None):
+        return False
     loader._invalidate_iter_cache()
     logger.info("Skill %s on trigger: %s", "injects fully" if inject else "sends a pointer", name)
     return True

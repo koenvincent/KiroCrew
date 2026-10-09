@@ -588,6 +588,25 @@ class TestRemove:
         mgr.uninstall_mcp.assert_awaited_once_with("srv")
 
     @pytest.mark.asyncio
+    async def test_a_commented_global_config_is_refused_before_the_uninstall(
+        self, sandbox: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The removal would rewrite the file as plain JSON, so it is refused
+        before the capability manager uninstalls anything."""
+        from kiro_crew.dashboard.handlers import _shared
+
+        mgr = MagicMock()
+        mgr.available.return_value = True
+        mgr.uninstall_mcp = AsyncMock()
+        monkeypatch.setattr(_shared, "_capability_manager", lambda: mgr)
+        text = '{\n  "mcpServers": {\n    "srv": {"command": "x"},\n    // parked\n  }\n}\n'
+        sandbox.global_json.write_text(text, encoding="utf-8")
+        with pytest.raises(mcp_mod.McpConfigHasComments):
+            await mcp_mod.api_mcp_remove(_request({"name": "srv"}))
+        mgr.uninstall_mcp.assert_not_awaited()
+        assert sandbox.global_json.read_text(encoding="utf-8") == text
+
+    @pytest.mark.asyncio
     async def test_corrupt_global_config_is_tolerated(
         self, sandbox: SimpleNamespace, no_capability_manager: MagicMock
     ) -> None:
@@ -711,6 +730,18 @@ class TestServerDetail:
         )
         assert resp.status == 400
         assert _payload(resp)["error"] == "invalid JSON"
+
+    @pytest.mark.asyncio
+    async def test_put_refuses_a_commented_global_config(self, sandbox: SimpleNamespace) -> None:
+        """A PUT would rewrite the file as plain JSON and drop its comments."""
+        text = '{\n  "mcpServers": {\n    // "parked": {"command": "p"}\n  }\n}\n'
+        sandbox.global_json.write_text(text, encoding="utf-8")
+        with pytest.raises(mcp_mod.McpConfigHasComments) as excinfo:
+            await mcp_mod.api_mcp_server_detail(
+                _request({"command": "node"}, match_info={"name": "srv"}, method="PUT")
+            )
+        assert json.loads(excinfo.value.text)["code"] == mcp_mod.MCP_CONFIG_HAS_COMMENTS
+        assert sandbox.global_json.read_text(encoding="utf-8") == text
 
     @pytest.mark.asyncio
     async def test_put_without_command_is_400(self, sandbox: SimpleNamespace) -> None:

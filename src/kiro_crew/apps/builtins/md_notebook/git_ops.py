@@ -126,6 +126,54 @@ class GitError(RuntimeError):
     """A git invocation failed. Carries the command's stderr tail."""
 
 
+#: stderr lines that name a transport cause, which git's own tail never repeats.
+#: git ends EVERY fetch/push failure with the same access-rights boilerplate, and
+#: an SSH transport failure prints its diagnosis FIRST, so a last-3-lines tail
+#: reports a permission problem the operator does not have. Concretely, for a
+#: remote reachable only through a ``ProxyCommand`` in ``~/.ssh/config`` the
+#: sandbox's ``ssh -F /dev/null`` (see :mod:`kiro_crew.sandbox`) discards that
+#: config, DNS then fails, and the whole diagnosis is one line above the tail:
+#:
+#:     ssh: Could not resolve hostname <host>: Name or service not known
+#:     fatal: Could not read from remote repository.
+#:     Please make sure you have the correct access rights and the repository exists.
+#:
+#: The tail alone points the operator at credentials for a host that never
+#: resolved. Both spellings are matched: ``ssh``'s own ``prog:`` prefix, and the
+#: same phrases unprefixed (git relays them on some transports).
+#: ``Could not read from remote repository`` is deliberately NOT listed: it is
+#: git's OWN boilerplate, printed for every failure. Treating it as a cause would
+#: let it be prepended when the real diagnosis is missing, leading the message
+#: with the same symptom the tail already carries.
+_TRANSPORT_CAUSE = re.compile(
+    r"^(?:ssh|ssh-\S+):"
+    r"|\b(?:Could not resolve hostname"
+    r"|Host key verification failed|Permission denied \(publickey"
+    r"|Connection refused|No route to host|Connection timed out)\b"
+)
+
+
+def _failure_detail(stderr: str) -> str:
+    """The stderr to put in a :class:`GitError`: git's tail plus the cause.
+
+    The tail alone is kept verbatim, because for most failures it IS the useful
+    part. A failure carrying no transport line produces exactly
+    ``" ".join(stderr.strip().splitlines()[-3:])`` -- the same bytes this helper
+    produced before, blank lines and indentation included (no line is dropped or
+    re-stripped). The FIRST transport-caused line is prepended only when one
+    exists OUTSIDE that tail, so a message never reports only the symptom git
+    repeats for every cause. A line already in the tail is not repeated. This
+    widens what a failure REPORTS; it does not decide whether the command failed.
+    """
+    lines = stderr.strip().splitlines()
+    tail = lines[-3:]
+    lead = next(
+        (line for line in lines[: len(lines) - len(tail)] if _TRANSPORT_CAUSE.search(line)),
+        None,
+    )
+    return " ".join([lead, *tail] if lead else tail)
+
+
 class AttachError(Exception):
     """A directory cannot serve as a vault. ``code`` is a UI-friendly token."""
 
@@ -486,8 +534,8 @@ async def run_git(
     stdout = out.decode("utf-8", errors)
     stderr = err.decode("utf-8", "replace")
     if check and proc.returncode != 0:
-        tail = " ".join(stderr.strip().splitlines()[-3:])
-        raise GitError(f"git {args[0]} failed ({proc.returncode}): {tail}")
+        detail = _failure_detail(stderr)
+        raise GitError(f"git {args[0]} failed ({proc.returncode}): {detail}")
     return proc.returncode or 0, stdout, stderr
 
 

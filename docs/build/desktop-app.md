@@ -534,8 +534,10 @@ same way). Key details:
   the half that resolves the chain.
 - **Local dictation runtime bundled** — supported desktop builds include
   `pywhispercpp`, the platform `imageio-ffmpeg` executable used for compressed
-  recordings, and all transitive runtime dependencies. The build imports the
-  recognizer and executes the exact packaged decoder before publishing — and
+  recordings, and all transitive runtime dependencies. The macOS Intel backend
+  installs no `imageio-ffmpeg`; the Intel app uses a system FFmpeg. The build
+  imports the recognizer and executes the exact packaged decoder before
+  publishing — and
   distinguishes a decoder that fails to AUTHENTICATE, which fails the build, from
   one that authenticates but will not run on the build host, which warns and
   ships (see [stt-streaming](../system-specs/modules/stt-streaming.md)). Model

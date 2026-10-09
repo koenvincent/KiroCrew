@@ -17,12 +17,14 @@ launcher prerequisites); #1 needs only the ``aws`` CLI.
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import os
 import platform
 import re
 import shutil
 import subprocess
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -37,6 +39,14 @@ logger = logging.getLogger(__name__)
 # How long to wait for a send-command invocation to finish, and the poll gap.
 _CMD_TOTAL_WAIT = 180
 _CMD_POLL_INTERVAL = 3
+
+#: Bound on the captured port-forward stdout (see :func:`open_port_forward`).
+#: Only a short close notice is ever read back; the cap keeps a chatty plugin
+#: from growing the buffer without bound over a long-lived tunnel.
+_MAX_FORWARD_STDOUT = 8192
+#: Read chunk for the stdout drain — small enough that a close notice written
+#: just before exit is observed promptly.
+_FORWARD_STDOUT_READ_CHUNK = 4096
 
 # Indirection so tests can patch out the poll sleep.
 _sleep = time.sleep
@@ -342,6 +352,8 @@ def open_port_forward(
     local_port: int,
     profile: str = "",
     region: str = "",
+    *,
+    capture_stdout: bool = False,
 ) -> subprocess.Popen:
     """Spawn a background SSM port-forward. Returns the live child process.
 
@@ -358,10 +370,16 @@ def open_port_forward(
     through :func:`cloud.aws.run_aws` because the session streams for its whole
     lifetime rather than returning captured output.
 
-    Output goes to DEVNULL: the plugin logs a line per connection, and no
-    caller drains the pipes (they block on ``wait()``), so PIPE would deadlock
-    the tunnel once the OS pipe buffer fills. Tunnel liveness is verified via
-    :func:`wait_for_local_port`, not by parsing plugin output.
+    stderr goes to DEVNULL. stdout goes to DEVNULL too UNLESS *capture_stdout*,
+    in which case it is piped AND drained concurrently from spawn by a daemon
+    thread into a bounded buffer on the returned process (``stdout_buf``). The
+    bare PIPE alone would deadlock the tunnel — the plugin logs a line per
+    connection and a pipe nobody reads blocks the writer once the OS buffer fills
+    — so the capture is only safe BECAUSE the drain runs for the child's whole
+    life, exactly as the instances-layer forward does. The notice the plugin
+    prints when a forward is closed goes to stdout, so capturing it lets a caller
+    name the cause instead of reporting a bare exit code. Tunnel liveness is
+    still verified via :func:`wait_for_local_port`, never by parsing output.
 
     The child gets :func:`~kiro_crew.deploy.engine.aws_spawn_env` rather than a
     bare inherited env: the ``aws`` head is resolved absolutely, but the CLI then
@@ -380,13 +398,57 @@ def open_port_forward(
     logger.info(
         "opening SSM port-forward %s: local %d -> remote %d", target, local_port, remote_port
     )
-    return subprocess.Popen(  # noqa: S603 — fixed argv, no shell
+    proc = subprocess.Popen(  # noqa: S603 — fixed argv, no shell
         argv,
-        stdout=subprocess.DEVNULL,
+        stdout=subprocess.PIPE if capture_stdout else subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
         start_new_session=True,
         env=aws_spawn_env(argv[0]),
     )
+    if capture_stdout:
+        _start_stdout_drain(proc)
+    return proc
+
+
+def _start_stdout_drain(proc: subprocess.Popen) -> None:
+    """Drain *proc*'s piped stdout for its whole life into a bounded buffer.
+
+    Attaches a ``stdout_buf`` attribute (``list[str]`` holding at most one entry,
+    the most recent ``_MAX_FORWARD_STDOUT`` characters) that a close-reason reader
+    can inspect after the child exits, and a ``stdout_drain`` attribute holding
+    the daemon thread so a reader can join it once the child has exited (the pipe
+    reaches EOF and the drain returns) rather than guess at a wait. A daemon
+    thread reads so the OS pipe buffer never fills — the deadlock the DEVNULL
+    default avoids — and because it is a daemon it never keeps the interpreter
+    alive. Decoding is lossy-by-design (``"replace"``): a split multi-byte
+    sequence must not raise in a thread whose failure nobody observes.
+    """
+    stdout = proc.stdout
+    if stdout is None:  # pragma: no cover - PIPE was requested
+        return
+    buf: list[str] = [""]
+    # Expose the shared buffer on the process so a later reader (see
+    # cloud.connect._port_forward_error) can pull the captured notice out.
+    proc.stdout_buf = buf  # type: ignore[attr-defined]
+
+    def _drain() -> None:
+        try:
+            while True:
+                chunk = stdout.read(_FORWARD_STDOUT_READ_CHUNK)
+                if not chunk:
+                    return
+                buf[0] = (buf[0] + chunk.decode("utf-8", "replace"))[-_MAX_FORWARD_STDOUT:]
+        except Exception:  # noqa: BLE001 - a background drain must never raise
+            return
+        finally:
+            with contextlib.suppress(Exception):
+                stdout.close()
+
+    thread = threading.Thread(target=_drain, name="ssm-forward-stdout-drain", daemon=True)
+    # Expose the thread so a reader can join it once the child has exited (EOF on
+    # the pipe ends the drain), rather than guessing at how long it needs.
+    proc.stdout_drain = thread  # type: ignore[attr-defined]
+    thread.start()
 
 
 def kill_port_forward(proc: Optional[subprocess.Popen]) -> None:

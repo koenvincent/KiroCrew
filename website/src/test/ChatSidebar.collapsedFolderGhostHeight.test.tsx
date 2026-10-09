@@ -220,6 +220,17 @@ describe('FolderBody defers layout suppression until the collapse has animated',
     expect(inner().style.visibility).toBe('hidden')
   })
 
+  it('instantClose drops the transition only for the close, so opening still animates', () => {
+    const box = () => inner().parentElement as HTMLElement
+    const { rerender } = render(<FolderBody open instantClose><div>rows</div></FolderBody>)
+    expect(box().style.transition).toMatch(/grid-template-rows/)
+    rerender(<FolderBody open={false} instantClose><div>rows</div></FolderBody>)
+    expect(box().style.transition).toBe('none')
+    expect(box().style.gridTemplateRows).toBe('0fr')
+    rerender(<FolderBody open={false}><div>rows</div></FolderBody>)
+    expect(box().style.transition).toMatch(/grid-template-rows/)
+  })
+
   it('cancels a pending suppression when reopened mid-collapse', () => {
     const { rerender } = render(<FolderBody open><div>rows</div></FolderBody>)
     rerender(<FolderBody open={false}><div>rows</div></FolderBody>)

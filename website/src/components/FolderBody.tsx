@@ -30,6 +30,15 @@ import { useEffect, useState } from 'react'
  * toward. A folder that mounts already closed suppresses immediately, so a
  * freshly rendered list neither animates nor reserves height.
  *
+ * `instantClose` closes with no transition, the same path
+ * `prefers-reduced-motion` takes. The list view sets it when the collapse
+ * starts from a PINNED header (see `stickyCollapse.ts`): the lane scrolls so
+ * the header holds still, and an animated close would then slide the folder's
+ * rows up past the header for the whole close, and with the rows hidden at
+ * once (above) the lane under the header would read as empty until the next
+ * folder rose into it. Closing in the same frame brings the next folder up
+ * under the header at once. Opening always animates.
+ *
  * This lives in one place deliberately: it used to be copied per call site, and
  * the copy kept the layout defect after the original was fixed.
  */
@@ -41,9 +50,12 @@ export const FOLDER_BODY_COLLAPSE_MS = 150
 export function FolderBody({
   open,
   padding = '2px',
+  instantClose = false,
   children,
 }: {
   open: boolean
+  /** Close with no transition (see the module note). Ignored while open. */
+  instantClose?: boolean
   /** Applied while open; the closed state always collapses padding to 0. */
   padding?: string
   children?: React.ReactNode
@@ -71,7 +83,7 @@ export function FolderBody({
       style={{
         display: 'grid',
         gridTemplateRows: open ? '1fr' : '0fr',
-        transition: `grid-template-rows ${FOLDER_BODY_COLLAPSE_MS}ms ease-out`,
+        transition: !open && instantClose ? 'none' : `grid-template-rows ${FOLDER_BODY_COLLAPSE_MS}ms ease-out`,
       }}
     >
       <div style={{

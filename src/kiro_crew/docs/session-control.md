@@ -1,16 +1,16 @@
 # Session Control — driving another session
 
-One chat session can open, fork, seed, watch, stop, close and revive another one,
+One chat session can open, fork, seed, watch, stop, retry, close and revive another one,
 change its model, reload its agent process, and take another one under itself in
 the sidebar. The tools come from the
 `kirocrew-dashboard` MCP server, so an agent that does not mount that server
 never has them — exactly like any other MCP server. This page is the reference
-for all 30 of its tools, written for the agent that is about to use them.
+for all 31 of its tools, written for the agent that is about to use them.
 
 The server is defined in `src/kiro_crew/mcp_dashboard.py`. Two halves:
 
 - **Session control** — `session_create`, `session_fork`, `session_send`,
-  `session_read_message`, `session_summary`, `session_stop`, `session_end_wait`,
+  `session_read_message`, `session_summary`, `session_stop`, `session_end_wait`, `session_retry`,
   `session_set_model`, `session_reload`, `session_close`, `session_revive`, `session_broadcast`,
   `session_status`, `session_adopt`, `session_release`. These reach another session.
 - **Sidebar shape** — `chat_folder_tree`, `chat_folder_create`,
@@ -440,17 +440,35 @@ delivers text the target then acts on. `session_end_wait` does neither.
 | Argument | Required | Meaning |
 |---|---|---|
 | `target` | yes | Session key or exact title |
-| `model` | yes | Model to switch to: a canonical key or provider id, such as `sonnet` or `opus` |
+| `model` | no | Model to switch to: a canonical key or provider id, such as `sonnet` or `opus`. Omit it to keep the target's model |
+| `reasoning_effort` | no | Reasoning effort, one of the five standard levels: `low`, `medium`, `high`, `xhigh`, `max`. Omit it to keep the target's level |
 
-The model is recorded as a pending pick and applied when the target's next turn
+Pass `model`, `reasoning_effort` or both; a call with neither is refused.
+Any other level is refused with `effort_rejected`. Every backend applies the
+five standard levels, so a level checked when you call cannot stop fitting
+before the pick applies. Levels only one backend offers, such as Pi's `minimal`,
+are set from the target's effort dropdown. So is `""` (back to the model's
+default level): on kiro-cli the default only takes once the workspace effort
+file is cleared, which the dropdown does and this tool cannot.
+The change is recorded as a pending pick and applied when the target's next turn
 starts. At that point the same permission check runs again, in the same step
-that sets the model. If the target has become channel-linked, mirrored or
-otherwise out of reach, the pick is dropped and the turn runs on its old model.
-A later call replaces a pick that has not been applied yet, and a model the
-user picks in the meantime wins over it. The conversation is kept.
-`session_read_message` shows the target's current model and any pick still
-pending, so you can tell whether yours took. A pending pick does not survive a
+that sets the model and effort. If the target has become channel-linked, mirrored or
+otherwise out of reach, the pick is dropped and the turn runs on its old settings.
+A later call replaces a pick that has not been applied yet. A model the user
+picks in the meantime wins over the pending model, and an effort level the user
+picks in the meantime wins over the pending level; each is judged on its own.
+On codex, where the level is part of the model id, a model the user picks also
+wins over the pending level.
+The conversation is kept. The target's session restarts on the new settings
+when the model changes, when the level changes, or when a codex model id still
+carrying an old `[level]` is folded.
+`session_read_message` shows the target's current model and reasoning effort
+and any pick still pending, so you can tell whether yours took. A pending pick does not survive a
 gateway restart.
+
+The tool takes no `mode` and no `agent`. A mode switch could turn on Autopilot
+or an auto-approve mode for another session, and an agent switch changes the
+memory store the session reads.
 
 Only an idle session takes a pick. If the target has a turn or sub-agents in
 flight, the call is refused with `target_busy` ("session busy, model not
@@ -493,6 +511,31 @@ If the old process fails while shutting down after it was removed, the reload
 still counts as done: the notice is written, the process starts again, and the
 reply carries a `warning`. A failure before anything was removed answers
 `reload_failed`, and nothing was torn down.
+
+### `session_retry`
+
+| Argument | Required | Meaning |
+|---|---|---|
+| `target` | yes | Session key or exact title |
+
+Re-runs a session's last turn when it failed, the same way the Resume button in
+that tab does. The target gets the same recovery row a Resume press leaves, and
+its most recent request runs again. No second copy of the user's message is
+added, which is the difference from re-sending the prompt with `session_send`.
+
+The target must be idle and its last turn must have failed: it ended in an error
+row, or the request got no reply at all. A target whose last turn finished, or
+was ended with Stop, is refused with `turn_not_failed`, so this tool cannot make
+another session produce a fresh answer on top of a good one. The other refusals
+are Resume's own: `slot_running`, `slot_stopping`,
+`slot_queue_pending`, `slot_approval_pending`, `slot_subagents_running` and
+`slot_empty`. After two failed session starts in a row the call is refused too. A third
+identical start will not go differently, so the host needs attention first
+(the refusal says to restart the gateway). An old relay chat, which ran on a
+remote crew and is read-only now, is refused with `relay_archive_read_only`.
+
+The session-control audit line records your session key as the caller, and the
+target's own `dashboard_continue` line records `via=session_control`.
 
 ### `session_revive`
 

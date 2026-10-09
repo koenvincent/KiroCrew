@@ -22,7 +22,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from kiro_crew import shutdown_event
-from kiro_crew.autonudge_service.gate import _WAKE_FOLLOWUP_TICKS
+from kiro_crew.autonudge_service.gate import _WAKE_FOLLOWUP_TICKS, _record_delivered_revision
 from kiro_crew.autonudge_service.maintenance import _release_mutation_lock
 from kiro_crew.autonudge_service.model import (
     _CONSECUTIVE_FAILURE_STANDDOWN_AFTER,
@@ -634,6 +634,11 @@ async def _run_fire_cycle(self: AutoNudgeService, loop: NudgeLoop) -> None:
         # carry. The clear may ride the delivered path's own write: losing it costs
         # one extra fire, which is the direction to be wrong in.
         loop.monitor.floor_fire_pending = False
+    if delivered and loop.monitor is not None:
+        # A work-ledger watch remembers the revision this turn was delivered at, so
+        # a later quiet floor can tell whether the ledger moved since. Rides the
+        # delivered path's own write, like the counters above.
+        _record_delivered_revision(loop.monitor)
     if not delivered:
         # If the fire path already removed the loop (e.g. slot missing →
         # remove()), do NOT resurrect it with a fresh timer — that would

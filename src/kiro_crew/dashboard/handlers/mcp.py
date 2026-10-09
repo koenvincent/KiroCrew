@@ -74,7 +74,12 @@ from kiro_crew.mcp_utils import (
 from kiro_crew.platform.governance import may_skip_gate_now
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
 from kiro_crew.sel import sel
-from kiro_crew.user_json import loads_mcp_config, loads_user_json
+from kiro_crew.user_json import (
+    has_json_comments,
+    loads_mcp_config,
+    loads_user_json,
+    loads_user_jsonc,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -309,7 +314,11 @@ def _get_apply_lock() -> LoopBoundLock:
 
 
 def _write_mcp_json(data: dict) -> None:
-    """Atomically write global mcp.json to prevent partial reads."""
+    """Atomically write global mcp.json to prevent partial reads.
+
+    Raises :class:`McpConfigHasComments` when the file on disk holds JSONC.
+    """
+    _refuse_commented_config(_GLOBAL_MCP_JSON)
     _GLOBAL_MCP_JSON.parent.mkdir(parents=True, exist_ok=True)
     _atomic_json_write(_GLOBAL_MCP_JSON, data)
 
@@ -366,7 +375,7 @@ def _sync_mcp_to_agent_unlocked(name: str, enabled: bool, *, remove: bool = Fals
         if alias not in mcp_servers:
             # Copy spec from global mcp.json (looked up by original name)
             try:
-                gdata = loads_mcp_config(_GLOBAL_MCP_JSON.read_text(encoding="utf-8"))
+                gdata = loads_mcp_config(_GLOBAL_MCP_JSON.read_text(encoding="utf-8"), jsonc=True)
                 spec = gdata.get("mcpServers", {}).get(name, {})
                 if isinstance(spec, dict) and spec:
                     entry = {k: v for k, v in spec.items() if k != "disabled"}
@@ -524,7 +533,7 @@ def _sync_mcp_to_agent_batch_unlocked(names: list[str], enabled: bool) -> None:
         # Ensure all servers exist in kirocrew.json mcpServers
         mcp_servers = cfg.setdefault("mcpServers", {})
         try:
-            gdata = loads_mcp_config(_GLOBAL_MCP_JSON.read_text(encoding="utf-8"))
+            gdata = loads_mcp_config(_GLOBAL_MCP_JSON.read_text(encoding="utf-8"), jsonc=True)
         except (FileNotFoundError, json.JSONDecodeError):
             gdata = {}
         granted_refs: list[str] = []
@@ -1019,7 +1028,7 @@ async def _run_mcp_probe() -> None:
 
         global_mcps: dict[str, Any] = {}
         try:
-            data = loads_mcp_config(_GLOBAL_MCP_JSON.read_text(encoding="utf-8"))
+            data = loads_mcp_config(_GLOBAL_MCP_JSON.read_text(encoding="utf-8"), jsonc=True)
             global_mcps = data.get("mcpServers", {})
         except (FileNotFoundError, json.JSONDecodeError):
             pass
@@ -1109,7 +1118,7 @@ async def api_mcp_servers(request: web.Request) -> web.Response:
     # Read global mcp.json for disabled state
     global_mcps: dict[str, Any] = {}
     try:
-        data = loads_mcp_config(_GLOBAL_MCP_JSON.read_text(encoding="utf-8"))
+        data = loads_mcp_config(_GLOBAL_MCP_JSON.read_text(encoding="utf-8"), jsonc=True)
         global_mcps = data.get("mcpServers", {})
     except (FileNotFoundError, json.JSONDecodeError):
         pass
@@ -1241,7 +1250,7 @@ async def api_mcp_active(request: web.Request) -> web.Response:
 
     global_mcps: dict[str, Any] = {}
     try:
-        data = loads_mcp_config(_GLOBAL_MCP_JSON.read_text(encoding="utf-8"))
+        data = loads_mcp_config(_GLOBAL_MCP_JSON.read_text(encoding="utf-8"), jsonc=True)
         global_mcps = data.get("mcpServers", {})
     except (FileNotFoundError, json.JSONDecodeError):
         pass
@@ -1302,7 +1311,7 @@ async def api_mcp_probe(request: web.Request) -> web.Response:
     # Read global mcp.json for enabled/disabledTools state
     global_mcps: dict[str, Any] = {}
     try:
-        data = loads_mcp_config(_GLOBAL_MCP_JSON.read_text(encoding="utf-8"))
+        data = loads_mcp_config(_GLOBAL_MCP_JSON.read_text(encoding="utf-8"), jsonc=True)
         global_mcps = data.get("mcpServers", {})
     except (FileNotFoundError, json.JSONDecodeError):
         pass
@@ -1570,6 +1579,9 @@ async def api_mcp_sync(request: web.Request) -> web.Response:
         sync_discovered_servers,
     )
 
+    # Refuse before ANY write: the global file is rewritten below as plain JSON.
+    await asyncio.to_thread(_refuse_commented_config, _GLOBAL_MCP_JSON)
+
     # One serialized discover→write pass (agent config + CC sidecar), off the
     # event loop — the sync is blocking file I/O, and sync_discovered_servers'
     # mutex is what keeps this handler and the sessions-restart pre-sync from
@@ -1800,6 +1812,7 @@ async def api_mcp_toggle(request: web.Request) -> web.Response:
         return web.json_response({"error": "name is required"}, status=400)
 
     async with _get_mcp_lock():
+        _refuse_commented_config(_GLOBAL_MCP_JSON)
         # 1. Update global mcp.json
         try:
             data = loads_mcp_config(_GLOBAL_MCP_JSON.read_text(encoding="utf-8"))
@@ -1892,6 +1905,7 @@ async def api_mcp_toggle_tool(request: web.Request) -> web.Response:
         return web.json_response({"error": "server and tool are required"}, status=400)
 
     async with _get_mcp_lock():
+        _refuse_commented_config(_GLOBAL_MCP_JSON)
         try:
             data = loads_mcp_config(_GLOBAL_MCP_JSON.read_text(encoding="utf-8"))
         except FileNotFoundError:
@@ -1958,6 +1972,7 @@ async def api_mcp_toggle_all(request: web.Request) -> web.Response:
     enabled = body.get("enabled", True)
 
     async with _get_mcp_lock():
+        _refuse_commented_config(_GLOBAL_MCP_JSON)
         try:
             data = loads_mcp_config(_GLOBAL_MCP_JSON.read_text(encoding="utf-8"))
         except FileNotFoundError:
@@ -2024,6 +2039,8 @@ async def api_mcp_remove(request: web.Request) -> web.Response:
     # reports it available so the handler stays fully functional without it.
     from kiro_crew.dashboard.handlers._shared import _capability_manager
 
+    # Before the uninstall, so a refused global file leaves nothing half done.
+    await asyncio.to_thread(_refuse_commented_config, _GLOBAL_MCP_JSON)
     mgr = _capability_manager()
     if mgr.available():
         try:
@@ -2108,6 +2125,7 @@ async def api_mcp_server_detail(request: web.Request) -> web.Response:
     if request.method == "DELETE":
         # Remove from global mcp.json
         async with _get_mcp_lock():
+            _refuse_commented_config(_GLOBAL_MCP_JSON)
             try:
                 data = loads_user_json(_GLOBAL_MCP_JSON.read_text(encoding="utf-8"))
             except (FileNotFoundError, json.JSONDecodeError):
@@ -2255,6 +2273,69 @@ async def api_mcp_global_scopes(request: web.Request) -> web.Response:
     return web.json_response({"scopes": scopes})
 
 
+#: Error code for a write refused because the file holds JSONC (see below).
+MCP_CONFIG_HAS_COMMENTS = "mcp_config_has_comments"
+
+
+def _has_json_comments_on_disk(path: Path) -> bool:
+    """Whether *path* parses only as JSONC (comments or trailing commas).
+
+    Readers accept such a file (``loads_user_jsonc``), but every writer here
+    emits plain JSON, so writing it back would drop the user's comments and
+    commented-out servers. Writers refuse instead of rewriting it.
+    """
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return False
+    return has_json_comments(text)
+
+
+class McpConfigHasComments(web.HTTPConflict):
+    """A write refused because its target file holds JSONC.
+
+    An HTTP 409 with a coded JSON body, so a handler that lets it propagate
+    answers the client directly.
+    """
+
+    def __init__(self, path: Path) -> None:
+        super().__init__(
+            text=json.dumps(
+                {
+                    "error": (
+                        f"{path} has comments or trailing commas; saving would rewrite "
+                        "it as plain JSON and drop them. Remove them, or edit the file "
+                        "directly."
+                    ),
+                    "code": MCP_CONFIG_HAS_COMMENTS,
+                }
+            ),
+            content_type="application/json",
+        )
+        self.path = path
+
+
+def _user_mcp_config_paths() -> list[Path]:
+    """The MCP config files a person edits by hand, which may hold JSONC."""
+    return [
+        _kirocrew_mcp_json(),
+        _GLOBAL_MCP_JSON,
+        *(scope.global_json for scope in _extra_mcp_scopes()),
+    ]
+
+
+def _refuse_commented_config(*paths: Path) -> None:
+    """Raise :class:`McpConfigHasComments` when any of *paths* holds JSONC.
+
+    The write helpers call it, so no writer can rewrite such a file; a handler
+    with other side effects also calls it before the first of them, so its
+    work is refused whole instead of stopping part way.
+    """
+    for path in paths:
+        if _has_json_comments_on_disk(path):
+            raise McpConfigHasComments(path)
+
+
 def _load_json_or_empty(path: Path) -> dict[str, Any]:
     """Load JSON from a path; return empty dict on missing/malformed/unreadable.
 
@@ -2264,7 +2345,7 @@ def _load_json_or_empty(path: Path) -> dict[str, Any]:
     partially-applied changes without a rebuild.
     """
     try:
-        data = loads_user_json(path.read_text(encoding="utf-8"))
+        data = loads_user_jsonc(path.read_text(encoding="utf-8"))
         return data if isinstance(data, dict) else {}
     except (OSError, json.JSONDecodeError):
         return {}
@@ -2328,7 +2409,12 @@ def _atomic_write(path: Path, data: dict) -> None:
     thread rather than call this on the event loop.  Other paths (the shared
     global file, agent files) keep the mode-preserving helper — their
     lifecycles are owned by other tools.
+
+    Raises :class:`McpConfigHasComments` when *path* is a hand-edited MCP config
+    (:func:`_user_mcp_config_paths`) and the file on disk holds JSONC.
     """
+    if path in _user_mcp_config_paths():
+        _refuse_commented_config(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     if path == _kirocrew_mcp_json():
         atomic_write(
@@ -3070,6 +3156,9 @@ async def _do_mcp_apply(request: web.Request) -> web.Response:
     )
     change_keys: dict[str, PreflightKeys] = {}
     if change_names:
+        # A scope file holding JSONC cannot be written without dropping its
+        # comments, so the batch is refused before its first write.
+        await asyncio.to_thread(_refuse_commented_config, *_user_mcp_config_paths())
         change_keys, ambiguous = await asyncio.to_thread(_preflight_change_keys, change_names)
         if ambiguous:
             sel().log_api_access(

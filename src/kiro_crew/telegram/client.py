@@ -1304,12 +1304,6 @@ class TelegramClient:
 
     # ── File download (attachment ingestion) ──
 
-    #: The default host Telegram file downloads resolve to. When
-    #: ``TELEGRAM_API_BASE_URL`` configures a proxy, downloads instead go to
-    #: that proxy's origin (and path prefix), derived by :func:`_file_base`.
-    #: A redirect to any other host is still refused.
-    _FILE_HOST = "api.telegram.org"
-
     async def download_file(self, file_id: str, dest: str) -> None:
         """Download a Telegram file by ``file_id`` to *dest*.
 

@@ -44,7 +44,7 @@ export interface LocalSidebarRow {
   needs_input?: boolean
   created_by?: string
   lineage_minted?: boolean
-  parent?: { slot?: string; key?: string | null } | null
+  parent?: { slot?: string; key?: string | null; ancestor?: boolean } | null
   source_links?: NonNullable<ChatSlot['source_links']>
 }
 

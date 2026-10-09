@@ -518,6 +518,11 @@ export interface ChatState {
   // the slots-sync ignores a server running=false for it (the snapshot may
   // predate the send). Cleared on server confirmation or turn end.
   pendingTurnSlot: string | null
+  // The last close the server refused, so the row that came back is explained.
+  // Set by `deleteSlot` itself, so every close path (sidebar X, any session
+  // menu, Cmd+W) reports it; the sidebar renders it. `historyWrite` is the
+  // server's "still saving" refusal; anything else is a plain failed close.
+  closeRefused: { key: string; title: string; reason: 'historyWrite' | 'failed' } | null
 }
 
 export const initialState: ChatState = {
@@ -593,4 +598,5 @@ export const initialState: ChatState = {
   runEpoch: {},
   activeRunEpochAtEntry: 0,
   pendingTurnSlot: null,
+  closeRefused: null,
 }

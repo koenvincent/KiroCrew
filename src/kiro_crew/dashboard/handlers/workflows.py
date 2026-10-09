@@ -727,6 +727,14 @@ async def api_workflow_run_cancel(request: web.Request) -> web.Response:
 
 async def api_workflow_run_rerun(request: web.Request) -> web.Response:
     """POST /api/workflows/runs/{id}/rerun — restart, replaying the prefix."""
+    # A rerun launches a new run under the prior run's origin session, optionally
+    # with an edited script, so it is gated like the other launch routes above.
+    if request.get("internal_auth") is not True and request.get("app") == "":
+        from kiro_crew.dashboard.handlers._shared import require_owner_dashboard_request
+
+        owner_denied = await require_owner_dashboard_request(request, "workflow.rerun")
+        if owner_denied is not None:
+            return owner_denied
     svc = _svc(request)
     if svc is None:
         return web.json_response({"error": "workflows not available"}, status=503)

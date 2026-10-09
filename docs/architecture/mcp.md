@@ -1545,7 +1545,7 @@ Managed servers, registered by `agent._MANAGED_MCP_SERVERS` and installed into
 | `kirocrew-cron` | `kirocrew mcp-cron` (`mcp_cron.py`) | `cron_add`, `cron_list`, `cron_update`, `cron_remove`, `cron_remove_all`, `cron_pause`, `cron_resume`, `cron_trigger`, `cron_secret_request` |
 | `kirocrew-core` | `kirocrew mcp-core` (`mcp_core.py` + `mcp_tools/`) | spawn/subagent, learn, task, messaging, artifact, workflow, knowledge and session-directive tools (see below) |
 | `kirocrew-computer` | `kirocrew mcp-computer` (`mcp_computer.py`) | `computer_list_apps`, `computer_launch_app`, `computer_get_state`, `computer_click`, `computer_drag`, `computer_type_text`, `computer_press_key`, `computer_set_value`, `computer_scroll`, `computer_perform_action`, `computer_end_turn` |
-| `kirocrew-dashboard` | `kirocrew mcp-dashboard` (`mcp_dashboard.py`) | `chat_folder_tree`, `chat_folder_create`, `chat_folder_move`, `chat_folder_update`, `chat_folder_move_session`, `chat_folder_delete`, `chat_folder_file_self`, `chat_tag_list`, `chat_tag_create`, `chat_tag_update`, `chat_tag_assign`, `chat_tag_column_list`, `chat_tag_column_create`, `chat_tag_column_move`, `chat_session_pin`, `session_create`, `session_fork`, `session_stop`, `session_end_wait`, `session_set_model`, `session_reload`, `session_close`, `session_revive`, `session_send`, `session_broadcast`, `session_status`, `session_adopt`, `session_release`, `session_read_message`, `session_summary` |
+| `kirocrew-dashboard` | `kirocrew mcp-dashboard` (`mcp_dashboard.py`) | `chat_folder_tree`, `chat_folder_create`, `chat_folder_move`, `chat_folder_update`, `chat_folder_move_session`, `chat_folder_delete`, `chat_folder_file_self`, `chat_tag_list`, `chat_tag_create`, `chat_tag_update`, `chat_tag_assign`, `chat_tag_column_list`, `chat_tag_column_create`, `chat_tag_column_move`, `chat_session_pin`, `session_create`, `session_fork`, `session_stop`, `session_end_wait`, `session_retry`, `session_set_model`, `session_reload`, `session_close`, `session_revive`, `session_send`, `session_broadcast`, `session_status`, `session_adopt`, `session_release`, `session_read_message`, `session_summary` |
 | `kirocrew-work` | `kirocrew mcp-work` (`mcp_work.py`) | `work_brief`, `work_report`, `work_ledger_read`, `work_ledger_rebuild`, `work_ledger_record` |
 | `kirocrew-crew-log` | `kirocrew mcp-crew-log` (`mcp_crew_log.py`) | `crew_log_list`, `crew_log_read`, `crew_log_projection` |
 | `kirocrew-debug` | `kirocrew mcp-debug` (`mcp_debug.py`) | `debug_gateway`, `debug_refusals`, `debug_threads`, `debug_processes`, `debug_snapshots` |
@@ -1655,9 +1655,9 @@ answers `tools/list` from):
     deliver into the parent's chat window. An unresolvable identity refuses the
     call rather than guessing.
 - **Session-bound directives** (`session_directive.DIRECTIVE_TOOLS`):
-  `ask_question`, `suggest_followup`, `monitor_start`, `monitor_watch`,
-  `monitor_update`, `monitor_stop`, `autonudge_stop`, `set_project`,
-  `reset_conversation`, `chat_tag`
+  `ask_question`, `nothing_to_do`, `suggest_followup`, `monitor_start`,
+  `monitor_watch`, `monitor_update`, `monitor_stop`, `autonudge_stop`,
+  `set_project`, `reset_conversation`, `chat_tag`
 - **Memory recall (V1 and V2):** `memory_recall` resolves authenticated session identity
   once through `require_strict_session_key` and passes that same identity to the gateway.
   Missing identity returns the shared gate's refusal and installation diagnosis.
@@ -2651,10 +2651,10 @@ identity, would hand the answer to whichever session the shared process last saw
 and let a sub-agent's card land in its parent's slot.
 
 **Return a session directive and let the session-aware consumer apply it.** This
-is what the `ask_question` MCP tool itself does, along with `monitor_start`,
-`monitor_watch`, `monitor_update`, `monitor_stop`, `autonudge_stop`, `set_project`
-and `suggest_followup`, `reset_conversation` and `chat_tag`
-(`session_directive.DIRECTIVE_TOOLS`). The tool validates its arguments and
+is what the `ask_question` MCP tool itself does, along with `nothing_to_do`,
+`monitor_start`, `monitor_watch`, `monitor_update`, `monitor_stop`,
+`autonudge_stop`, `set_project` and `suggest_followup`, `reset_conversation` and
+`chat_tag` (`session_directive.DIRECTIVE_TOOLS`). The tool validates its arguments and
 returns a human-readable confirmation plus a marker line carrying the validated
 payload and **no session key**. `dashboard/chat_runner`'s tool-result handler
 decodes the marker, applies the effect against **its own** `slot.key`, then
@@ -2662,6 +2662,34 @@ strips the marker from the stored transcript. Sub-agent isolation is therefore
 structural rather than cryptographic: a sub-agent's tool result flows through the
 sub-agent's own runner, so it can only bind to the sub-agent's session. There is
 no walk to get wrong.
+
+**Terminal directives carry a structured turn-end signal.** Two directives are
+the turn's intended LAST act — a shown `ask_question` card and a recorded
+`nothing_to_do` quiet end (`session_directive_apply.TERMINAL_DIRECTIVES`). Their
+applier returns a `DirectiveOutcome(text, ends_turn=True)` through
+`apply_session_directive_outcome`, and only on the path where the effect landed
+(a card a client will render; a quiet step recorded): a refusal, an error text or
+a dropped card leaves `ends_turn` False. Both consumers read that flag — the
+dashboard runner skips its empty-response ladder, the channel driver owes no
+empty-turn notice — and neither derives it from the outcome prose (the
+`QUESTION_CARD_SHOWN_PREFIX` match the first fix used was the thing #9324 asked
+to replace). The string-returning `apply_session_directive` remains for callers
+that need the text alone. `nothing_to_do` exists for the turn-end contract the
+base prompt states: after its tool calls a turn ends with a closing text or with
+`nothing_to_do`, never by stopping bare after an ordinary tool — a bare stop
+keeps the recovery ladder, which is what makes the directive the only sanctioned
+silent exit. Its ONE gate is who opened the turn: it applies on a monitor wake
+(`producer_is_self_wake`) or a headless producer (cron, crew runtime, app or
+task-runner injection), and is REFUSED (`QUIET_END_REFUSED_USER_TURN`,
+`ends_turn` False) on a turn a person opened — a user-facing dashboard turn or
+any channel turn, since the channel driver cannot yet tell a human's message
+from a loop's wake. The refusal is what keeps a model misfire a visible failure:
+the ladder, the Resume control and the channel notice run exactly as before. No
+slot or surface gate otherwise (it mutates nothing a wrong identity could
+misdirect); isolation from a sub-agent is the same structural isolation every
+directive has. The runner stamps `meta.ends_turn = True` on the applied
+directive's tool row (persisted, and patched live over `chat_message_update`),
+which is the structured fact the interrupted-turn scan reads.
 
 The directive marker is model-visible, since it comes back as tool-result text,
 so the consumer defends against forgery by honoring a directive only when the

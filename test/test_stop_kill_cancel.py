@@ -388,58 +388,67 @@ class TestTeardownUsesPortableSignalConstant:
 
         self._hide_sigkill(monkeypatch)
         socket_path = tmp_path / "gateway.sock"
-        (tmp_path / "gateway.sock.backends").write_text("111\n", encoding="utf-8")
+        (tmp_path / "gateway.sock.backends").write_text("111 s\n", encoding="utf-8")
 
         manager = object.__new__(mgr.GatewayManager)
         manager._spec = MagicMock()
         manager._spec.socket_path = str(socket_path)
-
-        with patch(
-            "kiro_crew.platform_compat.kill_process_tree_async",
-            new_callable=AsyncMock,
-        ) as mock_async:
-            await manager._reap_orphaned_backends()
-
-        assert mock_async.await_args.args == (111, 9)
-
-
-class TestOrphanReapIsPlatformCorrect:
-    """``_reap_orphaned_backends`` used a bare ``os.killpg`` per recorded pid.
-
-    On Windows that raises ``AttributeError`` (uncaught by its handler), and it
-    is awaited from ``_terminate_process``, so the sync helper would also spawn
-    one 5s-timeout ``taskkill`` per pid directly on the loop.
-    """
-
-    @pytest.mark.asyncio
-    async def test_reap_awaits_async_tree_kill_for_each_pid(self, tmp_path):
-        from kiro_crew.mcp_gateway import manager as mgr
-
-        socket_path = tmp_path / "gateway.sock"
-        (tmp_path / "gateway.sock.backends").write_text("111 222\n", encoding="utf-8")
-
-        manager = object.__new__(mgr.GatewayManager)
-        manager._spec = MagicMock()
-        manager._spec.socket_path = str(socket_path)
-
-        def _forbid_sync(*_a: Any, **_kw: Any) -> None:
-            raise AssertionError("sync kill_process_tree must not be called from a coroutine")
 
         with (
+            patch("kiro_crew.platform_compat.IS_WINDOWS", False),
             patch(
-                "kiro_crew.platform_compat.kill_process_tree_async",
-                new_callable=AsyncMock,
-            ) as mock_async,
-            patch(
-                "kiro_crew.platform_compat.kill_process_tree",
-                side_effect=_forbid_sync,
+                "kiro_crew.process_identity.isolated_group_of",
+                side_effect=lambda pid, start: pid,
             ),
-            patch("os.getpgid", side_effect=_forbid_sync, create=True),
-            patch("os.killpg", side_effect=_forbid_sync, create=True),
+            patch(
+                "kiro_crew.platform_compat.kill_process_group", return_value=True
+            ) as mock_group,
         ):
             await manager._reap_orphaned_backends()
 
-        assert [c.args[0] for c in mock_async.await_args_list] == [111, 222]
+        assert mock_group.call_args.args == (111, 9)
+
+
+class TestOrphanReapIsPlatformCorrect:
+    """On Windows ``_reap_orphaned_backends`` must not reach ``os.killpg``
+    (absent there), and the blocking handle-pinned ``taskkill`` must run off the
+    loop: the reap is awaited from ``_terminate_process``.
+    """
+
+    @pytest.mark.asyncio
+    async def test_reap_runs_the_pinned_tree_kill_off_the_loop_for_each_pid(self, tmp_path):
+        import threading
+
+        from kiro_crew.mcp_gateway import manager as mgr
+
+        socket_path = tmp_path / "gateway.sock"
+        (tmp_path / "gateway.sock.backends").write_text("111 7\n222 8\n", encoding="utf-8")
+
+        manager = object.__new__(mgr.GatewayManager)
+        manager._spec = MagicMock()
+        manager._spec.socket_path = str(socket_path)
+
+        def _forbid(*_a: Any, **_kw: Any) -> None:
+            raise AssertionError("no POSIX group call and no unpinned taskkill on Windows")
+
+        loop_thread = threading.get_ident()
+        calls: list[tuple[int, bool]] = []
+
+        def _pinned(pid: int, start: str, sig: int) -> bool:
+            calls.append((pid, threading.get_ident() != loop_thread))
+            return True
+
+        with (
+            patch("kiro_crew.platform_compat.IS_WINDOWS", True),
+            patch("kiro_crew.platform_compat.kill_process_tree_pinned", side_effect=_pinned),
+            patch("kiro_crew.platform_compat.kill_process_tree", side_effect=_forbid),
+            patch("kiro_crew.platform_compat.kill_process_group", side_effect=_forbid),
+            patch("os.getpgid", side_effect=_forbid, create=True),
+            patch("os.killpg", side_effect=_forbid, create=True),
+        ):
+            await manager._reap_orphaned_backends()
+
+        assert calls == [(111, True), (222, True)]
 
 
 # --- Scope A (gatewayd): abort frame handler tests ---------------------------

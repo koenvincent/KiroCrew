@@ -37,6 +37,10 @@ import { ContentSkeleton } from '../components/ui'
 const AgentBackendTab = lazy(() =>
   import('./developer/AgentBackendTab').then(m => ({ default: m.AgentBackendTab })),
 )
+/** Subagent Settings + Warm Pool, beside the backend picker: both govern how agents run. */
+const AgentRunSettings = lazy(() =>
+  import('./overview/KiroCrewCfgTab').then(m => ({ default: m.AgentRunSettings })),
+)
 
 import { i18nT } from '../i18n/t'
 import { usePreviewFlag } from '../hooks/usePreviewFlag'
@@ -254,6 +258,11 @@ export default function SettingsPage() {
         {tab === 'agent' && (
           <Suspense fallback={<ContentSkeleton rows={6} />}>
             <AgentBackendTab />
+          </Suspense>
+        )}
+        {tab === 'agent' && (
+          <Suspense fallback={<ContentSkeleton rows={4} />}>
+            <div className="mt-4"><AgentRunSettings /></div>
           </Suspense>
         )}
         {tab === 'chat' && <ChatPanel basePath={SETTINGS_BASE_PATH} />}

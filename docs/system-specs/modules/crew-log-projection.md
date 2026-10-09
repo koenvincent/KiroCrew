@@ -1340,20 +1340,33 @@ announces `TREE_ADVANCED` on every tree change and when its seed lands, and
 **The wire.** Each session row of `GET /api/sessions/memory` carries `parent`:
 `null` for a session nobody created, otherwise `{slot, key}` -- the cited creator
 slot, and `key` the creator's LIVE session key when the creator is running and the
-edge can be followed (`null` for a creator that is not running, a node on a cycle,
-or a citation pointing at the row itself). The join from a log's slot to a live
-row is by slot key alone: a dashboard row's key is `dashboard:{slot.key}` and its
-log -- and any child citing it -- carries the bare `slot.key`. `totals` carries
+edge can be followed (`null` for a node on a cycle, a citation pointing at the row
+itself, and a creator that is not running with no open session anywhere above it).
+When the creator is not running but an ANCESTOR is, `key` is that ancestor's live
+session key and the row carries a third field, `ancestor: true`. That is the one
+case where `key` and `slot` name different sessions: the row nests where the run is
+owned -- the nearest open ancestor, not the root, so `lead -> A -> B -> worker` with
+`B` closed nests the worker under `A` -- while `slot` still cites the creator that is
+gone, and a surface reads the closed-creator cue off that pair. The walk up the chain
+is cycle-guarded by the slots it has visited and by the fold's own `cycle` mark, and
+bounded by `TREE_UNIT_CAP`, already the most records a scan holds and so the most
+slots any chain can run through. `ancestor` is omitted, never `false`, so an
+ordinary edge is the two-key payload it has always been. The join from a log's slot
+to a live row is by slot key alone: a dashboard row's key is `dashboard:{slot.key}`
+and its log -- and any child citing it -- carries the bare `slot.key`. `totals` carries
 `lineage_over_cap` and `lineage_cap` (above); the sampler hands the tree the live
 rows' ACP session ids (`runtime_pids` carries each as `sid`, bounded by
 `MAX_ACP_SESSION_ID_LEN` at retention) so those logs are read first. The Memory column's hint says each row is its own runtime's figure, a parent's figure does not include the rows nested under it, and a group's header row under Group by is the one row that does total (TanStack's sum aggregation on the grouped column, which is the base table's behaviour), so the reader is not left to guess which bold rows sum. A task row carries a muted "task" marker before its name: once created sessions nest too, indent alone no longer says which kind an indented row is, and the kind otherwise showed only on hover (a session's name underlines, a task's does not). A folded session's count is the visible text "M MB in N hidden rows", unit included and the memory bound to the rows in the words (beside the parent's own Memory cell a bare "N rows, M MB" left the reader unsure which figure was whose): it counts sessions and tasks, where the footer's "nested" counts sessions only, and a bare numeral beside that reads as either; the memory is the hidden rows' own figures summed, carried on the badge because a folded parent's figure is its own and without the roll-up beside it the fold reads as a family total (a row with no memory data contributes nothing, and a fold with none shows the count alone). The
 System page's Sessions table nests a session under `parent.key` exactly as it
 nests a task under its `parent`, to whatever depth the creating went, with a task
 under whichever session spawned it wherever that session sits; a created session
-whose creator is not running is a top-level row that still carries its citation.
+with nothing open above it is a top-level row that still carries its citation.
 A row nested under its creator needs no further citation: its place in the tree
 is one, and the creator's expander names the relation ("Collapse sessions under
-{name}"). A created row that could NOT be nested (creator not running, a cycle)
+{name}"). A row placed on an `ancestor` edge is nested under a session that did not
+create it, so the citation it shows names `slot` rather than `key` -- crediting the
+creating to the ancestor would name a session that did not do it. A created row that
+could NOT be nested (nothing open above it, a cycle)
 says who opened it as VISIBLE text under its name -- "Created by {creator} (not
 running, so shown top-level)", the creator's display name when it has a live row, else the slot the
 log cited; the parenthetical names the one reason a created row is top-level

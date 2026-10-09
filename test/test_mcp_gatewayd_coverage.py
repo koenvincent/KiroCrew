@@ -24,7 +24,7 @@ import threading
 import time
 from pathlib import Path
 from typing import Any, Optional, cast
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -375,8 +375,8 @@ class _SweeperPool:
         self.reaped.extend(out)
         return out
 
-    def live_backend_pids(self) -> list[int]:
-        return list(self._pids)
+    def live_backend_identities(self) -> list[tuple[int, Optional[str]]]:
+        return [(pid, f"start-{pid}") for pid in self._pids]
 
 
 async def _run_one_heartbeat_sweep(pool: Any, pidfile: Optional[Path] = None) -> None:
@@ -459,14 +459,20 @@ class TestHeartbeatSweeper:
         assert pool.evicted == []
 
     @pytest.mark.asyncio
-    async def test_live_backend_pids_are_persisted_out_of_band(self, tmp_path):
-        """The supervising manager reads this file to killpg a wedged daemon."""
+    async def test_live_backend_identities_are_persisted_out_of_band(self, tmp_path):
+        """The supervising manager and the next daemon read this file to reap a
+        dead generation, so each pid carries the start id its backend captured
+        at spawn -- never one re-read now, which could name a recycled pid."""
         pool = _SweeperPool([], pids=[101, 202])
         pidfile = tmp_path / "backends.pid"
 
-        await _run_one_heartbeat_sweep(pool, pidfile)
+        with patch(
+            "kiro_crew.platform_compat.get_process_start_id",
+            side_effect=AssertionError("the heartbeat must not re-read identities"),
+        ):
+            await _run_one_heartbeat_sweep(pool, pidfile)
 
-        assert pidfile.read_text().split() == ["101", "202"]
+        assert pidfile.read_text().splitlines() == ["101 start-101", "202 start-202"]
 
     @pytest.mark.asyncio
     async def test_cancellation_is_swallowed(self):

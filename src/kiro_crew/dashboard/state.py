@@ -495,10 +495,18 @@ def _attach_slot_parents(
     through ``session_create``: the sidebar already receives the slots broadcast, so
     the edge rides a frame it gets anyway rather than a route it would have to poll.
 
-    The SHAPE is byte-identical to the Sessions table's ``parent`` -- same two keys,
-    same meaning, same ``key: None`` for a creator that is not running or sits on a
-    cycle -- because one moved ``nestsUnder`` serves both views and a second shape
-    would be a second way to nest the same gateway. What differs, necessarily, is the
+    The SHAPE is byte-identical to the Sessions table's ``parent`` -- same keys, same
+    meaning, same ``key: None`` for a creator that is not running under a chain with
+    nothing open in it, or one that sits on a cycle -- because one moved ``nestsUnder``
+    serves both views and a second shape would be a second way to nest the same
+    gateway. A third key, ``ancestor``, rides the one case where ``key`` and ``slot``
+    name different sessions: the creator in ``slot`` has CLOSED and ``key`` is the
+    nearest session above it still open, so the row nests where the run is owned and
+    still cites a creator that is gone (see
+    :func:`~kiro_crew.crew_log.session_tree.parent_payload`). It is omitted, never
+    ``False``, so an ordinary edge is the payload it has always been.
+
+    What differs between the two views, necessarily, is the
     KEY SPACE: ``key`` names the creator's row IN THIS PAYLOAD, so here it is the bare
     slot key and on the memory payload it is the full ``dashboard:`` session key.
     ``nestsUnder`` resolves ``parent.key`` against its own payload's keys, so that is
@@ -1132,6 +1140,43 @@ def chat_message_frame(note: dict, *, include_metadata: bool) -> dict[str, Any]:
     return frame
 
 
+#: The tool row a turn ends on when the agent called ``nothing_to_do``. Read from
+#: the row's persisted TRUSTED identity (``_tool_identity_fields``: the backend's
+#: ``_meta.kiro`` name and server), never from the row's title text, so a shell
+#: command printing the tool's name cannot close a turn.
+QUIET_END_TOOL = "nothing_to_do"
+QUIET_END_SERVER = "kirocrew-core"
+
+
+def is_quiet_end_row(m: dict) -> bool:
+    """True when *m* is the APPLIED ``nothing_to_do`` directive's tool row.
+
+    A quiet end is a FINISHED turn: the agent ran its checks, had nothing the
+    user needs to read, and said so through the directive rather than by
+    stopping bare. Without this the transcript tail is ``[user|nudge, tool…]``
+    -- shape-identical to a gateway that died mid-turn -- so the composer
+    would offer Resume and the sidebar would flag the session as interrupted
+    on every quiet patrol cycle.
+
+    Two structured facts, both required: the row's trusted identity, and the
+    ``meta.ends_turn`` flag the runner stamps only when the applier's
+    ``DirectiveOutcome.ends_turn`` was True. A REFUSED call (a person opened
+    the turn) carries the identity and no flag, so it stays an unanswered turn.
+
+    Mirrors ``isQuietEndRow`` in ``website/src/store/chat/selectors.ts``.
+    """
+    if m.get("role") != "tool":
+        return False
+    meta = m.get("meta")
+    if not isinstance(meta, dict):
+        return False
+    return (
+        meta.get("tool_name") == QUIET_END_TOOL
+        and meta.get("mcp_server") == QUIET_END_SERVER
+        and meta.get("ends_turn") is True
+    )
+
+
 def is_stop_event_row(m: dict) -> bool:
     """True when *m* is the card recorded because the user pressed Stop.
 
@@ -1249,6 +1294,11 @@ def is_turn_interrupted(messages: list[dict]) -> bool:
     """
     saw_trailing_error = False
     saw_compaction_result = False
+    # A tool row met AFTER the quiet end (later in time): the model broke the
+    # contract and kept working, so the quiet-end row is not the turn's last
+    # act and must not close it -- a gateway that died in that later work
+    # would otherwise hide behind it.
+    saw_later_tool = False
     for m in reversed(messages):
         role = m.get("role")
         meta = m.get("meta") or {}
@@ -1262,6 +1312,15 @@ def is_turn_interrupted(messages: list[dict]) -> bool:
         # first.
         if is_stop_event_row(m):
             return False
+        # A quiet end (``nothing_to_do``) is the turn's deliberate ending too:
+        # same reasoning as the Stop card, same position in the scan. Only the
+        # newest turn's row reaches here, for the same reason -- and only when
+        # it IS the turn's last tool row.
+        if is_quiet_end_row(m):
+            if not saw_later_tool:
+                return False
+        elif role == "tool":
+            saw_later_tool = True
         if is_system_notice(role, meta):
             # Remember a compaction RESULT row on the newest turn. Skipping the
             # row is still right in general (an auto-compaction notice inside
@@ -2684,7 +2743,8 @@ class _ChatSlot:
         "_crew_log_previous_from_mapping",
         "_crew_log_opened_sid",
         "_crew_log_pending_channel",
-        "reasoning_effort",
+        "_reasoning_effort",
+        "_effort_pick_gen",
         "autocompact_pct",
         "mode",
         "workspace",
@@ -2998,7 +3058,11 @@ class _ChatSlot:
         self.served_model: str = ""
         # Reasoning effort: "" = provider default, else one of low/medium/high/max.
         # Currently consumed by an alternate ACP backend (--effort flag); ACP wired later.
-        self.reasoning_effort: str = ""
+        # Every write that changes the level bumps ``_effort_pick_gen`` (see the
+        # property), so a queued session_set_model effort can tell that a newer
+        # choice landed even when that choice returned to the level it saw.
+        self._effort_pick_gen: int = 0
+        self._reasoning_effort: str = ""
         # Per-session auto-compact threshold override (percent). None = follow
         # the global session.autocompact_pct. Persisted with the slot and
         # re-seeded into the SessionManager after restore.
@@ -4120,6 +4184,24 @@ class _ChatSlot:
         """
         self.tags_revision = mint_tags_revision()
         return self.tags_revision
+
+    @property
+    def reasoning_effort(self) -> str:
+        """The slot's reasoning effort: "" = provider default, else a level."""
+        return self._reasoning_effort
+
+    @reasoning_effort.setter
+    def reasoning_effort(self, value: str) -> None:
+        # Bumped on every write that changes the level, rollbacks included: a
+        # rollback that lands while a session_set_model effort is pending drops
+        # that pick rather than letting it overwrite a level the user touched.
+        # A same-value write is not a new choice (the dropdown route re-commits
+        # the level it already wrote after awaiting its live push), so it must
+        # not drop a pick queued during that await; the route's explicit
+        # same-level fast path bumps the generation itself.
+        if value != self._reasoning_effort:
+            self._effort_pick_gen += 1
+        self._reasoning_effort = value
 
     @property
     def is_closing(self) -> bool:
@@ -10093,11 +10175,19 @@ class DashboardState:
         """Publish that slot *key* left the registry without re-sending the list.
 
         Patch-capable sockets receive ``{"slots": [...], "removed": [key]}``.
-        The ``slots`` rows re-state the ``parent`` of every row whose creator is
-        not live, because a removed conductor turns its workers' ``parent.key``
-        to ``None`` in the full frame; carrying those rows keeps the sidebar's
-        nesting identical to what a full list would have produced. Everyone else
-        gets the full list, as with :meth:`push_slot_patch`.
+        The ``slots`` rows re-state the ``parent`` of every row the removal MOVED,
+        because a removed conductor changes its workers' ``parent`` in the full
+        frame; carrying those rows keeps the sidebar's nesting identical to what a
+        full list would have produced. Everyone else gets the full list, as with
+        :meth:`push_slot_patch`.
+
+        Two shapes qualify, and the second is why the test is not ``key is None``.
+        A worker with no open ancestor loses its key outright. A worker that HAS one
+        is re-parented onto it and carries ``ancestor``, so its key is a live string
+        -- the lead's -- and a null test would leave the client holding the closed
+        conductor's key, a row the same frame just removed. Every one of those
+        workers would then render top-level with the orphan glyph until a full frame
+        happened along, which is the behaviour this method exists to prevent.
 
         A key that is registered again (a same-name replacement landed while the
         close was tearing down) is not removed: the full push describes it. The
@@ -10136,14 +10226,14 @@ class DashboardState:
         if self._has_slot_patch_clients():
             rows = self._lineage_rows()
             _attach_slot_parents(rows, getattr(self, "spend_slot_by_session", None))
-            orphans = [
+            restated = [
                 {"key": row["key"], "parent": row["parent"]}
                 for row in rows
                 if isinstance(row.get("parent"), dict)
-                and row["parent"].get("key") is None
+                and (row["parent"].get("key") is None or row["parent"].get("ancestor") is True)
                 and not row.get("lineage_pending")
             ]
-            self._send_slot_patch({"slots": orphans, "removed": [key]})
+            self._send_slot_patch({"slots": restated, "removed": [key]})
         self._emit_member_slot_transitions()
 
     def _has_slot_patch_clients(self) -> bool:

@@ -2197,7 +2197,11 @@ name:
   `"auto"` must take the pin back off or `"auto"` is unreachable from the
   configuration surface. Ownership decides who may clear: `model_managed=false`
   (an explicit user pick) and an **absent** sidecar entry (legacy status, owner
-  unknown) both keep their pin untouched.
+  unknown) both keep their pin untouched. Once a spec write publishes the
+  concrete global over a legacy-status spec, `rebuild_agent_config` claims it
+  (`model_managed=true`, set only when the entry holds no flag, under the
+  sidecar lock), since the published value is the propagation's; a failed
+  write claims nothing and an explicit pick is never claimed.
 - `migrate_agent_specs()` runs at startup (top of `rebuild_agent_config`): lifts
   the keys out of every `~/.kiro/agents/*.json` into the sidecar and removes
   them (idempotent), fixing installs polluted by older builds.

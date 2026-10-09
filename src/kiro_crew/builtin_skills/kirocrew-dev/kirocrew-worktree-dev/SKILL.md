@@ -34,9 +34,10 @@ git -C <main clone> merge --ff-only --no-autostash --no-overwrite-ignore origin/
 ```
 It refuses, changing nothing, when local `main` has diverged or a local change
 would be overwritten; then stop and report, because that state belongs to whoever
-left it. When the live install runs from that clone, do not sync it yourself: it
-is a live code change, and the operator's dashboard Update does it with the
-rebuild and reinstall. Never overlay a whole tree with `git checkout <ref> -- .`
+left it. Before any rebase, checkout, switch, merge, pull or reset in a clone,
+run `python3 <this skill>/scripts/live_checkout_guard.py <clone>`. Exit 30 (or 2):
+a running gateway runs from it, so make a worktree; the operator's dashboard
+Update syncs that clone. Never overlay a whole tree with `git checkout <ref> -- .`
 or `git restore --source <ref> .`: neither moves HEAD, both overwrite local edits
 without asking, and the checkout form keeps every file upstream deleted. Never
 `git stash`: every worktree shares one stash list, so a pop can apply another

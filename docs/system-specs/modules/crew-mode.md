@@ -749,14 +749,31 @@ using V1; member updates never initialize a V2 database. Global and named V1
 contents remain untouched. Config fields, exclusive database creation, immutable database identity and
 recovery semantics are owned by [config](config.md#named-memory-stores-memory_storespy).
 
-A new member DM inherits the member's configured workspace, falling back to
-`default_workspace` when that name is undeclared. Its project directory uses the
-shared `default_project_dir` validation, so provider cwd and project essentials
-refer to the same workspace. Resolution finishes before publishing the slot;
-the first slot broadcast includes its project directory. A concurrent opener's
-existing slot is preserved. Reopening a live or restored
-thread keeps its saved workspace and project, including an explicitly empty
-project, rather than resetting a session choice to the member default.
+A member DM has no project concept. The slot's `project` field is only where
+the dashboard (Files tab, terminal cwd, project essentials) and the provider
+cwd read a directory from, and for a member thread that directory IS the
+member's configured workspace, falling back to `default_workspace` when that
+name is undeclared, through the shared `default_project_dir` validation. It is
+derived from the crew's binding in config on EVERY open of
+`POST /api/members/{slug}/thread` (the only creator and repairer of member
+slots), never a per-thread choice read back from the transcript: a fresh mint
+resolves before publishing the slot, so the first slot broadcast carries the
+directory, and a live or rehydrated thread is re-pointed at the binding (off
+the event loop; compare-and-set, so an already-bound thread is neither
+re-marked dirty nor re-pushed; a changed binding reaches disk through the
+periodic flush and the client through a push). This is what makes a thread
+written before member slots carried the directory -- restored with an empty
+`project`, so its pinned Files tab read "no project directory" -- converge on
+the right one, and what makes a crew whose binding is later edited follow it.
+When the directory changes -- including from empty to bound, since a thread
+that ran while its workspace directory was missing has a provider warm in the
+fallback work dir -- the open arms the deferred provider reset every other
+`slot.project` writer arms: a warm provider keeps the cwd it was spawned in,
+the reset never tears down an active turn, and the next message cold-starts in
+the new directory. An unresolvable
+binding (workspace directory missing or fenced) leaves the thread as it is
+rather than clearing a directory the user can see. A concurrent opener's
+existing slot is preserved; both openers derive the same binding.
 
 A newly created V2 member starts a fresh conversation. Existing V1 conversation
 and native provider context cannot acquire member memory by changing a label.
@@ -822,7 +839,16 @@ shows a single empty-state hero (ghost avatar, "No crewmates yet", one line,
 with crewmates and no `?member=`, the crewmate the user last chatted with opens
 (greatest `last_chat_ts`, see below; it is server-side, so a gateway restart or a
 new browser keeps it), else the remembered crewmate, else the most recently used
-one (greatest `last_active_ts`, ties keep roster order). Below md
+one (greatest `last_active_ts`, ties keep roster order; never `default`). The
+built-in `default` row is remembered like any other when opened, with the
+roster's chat mark beside it (`mc-members-last-member-chat-mark` = the greatest
+crewmate `last_chat_ts` at that open); it is never ranked by its own
+`last_chat_ts` (that also moves for every plain chat that picked no crew, so it
+would win nearly always), and instead outranks the last-chatted crewmate exactly
+while no crewmate's `last_chat_ts` has moved past the mark (#17210). Both sides
+are the server's clock, so a remote dashboard compares the same. The mark is the
+user's own open (click or link): a restore re-reads it but never re-writes it.
+A roster holding only `default` still shows the hero. Below md
 nothing auto-opens — the roster is the page. A `?member=` naming a crewmate that
 is gone falls back the same way, under the existing swap notice. The page's copy
 says crewmate / Crewmates and "Built from"; the crew record, its API and its
@@ -992,8 +1018,8 @@ Glass chip is a door, since the switcher chip beside it is another Glass chip
 with faces in it. The pill is a toggle, as its `aria-expanded` says: with Profile
 already open a press CLOSES it through the same schedule-draft guard as the
 card's own close control (`requestCloseProfile`). It must not re-open on the
-Profile tab: `profile.tab` is part of the card's React key, so a card opened on
-another tab (the quiet-chat Sessions link) would be remounted and a New schedule
+default tab: `profile.tab` is part of the card's React key, so a card the reader
+moved to another tab (Schedules, say) would be remounted and a New schedule
 draft inside it destroyed with no question asked. Pointer users rarely reach the
 pill under the floating card's scrim; keyboard users reach it every time. The
 pill's title row is the display name plus the exact ID in mono when a label
@@ -1004,9 +1030,24 @@ the chat
 SidePanel is closed on a non-phone viewport, Profile takes a 34%-of-row in-flow
 column and narrows the thread. On phones it always floats over the thread: the
 composed column is wider than a 320px viewport and must never be added there. The
-pill unmounts in the non-phone column state and its `CrewStateAvatar` shares a Framer
-Motion `layoutId` with the card's head avatar: one face moves from the pill to the
-card rather than two faces cross-fading. Opening SidePanel collapses that Profile
+pill unmounts in the non-phone column state and its face flies to the card's head:
+one face moves rather than two faces cross-fading. The flight is `CrewFaceFlight`, a
+copy of the face portaled to `document.body` (`fixed`, `z-[60]`, `pointer-events-none`,
+`data-testid="crew-face-flight"`) tweened on framer's own default layout
+clock (`FACE_FLIGHT_SECS`, the `defaultLayoutTransition` the `layoutId` flight ran on) from the departing face's box to the landing face's box, which is
+re-read every frame because the landing face moves while the column reveals or folds;
+both real faces hold their place with `visibility: hidden` until it lands, and reduced
+motion or a face with no box (jsdom) is a plain swap. It is NOT a framer `layoutId`
+shared by the two faces (#18236): a shared element travels inside whichever surface
+owns it, so the card's face was clipped by the card's rounded `overflow-hidden`
+shell, its scrolling body and the width-revealing aside until it was already inside
+them, and the pill's face was painted under the thread and the folding card, both
+later siblings of the header. The docked column's `AnimatePresence` keeps one slot
+in both placements, so closing it runs its width exit and the leaving card's face
+stays measurable as the flight's origin; the presence is keyed on the card's
+placement, so a column RE-PLACED as the floating card (the window crossed below
+`md`) is dropped at once with no exit and no flight — a phone-width viewport never
+holds the column beside the floating card. Opening SidePanel collapses that Profile
 column and restores the pill. If SidePanel is already open, or the viewport is a
 phone, the pill opens Profile as a full-height, rounded hover card centred
 horizontally in the chat width the open SidePanel leaves; both surfaces remain
@@ -1043,7 +1084,10 @@ name + requested tab + accepted-open nonce).
 
 Profile uses the shared `Tablist` component with `labels="active"`: all four tabs
 carry Lucide icons and accessible labels, while only the selected tab paints its
-word. The tabs are **Profile**, **Schedules**, **Sessions**, and **Goals**. No
+word. The tabs are, in strip order, **Sessions**, **Schedules**, **Goals**, and
+**Profile** (the work first, the identity card last). The card opens on Sessions
+unless the opener names a tab (`openProfile(tab)`; today only the quiet-chat link
+calls it, and it asks for Sessions too). No
 tab carries a count, and there is no placeholder tab for a view that does not
 exist yet.
 
@@ -1527,13 +1571,38 @@ when the roster's quote or recency moved since the read observed it, so a
 message the crewmate speaks while a roster read is in flight is never
 overwritten by the older answer.
 
-While a turn runs (the slot's stream or its `running` flag), the chat also
-keeps that turn's progress rows — `tool` rows (the 🔧 line and its hidden ✅ /
-🚫 siblings) and thinking — after the newest turn opener (`TURN_OPENER_ROLES`:
-a user message, a patrol wake, a sub-agent drain), and draws them with the
-ordinary transcript's own tool line, step group and thinking block; earlier
-turns' machinery stays folded away, and the live rows fold away again when the
-turn ends (`filterCrewmateChat(messages, live)`).
+While a turn runs (the slot's stream or its `running` flag), the chat does not
+draw the turn's progress rows either; what the crewmate is doing right now is
+ONE status line directly above the working indicator (the ghost-pose carousel
+in `ChatFooter`), rendered by `CrewmateLiveActivity`. Its text is the DM
+header identity pill's OWN reading, through the one shared hook
+`useSlotActivity` (`pages/members/useSlotActivity.ts` → `resolvePillActivity`
+over the slot's live status record `slotStatusDetail`, the stream state and
+the tool log's returned flag, labelled by the shared `toolStatusLabel`), so
+the header and the chat can never name one moment differently. It answers
+"what is the crewmate doing now", never "what has it done": the open call's
+label while the call runs (`data-activity=tool`), the indicator's own
+"Thinking…" once the call has returned or the model is reasoning
+(`thinking`), the pill's other phase words otherwise (`writing`, `working`,
+`delegated`), and text-free (same height) for `compacting` and `stopping`,
+which the `ChatFooter` directly under it already spells out; and the line goes
+with the turn (#18238). Words only — the ghost under it carries the motion; a second
+spinner read as a second "working" sign. The line is a status, not a
+transcript row, for a reason that is part of the contract: it is one
+fixed-height row (`h-5`, truncating), mounted for the WHOLE live turn and
+never blank, whose text changes — so the indicator under it never moves while
+the crewmate works. Transcript rows mounting and unmounting above the
+indicator hopped it by a row on every step, and the "hasn't said anything yet"
+hint stays hidden while the crewmate is live for the same reason. The one step
+that never names itself in the chat line, even in flight, is the
+`nothing_to_do` call (#16429; the line reads "Thinking…"): matched inside
+the hook on the tool log entry's trusted identity (`tool_name` +
+`mcp_server`, the `QUIET_END_*` constants `store/chat/selectors.ts` defines,
+imported through the `store/chatSlice` facade), never on its title — the
+quiet end has to look quiet from its first frame, applied or refused, and
+since the header pill reads the same hook it reads "Thinking…" there too: one
+reading, no fork. The chat line shows the tool label in full (`fullText`,
+CSS-truncated, carried as `title`) where the pill clamps it to 40 chars.
 
 How it is drawn: the crewmate's messages form **runs**. A message carries NO
 author line — no avatar, no name, no time row — and no avatar gutter: the chat

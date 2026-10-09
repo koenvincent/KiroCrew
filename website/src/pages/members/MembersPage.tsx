@@ -40,7 +40,7 @@
  * it shows the New crewmate hero instead. Below md nothing auto-opens (the
  * phone's two-level list rule).
  */
-import { Fragment, lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { Fragment, lazy, Suspense, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import { useLocation, useNavigate, useSearchParams } from 'react-router-dom'
 import { ArrowLeft, Check, ChevronRight, Circle, Goal, LayoutDashboard, Loader2, MessageCircleQuestionMark, Plus, RotateCw, Sparkles, Square, Star, Users, X, Zap } from 'lucide-react'
 import { usePreviewFlag } from '../../hooks/usePreviewFlag'
@@ -95,25 +95,29 @@ import { fmtList } from '../../i18n/format'
 import { i18nT } from '../../i18n/t'
 import { usePersistedBool } from '../../hooks/usePersistedBool'
 import { usePersistedString } from '../../hooks/usePersistedString'
-import { findReport, type ErrorReport } from '../../utils/errorReport'
+import { findReport, reportForError, type ErrorReport } from '../../utils/errorReport'
 import { useAppDispatch, useAppSelector } from '../../store'
-import { selectSlotStreamState, selectSlotToolLog } from '../../store/chatSlice'
-import { toolStatusLabel, type ToolStatusDetail } from '../../utils/toolStatusLabel'
-import { useSimplifiedToolNames } from '../../hooks/useSimplifiedToolNames'
+import { selectSidebarAutomationRunningKeys, selectSlotStreamState } from '../../store/chatSlice'
 import { useLanguage } from '../../i18n/LanguageProvider'
 import { markSlotRead } from '../../store/dashboardSlice'
 import { emitSlotRead, flushSlotRead } from '../../lib/slotReadRelay'
 import { setViewedThreadSlot, clearViewedThreadSlot } from '../../lib/viewedThread'
 import CrewAvatar from '../../components/CrewAvatar'
 import CrewStateAvatar from '../../components/CrewStateAvatar'
+import CrewLoopIndicator from '../../components/crew/CrewLoopIndicator'
 import Glass from '../../components/Glass'
-import { resolvePillActivity, type PillActivityKind } from './pillActivity'
+import { Badge } from '../../components/ui'
+import { PILL_ACTIVITY_KEY, type PillActivityKind } from './pillActivity'
+import { useSlotActivity } from './useSlotActivity'
 import ChatPane from '../../components/ChatPane'
+import MateResumeCard from './MateResumeCard'
+import MateWelcomeCard from './MateWelcomeCard'
+import { useMateGreeting } from './mateGreeting'
 import type { ThreadHooks } from '../../app-sdk/messageRenderers'
 import { threadsApi, threadsQueryKey } from '../../api/threads'
 import ThreadPanel from './ThreadPanel'
 import CrewmateSwitcher from './CrewmateSwitcher'
-import CrewProfilePanel, { type ProfileTab } from './CrewProfilePanel'
+import CrewProfilePanel, { PROFILE_FACE_PX, type ProfileTab } from './CrewProfilePanel'
 import { createPortal } from 'react-dom'
 import { useCrewmateThreadsFlag } from '../../hooks/useCrewmateThreadsFlag'
 import { CrewDashboardFrame } from './CrewWebview'
@@ -138,7 +142,7 @@ import {
   type MemberSignals, type MemberSort, type MemberSourceFilter, type MemberStatusFilter, type RosterQuery,
 } from './rosterFilter'
 import { defaultAgentQuery } from '../../api/defaultAgentQuery'
-import { AnimatePresence, motion, useReducedMotion } from 'framer-motion'
+import { AnimatePresence, animate, motion, useReducedMotion } from 'framer-motion'
 import { isSidePanelHidden, shouldMountSidePanel, sidePanelDockMotion } from '../chat/sidePanelMount'
 import SidePanel, { SIDE_PANEL_MIN_W, SIDE_PANEL_RESERVED_W, type SidePanelLeadingTab, type SidePanelWithholdable } from '../chat/SidePanel'
 import { useRailWidth } from '../../hooks/useRailWidth'
@@ -187,6 +191,13 @@ const MEMBER_PARAM = 'member'
  *  the right scope: the roster is the gateway's global crew list, and
  *  localStorage is already per-gateway. */
 const LAST_MEMBER_KEY = 'mc-members-last-member'
+/** The greatest crewmate `last_chat_ts` on the roster WHEN the remembered
+ *  row was opened — the server's clock, so it compares with later rosters on
+ *  a remote dashboard too. Read only for a remembered built-in `default`: the
+ *  server cannot say when the user last talked to it (see
+ *  `rememberedDefaultPick`), so "no crewmate has been chatted with since this
+ *  open" stands in. */
+const LAST_MEMBER_CHAT_MARK_KEY = 'mc-members-last-member-chat-mark'
 
 /** Which crewmate to RESTORE when the URL names none, or to fall back to when
  *  it names one that is gone (deleted or renamed since the link/memory was
@@ -198,9 +209,12 @@ const LAST_MEMBER_KEY = 'mc-members-last-member'
  *  use, not on `ordered`'s position — #11763 rejected priming the user on
  *  whichever row the SORT floated to the top, and a recency the user produced
  *  themselves is a different thing from a sort they may not have chosen.
- *  `undefined` when no crewmate exists: the built-in `default` assistant is not one.
- *  Pure, so the cases — restore, most-recently-used, tie, stale, empty — are
- *  tested directly. */
+ *  The built-in `default` assistant is not a crewmate: it is never a
+ *  remembered hit here and the most-recently-used fallback never picks it, so
+ *  a roster holding only `default` resolves to `undefined` and shows the
+ *  empty-state hero. A remembered `default` is the restore effect's own case
+ *  (`rememberedDefaultPick`, ranked above this). Pure, so the cases —
+ *  restore, most-recently-used, tie, stale, empty — are tested directly. */
 export function resolveDefaultMember(
   remembered: string | null,
   ordered: readonly MemberRosterRow[],
@@ -232,6 +246,34 @@ export function lastChattedMember(rows: readonly MemberRosterRow[]): MemberRoste
     if (!best || (m.last_chat_ts ?? 0) > (best.last_chat_ts ?? 0)) best = m
   }
   return best
+}
+
+/** The greatest crewmate `last_chat_ts` on `rows` (the built-in `default`
+ *  excluded, 0 when nobody chatted): what `chatMark` records at an open. */
+export function chatMarkOf(rows: readonly MemberRosterRow[]): number {
+  return lastChattedMember(rows)?.last_chat_ts ?? 0
+}
+
+/** The built-in `default` row, when the user's last open of it (#17210) is
+ *  the conversation to reopen. `lastChattedMember` cannot rank `default`: its
+ *  `last_chat_ts` also moves for every plain chat that picked no crew, so it
+ *  would win nearly always and bury the crewmate the user actually talked to.
+ *  The signal is `chatMark`, the greatest crewmate `last_chat_ts` seen when
+ *  `default` was opened (written beside the memory): while no crewmate's
+ *  `last_chat_ts` has moved past it, nobody has been talked to since that
+ *  open, and `default` is the conversation the user left; once one has, that
+ *  crewmate is. Both sides are the server's clock, so a remote dashboard whose
+ *  own clock drifts compares the same. Never on a roster holding only
+ *  `default` — that roster lands on the empty-state hero. */
+export function rememberedDefaultPick(
+  remembered: string | null,
+  chatMark: number,
+  rows: readonly MemberRosterRow[],
+): MemberRosterRow | undefined {
+  if (remembered !== 'default' || hasNoCrewmates(rows)) return undefined
+  const hit = rows.find((m) => m.name === 'default')
+  if (!hit) return undefined
+  return chatMarkOf(rows) > chatMark ? undefined : hit
 }
 
 type MemberMemoryDisplay = 'global' | 'legacy' | 'private' | 'ownership_mismatch' | 'unavailable'
@@ -352,10 +394,81 @@ const SORT_KEY = 'mc-members-sort'
  *  a per-member state, so the choice follows the user across members and
  *  reloads exactly as the chat page's own panel flag does. */
 const PANEL_OPEN_KEY = 'mc-members-panel-open'
-/** Shared-layout id of the crewmate's face: the pill's face and the docked
- *  card's head face are the SAME element, so only one is ever on screen and the
- *  one slides into the other (framer `layoutId`). */
-const CREW_FACE_LAYOUT_ID = 'crew-identity-face'
+/** The crewmate's face in flight between the identity pill and the docked
+ *  Profile card's head: one face moves, two never cross-fade. It used to be a
+ *  framer `layoutId` shared by the two faces, but the shared element travels
+ *  INSIDE whichever surface owns it: the card's face is clipped by the card's
+ *  rounded `overflow-hidden` shell, its scrolling body and the width-revealing
+ *  aside until it is already inside them, and the pill's face is painted under
+ *  the thread and the closing card, both later siblings of the header (#18236).
+ *  So the flight is its own copy, portaled to `document.body` above every
+ *  surface, while both real faces hold their place unpainted. `from` is the
+ *  departing face measured before it went; `to` is read live each frame because
+ *  the landing face moves while the card's column reveals or folds. */
+interface FaceFlight {
+  key: number
+  seed: string
+  avatar: unknown
+  slotKey: string
+  running: boolean
+  from: DOMRect
+  to: () => DOMRect | null
+}
+/** Framer's own `defaultLayoutTransition` (motion-dom, create-projection-node:
+ *  0.45s, cubic-bezier 0.4/0/0.1/1) — the clock the shared `layoutId` flight
+ *  ran on, kept to the number so the copy moves exactly as that one did and
+ *  the only visible change is that it stays on top. */
+const FACE_FLIGHT_SECS = 0.45
+const FACE_FLIGHT_EASE: [number, number, number, number] = [0.4, 0, 0.1, 1]
+
+function CrewFaceFlight({ flight, onDone }: { flight: FaceFlight; onDone: () => void }) {
+  const ref = useRef<HTMLDivElement>(null)
+  useEffect(() => {
+    const el = ref.current
+    if (!el) return
+    // The copy is drawn at the card face's side and scaled, so its pill-sized
+    // end is a scale-down of a sharp raster, not a blurry scale-up. The scale
+    // would shrink the face's corner radius and hairline border with it, while
+    // the real faces at either end draw both at their fixed CSS size — the
+    // corner visibly snapped on landing — so the two are counter-scaled to
+    // hold their on-screen size for the whole flight.
+    const img = el.querySelector('img')
+    const rest = img ? getComputedStyle(img) : null
+    const restRadius = rest ? parseFloat(rest.borderRadius) || 0 : 0
+    const restBorder = rest ? parseFloat(rest.borderWidth) || 0 : 0
+    const place = (left: number, top: number, side: number) => {
+      const k = side / PROFILE_FACE_PX
+      el.style.transform = `translate(${left}px, ${top}px) scale(${k})`
+      if (img) {
+        img.style.borderRadius = `${restRadius / k}px`
+        img.style.borderWidth = `${restBorder / k}px`
+      }
+    }
+    const { from } = flight
+    place(from.left, from.top, from.width)
+    const ctrl = animate(0, 1, {
+      duration: FACE_FLIGHT_SECS,
+      ease: FACE_FLIGHT_EASE,
+      onUpdate: (p) => {
+        const to = flight.to() ?? from
+        place(from.left + (to.left - from.left) * p, from.top + (to.top - from.top) * p, from.width + (to.width - from.width) * p)
+      },
+      onComplete: onDone,
+    })
+    return () => ctrl.stop()
+  }, [flight, onDone])
+  return createPortal(
+    <div
+      ref={ref}
+      className="fixed left-0 top-0 z-[60] pointer-events-none origin-top-left will-change-transform"
+      aria-hidden="true"
+      data-testid="crew-face-flight"
+    >
+      <CrewStateAvatar seed={flight.seed} avatar={flight.avatar} slotKey={flight.slotKey} running={flight.running} size={PROFILE_FACE_PX} working="full" />
+    </div>,
+    document.body,
+  )
+}
 /** Static key per menu row — a map, not a template, so `check-i18n-keys` can
  *  resolve every reference (assembled keys are a counted blind spot there). */
 const SOURCE_LABEL_KEY: Record<Exclude<MemberSourceFilter, 'all'>, string> = {
@@ -428,14 +541,6 @@ const dockMotion = sidePanelDockMotion('right')
  *  spellings — with the time since the thread last moved when one is known,
  *  bare when it is not. File-scope and indexed in place so the key checker
  *  resolves every entry. */
-const PILL_ACTIVITY_KEY: Record<Exclude<PillActivityKind, 'tool' | 'thinking'>, string> = {
-  writing: 'pages.membersPage.pill_writing',
-  compacting: 'pages.membersPage.pill_compacting',
-  stopping: 'pages.membersPage.pill_stopping',
-  working: 'pages.membersPage.drawer_working',
-  delegated: 'pages.membersPage.drawer_delegated_working',
-  idle: 'pages.membersPage.pill_idle',
-}
 /** How often the "next wake in …" countdown in the drawer re-reads the clock.
  *  Coarser than the popover's per-second tick on purpose: the drawer line is
  *  an at-a-glance status, and a per-second re-render of the whole drawer for
@@ -468,7 +573,7 @@ function MemberRow({
   isRunning,
   isUnread,
   isNeedsYou,
-  activePatrolOf,
+  isLoopOn,
   reduceMotion,
   scrollActiveRowIntoView,
   slugCollides,
@@ -486,7 +591,8 @@ function MemberRow({
   /** The crewmate's turn is parked on an approval or a question — the same
    *  reading the status filter and the switcher row take (`signalsOf`). */
   isNeedsYou: (m: MemberRosterRow) => boolean
-  activePatrolOf: (m: MemberRosterRow) => AutoNudgeLoop | undefined
+  /** The crewmate's automation loop is on (`signalsOf().patrolling`). */
+  isLoopOn: (m: MemberRosterRow) => boolean
   reduceMotion: boolean | null
   scrollActiveRowIntoView: (el: HTMLButtonElement | null) => void
   slugCollides: boolean
@@ -596,55 +702,10 @@ function MemberRow({
                 data-testid="member-presence-dot"
               />
             )}
-            {/* Patrol badge — the member has an ACTIVE auto-nudge loop
-                on its own thread. Rendered only while the loop patrols:
-                a stopped loop and a never-armed member both show
-                nothing, because "not patrolling" is a member's resting
-                state, not an incident — a standing warn mark on an
-                idle avatar read as "something is broken", and the
-                drawer's block already spells a stopped loop's reason.
-                Top-right corner of the avatar, the composer's goal-chip
-                glyph on a solid accent fill (the presence dot's own
-                idiom — an outline read as nothing at a glance): a
-                different corner from the presence dot (bottom-right,
-                ok-green, "working now") and a different edge from the
-                row's right-side markers, so all of them can show at
-                once without covering each other. Mount/unmount is
-                animated (the badge fades out when the loop ends rather
-                than vanishing): a badge that pops in or out mid-glance
-                is what a state change looks like when it is not a
-                glitch. Under prefers-reduced-motion the tween is
-                skipped and the badge cuts straight to its new state. */}
-            <AnimatePresence initial={false}>
-              {(() => {
-                const lp = activePatrolOf(view)
-                if (!lp) return null
-                // The tooltip spells the count the drawer's way ("3 of 24"
-                // / "61 · no limit"): the compact "3/24" alone read as a date.
-                const cycle =
-                  lp.max_cycles > 0
-                    ? t('pages.membersPage.patrol_cycles_of', { n: lp.cycle_count, max: lp.max_cycles })
-                    : t('pages.membersPage.patrol_cycles_unlimited', { n: lp.cycle_count })
-                const label = t('pages.membersPage.patrol_badge', { cycle })
-                return (
-                  <motion.span
-                    key="patrol"
-                    initial={reduceMotion ? false : { opacity: 0, scale: 0.6 }}
-                    animate={{ opacity: 1, scale: 1 }}
-                    exit={reduceMotion ? { opacity: 0 } : { opacity: 0, scale: 0.6 }}
-                    transition={reduceMotion ? { duration: 0 } : { duration: 0.15, ease: [0.2, 0, 0, 1] }}
-                    className="absolute -right-1 -top-1 w-4 h-4 rounded-full border-2 border-bg flex items-center justify-center bg-accent text-accent-fg"
-                    role="img"
-                    aria-label={label}
-                    title={label}
-                    data-testid="member-patrol-dot"
-                    data-state="active"
-                  >
-                    <Goal size={10} aria-hidden="true" />
-                  </motion.span>
-                )
-              })()}
-            </AnimatePresence>
+            {/* On watch — the member's own thread has a live monitor or
+                goal loop. Presence only: no nudge text, no cycle count; the
+                drawer's block keeps the details. */}
+            <CrewLoopIndicator on={isLoopOn(view)} testId="member-loop-indicator" />
           </span>
           <span className="min-w-0 flex-1">
             <span className={`block ${ROW_TITLE_CLS} font-semibold text-text truncate`}>{crewDisplayName(view)}</span>
@@ -670,6 +731,17 @@ function MemberRow({
                   <Square size={9} fill="currentColor" className="lucide-inline" aria-hidden="true" />
                   {t('pages.membersPage.stopped_indicator')}
                 </span>
+              )}
+              {/* The mark's word, so it reads without a tooltip (touch,
+                  reduced motion). Accent, like the mark. */}
+              {isLoopOn(view) && (
+                <Badge
+                  variant="muted"
+                  className="shrink-0 px-1.5 py-0 text-[11px] font-sans bg-accent-subtle text-accent"
+                  data-testid="member-loop-label"
+                >
+                  {t('pages.membersPage.loop_on')}
+                </Badge>
               )}
               <span className="block truncate min-w-0">{view.last_message || '\u00a0'}</span>
             </span>
@@ -1219,6 +1291,12 @@ export default function MembersPage() {
   // ref, not state: it is a note between two runs of one effect, and must
   // not re-arm it.
   const goneStandInRef = useRef('')
+  // The member the fallback is about to RESTORE on a bare `/members` (the
+  // remembered or last-chatted one). Same note-between-two-runs shape as
+  // `goneStandInRef`: the open it triggers keeps the memory but must not
+  // re-write the chat mark — the mark means the USER's open, and a restore
+  // is the page reopening it, not a new one.
+  const restoredRef = useRef('')
   // The open member's thread, as the thread endpoint last answered it. The
   // roster's `bound`/`slot_key` are never trusted as mountable: dm.json
   // outlives the live slot (a restart drops an unmessaged slot while the
@@ -1304,7 +1382,18 @@ export default function MembersPage() {
   // window widens.
   const [dockedOpen, setDockedOpen] = usePersistedBool(PANEL_OPEN_KEY, true)
   const { panelVisible, showOpener } = panelChrome({ beside, dockedOpen, overlayOpen })
-  const openProfile = useCallback((tab: ProfileTab = 'profile') => {
+  // The two real faces the flight copy departs from and lands on (#18236), and
+  // the pill face's box taken HERE, on open: by the time the dock commits the
+  // pill has already given way to its placeholder and there is nothing left to
+  // measure. Undock measures the card face in the layout effect instead — the
+  // closing column stays mounted through its exit.
+  const pillFaceRef = useRef<HTMLSpanElement>(null)
+  const cardFaceRef = useRef<HTMLSpanElement>(null)
+  const flightFromRef = useRef<DOMRect | null>(null)
+  // The card opens on Sessions — what the crewmate is doing — unless a caller
+  // names another tab (today only the quiet-chat link, which also asks for Sessions).
+  const openProfile = useCallback((tab: ProfileTab = 'sessions') => {
+    flightFromRef.current = pillFaceRef.current?.getBoundingClientRect() ?? null
     setProfile((current) => ({
       tab,
       placement: isMobile || panelVisible ? 'floating' : 'column',
@@ -1325,9 +1414,9 @@ export default function MembersPage() {
   // Closing the card asks the Schedules draft question like every other exit. Hoisted
   // above the header because the identity pill is one of those exits: with Profile
   // floating, the pill reads `aria-expanded` and a press on it CLOSES the card rather
-  // than re-opening it. Re-opening set `profile.tab` back to `profile`, and the tab
-  // is part of the card's React key, so a card opened on another tab (the quiet-chat
-  // Sessions link) was remounted by that press and a New schedule draft inside it
+  // than re-opening it. Re-opening set `profile.tab` back to the default, and the tab
+  // is part of the card's React key, so a card the reader had moved to another tab
+  // (Schedules, say) was remounted by that press and a New schedule draft inside it
   // destroyed — with no question asked. Pointer users reach the pill rarely (the
   // floating card's scrim covers the header), keyboard users reach it every time.
   const requestCloseProfile = useCallback(() => {
@@ -2375,43 +2464,37 @@ export default function MembersPage() {
   const activeSlotLastTs = useAppSelector(
     (s) => (activeSlot ? s.dashboard.slots.find(sl => sl.key === activeSlot)?.last_ts : undefined),
   )
-  // The identity pill's second line — what the crewmate is doing now. Its
-  // busy readings are the slot's live status line (`slotStatusDetail`), the
-  // SAME record the sessions sidebar and the command palette render through
-  // `toolStatusLabel`, so the pill names a moment the way the sidebar row
-  // does and honours the `simplifiedToolNames` preference. Each read is
-  // memo-safe on its own (a string, a boolean or a stable entry ref), so the
-  // header does not re-render on every WS frame; `resolvePillActivity` folds
-  // them at render time. The key falls back to the roster's slot_key the same
-  // way the avatar does, so a thread whose confirmed slot has not resolved yet
-  // still reads live.
+  // The identity pill's second line — what the crewmate is doing now, read
+  // through the ONE seam the chat's live status line reads too
+  // (`useSlotActivity`): the slot's live status record, the SAME one the
+  // sessions sidebar and the command palette render through `toolStatusLabel`,
+  // so the pill names a moment the way the sidebar row does and honours the
+  // `simplifiedToolNames` preference. The key falls back to the roster's
+  // slot_key the same way the avatar does, so a thread whose confirmed slot
+  // has not resolved yet still reads live.
   const pillSlotKey = activeSlot || active?.slot_key || ''
   const pillStreamState = useAppSelector((s) => (pillSlotKey ? selectSlotStreamState(s, pillSlotKey) : 'idle'))
-  const pillDetail = useAppSelector((s) => (pillSlotKey ? s.chat.slotStatusDetail[pillSlotKey] : undefined))
-  // Whether the tool call the status describes has RETURNED: the status seam
-  // keeps the call's label until the next status frame, but once its output
-  // is in the tool log the model is reading it, and the pill says so. Matched
-  // by the call's own id, so parallel calls cannot be confused, and tested
-  // with `!== undefined`: an empty output is still a return.
-  const pillToolReturned = useAppSelector((s) => {
-    const d = pillSlotKey ? s.chat.slotStatusDetail[pillSlotKey] : undefined
-    if (d?.kind !== 'tool' || !d.toolCallId) return false
-    const entry = selectSlotToolLog(s, pillSlotKey).findLast((e) => e.type === 'tool' && e.tool_call_id === d.toolCallId)
-    return entry !== undefined && entry.output !== undefined
-  })
   const pillLiveSlot = useAppSelector((s) => (pillSlotKey ? s.dashboard.slots.find((sl) => sl.key === pillSlotKey) : undefined))
-  const simplifiedToolNames = useSimplifiedToolNames()
   const uiLang = useLanguage().resolved
-  const pillLabelOf = useCallback(
-    (detail: ToolStatusDetail) => toolStatusLabel(detail, simplifiedToolNames, uiLang),
-    [simplifiedToolNames, uiLang],
-  )
+  const pillAct = useSlotActivity(pillSlotKey, {
+    running: !!active && !!isRunning(active),
+    delegatedOnly: !!pillLiveSlot?.subagents_running && !pillLiveSlot?.running,
+  })
   // The resting line's age ("Idle · 6m ago") is on screen for as long as the
   // thread rests, so it must move on its own: re-read the clock on the
   // drawer's coarse tick while the pill is resting, and not at all while it is
   // busy (the busy line carries no age). A separate clock from the Schedules card, because it runs under a different
   // condition.
   const pillResting = !!active && !isRunning(active) && pillStreamState === 'idle'
+  // The greeting the open chat starts on (cold welcome or warm resume), read
+  // once per open of a confirmed thread. Mid-turn means the crewmate's OWN
+  // turn: workers it runs do not count, since a goal in flight is the very case
+  // the resume speaks to.
+  const { greeting: mateGreeting, failure: mateGreetingFailure, dismiss: dismissMateGreeting } = useMateGreeting(
+    confirmedSlot,
+    pillStreamState === 'idle' && !pillLiveSlot?.running,
+    activeView ? { slug: activeView.slug, member: activeView.name, lastActiveTs: activeView.last_active_ts ?? 0 } : null,
+  )
   const pillLastActive = (activeView ?? active)?.last_active_ts
   const [pillIdleAge, setPillIdleAge] = useState('')
   useEffect(() => {
@@ -2425,21 +2508,13 @@ export default function MembersPage() {
     // the next tick.
   }, [pillResting, pillLastActive, uiLang])
   const pillActivity = useMemo(() => {
-    const act = resolvePillActivity({
-      streamState: pillStreamState,
-      detail: pillDetail,
-      toolReturned: pillToolReturned,
-      running: !!active && !!isRunning(active),
-      delegatedOnly: !!pillLiveSlot?.subagents_running && !pillLiveSlot?.running,
-      labelOf: pillLabelOf,
-    })
-    const label = act.text !== undefined
-      ? act.text
-      : act.kind === 'idle' && pillIdleAge
+    const label = pillAct.text !== undefined
+      ? pillAct.text
+      : pillAct.kind === 'idle' && pillIdleAge
         ? t('pages.membersPage.pill_idle_since', { when: pillIdleAge })
-        : t(PILL_ACTIVITY_KEY[act.kind as Exclude<PillActivityKind, 'tool' | 'thinking'>])
-    return { kind: act.kind, label }
-  }, [pillStreamState, pillDetail, pillToolReturned, active, isRunning, pillLiveSlot, pillLabelOf, t, pillIdleAge])
+        : t(PILL_ACTIVITY_KEY[pillAct.kind as Exclude<PillActivityKind, 'tool' | 'thinking'>])
+    return { kind: pillAct.kind, label }
+  }, [pillAct, t, pillIdleAge])
   // Reactive document visibility AND focus, so the read effect below re-runs
   // when the user returns to a hidden tab or focuses the window — a plain
   // document.hidden read would leave the effect settled and the reveal
@@ -2556,6 +2631,18 @@ export default function MembersPage() {
     },
     [patrolLoopOf],
   )
+  // On watch: the sidebar's live-automation keys (Redux, kept by
+  // `autonudge_state` frames — structured monitors AND goal loops), or the
+  // registry read above.
+  const loopRunningKeys = useAppSelector(selectSidebarAutomationRunningKeys)
+  const isLoopOn = useCallback(
+    (m: MemberRosterRow) => {
+      if (activePatrolOf(m)) return true
+      const key = slotKeyOf(m)
+      return !!key && loopRunningKeys.includes(key)
+    },
+    [activePatrolOf, slotKeyOf, loopRunningKeys],
+  )
   // The live facts the status filters read, resolved per row the same way the
   // row's own markers are (isRunning / isUnread / activePatrolOf), so a filter
   // can never disagree with the dot it filters on.
@@ -2566,10 +2653,10 @@ export default function MembersPage() {
         running: !!isRunning(m),
         needsYou: !!key && !!liveNeedsYou[key],
         unread: isUnread(m),
-        patrolling: !!activePatrolOf(m),
+        patrolling: isLoopOn(m),
       }
     },
-    [slotKeyOf, isRunning, liveNeedsYou, isUnread, activePatrolOf],
+    [slotKeyOf, isRunning, liveNeedsYou, isUnread, isLoopOn],
   )
   // The roster row's needs-you cue reads the SAME resolver, so the full roster,
   // the folded switcher and the status filter can never disagree about a crewmate
@@ -2624,6 +2711,48 @@ export default function MembersPage() {
   // The roster badge's mount/unmount tween honours the OS motion preference:
   // the state change still happens, it just cuts instead of fading.
   const reduceMotion = useReducedMotion()
+  // Whether Profile holds its in-flow column right now — the state whose two
+  // flips the face flies on. Floating opens and closes fly nothing: the pill
+  // stays, so the face never changes place.
+  const profileDocked = !!activeView && !!profile && profile.placement === 'column'
+  const [faceFlight, setFaceFlight] = useState<FaceFlight | null>(null)
+  const flightKeyRef = useRef(0)
+  const wasDockedRef = useRef(profileDocked)
+  useLayoutEffect(() => {
+    const was = wasDockedRef.current
+    wasDockedRef.current = profileDocked
+    if (was === profileDocked) return
+    // A column re-placed as the floating card (the window crossed below md) is
+    // still the open card, not a close: the pill comes back beside it and the
+    // face does not move. Measuring here would read the floating card's face,
+    // which took over `cardFaceRef`, and hide it.
+    if (!profileDocked && profile) { flightFromRef.current = null; return }
+    const from = profileDocked ? flightFromRef.current : cardFaceRef.current?.getBoundingClientRect() ?? null
+    flightFromRef.current = null
+    // No box to depart from (reduced motion, a never-laid-out face, a dock that
+    // came from somewhere other than the pill) means a plain swap, not a flight.
+    if (reduceMotion || !active || !from || from.width === 0) return
+    // The folding card is AnimatePresence's exiting child, re-rendered with the
+    // props it left with — `faceHidden` can no longer reach it — so its face is
+    // unpainted here, on the element, for the rest of its exit.
+    if (!profileDocked && cardFaceRef.current) cardFaceRef.current.style.visibility = 'hidden'
+    const target = profileDocked ? cardFaceRef : pillFaceRef
+    setFaceFlight({
+      key: ++flightKeyRef.current,
+      seed: active.name,
+      avatar: active.avatar,
+      slotKey: activeSlot || active.slot_key || '',
+      running: !!isRunning(active),
+      from,
+      to: () => target.current?.getBoundingClientRect() ?? null,
+    })
+  }, [profileDocked, profile, reduceMotion, active, activeSlot, isRunning])
+  const endFaceFlight = useCallback(() => setFaceFlight(null), [])
+  // A flight belongs to the crewmate it was measured on. Leaving that crewmate
+  // mid-flight (Back, a bare /members, a team open) unmounts the copy before its
+  // `onComplete`, so the state is cleared here or the next crewmate's open would
+  // replay the old face from the old box and keep its own pill face hidden.
+  useEffect(() => { setFaceFlight(null) }, [activeName])
 
   // Open a member's thread and remember it as the last one opened. Called by
   // the URL sync effect only (plus the same-member re-click below), so every
@@ -2631,12 +2760,18 @@ export default function MembersPage() {
   // on return — runs one code path. `remember` is false only for the member
   // opened IN PLACE OF one a link named that is gone: that open is the page's
   // choice, not the user's, so one stale link must not overwrite the member
-  // they had actually chosen.
+  // they had actually chosen. The built-in `default` is remembered like any
+  // other row, with the roster's chat mark beside it (`rememberedDefaultPick`);
+  // `stamp` is false for a restore (`restoredRef`), which is the page
+  // reopening the user's last open, not a new one.
+  const membersRef = useRef(members)
+  membersRef.current = members
   const activate = useCallback(
-    (m: MemberRosterRow, remember = true) => {
+    (m: MemberRosterRow, remember = true, stamp = remember) => {
       activeNameRef.current = m.name
       setActiveName(m.name)
-      if (remember && m.name !== 'default') safeSetItem(LAST_MEMBER_KEY, m.name)
+      if (remember) safeSetItem(LAST_MEMBER_KEY, m.name)
+      if (stamp) safeSetItem(LAST_MEMBER_CHAT_MARK_KEY, String(chatMarkOf(membersRef.current)))
       // A Side Chat belongs to the member it was asked about; nothing to reset
       // here — the panel's strip is bucketed per member slot, so switching
       // members swaps the whole strip and a Side tab stays with its member.
@@ -2825,7 +2960,9 @@ export default function MembersPage() {
         // user's choice and must not become the memory (see `activate`).
         const standIn = goneStandInRef.current === hit.name
         goneStandInRef.current = ''
-        if (hit.name !== activeNameRef.current) activate(hit, !standIn)
+        const restored = restoredRef.current === hit.name
+        restoredRef.current = ''
+        if (hit.name !== activeNameRef.current) activate(hit, !standIn, !standIn && !restored)
         // The notice belongs to the member shown in place of the gone one;
         // opening anyone else retires it. Functional updates throughout, and
         // `gone` is NOT a dependency: the URL write below is a router
@@ -2891,11 +3028,16 @@ export default function MembersPage() {
     // recently used of those (listed while open), so the page never lands on an
     // empty pane or claims there are no crewmates.
     const remembered = safeGetItem(LAST_MEMBER_KEY)
+    const chatMark = Number(safeGetItem(LAST_MEMBER_CHAT_MARK_KEY)) || 0
     const rememberedRow =
       remembered && remembered !== 'default' ? members.find((m) => m.name === remembered) : undefined
     // The last crewmate the user CHATTED with outranks the memory (it is the
-    // server's record, so a restart or a new browser keeps it).
+    // server's record, so a restart or a new browser keeps it). A remembered
+    // built-in `default` outranks even that while no crewmate has been
+    // chatted with since it was opened (`rememberedDefaultPick`); a
+    // default-only roster still lands on the hero.
     const target =
+      rememberedDefaultPick(remembered, chatMark, members) ??
       lastChattedMember(orderedMembers) ??
       rememberedRow ??
       resolveDefaultMember(null, listedMembers) ??
@@ -2930,6 +3072,7 @@ export default function MembersPage() {
       )
       goneStandInRef.current = target.name
     }
+    restoredRef.current = target.name
     setSearchParams({ [MEMBER_PARAM]: target.name }, { replace: true })
   }, [loaded, loadError, urlMember, urlTeam, teamsQ.data, members, listedMembers, activeName, isMobile, activate, setSearchParams, rosterQuery.isFetching, defaultAgentSettled, orderedMembers])
 
@@ -3544,7 +3687,7 @@ export default function MembersPage() {
                       isRunning={isRunning}
                       isUnread={isUnread}
                       isNeedsYou={isNeedsYou}
-                      activePatrolOf={activePatrolOf}
+                      isLoopOn={isLoopOn}
                       reduceMotion={reduceMotion}
                       scrollActiveRowIntoView={scrollActiveRowIntoView}
                       slugCollides={collidingSlugs.has(m.slug)}
@@ -3751,8 +3894,8 @@ export default function MembersPage() {
                 // Profile is the read surface; its pencil owns the editor door.
                 // A toggle, as `aria-expanded` says: with the card already open the
                 // press closes it (through the draft guard — see requestCloseProfile)
-                // instead of re-opening on the Profile tab, which remounted the card.
-                onClick={() => { if (profile) requestCloseProfile(); else openProfile('profile') }}
+                // instead of re-opening on the default tab, which remounted the card.
+                onClick={() => { if (profile) requestCloseProfile(); else openProfile() }}
                 className="glass-shadow flex items-center gap-2.5 pl-2.5 pr-3 py-1.5 min-w-0 max-w-full justify-self-center cursor-pointer text-left focus-ring"
                 title={t('pages.membersPage.profile_card')}
                 aria-expanded={!!profile}
@@ -3760,9 +3903,15 @@ export default function MembersPage() {
               >
                 {/* The same reactive CrewStateAvatar as before — a plain face,
                     no scrim, no badge (issue #9425). */}
-                {/* The face is a shared layout element: when the card docks and the
-                    pill steps out, the same face slides into the card's head. */}
-                <motion.span layoutId={CREW_FACE_LAYOUT_ID} className="flex shrink-0 rounded-full">
+                {/* When the card docks and the pill steps out, the face flies to
+                    the card's head as `CrewFaceFlight`'s copy, above everything;
+                    this one holds its place unpainted while a flight is up. */}
+                <span
+                  ref={pillFaceRef}
+                  className="relative flex shrink-0 rounded-full"
+                  style={faceFlight ? { visibility: 'hidden' } : undefined}
+                  data-testid="member-pill-face"
+                >
                   <CrewStateAvatar
                     seed={active.name}
                     avatar={active.avatar}
@@ -3771,7 +3920,8 @@ export default function MembersPage() {
                     size={30}
                     working="full"
                   />
-                </motion.span>
+                  <CrewLoopIndicator on={isLoopOn(active)} testId="member-pill-loop-indicator" />
+                </span>
                 <div className="min-w-0 leading-tight">
                   {/* Title row = name (+ the ID when a label covers it). */}
                   <div className="min-w-0 flex items-center gap-1.5" data-testid="member-title-row">
@@ -3813,7 +3963,7 @@ export default function MembersPage() {
                     data-testid="member-pill-activity"
                     data-activity={pillActivity.kind}
                     aria-hidden="true"
-                  >{pillActivity.label}</div>
+                  >{pillActivity.label}{isLoopOn(active) ? ` · ${t('pages.membersPage.loop_on')}` : ''}</div>
                 </div>
                 {/* The one visible sign that this chip OPENS something. Without
                     it the pill and the switcher beside it are two controls
@@ -3841,7 +3991,7 @@ export default function MembersPage() {
                     live region — a line that changes several times a turn
                     would otherwise be announced on every change. It is in the
                     reading order for a reader who asks. */}
-                <span className="sr-only" data-testid="member-pill-activity-sr">{pillActivity.label}</span>
+                <span className="sr-only" data-testid="member-pill-activity-sr">{pillActivity.label}{isLoopOn(active) ? ` · ${t('pages.membersPage.loop_on')}` : ''}</span>
                 {showOpener && (
                   <button
                     onClick={togglePanel}
@@ -4050,6 +4200,25 @@ export default function MembersPage() {
                 )}
               </div>
             )}
+            {mateGreeting && crewmateIdentity && (mateGreeting.kind === 'warm'
+              ? <MateResumeCard resume={mateGreeting.resume} crewmate={crewmateIdentity} onDismiss={dismissMateGreeting} />
+              : <MateWelcomeCard recap={mateGreeting.recap} crewmate={crewmateIdentity} onDismiss={dismissMateGreeting} />
+            )}
+            {mateGreetingFailure && crewmateIdentity && (
+              /* The status read failed (not "no ledger", which is no greeting).
+                 No hand-off, for the reason the notices above give: the DM
+                 composer below may hold an unsaved draft. */
+              <div className="px-4 pt-3">
+                <ErrorNotice
+                  message={t(mateGreetingFailure.kind === 'cold' ? 'pages.membersPage.welcome_failed' : 'pages.membersPage.resume_failed', { name: crewmateIdentity.label || crewmateIdentity.name })}
+                  report={reportForError(mateGreetingFailure.error)}
+                  variant="inline"
+                  askAgent={false}
+                  onDismiss={dismissMateGreeting}
+                  testId="member-resume-error"
+                />
+              </div>
+            )}
             {activeSlot ? (
               <div className="flex-1 min-h-0">
                 <ErrorBoundary>
@@ -4071,7 +4240,8 @@ export default function MembersPage() {
                     // The failure notice above owns the verdict on this thread
                     // while a repair has failed; the pane's own "Session
                     // ready" would contradict it one line down.
-                    hideEmptyHint={activeThreadFailed}
+                    // A greeting card above already speaks for the empty chat.
+                    hideEmptyHint={activeThreadFailed || mateGreeting?.kind === 'cold'}
                     crewmate={crewmateIdentity}
                     onOpenCrewWorkLog={openCrewWorkLog}
                     openSideChat={openMemberSideChat}
@@ -4303,7 +4473,8 @@ export default function MembersPage() {
               newScheduleBody={schedulesBody}
               sessionsBody={sessionsBody}
               notesBody={notesBody}
-              faceLayoutId={profile.placement === 'column' ? CREW_FACE_LAYOUT_ID : undefined}
+              faceRef={cardFaceRef}
+              faceHidden={!!faceFlight}
               onClose={requestCloseProfile}
               onRequestBack={requestProfileBack}
               onEdit={() => setEditingCrew(active.name)}
@@ -4319,11 +4490,15 @@ export default function MembersPage() {
           // containing block, which is exactly the chat width the side panel leaves),
           // and a click outside it closes it. No scrim: the thread stays readable
           // beside it.
-          const profileDocked = !!profilePanel && profile?.placement === 'column'
           // The column reveals on the chat page's width axis (so the thread
           // narrows instead of jumping), while the face slides over from the pill.
+          // Keyed on the placement: a column RE-PLACED as the floating card (the
+          // window crossed below md) remounts the presence and drops the aside at
+          // once, with no width exit — the floating card is already up, and a
+          // phone-width viewport must never hold the in-flow column, not even for
+          // the 0.26s the exit would take. A close keeps the key and plays it.
           const dockedSurface = (
-            <AnimatePresence initial={false}>
+            <AnimatePresence initial={false} key={profile?.placement === 'floating' ? 'crew-profile-re-placed' : 'crew-profile-column'}>
               {profileDocked && (
                 <motion.aside
                   key="crew-profile-docked"
@@ -4436,7 +4611,13 @@ export default function MembersPage() {
             ? { initial: { x: 0 }, animate: { x: 0 }, exit: { x: 0 } }
             : { initial: { x: '100%' }, animate: { x: 0 }, exit: { x: '100%' } }
           return (<>
-            {profileDocked ? profileSurface : <>{dockedSurface}{profileSurface}</>}
+            {faceFlight && <CrewFaceFlight key={faceFlight.key} flight={faceFlight} onDone={endFaceFlight} />}
+            {/* The docked column's AnimatePresence keeps ONE slot in both states,
+                so folding it runs its exit (a column that swapped against a
+                fragment here was unmounted outright, no width tween) and the
+                leaving card's face stays measurable for the flight. */}
+            {dockedSurface}
+            {profileDocked ? null : profileSurface}
             <AnimatePresence initial={false}>
               {panelMounted && (
                 <motion.div

@@ -22,6 +22,7 @@ from kiro_crew.dashboard.remote_subagents import (
     RemoteSubagentError,
     RemoteSubagentService,
 )
+from kiro_crew.dashboard import remote_workspaces
 from kiro_crew.dashboard.remote_workspaces import (
     WorkspaceArchiveRejected,
     api_remote_workspace_upload,
@@ -35,6 +36,13 @@ from kiro_crew.validation import SPAWN_RUN_SCHEMA, validate_tool_args
 # The local-path cases drive SubagentManager.spawn; pin the host-memory reading
 # so a memory-pressured runner does not queue them.
 pytestmark = pytest.mark.usefixtures("healthy_host_memory")
+
+
+# Installs go through dir_fd-relative creates; a platform without them refuses.
+_PINNED_INSTALL = pytest.mark.skipif(
+    not remote_workspaces._can_extract_pinned(),
+    reason="workspace install needs descriptor-pinned extraction (POSIX)",
+)
 
 # A monitor that never settles (a scripted peer reply list run dry, a retry loop
 # that keeps re-polling) must fail its own test, not hang the xdist worker until
@@ -87,15 +95,12 @@ class _Instances:
         responses: list[tuple[int, dict[str, object]] | BaseException],
         *,
         connected: tuple[str, ...] = ("crew-a", "crew-b"),
-        legacy_peer: bool = False,
         advertises: bool = True,
     ) -> None:
         self._responses = list(responses)
         self._connected = connected
-        # A current peer echoes what it enforced on an accepted spawn; a peer
-        # without that change (same major.minor) silently drops the fields.
-        self._legacy_peer = legacy_peer
-        # A current peer also lists those fields in /api/version up front.
+        # A current peer lists the fields it enforces in /api/version; a peer
+        # without that change (same major.minor) silently drops them.
         self._advertises = advertises
         self.calls: list[tuple[str, str, str, dict[str, object] | bytes | None]] = []
 
@@ -139,21 +144,6 @@ class _Instances:
         if isinstance(scripted, BaseException):
             raise scripted
         status, payload = scripted
-        if (
-            not self._legacy_peer
-            and method == "POST"
-            and path == "api/spawn"
-            and 200 <= status < 300
-            and isinstance(body, dict)
-            and "applied" not in payload
-        ):
-            payload = {
-                **payload,
-                "applied": {
-                    "memory_mode": body.get("memory_mode") or "persistent",
-                    "approval_floor": body.get("approval_floor", ""),
-                },
-            }
         yield _Response(status, payload)
 
 
@@ -470,6 +460,7 @@ def _tar_payload(entries: list[tuple[str, bytes, int, str]]) -> bytes:
     return buffer.getvalue()
 
 
+@_PINNED_INSTALL
 def test_workspace_install_is_content_addressed_and_rejects_unsafe_members(
     tmp_path,
 ) -> None:
@@ -503,6 +494,7 @@ def test_workspace_install_is_content_addressed_and_rejects_unsafe_members(
             install_workspace(bad, hashlib.sha256(bad).hexdigest(), "b" * 40, root=tmp_path)
 
 
+@_PINNED_INSTALL
 def test_workspace_install_skips_tracked_symlinks_instead_of_rejecting(tmp_path) -> None:
     # build_source_tarball emits a symlink member for every tracked symlink; a
     # repo with one must still sync, and the link must never be created.
@@ -518,6 +510,91 @@ def test_workspace_install_skips_tracked_symlinks_instead_of_rejecting(tmp_path)
     assert not (path / "link").exists() and not (path / "link").is_symlink()
 
 
+@_PINNED_INSTALL
+@pytest.mark.parametrize("planted", ["file-link", "parent-link"])
+def test_extraction_never_writes_through_a_link_planted_in_staging(
+    tmp_path, monkeypatch: pytest.MonkeyPatch, planted: str
+) -> None:
+    # A same-user agent can see the staging directory while the gateway fills
+    # it. A link it plants at a name the archive will write must fail the
+    # create, not redirect the write onto a protected file.
+    base = tmp_path / "workspaces"
+    base.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    victim = outside / "security_policy.json"
+    victim.write_text("ceiling\n", encoding="utf-8")
+    payload = _tar_payload(
+        [
+            ("pkg/injected.py", b"overwritten\n", 0o644, "file"),
+            ("security_policy.json", b"overwritten\n", 0o644, "file"),
+        ]
+    )
+
+    def plant(staging: Path) -> None:
+        if planted == "file-link":
+            (staging / "security_policy.json").symlink_to(victim)
+        else:
+            (staging / "pkg").symlink_to(outside, target_is_directory=True)
+
+    real = remote_workspaces._extract_pinned
+
+    def _racing(archive: tarfile.TarFile, staging_fd: int) -> None:
+        (staging,) = [p for p in base.iterdir() if p.name.startswith(".")]
+        plant(staging)
+        real(archive, staging_fd)
+
+    monkeypatch.setattr(remote_workspaces, "_extract_pinned", _racing)
+
+    with pytest.raises(WorkspaceArchiveRejected):
+        install_workspace(payload, hashlib.sha256(payload).hexdigest(), "a" * 40, root=base)
+
+    assert victim.read_text(encoding="utf-8") == "ceiling\n"
+    assert sorted(p.name for p in outside.iterdir()) == ["security_policy.json"]
+    assert list(base.iterdir()) == []
+
+
+@_PINNED_INSTALL
+def test_a_staging_tree_swapped_before_publish_is_not_published(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The publish rename is by name, so the name must still be the directory
+    # the gateway filled; a link swapped in for it is refused and removed.
+    base = tmp_path / "workspaces"
+    base.mkdir()
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    payload = _tar_payload([("README.md", b"hello\n", 0o644, "file")])
+    real = remote_workspaces._write_marker
+
+    def _swap(staging_fd: int, digest: str, commit: str) -> None:
+        real(staging_fd, digest, commit)
+        (staging,) = [p for p in base.iterdir() if p.name.startswith(".")]
+        staging.rename(tmp_path / "moved")
+        staging.symlink_to(elsewhere, target_is_directory=True)
+
+    monkeypatch.setattr(remote_workspaces, "_write_marker", _swap)
+
+    with pytest.raises(WorkspaceArchiveRejected, match="replaced"):
+        install_workspace(payload, hashlib.sha256(payload).hexdigest(), "a" * 40, root=base)
+
+    assert list(base.iterdir()) == []
+    assert list(elsewhere.iterdir()) == []
+
+
+def test_a_platform_without_pinned_creates_refuses_the_install(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # No by-name fallback: that is the write-through-a-link hole itself.
+    monkeypatch.setattr(remote_workspaces, "_can_extract_pinned", lambda: False)
+    payload = _tar_payload([("README.md", b"hello\n", 0o644, "file")])
+
+    with pytest.raises(WorkspaceArchiveRejected, match="pinned"):
+        install_workspace(payload, hashlib.sha256(payload).hexdigest(), "a" * 40, root=tmp_path)
+
+    assert list(tmp_path.iterdir()) == []
+
+@_PINNED_INSTALL
 def test_workspace_prune_spares_snapshots_in_use(tmp_path) -> None:
     from kiro_crew.dashboard.remote_workspaces import _prune_workspaces
 
@@ -569,6 +646,27 @@ async def test_a_queued_runs_workspace_counts_as_in_use(
 
 
 @pytest.mark.asyncio
+async def test_a_run_admitted_during_the_queued_read_still_counts_as_in_use(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The run leaves the queue while the listing is read; it must be seen live."""
+    from kiro_crew.dashboard import remote_workspaces
+    from kiro_crew.subagent_manager.admission.types import QueuedRunListing
+
+    monkeypatch.setattr(remote_workspaces, "_workspace_root", lambda: tmp_path)
+    name = "c" * 24 + "-0000cccc"
+    manager = SimpleNamespace(all_agents=[])
+
+    async def admitted_meanwhile(_parent):
+        manager.all_agents = [SimpleNamespace(done=False, cwd=str(tmp_path / name))]
+        return QueuedRunListing(())
+
+    manager.queued_runs_async = admitted_meanwhile
+
+    assert await remote_workspaces._workspaces_in_use(_ownership_request(manager)) == {name}
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("failure", ["partial", "raises", "no-listing"])
 async def test_ownership_that_cannot_be_read_completely_is_none(
     tmp_path, monkeypatch: pytest.MonkeyPatch, failure: str
@@ -586,6 +684,7 @@ async def test_ownership_that_cannot_be_read_completely_is_none(
     assert await remote_workspaces._workspaces_in_use(_ownership_request(manager)) is None
 
 
+@_PINNED_INSTALL
 def test_unknown_ownership_prunes_nothing(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr("kiro_crew.dashboard.remote_workspaces._WORKSPACE_TTL_SECS", 1)
     first = _tar_payload([("one.txt", b"one", 0o644, "file")])
@@ -1087,6 +1186,7 @@ async def test_delivered_remote_records_expire_at_configured_ttl(
     await service.close()
 
 
+@_PINNED_INSTALL
 def test_workspace_install_prunes_only_expired_marked_snapshots(
     tmp_path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1447,80 +1547,6 @@ async def test_unpersisted_mapping_cancels_the_peer_run_instead_of_publishing(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("overrides", "applied", "refused"),
-    [
-        # An older peer drops both fields without saying so.
-        ({"memory_mode": "incognito", "approval_mode": "auto"}, None, True),
-        ({"approval_mode": ""}, None, True),
-        # A peer that echoes something weaker than what was sent.
-        (
-            {"memory_mode": "temporary", "approval_mode": "auto"},
-            {"memory_mode": "incognito", "approval_floor": ""},
-            True,
-        ),
-        ({"approval_mode": ""}, {"memory_mode": "persistent", "approval_floor": ""}, True),
-        # Nothing to tighten: an older peer is fine.
-        ({"approval_mode": "auto"}, None, False),
-        # A peer that applied something stricter is fine.
-        (
-            {"memory_mode": "incognito", "approval_mode": "auto"},
-            {"memory_mode": "temporary", "approval_floor": ""},
-            False,
-        ),
-    ],
-    ids=[
-        "legacy-incognito",
-        "legacy-floor",
-        "weaker-mode",
-        "dropped-floor",
-        "legacy-nothing-to-tighten",
-        "stricter-mode",
-    ],
-)
-async def test_a_peer_that_does_not_confirm_the_tightening_is_refused(
-    tmp_path,
-    monkeypatch: pytest.MonkeyPatch,
-    overrides: dict[str, object],
-    applied: dict[str, str] | None,
-    refused: bool,
-) -> None:
-    """Version parity is major.minor only, so the peer's echo is the proof."""
-    monkeypatch.setattr("kiro_crew.dashboard.remote_subagents.data_home", lambda: tmp_path)
-    accepted: dict[str, object] = {"id": "peer01"}
-    if applied is not None:
-        accepted["applied"] = applied
-    instances = _Instances(
-        [(200, accepted), (200, {"cancelled": True})],
-        connected=("crew-a",),
-        legacy_peer=True,
-    )
-    manager = _Manager()
-    service = RemoteSubagentService(
-        cast(Any, SimpleNamespace(instances_manager=instances)), cast(Any, manager)
-    )
-    monkeypatch.setattr(service, "_monitor", AsyncMock())
-
-    if refused:
-        with pytest.raises(RemoteSubagentError) as caught:
-            await service.spawn(**_spawn_kwargs(**overrides))  # type: ignore[arg-type]
-        assert caught.value.code == "remote_peer_unenforced"
-        assert caught.value.status == 409
-        assert [call[1:3] for call in instances.calls] == [
-            ("POST", "api/spawn"),
-            ("DELETE", "api/spawn/peer01"),
-        ]
-        assert manager.external_agents == []
-        assert not (tmp_path / "subagents" / "remote").exists() or not any(
-            (tmp_path / "subagents" / "remote").iterdir()
-        )
-    else:
-        info = await service.spawn(**_spawn_kwargs(**overrides))  # type: ignore[arg-type]
-        assert info.remote_id == "peer01"
-        assert [call[1:3] for call in instances.calls] == [("POST", "api/spawn")]
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
     ("overrides", "refused"),
     [
         ({"memory_mode": "incognito", "approval_mode": "auto", "include_project": False}, True),
@@ -1537,12 +1563,11 @@ async def test_a_crew_that_does_not_advertise_the_tightening_never_gets_the_task
     overrides: dict[str, object],
     refused: bool,
 ) -> None:
-    """The echo arrives after the peer stored the task; the advertisement comes first."""
+    """A crew that does not advertise the fields is refused before it sees the task."""
     monkeypatch.setattr("kiro_crew.dashboard.remote_subagents.data_home", lambda: tmp_path)
     instances = _Instances(
         [(200, {"id": "peer01"})],
         connected=("crew-a",),
-        legacy_peer=True,
         advertises=False,
     )
     manager = _Manager()
@@ -2255,4 +2280,49 @@ async def test_restored_remote_run_keeps_its_approval_floor(
     assert kept is not None and kept.approval_floor == "interactive"
     # Only the one known value survives a reload; anything else reads as none.
     assert unknown is not None and unknown.approval_floor == ""
+    await service.close()
+
+
+@pytest.mark.asyncio
+async def test_a_lost_private_result_is_redelivered_as_an_error_not_an_empty_success(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # An incognito/temporary result is never written to disk, so a run that
+    # finished but was not delivered before a restart has no result left.
+    monkeypatch.setattr("kiro_crew.dashboard.remote_subagents.data_home", lambda: tmp_path)
+    cases = (
+        ("abcdef21", "incognito", False),
+        ("abcdef22", "temporary", False),
+        ("abcdef23", "incognito", True),
+        ("abcdef24", "persistent", False),
+    )
+    for run_id, mode, delivered in cases:
+        RemoteSubagentService._persist_info(
+            SubagentInfo(
+                id=run_id,
+                task="review",
+                parent_session_key="dashboard:chat-1",
+                done=True,
+                executor="remote",
+                instance_id="crew-a",
+                remote_id=f"peer-{run_id}",
+                memory_mode=mode,
+            ),
+            delivered=delivered,
+        )
+    manager = _Manager()
+    service = RemoteSubagentService(
+        cast(Any, SimpleNamespace(instances_manager=None)), cast(Any, manager)
+    )
+    await service.ensure_restored()
+
+    errors = {}
+    for run_id, *_ in cases:
+        restored = manager.get(run_id)
+        assert restored is not None
+        errors[run_id] = restored.error
+    assert "did not survive a gateway restart" in errors["abcdef21"]
+    assert "did not survive a gateway restart" in errors["abcdef22"]
+    assert errors["abcdef23"] == ""  # already delivered: nothing to redeliver
+    assert errors["abcdef24"] == ""  # persistent: its result is on disk when it exists
     await service.close()

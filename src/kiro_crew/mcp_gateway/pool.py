@@ -591,26 +591,26 @@ class BackendPool:
         if self._breaker is not None:
             self._breaker.record_healthy(breaker_key)
 
-    def live_backend_pids(self) -> list[int]:
-        """PIDs of all currently-pooled backends **and draining backends**. Each
-        backend is spawned as a session leader (``start_new_session=True``), so
-        ``pid == pgid``. Persisted out-of-band so a supervising manager can
-        ``killpg`` these survivors if it has to SIGKILL a wedged gatewayd (which
-        then never runs :meth:`shutdown_all`).
+    def live_backend_identities(self) -> list[tuple[int, Optional[str]]]:
+        """``(pid, start_id)`` of every pooled, draining and connection-private
+        backend. Each is a session leader (``start_new_session=True``, so
+        ``pid == pgid``), and the heartbeat persists these out-of-band so a
+        supervising manager or the next daemon can reap survivors of a gatewayd
+        that died without running :meth:`shutdown_all`.
 
         Draining backends (blue-green cutover) keep running as live session
-        leaders for up to :data:`DRAIN_DEADLINE_SECS` after being removed from
-        the active index, so they MUST appear here too — otherwise a gatewayd
-        SIGKILLed during the drain window leaves them orphaned, the exact leak
-        this pidfile mechanism exists to prevent.
+        leaders for up to :data:`DRAIN_DEADLINE_SECS` after leaving the active
+        index, so they MUST appear here too, or a gatewayd SIGKILLed during the
+        drain window leaves them orphaned. The start id is the one each backend
+        captured at spawn (:attr:`Backend.start_id`), never re-read here.
         """
-        pids = [b.pid for b in self._backends.values() if b.pid is not None]
-        pids.extend(e.backend.pid for e in self._draining if e.backend.pid is not None)
+        backends = list(self._backends.values())
+        backends.extend(e.backend for e in self._draining)
         # Connection-private backends are ordinary child processes; being outside
         # the reuse index and the capacity budget does not make them any less
         # orphanable by a SIGKILLed gatewayd.
-        pids.extend(b.pid for b in self._exclusive.values() if b.pid is not None)
-        return pids
+        backends.extend(self._exclusive.values())
+        return [(b.pid, b.start_id) for b in backends if b.pid is not None]
 
     async def add(
         self,

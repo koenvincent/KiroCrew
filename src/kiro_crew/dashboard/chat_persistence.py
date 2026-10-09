@@ -2256,9 +2256,37 @@ def _save_slot_to_history(
         )
         return False
     window = _write_guards.drop_notes_authorized_elsewhere(slot, window, note_auth_key)
+
+    # The two retryable refusals, evaluated under the transcript lock by both the
+    # empty-window merge and the full save below. Each returns the reason to log,
+    # or ``None`` to proceed.
+    def _queue_line_is_ours(meta: dict) -> bool:
+        # A rows-only write over another holder's line defers the queue key to
+        # that line, so it neither decides nor commits the queue.
+        return not (rows_only and meta and not _line_is_this_slots(slot, meta))
+
+    def _stale_queue_refusal(meta: dict) -> str | None:
+        # The lock orders the queue writers' commits, not their reads, so a
+        # writer holding an older queue can arrive here second.
+        if _queue_line_is_ours(meta) and _queue_snapshot_is_stale(slot, queue_write_basis):
+            return (
+                "another writer committed a newer queued-prompt value "
+                "while this save held an older snapshot"
+            )
+        return None
+
+    def _replaced_refusal() -> str | None:
+        if expected_slot_name is not None and state._slots.get(expected_slot_name) is not slot:
+            return f"slot {expected_slot_name} was replaced before the write committed"
+        return None
+
     if not window:
         if force or closed:
-            _metadata_line.merge_empty_window(
+
+            def _refusal_under_lock(meta: dict) -> str | None:
+                return _stale_queue_refusal(meta) or _replaced_refusal()
+
+            refusal = _metadata_line.merge_empty_window(
                 state.conversation_log,
                 slot,
                 history_key,
@@ -2267,7 +2295,15 @@ def _save_slot_to_history(
                 closed=closed,
                 closed_at=closed_at,
                 pending_mode_target=pending_mode_target,
+                # A close commits unconditionally, as it does on main: its
+                # callers ignore a refused save, so a refusal would leave an
+                # open-shaped line that a restart resurrects.
+                refusal_under_lock=None if closed else _refusal_under_lock,
             )
+            if refusal is not None:
+                logger.warning("Slot %s empty-window save refused: %s", slot.key, refusal)
+                _keep_owed_after_refusal(slot)
+                return False
         return True
     # Skip a pure no-op: a freshly resumed slot with no new AND no edited
     # messages. ``slot._dirty`` is set by both append and in-place edits
@@ -2308,24 +2344,15 @@ def _save_slot_to_history(
             )
 
             # ── Stale-queue guard ───────────────────────────────────────────
-            # The lock orders the queue writers' commits, not their reads, so a
-            # writer holding an older queue can arrive here second. Refuse rather
-            # than put the older value back: nothing is written, the queue stays
-            # owed by the drift check, and the next pass re-decides against the
-            # state that exists. Skipped when this write defers the key to the
-            # line on disk (rows-only over another holder's line), because then
-            # it is not deciding the queue at all.
-            queue_line_is_ours = not (
-                rows_only and existing_meta and not _line_is_this_slots(slot, existing_meta)
-            )
-            if queue_line_is_ours and _queue_snapshot_is_stale(slot, queue_write_basis):
-                logger.warning(
-                    "Slot %s save refused: another writer committed a newer queued-prompt "
-                    "value while this save held an older snapshot",
-                    slot.key,
-                )
+            # Refuse rather than put an older queue back: nothing is written, the
+            # queue stays owed by the drift check, and the next pass re-decides
+            # against the state that exists.
+            refusal = _stale_queue_refusal(existing_meta)
+            if refusal is not None:
+                logger.warning("Slot %s save refused: %s", slot.key, refusal)
                 _keep_owed_after_refusal(slot)
                 return False
+            queue_line_is_ours = _queue_line_is_ours(existing_meta)
 
             path = state.conversation_log._path(history_key)
             if _write_guards.delete_won(
@@ -2353,12 +2380,9 @@ def _save_slot_to_history(
             # truncation has no future, so refuse the whole save (``False``,
             # nothing written) rather than land the stale snapshot on the
             # replacement's transcript.
-            if expected_slot_name is not None and state._slots.get(expected_slot_name) is not slot:
-                logger.warning(
-                    "Slot %s save refused: slot %s was replaced before the write committed",
-                    history_key,
-                    expected_slot_name,
-                )
+            refusal = _replaced_refusal()
+            if refusal is not None:
+                logger.warning("Slot %s save refused: %s", history_key, refusal)
                 # A refusal is not a commit, and the periodic writer cannot tell
                 # the difference: it clears ``_dirty`` on any return that did not
                 # raise. Keeping the state owed is what makes this guard safe for

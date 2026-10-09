@@ -619,6 +619,40 @@ class TestFileWrite:
             )
 
     @pytest.mark.asyncio
+    async def test_write_numeric_content_is_rejected_not_coerced(
+        self, tmp_file, mock_sel, home_patch
+    ):
+        """The dashboard file-write endpoint keeps its ORIGINAL contract: a
+        non-string ``content`` is rejected by schema validation (HTTP 400) and
+        no file is written. The int->str repair for a numeric-looking string
+        argument lives ONLY at the MCP tool-call entry points, not in the shared
+        validator the dashboard HTTP endpoints go through, so this endpoint must
+        not silently coerce an int to "42"."""
+        before = tmp_file.read_text(encoding="utf-8")
+        async with TestClient(TestServer(_make_app())) as client:
+            resp = await client.post(
+                "/api/file-write", json={"path": str(tmp_file), "content": 42}
+            )
+            assert resp.status == 400
+            # The file is untouched: nothing was written on the rejected call.
+            assert tmp_file.read_text(encoding="utf-8") == before
+
+    @pytest.mark.asyncio
+    async def test_write_string_content_is_not_sanitized(self, tmp_file, mock_sel, home_patch):
+        """A string file save must write the author's bytes verbatim: no .strip()
+        of the final newline or leading indentation, no NFC renormalization, and
+        no removal of hidden Cf characters (BOM, soft hyphen). The dashboard
+        endpoint writes the raw request body, never the validator's normalized
+        value."""
+        content = "  indented\nbody \u00e9\ufeff x\u00ad\n\n"
+        async with TestClient(TestServer(_make_app())) as client:
+            resp = await client.post(
+                "/api/file-write", json={"path": str(tmp_file), "content": content}
+            )
+            assert resp.status == 200
+            assert tmp_file.read_text(encoding="utf-8") == content
+
+    @pytest.mark.asyncio
     async def test_write_outside_home(self, mock_sel, home_patch):
         """Non-sensitive paths outside home are allowed; /etc/evil returns 404 (not found)."""
         async with TestClient(TestServer(_make_app())) as client:

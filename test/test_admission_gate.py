@@ -96,6 +96,27 @@ async def _wait_for(predicate, timeout=5.0, interval=0.05, message="predicate"):
         await asyncio.sleep(interval)
 
 
+async def _backdate_persisted(svc: CronService, job_id: str, secs: float) -> None:
+    """Make *job_id* overdue by *secs*, in memory AND in ``crons.json``.
+
+    Any ``_sync()`` that finds the store's digest unlike the recorded one
+    (a store write whose fingerprint read failed, as a briefly held file on
+    Windows can make it) reloads ``svc._jobs`` as NEW objects. A job object a
+    test captured earlier is then detached, so writing ``last_run_ts`` on it
+    changes nothing the next tick scans. Rewriting the live record and saving
+    it under the store lock keeps the backdate whether or not the tick reloads.
+    """
+
+    def _write() -> None:
+        with svc._file_lock():
+            svc._sync()
+            live = next(j for j in svc._jobs if j.id == job_id)
+            live.last_run_ts = time.time() - secs
+            svc._save()
+
+    await asyncio.to_thread(_write)
+
+
 async def _retire_real_timer(svc: CronService) -> None:
     """Make the test's own ``await svc._on_timer()`` calls the only ticks.
 
@@ -232,12 +253,47 @@ class TestCronAdmissionDeferral:
         await asyncio.wait_for(run_task, timeout=5.0)
         await _wait_for(lambda: "gated" in executed)
 
-        # A NEW critical episode logs its own INFO line.
-        job.last_run_ts = time.time() - 120
+        # A NEW critical episode logs its own INFO line. The run's result merge
+        # wrote the store from a worker thread, so backdate the live record.
+        await _backdate_persisted(svc, job.id, 120)
         caplog.clear()
         with caplog.at_level(logging.INFO, logger="kiro_crew.cron"):
             with patch("kiro_crew.cron.admission_check", return_value=_refused()):
                 await svc._on_timer()
+        assert any(
+            "deferring" in r.getMessage() for r in caplog.records if r.levelno == logging.INFO
+        )
+        await svc.stop()
+
+    @pytest.mark.asyncio
+    async def test_a_new_episode_is_logged_when_the_tick_reloads_the_store(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        svc = CronService(base_dir=tmp_path, on_job=AsyncMock())
+        await svc.start()
+        await _retire_real_timer(svc)
+        svc.add_job("gated", "msg", every_secs=60)
+        job_id = svc._jobs[0].id
+        await _backdate_persisted(svc, job_id, 120)
+        with patch("kiro_crew.cron.admission_check", return_value=_admitted()):
+            await svc._on_timer()
+            run_task = svc._claims[job_id].task
+        assert run_task is not None
+        await asyncio.wait_for(run_task, timeout=5.0)
+
+        # Force the next _sync() to reload, the way a failed fingerprint read
+        # after a store write does: every job object is replaced.
+        svc._reset_fingerprint()
+        await _backdate_persisted(svc, job_id, 120)
+        svc._reset_fingerprint()
+        before = svc._jobs[0]
+
+        caplog.clear()
+        with caplog.at_level(logging.INFO, logger="kiro_crew.cron"):
+            with patch("kiro_crew.cron.admission_check", return_value=_refused()):
+                await svc._on_timer()
+        assert svc._jobs[0] is not before  # the tick really reloaded
+        assert job_id not in svc._claims
         assert any(
             "deferring" in r.getMessage() for r in caplog.records if r.levelno == logging.INFO
         )

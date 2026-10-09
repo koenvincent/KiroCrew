@@ -1086,6 +1086,13 @@ class Backend:
     # loop and (b) outlives shutdown if the process survives SIGKILL, leaking
     # its stderr pipe fd across LRU-eviction churn.
     _stderr_task: Optional[asyncio.Task[None]] = None
+    # The process's start id, read once right after spawn, while nothing can
+    # have reaped it yet. The out-of-band backend record publishes this, not a
+    # fresh read at heartbeat time: by then the backend may have exited and
+    # its pid been handed to an unrelated process, whose start id a fresh read
+    # would publish as this backend's. ``None`` when it could not be read; the
+    # record then carries a bare pid, which no reap signals.
+    start_id: Optional[str] = None
     # Quarantine: no new stubs may attach; kill when refcount drains to 0.
     quarantined: bool = False
     # Ping-gated wedge detection: updated each time the heartbeat ping response
@@ -4729,6 +4736,9 @@ async def spawn_backend(
         if backend_tmp is not None:
             await asyncio.to_thread(sweep_backend_tmp, backend_tmp)
         raise
+    # Read before the first await: the child watcher cannot have reaped the
+    # process yet, so this is the backend's own identity (see Backend.start_id).
+    start_id = platform_compat.get_process_start_id(process.pid)
     if process.stdin is None or process.stdout is None:
         # asyncio.create_subprocess_exec populates these whenever PIPE was
         # requested; the guard exists for type checkers. Kill the child on
@@ -4761,6 +4771,7 @@ async def spawn_backend(
     )
     backend._last_ping_response_mono = now  # cold-start: not insta-stale
     backend._stderr_task = stderr_task
+    backend.start_id = start_id
     if backend_tmp is not None:
         # Liveness anchor for the daemon-boot sweep: a SIGKILL'd daemon can
         # leave this backend running (start_new_session), and the next boot

@@ -122,7 +122,10 @@ def _read_pin_strict(cfg: Any, name: str) -> tuple[bool, str | None]:
         # hooks gate refused (symlink/hardlink/containment/sensitive/IO):
         # "exists but cannot be positively read" is a DENY, never "unpinned".
         raise OSError(f"pin file refused by hooks read gate: {env_path}")
-    text = data.decode("utf-8", errors="replace")
+    # A leading UTF-8 byte-order mark (a Windows editor's "UTF-8") would
+    # otherwise ride on the first key, so a CHECKOUT pin on line one reads as
+    # absent -- the same mark ``rt._parse_env_text`` drops.
+    text = data.decode("utf-8", errors="replace").removeprefix("\ufeff")
     for ln in text.splitlines():
         ln = ln.strip()
         if not ln or ln.startswith("#") or "=" not in ln:

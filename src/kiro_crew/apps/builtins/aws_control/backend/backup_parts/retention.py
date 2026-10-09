@@ -17,6 +17,9 @@ from typing import Any
 from kiro_crew.apps.builtins.aws_control.backend import storage
 from kiro_crew.apps.builtins.aws_control.backend.backup_parts import _FACADE_MODULE
 from kiro_crew.apps.builtins.aws_control.backend.backup_parts.catalog import _archive_sort_key
+from kiro_crew.apps.builtins.aws_control.backend.backup_parts.fingerprints import (
+    _is_provable_version_id,
+)
 from kiro_crew.apps.builtins.aws_control.backend.backup_parts.identity import (
     KEY_SEP,
     KIND_SUBPATHS,
@@ -388,11 +391,21 @@ def _current_version_is_ours(rows: list[dict[str, Any]], recorded: str) -> bool:
     be ours, which is the fail-closed end. Note this is the same input that makes
     recovery unavailable, so the two agree rather than merely coinciding.
 
+    The recorded id and the current version's id are each worth comparing only when
+    each identifies ONE version. :func:`_is_provable_version_id` is false for the
+    empty string and for ``"null"`` -- the id S3 gives every object written while the
+    bucket's versioning is SUSPENDED, where an overwrite REPLACES that version rather
+    than adding one, so a co-writer's object and ours both report ``"null"`` at a
+    shared key. Both sides run through it before the equality, the same reading the
+    nightly skip applies, so an unprovable id on either side reads as not-ours rather
+    than letting two ``"null"`` ids compare equal and a foreign object pass as our
+    archive.
+
     It is a question about the CURRENT version rather than the newest-by-timestamp
     one, so a key ordered by `_newest_first` also carries our version as its newest
     -- one rule, not two that can drift.
     """
-    if not recorded:
+    if not _is_provable_version_id(recorded):
         return False
     current = [row for row in rows if row.get("latest")]
     if not current:
@@ -400,7 +413,10 @@ def _current_version_is_ours(rows: list[dict[str, Any]], recorded: str) -> bool:
     row = current[0]
     if row.get("deleteMarker"):
         return False
-    return str(row.get("versionId", "")) == recorded
+    current_id = row.get("versionId", "")
+    if not _is_provable_version_id(current_id):
+        return False
+    return str(current_id) == recorded
 
 
 def _audit_retention(

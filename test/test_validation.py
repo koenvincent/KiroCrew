@@ -265,8 +265,17 @@ class TestValidateField:
         assert validate_field(None, FieldSpec("x", str, default="hi")) == "hi"
 
     def test_wrong_type(self):
+        # validate_field keeps its original contract: a number on a string
+        # field is a plain type error. The int->str repair for a re-typed
+        # numeric-looking string lives ONLY at the MCP tool-call entry points
+        # (see test_validation_numeric_string_coercion.py), not here, so the
+        # dashboard HTTP endpoints that go through this function are unchanged.
         with pytest.raises(ValidationError, match="expected str"):
             validate_field(123, FieldSpec("x", str))
+        with pytest.raises(ValidationError, match="expected str"):
+            validate_field(["a"], FieldSpec("x", str))
+        with pytest.raises(ValidationError, match="expected str"):
+            validate_field({"a": 1}, FieldSpec("x", str))
 
     def test_string_max_len(self):
         with pytest.raises(ValidationError, match="max length"):
@@ -742,8 +751,13 @@ class TestSetProjectSchema:
             validate_tool_args({"path": "relative/path"}, SET_PROJECT_SCHEMA)
 
     def test_non_string_rejected(self):
+        # validate_tool_args does not coerce (coercion is applied only at the
+        # MCP entry point before this call), so a non-string path is a plain
+        # type error here, exactly as before.
         with pytest.raises(ValidationError, match="expected str"):
             validate_tool_args({"path": 42}, SET_PROJECT_SCHEMA)
+        with pytest.raises(ValidationError, match="expected str"):
+            validate_tool_args({"path": ["/abs/path"]}, SET_PROJECT_SCHEMA)
 
     def test_oversized_rejected(self):
         too_long = "/" + "a" * 4096

@@ -197,7 +197,7 @@ Consumes a provider's `AcpEvent` stream and emits abstract `OutputEvent`s to a p
 
 The dashboard does **not** flow through `TurnDriver`; it remains unchanged as the authoritative transcript surface. Direct channel paths that bypass the driver are sanitized at source: Discord's explicit five-message resume replay strips legacy steering frames and summary-bearing compaction notices, shortens each entry to the shared splitter's first (sealed) chunk so a replayed code block cannot arrive with its fence cut in half, and puts the role icon on its own line so the body's first line still starts where the fence grammar needs it; direct compact commands publish only terse receipts. Stored transcripts remain intact for audit.
 
-**Session-directive consumption** — an optional `directive_consumer` callback (`(kind, args) -> awaitable`) makes the driver the channel-side consumer of the stateless session-directive protocol (`session_directive.py`): the trusted `_meta.kiro` identity is resolved by the shared forgery-gate predicate (`session_directive.directive_tool_for(mcp_server_name, tool_name)`, the same single spelling the dashboard consumer uses) and recorded at `EVENT_TOOL_CALL`, and the matching `EVENT_TOOL_RESULT`'s marker is decoded and handed to the consumer — single-consume across result frames, forged markers under any other tool ignored, `encode()` refusals logged, a lost marker on the final frame logged at WARNING. A tool call announced as a NATIVE sub-agent's (`EVENT_SUBAGENT_ACTIVITY` with a `tool_call_id`) is refused with a SEL `denied` audit rather than applied — a child session must never arm/mutate its parent, mirroring the dashboard consumer's isolation. Dispatchers inject `messaging.dispatch.build_directive_consumer(session_key=…, sessions=…, dispatcher=…)`, which funnels into the same `apply_session_directive` core the dashboard consumer uses with `slot=None` (so card-producing dashboard-only directives stay refused for channel turns). Channel `set_project` writes the durable per-conversation project/CWD override; because its tool result arrives while the current provider still owns the turn semaphore, the provider is not killed in place. The next claimant acquires the old semaphore, replaces that provider, and cold-starts in the new CWD before sending its prompt. Legacy prompt loops take effect where the session is nudge-able (`slack:`/`discord:`/`webex:`). Structured monitor creation is narrower: dashboard, Slack, and Discord have typed dispatch plus completion correlation, while Webex is refused before a structured record is armed. On the other seven transports (Telegram, iMessage, Teams, WeCom, Weixin, WhatsApp, Feishu) the applier likewise answers "not supported from this session type" — logged and SEL-audited instead of the old silent drop. Being on either list takes both an admitted binding and the matching fire contract; otherwise a loop can report itself healthy before dying on its first cycle. Without a consumer, directive markers are inert exactly as before.
+**Session-directive consumption** — an optional `directive_consumer` callback (`(kind, args) -> awaitable`, whose awaited value `True` is the structured terminal-turn signal — see "The empty-turn verdict") makes the driver the channel-side consumer of the stateless session-directive protocol (`session_directive.py`): the trusted `_meta.kiro` identity is resolved by the shared forgery-gate predicate (`session_directive.directive_tool_for(mcp_server_name, tool_name)`, the same single spelling the dashboard consumer uses) and recorded at `EVENT_TOOL_CALL`, and the matching `EVENT_TOOL_RESULT`'s marker is decoded and handed to the consumer — single-consume across result frames, forged markers under any other tool ignored, `encode()` refusals logged, a lost marker on the final frame logged at WARNING. A tool call announced as a NATIVE sub-agent's (`EVENT_SUBAGENT_ACTIVITY` with a `tool_call_id`) is refused with a SEL `denied` audit rather than applied — a child session must never arm/mutate its parent, mirroring the dashboard consumer's isolation. Dispatchers inject `messaging.dispatch.build_directive_consumer(session_key=…, sessions=…, dispatcher=…)`, which funnels into the same `apply_session_directive` core the dashboard consumer uses with `slot=None` (so card-producing dashboard-only directives stay refused for channel turns). Channel `set_project` writes the durable per-conversation project/CWD override; because its tool result arrives while the current provider still owns the turn semaphore, the provider is not killed in place. The next claimant acquires the old semaphore, replaces that provider, and cold-starts in the new CWD before sending its prompt. Legacy prompt loops take effect where the session is nudge-able (`slack:`/`discord:`/`webex:`). Structured monitor creation is narrower: dashboard, Slack, and Discord have typed dispatch plus completion correlation, while Webex is refused before a structured record is armed. On the other seven transports (Telegram, iMessage, Teams, WeCom, Weixin, WhatsApp, Feishu) the applier likewise answers "not supported from this session type" — logged and SEL-audited instead of the old silent drop. Being on either list takes both an admitted binding and the matching fire contract; otherwise a loop can report itself healthy before dying on its first cycle. Without a consumer, directive markers are inert exactly as before.
 
 **`run(message) -> str`** — calls `renderer.on_turn_start()`, then translates each provider event into a dispatched `OutputEvent` and returns the accumulated (redacted) assistant text:
 
@@ -350,6 +350,7 @@ and the durable write, so neither files an assistant row the other skipped.
 | `error:*`, after a tool call or reasoning | `EMPTY_TURN_NOTICE_ERROR_AFTER_WORK` — the same label, and the continue remedy: `tool stall` in particular is synthesised only after a tool ran, so its notice can never ask for a resend |
 | stream ended without a terminal | the same flush trio the terminal branch runs (compaction filter, steering filter, stream redactor — the redactor withholds a whole trailing letter run, so a last chunk of `Done` is still in its buffer) runs first, so the verdict reads the real text and a reply that ended in an exhausted stream is delivered and recorded as a reply; only a genuinely textless exhaustion takes `EMPTY_TURN_NOTICE_UNCLOSED`, or `EMPTY_TURN_NOTICE_UNCLOSED_AFTER_WORK` when the turn did work — no `DONE` reached the renderer, so the dispatcher hands it one (`stop_reason="error"`, the verdict riding it) BEFORE it judges delivery: the bubble carries the same sentence the row records, and `delivery_failed` reads the fate of that send rather than a turn that had not yet tried to say anything |
 | `cancelled` | `""` — the cancel is the answer; a notice would contradict it |
+| a terminal directive applied (`TurnDriver.terminal_directive_applied`) | `""` — the quiet end IS the reply. The injected `directive_consumer` answers `True` when the applied directive's structured `DirectiveOutcome.ends_turn` is set (`build_directive_consumer` reads it from `apply_session_directive_outcome`); today no directive reaches it on a channel turn: `ask_question` is refused slot-less, and `nothing_to_do` is refused because the channel driver cannot yet tell a human's message from a loop's wake (`producer_is_channel` with no self-wake provenance) — the conservative answer, so a channel patrol gets the pre-existing notice rather than silence until the driver carries that provenance. A consumer that answers anything else (`None` from an older one) leaves the verdict as it was. Only a CLEAN terminal consults the flag: a `refusal` or an `error:`-family terminal after the directive keeps its notice (`_is_fault_terminal`) because that fault is still the user's to hear, and a stream that ended without a terminal still takes the unclosed notice, because that fault is the transport's, not the model's |
 | any text at all | `""` |
 
 The sentences live in `messaging/empty_turn_copy.py`, and the dashboard runner's
@@ -1673,8 +1674,40 @@ abstraction Slack uses, so one bot serves many parallel, topic-scoped sessions
   collapses **only** direct DMs into the `unified:{agent}` bucket — forum routes
   always keep the full per-Topic key, so no group Topic can share a session with
   a DM or another group.
+- **Private-chat Topics.** Telegram also carries `message_thread_id` in
+  a **1:1 private chat** once direct-message topics are enabled (per-bot in
+  @BotFather). A private chat (`chat_type == "private"`) carrying a truthy
+  `thread_id` folds to a third `chat_type`, `direct_topic`, keyed
+  `telegram:{agent}:direct_topic:{chat_id}:{thread_id}` (the chat_id equals the
+  user id); the threadless General topic keeps the byte-for-byte
+  `direct` DM key, so a user who never enables topics — and their pre-topic
+  history — is unchanged. `direct_topic` is **per-topic isolated and never
+  collapses** under `dm_scope=unified` (only `CHAT_TYPE_DIRECT` collapses), so
+  switching topic switches conversation. It is still a 1:1 DM, so the DM-only
+  **audience** guards (`/kirocrew dashboard`, the host-wide listings in
+  `_require_direct_chat`) treat it as private via `_is_private_route`; but it is
+  deliberately NOT given the owner-DM **session-control** exemption
+  (`session_control.owner_dm_refusal` stays `direct` + a single scope segment, a
+  predicate shared with Discord), the fail-safe default — a private topic can
+  hold a conversation without gaining host-wide session-control authority.
+  Outbound: `may_send_to` authorizes a threaded link whose chat_id is a
+  roster-listed **positive** user id — a private topic, attested by the same
+  `direct_peer_of` the owner-DM predicate uses — so proactive sends (cron,
+  subagent completions, monitor wakes) thread into the topic; a **negative**
+  supergroup chat_id with a thread still routes to the fail-closed
+  `forum_gate_outcome`. `may_resume_from` is **unchanged**: it still refuses any
+  threaded link (`thread_id is None` with a single-owner roster). That predicate
+  governs only the dashboard **mirror-link** target (the outbound binding a
+  dashboard connect may mark `direction: both`), so a private topic is never
+  handed an inbound mirror binding off a multi-user roster. The `/sessions`
+  resume **picker** is a separate path: `TelegramSessionResume.is_owner` keys on
+  the owner's own private chat (`chat_type == "private"`, `user_id == owner_id`,
+  `chat_id == user_id`) and does not inspect the thread, so the owner can open
+  and bind a dashboard-session resume from inside a private topic, keyed on that
+  topic's `(chat_id, thread)` link.
 - **Per-Topic generation.** `ConversationState` is keyed on the same route, so
-  `/new`, idle/daily rotation and `/compact` are scoped to one Topic.
+  `/new`, idle/daily rotation and `/compact` are scoped to one Topic (group OR
+  private-chat).
 - **Gate — fail-closed AND Topic-scoped.** `forum_gate_outcome(chat_type,
   chat_id, message_thread_id, *, allow_forum, allowed_forum_chat_ids)` is the
   single predicate guarding **both** `TelegramTransport.receive` (frozen

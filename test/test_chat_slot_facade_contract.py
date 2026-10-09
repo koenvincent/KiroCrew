@@ -86,7 +86,6 @@ _TO_DICT_KEYS = (
     "memory_mode",
     "forked_from",
     "linked_session_key",
-    "history_key",
     "app",
     "origin",
     "created_by",

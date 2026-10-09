@@ -6329,6 +6329,60 @@ class TestOpenTaskSession:
         await mgr.close_all()
 
     @pytest.mark.asyncio
+    async def test_open_task_session_reserves_key_while_creating(self, cfg):
+        created: list = []
+        mgr = SessionManager(cfg, provider_factory=_run_runtime_factory(created))
+        parent = "taskrunner:run3:runtime"
+        first = "taskrunner:run3:decompose"
+        key = "taskrunner:run3:task0"
+        await mgr.open_task_session(parent, first, agent="kirocrew")
+        runtime = created[0]
+        inner = runtime.create_session.side_effect
+        seen: dict[str, object] = {}
+
+        def observe(**kw):
+            if kw.get("session_key") == key:
+                seen["reserved"] = mgr._has_allocation_reservation(key)
+                seen["listed"] = key in mgr.session_keys()
+                seen["generation"] = mgr.session_generation(key)
+            return inner(**kw)
+
+        runtime.create_session.side_effect = observe
+        before = mgr.session_generation(key)
+        await mgr.open_task_session(parent, key, agent="kirocrew")
+
+        # The create window is visible to the registry, and the reservation is
+        # dropped once the session is registered.
+        assert seen["reserved"] is True
+        assert seen["listed"] is True
+        assert seen["generation"] > before
+        assert not mgr._has_allocation_reservation(key)
+        assert key in mgr._sessions
+        mgr.release(key)
+        mgr.release(first)
+        await mgr.release_subagent_runtime(parent)
+        await mgr.close_all()
+
+    @pytest.mark.asyncio
+    async def test_open_task_session_drops_reservation_when_create_fails(self, cfg):
+        created: list = []
+        mgr = SessionManager(cfg, provider_factory=_run_runtime_factory(created))
+        parent = "taskrunner:run4:runtime"
+        first = "taskrunner:run4:decompose"
+        key = "taskrunner:run4:task0"
+        await mgr.open_task_session(parent, first, agent="kirocrew")
+        created[0].create_session.side_effect = RuntimeError("create failed")
+
+        with pytest.raises(RuntimeError, match="create failed"):
+            await mgr.open_task_session(parent, key, agent="kirocrew")
+
+        assert not mgr._has_allocation_reservation(key)
+        assert key not in mgr.session_keys()
+        mgr.release(first)
+        await mgr.release_subagent_runtime(parent)
+        await mgr.close_all()
+
+    @pytest.mark.asyncio
     async def test_macos_workspace_mismatch_uses_dedicated_provider(self, cfg):
         mgr = SessionManager(cfg, provider_factory=_mock_provider_factory())
         runtime = MagicMock()

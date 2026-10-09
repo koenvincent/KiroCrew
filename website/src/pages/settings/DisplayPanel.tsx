@@ -28,7 +28,9 @@ import {
   useTerminalFont,
   setTerminalFontFamily,
   setTerminalFontSize,
+  setTerminalCursorStyle,
   DEFAULT_TERMINAL_FONT_SIZE,
+  TERMINAL_CURSOR_STYLES,
 } from '../../hooks/useTerminalFont'
 import { FONT_FAMILY_OPTIONS, OPENDYSLEXIC_MONO_FAMILY_NAME } from '../../utils/fontFamilyOptions'
 import { useFontOptions } from '../../hooks/useFontOptions'
@@ -665,6 +667,29 @@ export function DisplayPanel({ basePath }: { basePath?: string } = {}) {
             onIncrement={() => setTerminalFontSize(termFont.fontSize + 1)}
             onDecrement={() => setTerminalFontSize(termFont.fontSize - 1)}
             onReset={() => setTerminalFontSize(DEFAULT_TERMINAL_FONT_SIZE)}
+          />
+          {/* Cursor shape — a per-client xterm render option (not a host
+              setting), so it rides the same localStorage store as the font
+              above and CliPanel's font subscription repaints every open
+              terminal when it changes. Defaults to block so no one's terminal
+              changes unless they ask; bar and underline are the thin cursors
+              the request wanted and most editors use. The option labels are a
+              literal key per branch, never an assembled one, so the catalog
+              reference scanner can see each. */}
+          <SettingsButtonGroup
+            label={i18nT('pages.settings.displayPanel.terminal_cursor_style')}
+            hint={i18nT('pages.settings.displayPanel.terminal_cursor_style_desc')}
+            value={termFont.cursorStyle}
+            options={TERMINAL_CURSOR_STYLES.map(style => ({
+              value: style,
+              label:
+                style === 'block'
+                  ? i18nT('pages.settings.displayPanel.terminal_cursor_style_block')
+                  : style === 'bar'
+                    ? i18nT('pages.settings.displayPanel.terminal_cursor_style_bar')
+                    : i18nT('pages.settings.displayPanel.terminal_cursor_style_underline'),
+            }))}
+            onChange={v => setTerminalCursorStyle(v as (typeof TERMINAL_CURSOR_STYLES)[number])}
           />
           {/* Free text with commit-on-blur, mirroring the font field above: the
               gateway host's installed shells cannot be enumerated from the

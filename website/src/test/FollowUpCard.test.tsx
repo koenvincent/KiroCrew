@@ -95,6 +95,27 @@ describe('FollowUpCard', () => {
     expect(screen.queryByText(/^both actions pre-fill/i)).not.toBeInTheDocument()
   })
 
+  // #17167: a project folder that is not a git repo (the default workspace a
+  // coordination session runs in) used to get an enabled worktree button whose
+  // click the server could only refuse with "Not a git repository".
+  it('disables, demotes and explains the worktree action when the project is not a git repo', () => {
+    const { onStartInWorktree } = setup({ projectIsRepo: false })
+    const worktree = screen.getByRole('button', { name: /start in new worktree/i })
+    expect(worktree).toBeDisabled()
+    expect(worktree.className).not.toContain('bg-accent')
+    fireEvent.click(worktree)
+    expect(onStartInWorktree).not.toHaveBeenCalled()
+    expect(screen.getByRole('button', { name: /add to this session/i })).not.toBeDisabled()
+    expect(screen.getByText(/is not a git repository/i)).toBeInTheDocument()
+    expect(screen.queryByText(/^both actions pre-fill/i)).not.toBeInTheDocument()
+  })
+
+  it('keeps the worktree action enabled while the repo probe is unresolved', () => {
+    // The server stays the backstop; an unknown probe must not suppress a real repo.
+    setup({ projectIsRepo: undefined })
+    expect(screen.getByRole('button', { name: /start in new worktree/i })).not.toBeDisabled()
+  })
+
   it('renders the worktree failure inline instead of throwing', async () => {
     const onStartInWorktree = vi.fn().mockRejectedValue(new Error('Branch already exists: feat/x'))
     setup({ onStartInWorktree })

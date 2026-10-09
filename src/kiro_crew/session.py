@@ -2709,7 +2709,7 @@ class SessionManager:
         Synchronous: raised before the holder's first await, lifted however the
         block ends. :class:`SessionEndingError` reaches a caller only when its
         wait outlives the bound, or from ``open_task_session``, which is refused
-        while the fence is up rather than held (it reserves nothing and creates
+        while the fence is up rather than held (it reserves only around its create
         on a shared runtime).
         """
         boundary = self._allocation_boundary()

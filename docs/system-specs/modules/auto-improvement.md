@@ -425,7 +425,10 @@ caller treats ``""`` as "no push target", so each refusal below fails closed.
    differ, or ``target_url`` is missing or does not validate, there is no push target.
 3. **Local paths stay allowed.** ``/tmp/x.git`` and ``file://`` have no network host to
    redirect to; they are what the app's own tests push to, and a local bare repo is a
-   legitimate offline setup.
+   legitimate offline setup. On Windows a drive path (``C:\work\repo.git`` or
+   ``C:/work/repo.git``) is local too, even though ``urlparse`` reads the drive letter as a
+   scheme. Elsewhere the same text stays refused, because git on POSIX parses ``C:path``
+   as scp-like ssh to a host named ``C``.
 
 With no ``origin_url``, the legacy ``target_url`` is re-validated and its rebuilt clone URL
 is used. The security guidance on untrusted URL destinations asks for exactly this:
@@ -434,6 +437,7 @@ allowlist the destination rather than trust persisted input.
 **Pinned invariants.**
 
 - `resolve_origin_url` host-allowlists a stored `origin_url` (exact host, no `http://`/`git://`, no sentinel); local paths stay allowed. (D-57)
+- A Windows drive path is a local `origin_url` only when running on Windows; on POSIX the same text is ssh to a one-letter host and stays refused (`test_a_drive_shaped_origin_stays_refused_where_git_reads_it_as_ssh`).
 - A network `origin_url` must name the same `owner/repo` as the validated `target_url` (`_remote_slug`); a mismatch or an invalid `target_url` leaves no push target (`test_origin_url_wins_when_present`). (D-138)
 
 ### Why tool approval is one-shot and a queued change is not "filed"

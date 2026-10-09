@@ -345,6 +345,12 @@ _last_startup_race_time: float = 0.0  # no session key or 404 — recovers fast
 # ordinary: a mapping is published mid-window on every warm-pool claim.
 _last_startup_race_key: str = ""
 _failure_count: int = 0
+# Class name of the exception behind the last ``resolution_failed``. A negative
+# cache hit hands it back as the refusal's cause, so the agent and the audit log
+# still name WHY while the long window is answering instead of the gateway.
+_last_failure_class: str = ""
+# Cap on the scrubbed exception message the audit event carries.
+_FAILURE_MESSAGE_MAX = 200
 # Long TTL applies only when the gateway is genuinely unreachable
 # (HTTP errors other than 404, connection refused, timeout).  Kept short
 # (60s) because this window is how long ``tools/call`` keeps REFUSING for a
@@ -395,8 +401,10 @@ class ToolPolicy(NamedTuple):
     gave one -- the ``reason`` field of a ``409 policy_unreadable`` body, which
     names the spec file it could not read and what to do about it. Text only,
     never a decision: nothing reads it but the refusal message, so a caller
-    that ignores it behaves exactly as before it existed. Empty whenever the
-    gateway sent none, which every path other than that 409 does.
+    that ignores it behaves exactly as before it existed. For
+    ``resolution_failed`` it is the class name of the exception that stopped the
+    read (``ConnectionRefusedError``), so the agent sees which failure it hit;
+    the scrubbed message goes only to the audit event. Empty on every other path.
     """
 
     excluded: frozenset[str]
@@ -632,7 +640,7 @@ def _resolve_tool_policy(
     choice available without guessing which tools the operator meant to deny.
     """
     global _last_failure_time, _last_startup_race_time, _last_startup_race_key
-    global _failure_count
+    global _failure_count, _last_failure_class
     # Resolve BEFORE the cache is consulted when the gateway did not name the caller:
     # the entry has to be found under the session this call is for, and only
     # resolution knows which that is. A named caller needs no resolution at all — its
@@ -680,8 +688,9 @@ def _resolve_tool_policy(
             outcome="unresolved",
             source="mcp_shared",
             resources=f"reason={_reason}",
+            error=_last_failure_class if _failure_cached else "",
         )
-        return ToolPolicy(frozenset(), _reason)
+        return ToolPolicy(frozenset(), _reason, _last_failure_class if _failure_cached else "")
 
     try:
         port, _source = resolve_client_port_src(None)
@@ -989,6 +998,7 @@ def _resolve_tool_policy(
         # there is no sibling the window wrongly affects.
         _last_failure_time = time.monotonic()
         _failure_count += 1
+        _last_failure_class = exc.__class__.__name__
         # Suppress repeated warnings — once we've logged twice the operator
         # has all the diagnostic info and further entries flood gateway.log
         # at every MCP server startup (10+ servers × every session start).
@@ -1010,8 +1020,29 @@ def _resolve_tool_policy(
             operation="tool_policy.resolution_failed",
             outcome="unresolved",
             source="mcp_shared",
+            resources=f"error_class={_last_failure_class}",
+            error=_failure_cause(exc),
         )
-        return ToolPolicy(frozenset(), "resolution_failed")
+        return ToolPolicy(frozenset(), "resolution_failed", _last_failure_class)
+
+
+def _failure_cause(exc: BaseException) -> str:
+    """``Class: message`` for an audit event -- redacted, one line, capped.
+
+    The message can carry a URL, a path or a header value, so it goes through
+    the log redactor before it is written. A redactor that cannot run withholds
+    the message and keeps the class: the class alone is what names the cause.
+    """
+    name = exc.__class__.__name__
+    try:
+        from kiro_crew.platform import redact_log_via_context
+
+        message = redact_log_via_context(" ".join(str(exc).split()))
+    except Exception:
+        message = "<withheld: redaction unavailable>"
+    if len(message) > _FAILURE_MESSAGE_MAX:
+        message = message[: _FAILURE_MESSAGE_MAX - 3] + "..."
+    return f"{name}: {message}" if message else name
 
 
 def _resolve_excluded_tools(caller_session: str = "") -> set[str]:
@@ -2042,6 +2073,8 @@ def _run_stdio_dispatch_loop(
                     if _caller_ctx is None and spawned_without_gateway_identity():
                         _refusal += external_client_identity_note(server_name)
                 elif _policy.unresolved == "resolution_failed":
+                    # The exception class only; its message stays in the audit log.
+                    _cause = f" (cause: {_policy.detail})" if _policy.detail else ""
                     # A DIFFERENT diagnosis and a different remedy from the branch
                     # below, which is why it cannot share that text: the gateway was
                     # never reached, so no agent spec is implicated and there is
@@ -2053,7 +2086,7 @@ def _run_stdio_dispatch_loop(
                         f"server could not reach the gateway to read session "
                         f"{_policy_session}'s tool policy (resolution_failed): the "
                         f"read got no answer, or the gateway answered that it is "
-                        f"broken. No agent spec is implicated and nothing needs "
+                        f"broken{_cause}. No agent spec is implicated and nothing needs "
                         f"editing. Refusing the call rather than ignoring an "
                         f"operator's exclusion list; the call succeeds on retry "
                         f"within {_NEGATIVE_CACHE_TTL:.0f}s of the gateway "

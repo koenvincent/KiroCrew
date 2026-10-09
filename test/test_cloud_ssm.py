@@ -107,6 +107,53 @@ class TestOpenPortForward:
         assert captured["stderr"] == subprocess.DEVNULL
         assert captured["start_new_session"] is True
 
+    def test_capture_stdout_pipes_and_drains_into_a_bounded_buffer(self, monkeypatch):
+        # The sibling cloud.connect path opts in to capture so a failed tunnel
+        # can name its cause. stdout is PIPEd (stderr still DEVNULL) and a daemon
+        # thread drains it for the child's whole life, so the pipe never fills.
+        import io
+        import subprocess
+
+        captured: dict = {}
+        notice = b"Exiting session with sessionId: user-0123456789abcdef.\n"
+
+        class _Proc:
+            def __init__(self):
+                self.stdout = io.BytesIO(notice)
+
+        def fake_popen(argv, **kwargs):
+            captured.update(kwargs, argv=argv)
+            return _Proc()
+
+        monkeypatch.setattr(ssm, "require_session_manager_plugin", lambda: None)
+        monkeypatch.setattr(ssm.subprocess, "Popen", fake_popen)
+        proc = ssm.open_port_forward("i-0abc", 5476, 5599, "dev", "us-east-1", capture_stdout=True)
+        assert captured["stdout"] == subprocess.PIPE
+        assert captured["stderr"] == subprocess.DEVNULL
+        # The drain thread exposes a shared buffer and lands the notice at EOF.
+        # The fake stdout is a finite BytesIO, so the drain reaches EOF and the
+        # thread ends on its own; join it to read the result without a sleep.
+        assert hasattr(proc, "stdout_buf")
+        proc.stdout_drain.join(timeout=5)
+        assert not proc.stdout_drain.is_alive()
+        assert "Exiting session" in proc.stdout_buf[0]
+
+    def test_capture_buffer_is_capped(self, monkeypatch):
+        import io
+
+        big = b"x" * (ssm._MAX_FORWARD_STDOUT * 3)
+
+        class _Proc:
+            def __init__(self):
+                self.stdout = io.BytesIO(big)
+
+        monkeypatch.setattr(ssm, "require_session_manager_plugin", lambda: None)
+        monkeypatch.setattr(ssm.subprocess, "Popen", lambda *a, **k: _Proc())
+        proc = ssm.open_port_forward("i-0abc", 5476, 5599, "dev", "us-east-1", capture_stdout=True)
+        proc.stdout_drain.join(timeout=5)
+        assert not proc.stdout_drain.is_alive()
+        assert len(proc.stdout_buf[0]) == ssm._MAX_FORWARD_STDOUT
+
     def test_child_env_can_find_the_session_manager_plugin(self, monkeypatch, tmp_path):
         """The child needs its OWN widened PATH, not just a resolved argv head.
 

@@ -1052,6 +1052,13 @@
       "configKey": "dashboard.terminal.completion.enabled"
     },
     {
+      "id": "display.cursor-style",
+      "label": "Cursor style",
+      "tab": "display",
+      "route": "/settings/display/terminal?highlight=display.cursor-style",
+      "description": "Shape of the terminal cursor. Bar and underline leave the character under it visible."
+    },
+    {
       "id": "display.custom-font",
       "label": "Custom font",
       "tab": "display",
@@ -1597,6 +1604,13 @@
       "route": "/settings/voice?highlight=key%3Astt.polish",
       "description": "Sends the finished text, never the audio, to the AI model you already chat with, which fixes punctuation and capitalisation. Your words are never changed.",
       "configKey": "stt.polish"
+    },
+    {
+      "id": "voice.use-a-key-to-start-dictation",
+      "label": "Use a key to start dictation",
+      "tab": "voice",
+      "route": "/settings/voice?highlight=voice.use-a-key-to-start-dictation",
+      "description": "Turn this off to stop a key from starting dictation — you can still dictate from the microphone button."
     },
     {
       "id": "voice.voice",

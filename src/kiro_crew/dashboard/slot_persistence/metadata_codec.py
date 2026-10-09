@@ -1063,20 +1063,20 @@ FIELDS: tuple[Field, ...] = (
     # target would resurrect a session that can never run.
     Field(
         "executor",
-        frozenset({RESTORE}),
+        frozenset({RESTORE, RECENT}),
         attr="executor",
         line=_if_bound(lambda s: "remote"),
         merge=_if_bound(lambda s: "remote"),
         read=_read_executor,
         why=(
-            "only RESTORE rehydrates the remote binding. RECENT does not, so the "
-            "next full save of a recent-restored remote session clears it (#10826); "
-            "RESUME deliberately does not, and the session comes back local"
+            "both startup restores keep the marker, so an old relay chat comes back "
+            "a read-only archive, never a local chat (#10826); RESUME deliberately "
+            "does not, and the session comes back local"
         ),
     ),
     Field(
         "instance_id",
-        frozenset({RESTORE}),
+        frozenset({RESTORE, RECENT}),
         attr="instance_id",
         line=_if_bound(lambda s: s.instance_id),
         merge=_if_bound(lambda s: s.instance_id),
@@ -1084,7 +1084,7 @@ FIELDS: tuple[Field, ...] = (
     ),
     Field(
         "remote_slot",
-        frozenset({RESTORE}),
+        frozenset({RESTORE, RECENT}),
         attr="remote_slot",
         line=_if_bound(lambda s: s.remote_slot),
         merge=_if_bound(lambda s: s.remote_slot),

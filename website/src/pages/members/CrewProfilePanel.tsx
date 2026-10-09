@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, type HTMLAttributes, type ReactNode } from 'react'
+import { useEffect, useRef, useState, type HTMLAttributes, type ReactNode, type Ref } from 'react'
 import { AnimatePresence, motion, useReducedMotion } from 'framer-motion'
 import { AlarmClock, Brain, ChevronLeft, ChevronRight, Cpu, FolderOpen, Goal, IdCard, NotebookPen, Pencil, Route, Shield, X } from 'lucide-react'
 import { useTranslation } from 'react-i18next'
@@ -12,8 +12,12 @@ import { cn } from '../../lib/utils'
 import ErrorNotice from '../../components/ErrorNotice'
 
 /** The card's four tabs, in strip order (crewmate-panel IA sketch). */
-export const PROFILE_TABS = ['profile', 'schedule', 'sessions', 'goals'] as const
+export const PROFILE_TABS = ['sessions', 'schedule', 'goals', 'profile'] as const
 export type ProfileTab = (typeof PROFILE_TABS)[number]
+/** The head face's side. Exported so the page's face flight can render its
+ *  copy at this size (the larger of the two faces, so the pill-sized end is a
+ *  scale-down and never a blurry scale-up). */
+export const PROFILE_FACE_PX = 84
 
 /** A page the card pushes OVER its tabs (iOS push: one back control pointing at
  *  the card), for the things a tab opens in place: the full description, the
@@ -32,10 +36,14 @@ export interface CrewProfilePanelProps {
   memoryLabel: string
   /** Which tab opens first. */
   initialTab?: ProfileTab
-  /** Shared-layout id for the head face. Set when the card took the header
-   *  pill's place, so the pill's face slides into this one (one face on screen,
-   *  never two); undefined when the pill stays (the card floats beside it). */
-  faceLayoutId?: string
+  /** The head face's element, for the page's face flight (#18236): the page
+   *  measures where this face sits to fly the pill's face into it (and out of
+   *  it again) ABOVE the card, since this face lives inside the card's clipped,
+   *  scrolling body and could never travel there itself. */
+  faceRef?: Ref<HTMLSpanElement>
+  /** Hold the head face's place but paint nothing: the page's flight copy is
+   *  the one face on screen until it lands here. */
+  faceHidden?: boolean
   /** The schedules that wake this crewmate, as the page already reads them. */
   schedules: CronJob[]
   schedulesLoading: boolean
@@ -131,7 +139,7 @@ function Tile({ icon, tone, label, value, title, onClick, testId }: {
 export default function CrewProfilePanel(p: CrewProfilePanelProps) {
   const { t } = useTranslation()
   const reduce = useReducedMotion()
-  const [tab, setTab] = useState<ProfileTab>(p.initialTab ?? 'profile')
+  const [tab, setTab] = useState<ProfileTab>(p.initialTab ?? PROFILE_TABS[0])
   const [pushed, setPushed] = useState<Pushed | null>(null)
   const rootRef = useRef<HTMLDivElement>(null)
   const backRef = useRef<HTMLButtonElement>(null)
@@ -179,11 +187,13 @@ export default function CrewProfilePanel(p: CrewProfilePanelProps) {
     }
   }, [pushed])
 
+  // Strip order = PROFILE_TABS: the work first (what the crewmate is doing,
+  // when it wakes, what it is after), the identity card last.
   const tabs: Array<TablistTab<ProfileTab>> = [
-    { key: 'profile', label: t('pages.membersPage.profile_tab'), icon: <IdCard size={15} aria-hidden="true" /> },
-    { key: 'schedule', label: t('pages.membersPage.schedules_tab'), icon: <AlarmClock size={15} aria-hidden="true" /> },
     { key: 'sessions', label: t('pages.membersPage.profile_sessions_tab'), icon: <Route size={15} aria-hidden="true" /> },
+    { key: 'schedule', label: t('pages.membersPage.schedules_tab'), icon: <AlarmClock size={15} aria-hidden="true" /> },
     { key: 'goals', label: t('pages.membersPage.profile_goals_tab'), icon: <Goal size={15} aria-hidden="true" /> },
+    { key: 'profile', label: t('pages.membersPage.profile_tab'), icon: <IdCard size={15} aria-hidden="true" /> },
   ]
   const pushedTitle = pushed === 'about'
     ? t('pages.membersPage.profile_about')
@@ -212,7 +222,7 @@ export default function CrewProfilePanel(p: CrewProfilePanelProps) {
     >
       {/* Bar: one back control while a page is pushed (pointing at the card), the
           title, and the close. Sticky by construction — only the body scrolls. */}
-      <div className="h-11 shrink-0 flex items-center gap-1 px-2 border-b border-border">
+      <div className="h-11 shrink-0 flex items-center gap-1 px-2">
         {pushed ? (
           <button
             type="button"
@@ -249,17 +259,23 @@ export default function CrewProfilePanel(p: CrewProfilePanelProps) {
           transition={{ duration: 0.22, ease: [0.2, 0.8, 0.2, 1] }}
           {...coveredProps}
         >
-          <div className="relative flex flex-col items-center gap-1.5 pt-5 pb-3 text-center">
-            <motion.span layoutId={p.faceLayoutId} className="flex rounded-full" data-testid="crew-profile-face">
-              <CrewStateAvatar seed={p.member.name} avatar={p.member.avatar} slotKey={p.slotKey} running={p.running} size={84} working="full" />
-            </motion.span>
+          {/* No hairline under the title bar, so the head starts right below it. */}
+          <div className="relative flex flex-col items-center gap-1.5 pt-1 pb-3 text-center">
+            <span
+              ref={p.faceRef}
+              className="flex rounded-full"
+              style={p.faceHidden ? { visibility: 'hidden' } : undefined}
+              data-testid="crew-profile-face"
+            >
+              <CrewStateAvatar seed={p.member.name} avatar={p.member.avatar} slotKey={p.slotKey} running={p.running} size={PROFILE_FACE_PX} working="full" />
+            </span>
             {/* Face and name only: the id, the role and the activity line were
                 dropped from the head (they live in the pill and the editor). */}
             <div className="mt-1 text-[19px] font-bold tracking-tight text-text-strong leading-tight" data-testid="crew-profile-name">{name}</div>
             <button
               type="button"
               onClick={p.onEdit}
-              className="absolute right-0 top-4 w-9 h-9 rounded-full grid place-items-center bg-bg border border-border text-muted hover:text-accent hover:border-accent transition-colors cursor-pointer focus-ring"
+              className="absolute right-0 top-0 w-9 h-9 rounded-full grid place-items-center bg-bg border border-border text-muted hover:text-accent hover:border-accent transition-colors cursor-pointer focus-ring"
               aria-label={t('pages.membersPage.edit_member')}
               title={t('pages.membersPage.edit_member')}
               data-testid="crew-profile-edit"

@@ -1370,7 +1370,7 @@ AUTO_FETCH_BUNDLED = "bundled"
 
 def _ffmpeg_auto_fetch() -> str:
     """Whether this host's decoder can be fetched, and if not, why not."""
-    if platform_compat.is_bundled_interpreter():
+    if stt_decoder.bundle_carries_decoder():
         return AUTO_FETCH_BUNDLED
     if stt_decoder.artifact_for() is None:
         return AUTO_FETCH_UNSUPPORTED
@@ -1897,7 +1897,7 @@ def _stt_prereq_commands(provider: str = "local") -> list[str]:
         command = pip_extra_install_command(extra)
         if command:
             cmds.append(command)
-    if not platform_compat.is_bundled_interpreter():
+    if not stt_decoder.bundle_carries_decoder():
         cmds.extend(_ffmpeg_install_commands())
     return cmds
 

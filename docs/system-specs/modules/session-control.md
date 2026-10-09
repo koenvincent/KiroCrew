@@ -22,7 +22,8 @@ unreachable in production because the caller's `X-Internal-Secret` is ignored.
 | `session_fork` | `POST /api/session-control/fork` | Open a new session that CARRIES a copy of a source session's transcript — the caller's own by default — the way the dashboard's Fork button does; optionally titled, filed, and cut at a fork point |
 | `session_stop` | `POST /api/session-control/stop` | Stop another session's in-flight turn |
 | `session_end_wait` | `POST /api/session-control/end-wait` | Wake a session the caller CREATED from the `wait` tool early, keeping its turn; any other target is refused `not_creator`, for every caller class |
-| `session_set_model` | `POST /api/session-control/set-model` | Record a pending model pick on an idle session; `apply_pending_model_pick` commits it at the start of the target's next turn after re-running `authorize_target` in the same synchronous step. A busy target is refused with `target_busy` and keeps its model |
+| `session_retry` | `POST /api/session-control/retry` | Re-run a failed last turn through `continue_slot_turn`, the Resume button's path, with `require_interrupted=True` (`turn_not_failed` otherwise) and `authorize_target` re-run synchronously under the slot lock before the continuation is queued |
+| `session_set_model` | `POST /api/session-control/set-model` | Record a pending model and/or reasoning-effort pick on an idle session; `apply_pending_model_pick` commits it at the start of the target's next turn after re-running `authorize_target` in the same synchronous step. Each half yields separately to a newer user pick from its own control. A busy target is refused with `target_busy` and keeps its settings |
 | `session_reload` | `POST /api/session-control/reload` | Relaunch the agent process of an idle session the caller created, through `chat_handlers.reload_slot_session` (shared with the tab menu's Reload session). The transcript is kept and gets one notice naming the caller. Self, remote-crew and busy targets (turn running or starting, queued messages, sub-agents) are refused |
 | `session_close` | `POST /api/session-control/close` | Close (archive) another session, as the tab ✕ does — heavier than stop, and recoverable rather than a delete |
 | `session_revive` | `POST /api/session-control/revive` | Bring an archived session back into the live sidebar, as clicking it in the History tab does — the mirror of close, optionally filing it into a folder |
@@ -1048,7 +1049,7 @@ KAS backend the wire agent projection additionally grants the server in
 conductor's set (`_CONDUCTOR_DASHBOARD_GRANTS`: `chat_folder_tree`,
 `chat_folder_create`, `chat_folder_file_self`, `session_create`,
 `session_read_message`, `session_status`) plus `session_send`,
-`session_broadcast` and `session_stop` — the write verbs are safe to auto-approve for a member *specifically* because the
+`session_broadcast`, `session_stop` and `session_retry` — the write verbs are safe to auto-approve for a member *specifically* because the
 `created_by` ownership fence above bounds them to worker sessions the member
 itself opened. Member sessions also bypass the provider warm pool
 (`bypass_member`): a pooled child was spawned with no session key on the

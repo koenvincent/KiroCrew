@@ -390,6 +390,37 @@ class TestApplyEndpoint:
         assert ops == ["mcp_apply_rejected_ambiguous"]
 
     @pytest.mark.asyncio
+    async def test_a_commented_scope_file_is_refused_before_any_write(self, tmp_path, monkeypatch):
+        """Writers emit plain JSON, so a scope file with comments would lose them:
+        the whole batch is a 409 before its first write, and no file changes."""
+        from kiro_crew.dashboard.handlers import mcp as mcp_mod
+
+        mc_path = tmp_path / "kirocrew.mcp.json"
+        kiro_path = tmp_path / "kiro_global.json"
+        mc_path.write_text(json.dumps({"mcpServers": {"srv": {"command": "a"}}}))
+        kiro_path.write_text('{\n  "mcpServers": {\n    // "parked": {"command": "p"}\n  }\n}\n')
+        before = {p: p.read_bytes() for p in (mc_path, kiro_path)}
+        monkeypatch.setattr(mcp_mod, "_KIROCREW_MCP_JSON", mc_path)
+        monkeypatch.setattr(mcp_mod, "_GLOBAL_MCP_JSON", kiro_path)
+        monkeypatch.setattr(mcp_mod, "_extra_mcp_scopes", list)
+        monkeypatch.setattr(mcp_mod, "kiro_agents_dir", lambda: tmp_path / "agents")
+        rebuild = MagicMock()
+        monkeypatch.setattr("kiro_crew.dashboard.handlers.mcp.rebuild_agent_config", rebuild)
+        monkeypatch.setattr(mcp_mod, "sel", lambda: MagicMock())
+
+        request = _make_request(
+            {"changes": [{"name": "srv", "kirocrew": False, "kiroGlobal": True}]}
+        )
+        with pytest.raises(mcp_mod.McpConfigHasComments) as excinfo:
+            await mcp_mod.api_mcp_apply(request)
+
+        assert excinfo.value.status == 409
+        assert json.loads(excinfo.value.text)["code"] == mcp_mod.MCP_CONFIG_HAS_COMMENTS
+        for p, raw in before.items():
+            assert p.read_bytes() == raw, p
+        rebuild.assert_not_called()
+
+    @pytest.mark.asyncio
     async def test_a_config_edited_between_pin_and_purge_changes_nothing_about_the_removal(
         self, tmp_path, monkeypatch
     ):

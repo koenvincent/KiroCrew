@@ -1974,6 +1974,24 @@ class TestStdioLoopCallerIdentity:
         finally:
             harness.close()
 
+    def test_the_unreachable_gateway_refusal_names_the_exception_class(self, monkeypatch):
+        """The agent sees WHICH failure blocked it, not just that one happened."""
+        harness = _LoopHarness(monkeypatch, lambda n, a: "ok")
+        monkeypatch.setattr(
+            mcp_shared,
+            "_resolve_tool_policy",
+            lambda *a, **k: mcp_shared.ToolPolicy(
+                frozenset(), "resolution_failed", "ConnectionRefusedError"
+            ),
+        )
+        try:
+            harness.send(_tools_call_with_caller(57, "echo", "dashboard:chat-17"))
+            assert harness.wait_for(lambda: len(harness.responses) >= 1)
+            body = json.dumps(harness.responses[0][1])
+            assert "(cause: ConnectionRefusedError)" in body
+        finally:
+            harness.close()
+
     def test_the_unreachable_gateway_refusal_names_a_retry_not_a_spec_edit(self, monkeypatch):
         """The refusal has to diagnose the condition it actually hit.
 

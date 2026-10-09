@@ -11,10 +11,11 @@ starts it with the `task_run` tool.
 
 ### Via Dashboard
 
-Open the **Task Runner** page and use **New Task**. Describe the task in plain
-words (**Compose**), paste or upload a spec (**From Spec**), or paste or upload a
-YAML plan (**From YAML**). Then press **Run**, or **Plan** to review the steps
-before they run. The page has no spec-path field; a spec path is accepted by
+Open the **Task Runner** page (in the **Apps** section of the left rail, or press
+**Alt+P** / **Option+P**) and use **New Task**. Describe the task in plain words
+(**Compose**), paste or upload a spec (**From Spec**), or paste or upload a YAML
+plan (**From YAML**). Then press **Run**, or **Plan** to review the steps before
+they run. The page has no spec-path field; a spec path is accepted by
 `kirocrew run`, the `task_run` tool, the `task run` keyword below and
 `POST /api/taskrunner`.
 

@@ -1276,3 +1276,85 @@ class TestExtraRowFields:
             is None
         )
         assert log_home() == []
+
+
+# ---------------------------------------------------------------------------
+# Provider-stamped response metadata on the row
+# ---------------------------------------------------------------------------
+
+
+class _MetaOracle:
+    """A passing oracle that exposes ``last_response_meta`` the way ``JevOracle`` does."""
+
+    def __init__(self, meta):
+        self.last_response_meta = meta
+
+    async def ask(self, state, questions):
+        return {q.id: Answer(id=q.id, value="DUP", p=0.9, confidence=0.8) for q in questions}
+
+
+class TestResponseMetadataOnRow:
+    """``last_response_meta`` from the lane's oracle rides onto the success row."""
+
+    @pytest.mark.asyncio
+    async def test_model_usage_and_request_id_land_on_the_success_row(self, install_impl, log_home):
+        install_impl(
+            _MetaOracle(
+                {
+                    "provider_model": "jev-1.13",
+                    "input_tokens": 312,
+                    "output_tokens": 48,
+                    "request_id": "req_abc",
+                }
+            )
+        )
+        answers = await decide(POINT, {"q": "x"}, QUESTIONS, config=_config())
+        assert answers is not None
+        row = log_home()[0]
+        assert row["provider_model"] == "jev-1.13"
+        assert row["input_tokens"] == 312
+        assert row["output_tokens"] == 48
+        assert row["request_id"] == "req_abc"
+        assert row["answers"] is not None
+
+    @pytest.mark.asyncio
+    async def test_a_lane_that_stamps_no_metadata_writes_a_plain_row(self, install_impl, log_home):
+        """An oracle without the attribute (the LLM judge lane) leaves the row plain."""
+        install_impl(_RecordingOracle())  # no last_response_meta attribute at all
+        answers = await decide(POINT, {"q": "x"}, QUESTIONS, config=_config())
+        assert answers is not None
+        row = log_home()[0]
+        assert "provider_model" not in row
+        assert "request_id" not in row
+
+    @pytest.mark.asyncio
+    async def test_a_none_metadata_adds_nothing(self, install_impl, log_home):
+        install_impl(_MetaOracle(None))
+        await decide(POINT, {"q": "x"}, QUESTIONS, config=_config())
+        row = log_home()[0]
+        assert "provider_model" not in row
+
+    @pytest.mark.asyncio
+    async def test_a_callers_extra_wins_a_name_collision(self, install_impl, log_home):
+        """The point's own field wins; metadata only ever adds, never overwrites."""
+        install_impl(_MetaOracle({"provider_model": "from-provider", "request_id": "req_x"}))
+        await decide(
+            POINT,
+            {"q": "x"},
+            QUESTIONS,
+            config=_config(),
+            extra={"provider_model": "from-point"},
+        )
+        row = log_home()[0]
+        assert row["provider_model"] == "from-point"
+        assert row["request_id"] == "req_x"
+
+    @pytest.mark.asyncio
+    async def test_metadata_does_not_ride_a_failure_row(self, install_impl, log_home):
+        """An error row carries no metadata: the oracle sets it only on success,
+        and a failing oracle never ran the attribute set."""
+        install_impl(_RaisingOracle(RuntimeError("transport")))
+        assert await decide(POINT, {"q": "x"}, QUESTIONS, config=_config()) is None
+        row = log_home()[0]
+        assert row["error"] == gate_mod.ERROR_PROVIDER
+        assert "provider_model" not in row

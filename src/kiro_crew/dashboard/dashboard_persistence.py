@@ -113,13 +113,20 @@ class DashboardPersistenceCoordinator:
         # persists the window itself through its own archival save.
         if getattr(slot, "is_closing", False):
             return
-        if not owner.conversation_log or not slot.messages:
+        if not owner.conversation_log:
             return
         # A queued user prompt is persisted by the metadata line, not by a row,
         # so an enqueue does not make the transcript dirty. Save on either
         # signal: ``_dirty`` for the window, queue drift for the queue.
         if not slot._dirty and not getattr(slot, "queue_persist_pending", False):
             return
+        # A message-less slot has no window to write, but it can still owe a
+        # metadata edit: a newborn from ``session_create`` has a birth line, and
+        # a sidebar color, title or similar edit made before its first message
+        # only marks it dirty. The forced save takes the empty-window merge for
+        # it, which writes into an existing line only, so a plain empty tab
+        # still gets no file.
+        force = not slot.messages
         save_slot_to_history = self._slot_saver_provider()
 
         # Keep the dirty bit true for the whole save. chat_fork treats it as
@@ -140,7 +147,10 @@ class DashboardPersistenceCoordinator:
             # matters here more than elsewhere, because a periodic save is a full
             # metadata rebuild -- it does not request the ``rows_only`` deferral
             # that keeps another holder's folder, title and tag.
-            save_slot_to_history(owner, slot, expected_slot_name=slot.key)
+            if force:
+                save_slot_to_history(owner, slot, expected_slot_name=slot.key, force=True)
+            else:
+                save_slot_to_history(owner, slot, expected_slot_name=slot.key)
         except Exception:
             # A failed write remains owed to the next periodic pass.
             self._logger_provider().warning("Flush failed for slot %s", slot.key, exc_info=True)

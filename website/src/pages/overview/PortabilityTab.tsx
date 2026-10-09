@@ -5,6 +5,7 @@ import SimpleSelect from '../../components/SimpleSelect'
 import ErrorNotice from '../../components/ErrorNotice'
 
 import { i18nT } from '../../i18n/t'
+import { noteStaleOwnerResponse } from '../../api/staleOwnerSignal'
 import { adoptHostUiPrefsOnNextLoad, pauseUiPrefsSync, resumeUiPrefsSync } from '../../lib/uiPrefs'
 
 /**
@@ -250,6 +251,7 @@ export default function PortabilityTab() {
       const resp = await fetch(includeChats ? '/api/portability/export?include_sessions=true' : '/api/portability/export')
       if (!resp.ok) {
         const err = await resp.json().catch(() => ({ error: resp.statusText }))
+        noteStaleOwnerResponse(resp.status, err)
         setExportStatus({ type: 'error', msg: err.error || resp.statusText })
         return
       }
@@ -362,6 +364,7 @@ export default function PortabilityTab() {
           window.location.reload()
         }
       } else {
+        noteStaleOwnerResponse(resp.status, data)
         setImportStatus({
           type: 'error',
           msg: refusalText(resp.status, data, i18nT('pages.overview.portabilityTab.import_failed')),

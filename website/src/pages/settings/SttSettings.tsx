@@ -1,9 +1,11 @@
 import { useState, useEffect, useRef, useCallback } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
+import { Trans } from 'react-i18next'
 import { Download, Sparkles } from 'lucide-react'
 import { SettingsCard, SettingsToggle, SettingsSelect, SettingsInput, SettingsButtonGroup, SettingsSection, SettingsStepper } from '../../components/settings'
 import { Badge, Btn, FormSkeleton } from '../../components/ui'
 import InfoTip from '../../components/InfoTip'
+import { CopyCommand } from '../../components/agentHarness/CopyCommand'
 import { api, ApiError, type AwsConsentStatus } from '../../api/client'
 import { RestartGatewayButton } from './AboutPanel'
 import { listMicrophones, selectableMicrophones, getPreferredMicId, setPreferredMicId, acquireMicStream, reportIfMicDenied, defaultMicName, DEFAULT_PSEUDO_DEVICE_ID } from '../../hooks/mic'
@@ -194,6 +196,11 @@ const DOWNLOAD_STEP_FAILED = 'failed'
 const FFMPEG_STAGE_RUNNING = 'downloading'
 const FFMPEG_STAGE_FAILED = 'failed'
 const FFMPEG_AUTO_FETCH_AVAILABLE = 'available'
+const FFMPEG_AUTO_FETCH_BUNDLED = 'bundled'
+/** `ffmpeg.os` on a macOS gateway (Python's `platform.system()`), compared lowercased. */
+const GATEWAY_OS_MACOS = 'darwin'
+/** Where the Homebrew installer lives, linked from the no-decoder hint. */
+const HOMEBREW_URL = 'https://brew.sh'
 
 /**
  * How often the status endpoint is re-read while a model transfer runs.
@@ -528,7 +535,23 @@ function PushToTalkConfig() {
        The heading's explanation moves inside, where a reader who opened this has
        already said they want it. */
     <SettingsSection title={i18nT('pages.settings.sttSettings.ptt_heading')} collapsible>
-      <p className="text-[12px] text-muted mb-1">{i18nT(headingDescKey)}</p>
+      {/* The intro says the key "works out of the box"; that is only true while
+          the key is on, so once the user opts out it is hidden rather than left
+          claiming the key works. The toggle's own hint covers the off state. */}
+      {cfg.enabled && <p className="text-[12px] text-muted mb-1">{i18nT(headingDescKey)}</p>}
+
+      {/* The off switch. Default ON — the key trigger has always been on, and a
+          T2 fix leaves that default alone — so this is purely an opt-out for the
+          user who keeps triggering recording by accident on the bound modifier.
+          With it off the mic button stays the way in and the rows below have
+          nothing to configure, so they dim rather than vanish: a reader who
+          turned it off can still see WHICH key they turned off. */}
+      <SettingsToggle
+        label={i18nT('pages.settings.sttSettings.ptt_enabled')}
+        hint={i18nT('pages.settings.sttSettings.ptt_enabled_hint')}
+        checked={cfg.enabled}
+        onChange={v => patch({ enabled: v })}
+      />
 
       <SettingsSelect
         label={i18nT('pages.settings.sttSettings.ptt_key')}
@@ -537,6 +560,7 @@ function PushToTalkConfig() {
         options={options}
         optionLabels={optionLabels}
         onChange={code => { if (code !== '__chord__') patch({ binding: { code } }) }}
+        disabled={!cfg.enabled}
       />
 
       {/* Right Alt is AltGr on most non-mac layouts (reports ctrl+alt and
@@ -557,13 +581,14 @@ function PushToTalkConfig() {
         value={cfg.mode}
         options={PTT_MODES.map(m => ({ value: m, label: i18nT(PTT_MODE_LABEL_KEY[m]) }))}
         onChange={v => patch({ mode: v as PttMode })}
+        disabled={!cfg.enabled}
       />
 
       {/* Hidden rather than disabled outside hybrid: the cutoff has no meaning
           at all there. Its description names the mode that uses it, so when it
           IS shown the dependency is explicit rather than inferred from the row
           appearing and disappearing. */}
-      {cfg.mode === 'hybrid' && (
+      {cfg.enabled && cfg.mode === 'hybrid' && (
         <SettingsStepper
           label={i18nT('pages.settings.sttSettings.ptt_hold_threshold')}
           description={i18nT('pages.settings.sttSettings.ptt_hold_threshold_desc')}
@@ -573,17 +598,21 @@ function PushToTalkConfig() {
         />
       )}
 
-      <div className="flex flex-col gap-1.5 py-1.5">
-        <span className="text-[13px] font-semibold text-text">{i18nT('components.pttTestStrip.title')}</span>
-        <span className="text-[12px] text-muted">{i18nT('pages.settings.sttSettings.ptt_try_desc')}</span>
-        <PttTestStrip
-          binding={cfg.binding}
-          mode={cfg.mode}
-          holdMs={cfg.holdMs}
-          modeLabel={modeLabel}
-          fieldLabel={keyFieldLabel}
-        />
-      </div>
+      {/* The test strip listens for the bound key, so it has nothing to show
+          once the trigger is off — hidden rather than dimmed. */}
+      {cfg.enabled && (
+        <div className="flex flex-col gap-1.5 py-1.5">
+          <span className="text-[13px] font-semibold text-text">{i18nT('components.pttTestStrip.title')}</span>
+          <span className="text-[12px] text-muted">{i18nT('pages.settings.sttSettings.ptt_try_desc')}</span>
+          <PttTestStrip
+            binding={cfg.binding}
+            mode={cfg.mode}
+            holdMs={cfg.holdMs}
+            modeLabel={modeLabel}
+            fieldLabel={keyFieldLabel}
+          />
+        </div>
+      )}
     </SettingsSection>
   )
 }
@@ -848,6 +877,10 @@ export default function SttSettings({ cardIndex }: {
   const decoderDownload = ffmpeg?.download
   const decoderDownloading = decoderDownload?.stage === FFMPEG_STAGE_RUNNING
   const decoderFailed = decoderDownload?.stage === FFMPEG_STAGE_FAILED
+  // A Mac desktop release. Of those, only the Intel one reaches the manual route
+  // below (the arm64 one reports `bundled`), and its reader is the one who may
+  // never have used a terminal.
+  const isMacDesktopRelease = !!stt.bundled_interpreter && ffmpeg?.os.toLowerCase() === GATEWAY_OS_MACOS
   // The code is the contract and the sentence is advisory, so the sentence is
   // preferred for a human reader and the code is the fallback when a failure
   // carried no prose.
@@ -1185,10 +1218,13 @@ export default function SttSettings({ cardIndex }: {
           </div>
         )}
 
-        {/* A packaged desktop install owns its decoder. If its authenticated
+        {/* A desktop release that ships a decoder owns it. If its authenticated
             payload is absent or damaged, reinstalling the app is the only
-            supported recovery; the user must not install FFmpeg separately. */}
-        {!!stt.ffmpeg_missing && !!stt.bundled_interpreter && (
+            supported recovery; the user must not install FFmpeg separately.
+            The gateway reports that case as `auto_fetch: bundled`. A release
+            with no decoder for its platform (macOS Intel) reports
+            `unsupported` instead and gets the source-install block below. */}
+        {!!stt.ffmpeg_missing && ffmpeg?.auto_fetch === FFMPEG_AUTO_FETCH_BUNDLED && (
           <div className="mt-2 bg-warn-subtle border border-border rounded-lg p-3 animate-rise">
             <p className="text-sm text-text font-medium">
               {i18nT('pages.settings.sttSettings.the_bundled_audio_decoder_is_missing_or_damaged')}
@@ -1196,7 +1232,8 @@ export default function SttSettings({ cardIndex }: {
           </div>
         )}
 
-        {/* A source install's decoder, and the one thing on this page that used
+        {/* A source install's decoder (and a macOS Intel release's, which carries
+            none), and the one thing on this page that used
             to be a dead end: the panel printed a shell command, and on a
             distribution with no ffmpeg package that command was an `echo` of a
             URL. The gateway can fetch the same digest-verified upstream bytes a
@@ -1206,7 +1243,7 @@ export default function SttSettings({ cardIndex }: {
             Rendered even when Status reads "ready": availability deliberately
             treats the decoder as optional, so a provider can be usable while an
             uploaded WebM cannot be decoded. */}
-        {!stt.bundled_interpreter && ffmpeg && !ffmpeg.present && (
+        {ffmpeg && !ffmpeg.present && ffmpeg.auto_fetch !== FFMPEG_AUTO_FETCH_BUNDLED && (
           <div className="mt-2 bg-warn-subtle border border-border rounded-lg p-3 animate-rise">
             <p className="text-sm text-text font-medium mb-2">
               {i18nT('pages.settings.sttSettings.ffmpeg_is_missing_voice_recordings_from_the_brow')}
@@ -1230,11 +1267,32 @@ export default function SttSettings({ cardIndex }: {
                     command list is the honest answer on a host where no package
                     manager can supply one, so the block renders nothing rather
                     than an instruction that only prints a sentence. */}
-                {ffmpeg.auto_fetch !== FFMPEG_AUTO_FETCH_AVAILABLE && stt.prereqs?.length > 0 &&
-                  stt.prereqs.map((cmd, i) => (
-                    <code key={i} className="block bg-bg-elevated rounded px-3 py-1.5 text-[13px] font-mono text-accent mb-1 select-all">{cmd}</code>
-                  ))
-                }
+                {ffmpeg.auto_fetch !== FFMPEG_AUTO_FETCH_AVAILABLE && stt.prereqs?.length > 0 && (
+                  <>
+                    {/* A Mac desktop release that ships no decoder lands here too, and its
+                        reader may never have used a terminal or Homebrew: say why the app
+                        needs this and where the command goes, before the command itself. */}
+                    {isMacDesktopRelease && (
+                      <p className="text-sm text-text mb-1.5">
+                        <Trans
+                          i18nKey="pages.settings.sttSettings.desktop_app_ships_no_decoder_homebrew_hint"
+                          components={[
+                            // eslint-disable-next-line jsx-a11y/anchor-has-content, jsx-a11y/control-has-associated-label
+                            <a key="homebrew" href={HOMEBREW_URL} target="_blank" rel="noopener noreferrer" className="text-accent hover:underline" />,
+                          ]}
+                        />
+                      </p>
+                    )}
+                    {/* That reader is told to copy the command, so it copies in one click,
+                        through the shared block the voice-disabled modal and Agent Harness
+                        use for install commands. A source install keeps the bare command. */}
+                    {stt.prereqs.map((cmd, i) => isMacDesktopRelease ? (
+                      <CopyCommand key={i}><code>{cmd}</code></CopyCommand>
+                    ) : (
+                      <code key={i} className="block bg-bg-elevated rounded px-3 py-1.5 text-[13px] font-mono text-accent mb-1 select-all">{cmd}</code>
+                    ))}
+                  </>
+                )}
                 {decoderFailed && (
                   // The agent gets the failure, not the user: a digest mismatch
                   // or an unreachable index is not something a settings page can

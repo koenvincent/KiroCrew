@@ -2390,6 +2390,33 @@ def get_shipped_tools() -> dict[str, list[str]]:
     return {k: shipped.get(k, []) for k in ("tools", "allowedTools")}
 
 
+def _claim_propagated_model(config: dict, name: str) -> None:
+    """Record *name*'s model as managed once a published spec carries the global.
+
+    Runs only after the spec write returned, so a write that fails leaves the
+    sidecar as it was. When the spec on disk holds the concrete global model,
+    that value is the propagation's, not a legacy pin: recording it managed is
+    what lets returning the global to "auto" clear it. An explicit pick
+    (``False``) is never claimed, and an unreadable sidecar claims nothing.
+    """
+    from kiro_crew.config.loader import coerce_config_field, normalize_agent_model
+
+    mc_cfg = _load_json(_mc_config_path()) or {}
+    global_model = normalize_agent_model(
+        coerce_config_field(mc_cfg, "agent", dict, {}).get("model")
+    )
+    if not global_model or config.get("model") != global_model:
+        return
+    try:
+        agent_state.claim_model_managed_if_unset(name)
+    except (OSError, ValueError):
+        logger.warning(
+            "Agent state sidecar unreadable; not recording model ownership for %s",
+            name,
+            exc_info=True,
+        )
+
+
 def _load_existing_config(
     path: Path, *, gated_off: "frozenset[str] | None" = None
 ) -> tuple[dict, bool]:
@@ -3741,6 +3768,7 @@ def rebuild_agent_config(
         app_owned_at_start=_app_owned_at_start,
     )
     logger.info("Installed agent config: %s", path)
+    _claim_propagated_model(config, main_name)
 
     # Install KiroCrew AIM capabilities package (includes kirocrew-lite)
     _install_aim_capabilities()
@@ -4686,6 +4714,11 @@ handle immediately.
 #:   and relaunches it. The conversation survives, but a reload is still a
 #:   process-level action on a session a person may be watching, and no
 #:   conductor step needs it.
+#: * ``session_retry`` — WITHHELD here, GRANTED to members (below). It sends no
+#:   new text: it re-runs a failed last turn through Resume's path, and it refuses
+#:   any turn that did not fail. But it still starts a turn in a session that is
+#:   not the caller's own, and the conductor has no ownership fence to bound which
+#:   session that is.
 #:
 #: Every withheld verb stays MOUNTED (``@kirocrew-dashboard`` is still in
 #: ``tools``) — it just passes through ``hooks.on_tool_call`` like any ungranted
@@ -4722,10 +4755,18 @@ _CONDUCTOR_DASHBOARD_GRANTS: tuple[str, ...] = (
 #: several targets instead of one. A member telling its whole fleet "the base moved"
 #: is the ordinary case of the dispatch loop these grants exist for, and the
 #: alternative is one approval prompt per worker on an unattended cycle.
+#: ``session_retry`` joins under the same fence and is narrower than
+#: ``session_send``. It runs ``authorize_target`` for the caller, so it reaches
+#: only worker sessions the member opened. It sends no text: the resumed turn is
+#: the one the worker already had, queued without the authenticated-human flag.
+#: And it refuses a turn that finished or was stopped (``turn_not_failed``).
+#: Restarting a worker whose turn timed out is the patrol step the verb exists
+#: for, and that step runs with nobody at the keyboard.
 _MEMBER_DASHBOARD_GRANTS: tuple[str, ...] = _CONDUCTOR_DASHBOARD_GRANTS + (
     "@kirocrew-dashboard/session_send",
     "@kirocrew-dashboard/session_broadcast",
     "@kirocrew-dashboard/session_stop",
+    "@kirocrew-dashboard/session_retry",
 )
 
 
@@ -4894,7 +4935,9 @@ the charter, not the procedure.
 #: patrol loop's own lifecycle (``monitor_*``, ``autonudge_stop``, ``wait``),
 #: the conductor's OWN durable ledger, routing (``select_crew``), and
 #: reporting to the owner (``send_message``, ``send_notification``,
-#: ``ask_question``).
+#: ``ask_question``), and the quiet end of a patrol cycle with nothing to report
+#: (``nothing_to_do``, which mutates nothing and would otherwise prompt on every
+#: quiet wake -- a blocking prompt in place of the noise it removes).
 #: The work-ledger verbs the conductor may call without an approval prompt.
 #: Per tool rather than the whole server, because the worker half is mounted on the
 #: same server and a conductor has no reason to auto-approve a tool whose only
@@ -4982,6 +5025,7 @@ _CONDUCTOR_CORE_GRANTS: tuple[str, ...] = (
     "@kirocrew-core/send_message",
     "@kirocrew-core/send_notification",
     "@kirocrew-core/ask_question",
+    "@kirocrew-core/nothing_to_do",
 )
 
 
@@ -5117,8 +5161,9 @@ instruction with `monitor_update` so every later cycle honors it.
 #: subagents with no human in the loop. What is granted is reads
 #: (``resource_status``, ``list_sessions``, skills), the conductor's OWN
 #: patrol-loop lifecycle (``monitor_*``, ``autonudge_stop``, ``wait``), its
-#: OWN durable ledger, and reporting to the owner (``send_message``,
-#: ``send_notification``, ``ask_question``). ``spawn_run`` — the intervention
+#: OWN durable ledger, reporting to the owner (``send_message``,
+#: ``send_notification``, ``ask_question``), and the quiet end of a patrol
+#: cycle with nothing to report (``nothing_to_do``, which mutates nothing). ``spawn_run`` — the intervention
 #: ladder's read-only inspector — is deliberately NOT here: it starts agent
 #: work from ingested context, so like ``session_send``/``session_stop`` it
 #: stays mounted-but-gated and unattended runs get it from the operator's
@@ -5137,6 +5182,7 @@ _PIPELINE_CONDUCTOR_CORE_GRANTS: tuple[str, ...] = (
     "@kirocrew-core/send_message",
     "@kirocrew-core/send_notification",
     "@kirocrew-core/ask_question",
+    "@kirocrew-core/nothing_to_do",
 )
 
 

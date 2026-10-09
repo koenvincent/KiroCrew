@@ -86,6 +86,10 @@ include it. Unmapped custom agents gain no tools or servers and have an empty
 discovery scope. The added tool uses the managed server declaration without
 adding auto-approval. Native `/agent` mutations are refused with a pointer to Crew's
 agent selector, which updates both the native mode and Crew's template binding.
+A typed `/agent <name>` never reaches that refusal on Crew's own surfaces: the
+dashboard composer, the chat runner (split pane and linked channel threads) and a
+Slack thread each switch through Crew instead (`agent_switch_command.py`; the
+runner and the picker's route share `chat_handlers.switch_slot_agent`).
 Read-only native agent listing/schema commands remain available. Mode activation
 refreshes the view inside the existing derived-spec freshness bracket.
 The reserved core server's command and environment are pinned to the managed
@@ -222,6 +226,10 @@ alias. A launcher nonce under a
 key the set does not know shows up as one view per launch; `kirocrew doctor`
 names each `<server>.<KEY>` whose value differs across one agent's views
 (`census_churning_env_keys`), so the operator can declare it volatile.
+The same list governs the worker-spec freshness gate: a change to a volatile value
+alone neither ends a worker load (`require_unchanged_derived_spec`) nor re-derives
+the `kirocrew-worker.json` mirror. So a key declared volatile must be one the
+launcher writes into every agent spec it manages, the worker's included.
 Views can still differ per
 workspace: a SCOPE_PROJECT agent's prompt path and workspace-local inheritance
 shape the view, so those agents get
@@ -824,6 +832,16 @@ to an empty string before redaction, cache lookup, or event construction. A
 shell-cache hit whose value is `False` sets `shell_classified=True` — it is a
 resolved non-shell call, not a cache miss — and a structured-params cache hit
 sets `raw_params_trusted=True`.
+
+Both transports use `_dispatch.select_tool_title`; the direct client imports
+it as `_select_tool_title`. A confirmed shell call prefers `rawInput.description`,
+then its command, then the SDK title. A sub-agent call identified by a non-blank
+string `rawInput.subagent_type` also prefers its description (for example Claude's
+`Task` tool). Every other non-shell or unclassified call keeps the SDK title; its
+`description` can be a functional argument such as an issue body and is not a
+label. Refinements use cached parameters and `is_shell` when fields are absent,
+including an explicit cached `False`. This display rule does not alter tool
+identity, permission checks, reserved purpose arguments, or the delivered tool input.
 
 The shell cache is written **only** from a usable backend `kind` string. A
 `tool_call` frame that omits `kind` writes nothing — even when its
@@ -3087,8 +3105,20 @@ names, allocated before the sandbox wrap and reclaimed by
 `agent_scratch.sweep_dead_scratch` once the process is dead -- so no new tree,
 lock or slot exists. Only the databases move: config, auth and the thread
 rollouts stay in `CODEX_HOME`, and a thread resumes from its rollout (measured on
-codex 0.159), so `spawn_continue` works across runtimes; a fresh home rebuilds
-its index on first start, an accepted cost. A value the operator set, or one a
-cron or workflow `extra_env` carries, reaches the child as set. Without a scratch
-directory nothing is set and one warning is logged: the child gets codex's shared
-default rather than a refused spawn.
+codex 0.159), so `spawn_continue` works across runtimes. A value the operator
+set, or one a cron or workflow `extra_env` carries, reaches the child as set.
+Without a scratch directory nothing is set and one warning is logged: the child
+gets codex's shared default rather than a refused spawn.
+
+The rebuild cost is paid on every start, not once. The scratch directory lives
+and dies with its process, so each new chat, resume, subagent, cron run and
+knowledge worker that starts Codex begins on an empty database home and rebuilds
+codex's index from the rollouts in `CODEX_HOME`. The cost scales with the
+user's Codex history: reported on codex 0.159 with about 3,200 threads (7.5 GB
+of rollouts), `initialize` took about 60 s and wrote about 400 MB per runtime,
+against 0.2 s on the shared home. On that host dashboard model discovery for a
+Codex crew gave up before `initialize` answered, so the model picker offered
+only `auto`. The operator workaround is to set `CODEX_SQLITE_HOME` in the gateway's
+own environment (for a systemd user unit, `Environment=CODEX_SQLITE_HOME=%h/.codex`
+in a drop-in), which restores the shared, warm index and gives up the isolation
+from other `codex app-server` processes that this section exists for.

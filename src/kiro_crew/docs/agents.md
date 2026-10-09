@@ -30,11 +30,17 @@ The generated default configuration is `~/.kiro/agents/kirocrew.json`. Its shipp
 !ta code-reviewer        # this thread uses code-reviewer
 !ta off                  # remove thread override
 !ta                      # show current thread agent
+/agent code-reviewer     # same as !ta code-reviewer (owner only)
 ```
 
 ### Per-Tab (Dashboard)
 
-Use the agent selector dropdown in the chat topbar or welcome screen.
+Use the agent selector dropdown in the chat topbar or welcome screen, or type
+`/agent <name>` in the chat: it makes the same switch as the selector, and a name
+no agent answers to is refused rather than silently running the default agent.
+The same command works in a Slack thread linked to a dashboard chat (it switches
+that chat's agent). `/agent list` and kiro-cli's other `/agent` subcommands are
+passed through unchanged.
 
 ### Per-Cron Job
 
@@ -103,7 +109,7 @@ What differs from a JSON agent:
 
 Each agent template can be given its own set of [skills](skills.md). Open **Customize → Crewmates**, select a crewmate, open its **Built from** pane, and use the **Skills** section to add or remove them. Every edit saves immediately.
 
-Under the hood a mapped skill is a `skill://` entry in the agent's `resources`, so kiro-cli loads it natively when the agent starts:
+Under the hood a mapped skill is a `skill://` entry in the agent's `resources`. Kiro Crew reads that entry to scope the agent's skill directory and its `skill_search`/read access; it does not rely on the native backend loading `skill://` resources. Native launch views carry no `skill://` resources (see `src/kiro_crew/acp/skill_projection.py`), and Kiro Crew supplies the skill directory itself:
 
 ```json
 {

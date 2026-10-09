@@ -50,6 +50,10 @@ vi.mock('../components/settingRef/useConfigSchema', () => ({
     new Map([['agent.acp_backend', { path: 'agent.acp_backend', type: 'enum', enum: ['', 'claude', 'kas'] }]]),
 }))
 
+// The run cards beside the switch (Subagent Settings + Warm Pool) read a config
+// shape this suite does not seed; they are pinned in CfgTabCoverage.test.tsx.
+vi.mock('../pages/overview/KiroCrewCfgTab', () => ({ AgentRunSettings: () => <div /> }))
+
 // Settings panels: heavy and irrelevant here.
 vi.mock('../pages/settings/OverviewPanel', () => ({ OverviewPanel: () => <div data-testid="overview-panel" /> }))
 vi.mock('../pages/settings/ChatPanel', () => ({ ChatPanel: () => <div data-testid="chat-panel" /> }))

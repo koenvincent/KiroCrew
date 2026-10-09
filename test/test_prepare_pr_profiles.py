@@ -162,7 +162,14 @@ def test_cli_without_base_ref_pins_to_the_remote_default_branch(tmp_path, monkey
     _git(upstream, "add", ".prepare-pr.toml")
     _git(upstream, "commit", "-qm", "base")
     clone = tmp_path / "clone"
-    _git(tmp_path, "clone", "-q", str(upstream), str(clone))
+    # ``--no-local`` forces the ordinary pack-transfer path instead of git's
+    # same-filesystem clone optimization, which hardlinks/copies pack files into
+    # ``clone/.git/objects/pack/`` via a ``.tmp-*-pack`` staging file. On a
+    # shared CI runner's ``/tmp`` that cross-directory copy raced a basetemp
+    # reaper and failed ``git clone`` with exit 128 ("failed to copy file to
+    # '.../.tmp-*-pack': No such file or directory"), flaking this test. The
+    # transfer path builds the object store in place and does not do that copy.
+    _git(tmp_path, "clone", "-q", "--no-local", str(upstream), str(clone))
     (clone / ".prepare-pr.toml").write_text("[project]\nsingle_commit = false\n")
 
     # The script as a process, from the clone it is handed rather than from

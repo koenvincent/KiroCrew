@@ -1628,8 +1628,55 @@ class SessionTree:
             )
 
 
+def _nearest_open_ancestor(
+    node: TreeNode,
+    live_key_of: Mapping[str, str],
+    own_key: str,
+    nodes: Mapping[str, TreeNode],
+) -> str | None:
+    """The live key of the nearest OPEN ancestor above *node*'s closed creator, or ``None``.
+
+    Called only once the creator itself answered no live key. The walk steps up the
+    citations the fold already holds -- a closed session's records stay in the
+    projection, which only a retention removal drops -- and stops at the first slot
+    that has one.
+
+    Three ways it answers ``None``, and each is a real tree rather than a defect: a
+    chain whose every member is closed, a chain that leaves the fold (a creator whose
+    own log is past :data:`TREE_UNIT_CAP` or was never admitted), and a chain that
+    reaches this row again. A ``None`` here keeps the base answer, so every one of them
+    renders the orphan the surface drew before this walk existed.
+
+    Bounded twice over. ``seen`` is the real terminator -- a citation chain visits each
+    slot once, so it stops at the chain's own length -- and the hop ceiling is
+    :data:`TREE_UNIT_CAP`, which is already the most records a scan holds and therefore
+    the most slots any chain can run through. A node marked ``cycle`` is not followed,
+    the same refusal :func:`parent_payload` applies to the child's own node.
+    """
+    seen = {node.slot}
+    cursor: str | None = node.parent_slot
+    for _ in range(TREE_UNIT_CAP):
+        if cursor is None or cursor in seen:
+            return None
+        seen.add(cursor)
+        up = nodes.get(cursor)
+        if up is None or up.cycle or up.parent_slot is None:
+            return None
+        key = live_key_of.get(up.parent_slot)
+        if key == own_key:
+            # The chain leads back to this row, which is not an edge it can nest on.
+            return None
+        if key is not None:
+            return key
+        cursor = up.parent_slot
+    return None
+
+
 def parent_payload(
-    node: TreeNode | None, live_key_of: Mapping[str, str], own_key: str
+    node: TreeNode | None,
+    live_key_of: Mapping[str, str],
+    own_key: str,
+    nodes: Mapping[str, TreeNode] | None = None,
 ) -> dict[str, Any] | None:
     """The ``parent`` a session row carries on the wire, or ``None``.
 
@@ -1640,10 +1687,34 @@ def parent_payload(
     creator is not running (the child stays a root), when the node sits on a
     cycle, and when the citation would point at the row itself. ``slot`` is the
     child's own citation and survives all of those.
+
+    *nodes* is the fold the caller read, and it is what lets a child whose own creator
+    is CLOSED nest under the nearest ancestor that is still open: a lead opens a
+    conductor, the conductor opens three workers, the conductor is closed, and the
+    workers belong under the lead rather than at the top level pretending nobody owns
+    the run. ``ancestor`` is then ``True`` and ``key`` names that ancestor instead of
+    the creator -- the one case where the two differ, so a surface nesting on ``key``
+    still knows to read ``slot`` as a creator that is gone. Omitted, never ``False``,
+    so an ordinary edge is the same payload it has always been.
+
+    Passing no *nodes* is the base answer and the whole of it: the creator is live or
+    the row is a root. Only a caller that holds a fold can offer the walk, and the two
+    that do (both halves of :func:`~kiro_crew.dashboard.session_memory.lineage_parents`)
+    pass the one they read.
     """
     if node is None or node.parent_slot is None:
         return None
+    if node.cycle:
+        return {"slot": node.parent_slot, "key": None}
     parent_key = live_key_of.get(node.parent_slot)
-    if node.cycle or parent_key == own_key:
-        parent_key = None
-    return {"slot": node.parent_slot, "key": parent_key}
+    if parent_key == own_key:
+        # A citation pointing at the row itself is not an edge, and neither is the
+        # chain above it: walking on would nest the row under its own descendant.
+        return {"slot": node.parent_slot, "key": None}
+    if parent_key is not None:
+        return {"slot": node.parent_slot, "key": parent_key}
+    if nodes:
+        ancestor_key = _nearest_open_ancestor(node, live_key_of, own_key, nodes)
+        if ancestor_key is not None:
+            return {"slot": node.parent_slot, "key": ancestor_key, "ancestor": True}
+    return {"slot": node.parent_slot, "key": None}

@@ -497,6 +497,33 @@ def test_a_removed_lead_re_states_its_pending_child_as_orphaned(state):
     assert [{"key": "worker-b", "parent": {"slot": "lead", "key": None}}] in ws.patches()
 
 
+def test_a_removed_conductor_re_states_its_workers_under_the_lead(state):
+    """The close that re-parents: a lead, a conductor under it, two workers under the
+    conductor, and the conductor goes.
+
+    The removal patch must carry the workers' NEW parent -- the lead, with
+    ``ancestor`` -- and not only rows whose key went null. Left out, the client keeps
+    the closed conductor's key and every worker renders top-level with the orphan
+    glyph until a full frame arrives.
+    """
+    for key in ("lead", "worker-a", "worker-b"):
+        state.get_or_create_slot(key, origin=SlotOrigin.USER)
+    ws = _WS()
+    state.register_ws(ws)  # type: ignore[arg-type]
+    _opened_log("s-lead", "lead")
+    _opened_log("s-mid", "mid", parent="lead")
+    _opened_log("s-a", "worker-a", parent="mid")
+    _opened_log("s-b", "worker-b", parent="mid")
+    stp.projection().ensure_seeded()
+
+    state.push_slot_removed("mid")
+
+    moved = {row["key"]: row["parent"] for frame in ws.patches() for row in frame}
+    under_lead = {"slot": "mid", "key": "lead", "ancestor": True}
+    assert moved["worker-a"] == under_lead
+    assert moved["worker-b"] == under_lead
+
+
 def test_the_publisher_coalesces_a_burst_into_one_push():
     from kiro_crew.dashboard.handlers.crew_log import COALESCE_SECONDS, CrewLogPublisher
 

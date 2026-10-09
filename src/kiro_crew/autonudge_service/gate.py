@@ -63,6 +63,64 @@ _MAX_QUIET_STREAK = 10
 #: the one that drifted would be the one nobody reads.
 _JUDGE_QUIET_STREAK_FLOOR_DEFAULT = _MAX_QUIET_STREAK
 
+#: Quiet ticks before a work-ledger watch's floor turn when no worker has reported
+#: since the last delivered turn: four times the shipped floor. A floor turn then
+#: re-reads a long conductor chat to find the board as the conductor left it, since
+#: a worker's report and a stalled worker are WAKEs the probe raises on its own. The
+#: longer floor still DELIVERS, so silence stays bounded -- which also covers a
+#: stall the probe's rate limit folded forward without waking.
+_IDLE_LEDGER_QUIET_FLOOR = 4 * _MAX_QUIET_STREAK
+
+
+def _quiet_floor(loop: NudgeLoop, monitor: MonitorState) -> int:
+    """Quiet ticks before this monitor's floor turn.
+
+    The shipped floor, except for a work-ledger watch whose ledger is idle (see
+    :func:`_ledger_is_idle`), which waits :data:`_IDLE_LEDGER_QUIET_FLOOR`.
+    Re-read every tick, so a worker report landing mid-streak puts the floor back
+    to the shipped length at once.
+    """
+    if _ledger_is_idle(loop, monitor):
+        return _IDLE_LEDGER_QUIET_FLOOR
+    return _MAX_QUIET_STREAK
+
+
+def _note_ledger_revision(monitor: MonitorState, probe: object) -> None:
+    """Keep the revision a work-ledger probe just read.
+
+    A probe that read nothing leaves ``revision`` as ``None``, and that keeps the
+    stored value: no reading is no evidence that the ledger moved or stayed still.
+    """
+    revision = getattr(probe, "revision", None)
+    if isinstance(revision, str):
+        monitor.ledger_revision = revision
+
+
+def _ledger_is_idle(loop: NudgeLoop, monitor: MonitorState) -> bool:
+    """Whether no worker has reported since this work-ledger watch's last delivered turn.
+
+    True only when a turn was delivered at a KNOWN revision and the newest reading
+    is that same revision. An empty value is "not known", which is never idle.
+
+    Never while the loop's own recent turns failed. "Delivered" means dispatched,
+    and a dispatched turn can still fail to start or die mid-run; then the
+    conductor never read the board that revision names, and the shipped floor is
+    the retry that brings it back.
+    """
+    return (
+        monitor.kind == probes.WORK_LEDGER
+        and loop.consecutive_start_failures == 0
+        and loop.consecutive_failed_cycles == 0
+        and bool(monitor.ledger_delivered_revision)
+        and monitor.ledger_revision == monitor.ledger_delivered_revision
+    )
+
+
+def _record_delivered_revision(monitor: MonitorState) -> None:
+    """A turn landed: remember the work-ledger revision it was delivered at."""
+    if monitor.kind == probes.WORK_LEDGER:
+        monitor.ledger_delivered_revision = monitor.ledger_revision
+
 
 async def _commit_judge_pr_seen(
     self: AutoNudgeService,
@@ -519,6 +577,11 @@ async def _monitor_tick_is_quiet(self: AutoNudgeService, loop: NudgeLoop) -> boo
         )
         return False
 
+    if monitor.kind == probes.WORK_LEDGER:
+        # Read only after the binding check above, so a reading of an old subject
+        # is never kept for a new one.
+        _note_ledger_revision(monitor, probe)
+
     # THE one deterministic mapping, and it lives here rather than in the reader
     # or the judge. The reader fetches and judges nothing; the judge reads prose
     # a third party wrote, so it must never be able to end a watch. Ending one is
@@ -877,7 +940,7 @@ async def _monitor_tick_is_quiet(self: AutoNudgeService, loop: NudgeLoop) -> boo
         monitor.quiet_ticks += 1
         monitor.quiet_streak += 1
         monitor.last_observed_at = time.time()
-        if monitor.quiet_streak >= _MAX_QUIET_STREAK:
+        if monitor.quiet_streak >= _quiet_floor(loop, monitor):
             # Floor reached: deliver anyway. The gate can only see the
             # SUBJECT, and a loop whose duty is to act while the subject is
             # quiet -- refresh a heartbeat, chase a silent reviewer, rebase
@@ -918,7 +981,7 @@ async def _monitor_tick_is_quiet(self: AutoNudgeService, loop: NudgeLoop) -> boo
             logger.info(
                 "AutoNudge: loop %s hit the quiet-streak floor after %d quiet ticks",
                 loop.id,
-                _MAX_QUIET_STREAK,
+                _quiet_floor(loop, monitor),
             )
             # Persisted AFTER the reset, not before it: a restart reading a
             # streak that was never reset would deliver one extra turn and

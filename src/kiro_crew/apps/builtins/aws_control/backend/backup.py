@@ -162,7 +162,9 @@ from pathlib import Path
 from types import ModuleType as _ModuleType
 from typing import IO, Any, NamedTuple, Optional
 
-from kiro_crew import hooks, snapshot
+from kiro_crew import hooks
+from kiro_crew import platform_compat as _platform_compat
+from kiro_crew import snapshot
 from kiro_crew.apps.builtins.aws_control.backend import accounts as accounts_mod
 from kiro_crew.apps.builtins.aws_control.backend import storage
 from kiro_crew.apps.builtins.aws_control.backend.backup_parts.egress_text import (
@@ -314,12 +316,65 @@ def _publish_label(
         )
 
 
+def _open_pinned_archive_fd(staging: Path, dir_fd: int, name: str) -> int:
+    """Open an EXISTING ``name`` under *dir_fd* and prove it is a file of its own.
+
+    Both backup kinds build their archive BY NAME in the pinned staging directory --
+    ``snapshot_main`` / :func:`snapshot.prepare_redacted_copy` for the snapshot, the
+    tar for the sessions archive -- so the earliest a run can take hold of the file is
+    after it exists. The three checks (``O_NOFOLLOW`` + ``S_ISREG`` + ``st_nlink ==
+    1`` + owner) are taken here so the fingerprints and the upload share one
+    already-proven descriptor.
+
+    *staging* is the directory the descriptor pins, consulted only where ``os.open``
+    cannot take a ``dir_fd`` -- which on a real host means Windows. Both backup kinds
+    reach this helper: the snapshot path pins the file ``snapshot_main`` wrote, and
+    the sessions path pins the tar it just built in :func:`storage.pinned_staging`.
+    On Windows (no ``dir_fd``) the ``staging``-relative arm opens the name with a
+    reparse-point refusal and a deny-write share, so the file cannot be followed
+    through a link and no other writer can open it while it is read.
+
+    Raises ``OSError`` when the name is a symlink (``O_NOFOLLOW``) and
+    ``ValueError`` when the descriptor is not a singly-named regular file owned by
+    this process.
+    """
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0)
+    if _platform_compat.IS_POSIX:
+        flags |= getattr(os, "O_NONBLOCK", 0)
+    if os.open in os.supports_dir_fd:
+        fd = os.open(name, flags, dir_fd=dir_fd)
+    else:
+        # Windows (and any platform with no ``dir_fd`` support). The payload was
+        # created and closed in the pinned staging directory before this runs; the
+        # reparse-point refusal + deny-write here opens that existing name without
+        # following a link and without letting another writer in while it is read.
+        # The pinned directory handle holds the path itself (a pinned directory can
+        # be neither renamed nor deleted), so the name cannot be re-pointed between
+        # the build and this open.
+        fd = _platform_compat.open_file_no_reparse(
+            os.path.join(str(staging), name), deny_write=True
+        )
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode):
+            raise ValueError("the staged archive is not a regular file")
+        if info.st_nlink != 1:
+            raise ValueError("the staged archive has more than one name")
+        if not _platform_compat.stat_owned_by_current_user(info):
+            raise ValueError("the staged archive is owned by another user")
+    except Exception:
+        os.close(fd)
+        raise
+    return fd
+
+
 def run_snapshot_backup(
     account: str, profile: str, region: str, bucket: str, *, caller: str
 ) -> dict[str, Any]:
     """Build a snapshot archive and push it. Returns the run record."""
     identity = install_identity()
-    with tempfile.TemporaryDirectory(prefix="kc-backup-") as tmp:
+    with storage.pinned_staging("kc-backup-") as (tmp_dir, dir_fd):
+        tmp = str(tmp_dir)
         rc = snapshot_main([tmp, "--keep", "1"])
         if rc != 0:
             raise RuntimeError(f"snapshot build failed (rc={rc})")
@@ -341,75 +396,106 @@ def run_snapshot_backup(
         # redacted copy never outlives the push.
         redacted = snapshot.prepare_redacted_copy(archive, Path(tmp), list(snapshot.COMPONENTS))
         payload = redacted or archive
-        # Does this archive carry anything the drive does not already hold? Taken over
-        # the PAYLOAD, so it is the bytes that would actually leave that are compared --
-        # a redaction switch flipped since the last run changes those without the source
-        # tree moving, and this notices.
-        #
-        # Placed BEFORE `_authorize_upload` deliberately. The gate's contract is that it
-        # sits immediately before the PUT with nothing in between, so a decision that
-        # can end the run has to be taken on this side of it; and a run that is about to
-        # send nothing has no upload to authorize in the first place.
-        tree = _tree_fingerprint(payload, volatile_root=True)
-        baseline = _unchanged_baseline(
-            account, KIND_SNAPSHOT, tree, profile, region, bucket, caller=caller
-        )
-        if baseline is not None:
-            record = _record_skip(account, KIND_SNAPSHOT, baseline, tree)
-            if record is not None:
+        # Take hold of the payload ONCE, and read nothing by name afterwards. Both
+        # files here are created by another module (``snapshot_main`` and
+        # ``prepare_redacted_copy``), so the earliest this run can pin one is now --
+        # but from here the entry-set digest, the size, the body digest and the AWS
+        # CLI's body all come from this descriptor. A name resolved once per step in
+        # a directory a same-UID process can write is a different answer per step,
+        # and a file swapped between two of them makes the upload carry bytes
+        # nothing measured. ``_open_pinned_archive_fd`` also refuses a link or a
+        # multiply-named file AT the name, which is what a bundle replaced before
+        # this point would be.
+        verified_fd = _open_pinned_archive_fd(tmp_dir, dir_fd, payload.name)
+        # The snapshot body is a NAMED on-disk file ``snapshot_main`` /
+        # ``prepare_redacted_copy`` write, so it is held by pinning its INODE
+        # (``_open_pinned_archive_fd``: O_NOFOLLOW + S_ISREG + st_nlink == 1 + owner),
+        # plus a deny-write open on Windows and the post-transfer ``_assert_same_file``
+        # inode backstop. The size, both fingerprints and the upload all read THIS one
+        # descriptor, so no step re-resolves the name. Its CONTENT is not held
+        # unrewritable in place: a same-UID writer the staging census cannot see could
+        # rewrite the file before the transfer finishes. Holding the content for the
+        # whole transfer needs the producer to write into a descriptor it never lets a
+        # name reach, which this inode pin does not provide for either kind.
+        payload_fd = verified_fd
+        try:
+            # Does this archive carry anything the drive does not already hold? Taken
+            # over the PAYLOAD, so it is the bytes that would actually leave that are
+            # compared -- a redaction switch flipped since the last run changes those
+            # without the source tree moving, and this notices.
+            #
+            # Placed BEFORE `_authorize_upload` deliberately. The gate's contract is
+            # that it sits immediately before the PUT with nothing in between, so a
+            # decision that can end the run has to be taken on this side of it; and a
+            # run that is about to send nothing has no upload to authorize in the
+            # first place.
+            tree = _tree_fingerprint(payload, volatile_root=True, fd=payload_fd)
+            baseline = _unchanged_baseline(
+                account, KIND_SNAPSHOT, tree, profile, region, bucket, caller=caller
+            )
+            if baseline is not None:
+                record = _record_skip(account, KIND_SNAPSHOT, baseline, tree)
+                if record is not None:
+                    logger.info(
+                        "aws-control: snapshot backup for %s found the tree unchanged since "
+                        "the archive already in the drive, so it uploaded nothing",
+                        account,
+                    )
+                    # No label publish and no retention sweep. Both exist to follow a
+                    # push: a local rename reaches the drive on the next real upload
+                    # rather than on this skip, and retention retires copies by count --
+                    # running it here would let a stretch of unchanged nights walk the
+                    # keep window down and delete the very archive the next skip has to
+                    # prove is present.
+                    return record
                 logger.info(
-                    "aws-control: snapshot backup for %s found the tree unchanged since the "
-                    "archive already in the drive, so it uploaded nothing",
+                    "aws-control: snapshot backup for %s could not record its skip because "
+                    "the recorded baseline moved while the archive was being built, so it "
+                    "is uploading a full copy",
                     account,
                 )
-                # No label publish and no retention sweep. Both exist to follow a push:
-                # a local rename reaches the drive on the next real upload rather than
-                # on this skip, and retention retires copies by count -- running it here
-                # would let a stretch of unchanged nights walk the keep window down and
-                # delete the very archive the next skip has to prove is present.
-                return record
-            logger.info(
-                "aws-control: snapshot backup for %s could not record its skip because "
-                "the recorded baseline moved while the archive was being built, so it "
-                "is uploading a full copy",
-                account,
+            # snapshot_main names by second-resolution timestamp; a racing pair
+            # would collide on the key, so the pushed key carries its own
+            # entropy (the _stamp shape) rather than trusting the file name.
+            #
+            # The install id is a SEPARATE segment rather than more characters in the
+            # file name, and the shape is what buys the listing its answer: one
+            # delimited list of ``snapshots/`` returns the id of every install writing
+            # here as a folder AND the pre-namespace archives as files, so "whose is
+            # this" and "is another install writing here" come back together. An id
+            # folded into the name would need the whole prefix walked to learn either.
+            key = (
+                f"{KIND_SUBPATHS[KIND_SNAPSHOT]}/{identity['id']}/"
+                f"kirocrew-snapshot-{_stamp()}.tar.gz"
             )
-        # snapshot_main names by second-resolution timestamp; a racing pair
-        # would collide on the key, so the pushed key carries its own
-        # entropy (the _stamp shape) rather than trusting the file name.
-        #
-        # The install id is a SEPARATE segment rather than more characters in the
-        # file name, and the shape is what buys the listing its answer: one
-        # delimited list of ``snapshots/`` returns the id of every install writing
-        # here as a folder AND the pre-namespace archives as files, so "whose is
-        # this" and "is another install writing here" come back together. An id
-        # folded into the name would need the whole prefix walked to learn either.
-        key = f"{KIND_SUBPATHS[KIND_SNAPSHOT]}/{identity['id']}/kirocrew-snapshot-{_stamp()}.tar.gz"
-        # The gate sits IMMEDIATELY before the archive PUT with nothing in
-        # between -- no other network call, no second upload -- so the decision
-        # that authorizes these bytes cannot go stale before they leave. The
-        # label's own PUT takes its own authorization inside `_publish_label`,
-        # which is why it can safely run afterwards.
-        _authorize_upload(account, profile, region, caller=caller, payload_kind=KIND_SNAPSHOT)
-        version = storage.put_file(
-            profile,
-            region,
-            bucket,
-            "backup",
-            key,
-            str(payload),
-            account=account,
-            timeout=_PUSH_TIMEOUT_SECS,
-        )
-        record = _record_run(
-            account,
-            KIND_SNAPSHOT,
-            key,
-            payload.stat().st_size,
-            _body_fingerprint(payload),
-            version,
-            tree=tree,
-        )
+            # The gate sits IMMEDIATELY before the archive PUT with nothing in
+            # between -- no other network call, no second upload -- so the decision
+            # that authorizes these bytes cannot go stale before they leave. The
+            # label's own PUT takes its own authorization inside `_publish_label`,
+            # which is why it can safely run afterwards.
+            _authorize_upload(account, profile, region, caller=caller, payload_kind=KIND_SNAPSHOT)
+            version = storage.put_file(
+                profile,
+                region,
+                bucket,
+                "backup",
+                key,
+                str(payload),
+                account=account,
+                timeout=_PUSH_TIMEOUT_SECS,
+                body_fd=payload_fd,
+            )
+            record = _record_run(
+                account,
+                KIND_SNAPSHOT,
+                key,
+                os.fstat(payload_fd).st_size,
+                _body_fingerprint(fd=payload_fd),
+                version,
+                tree=tree,
+            )
+        finally:
+            os.close(payload_fd)
         # After the archive and after the ledger write, and with its own
         # authorization: a caption must never delay or endanger the payload.
         _publish_label(account, profile, region, bucket, identity, caller=caller)
@@ -1284,8 +1370,23 @@ def run_sessions_backup(
     # says which of those happened.
     layer_b_scope = "cli" if layer_b and not layer_b_conversations else ""
     _audit_layer_b_decision(account, layer_b, conversations=layer_b_conversations, caller=caller)
-    with tempfile.TemporaryDirectory(prefix="kc-backup-") as tmp:
-        archive = Path(tmp) / f"sessions-{_stamp()}.tar.gz"
+    name = f"sessions-{_stamp()}.tar.gz"
+    # Stage into a private, owner-only directory this app cuts and PINS
+    # (``storage.pinned_staging``: ``mkdtemp`` 0700 under the masked staging root,
+    # then a pinned directory handle), build the tar there by name, and then take
+    # hold of it ONCE through ``_open_pinned_archive_fd``. From that point the
+    # entry-set digest, the size, the body digest and the AWS CLI's body all come
+    # from that one descriptor checked at the point it is taken (O_NOFOLLOW +
+    # S_ISREG + st_nlink == 1 + owner), so no step re-resolves the name. This is the
+    # same hold the snapshot path uses, and it works on every platform the backup
+    # runs on (Linux, macOS, the BSDs, Windows).
+    #
+    # The inode pin fixes WHICH file the descriptor reaches; it does not hold the
+    # file's CONTENT unrewritable in place against a same-UID writer for the whole
+    # transfer. That needs the producer to write the body into a descriptor it never
+    # lets a name reach, which this pin does not provide.
+    with storage.pinned_staging("kc-backup-") as (tmp_dir, dir_fd):
+        archive = tmp_dir / name
         with tarfile.open(archive, "w:gz") as tar:
             count = _add_tree(tar, crew_sessions, "crew")
             # Counted separately because the RECORD below must describe the
@@ -1351,311 +1452,331 @@ def run_sessions_backup(
             count += conversations.rows
         if count == 0 and conversations.members == 0:
             raise RuntimeError("no session files to archive")
-        # `volatile_root=False`: this archive's roots are `crew` and `cli`, which are
-        # meaningful and stable. Only the snapshot bundle carries a timestamped root.
-        tree = _tree_fingerprint(archive, volatile_root=False)
-        baseline = _unchanged_baseline(
-            account, KIND_SESSIONS, tree, profile, region, bucket, caller=caller
-        )
-        if baseline is not None:
-            record = _record_skip(
+        # Take hold of the finished archive ONCE and read nothing by name after.
+        # ``_open_pinned_archive_fd`` opens it O_NOFOLLOW relative to the pinned
+        # staging directory and refuses a symlink, a non-regular file, a hard link,
+        # or a file this process does not own -- so what the descriptor reaches is
+        # the archive this run just wrote, and the size, both fingerprints and the
+        # upload all read THAT descriptor.
+        archive_fd = _open_pinned_archive_fd(tmp_dir, dir_fd, name)
+        try:
+            # The descriptor was taken on the archive this run wrote and every later
+            # step reads it, so the size, the tree digest, the body digest and the
+            # uploaded bytes all describe one object reached without re-resolving the
+            # name.
+            #
+            # `volatile_root=False`: this archive's roots are `crew` and `cli`, which
+            # are meaningful and stable. Only the snapshot bundle carries a timestamped
+            # root. The entry set is read from the pinned descriptor (``fd``), not by
+            # re-opening the name.
+            tree = _tree_fingerprint(None, volatile_root=False, fd=archive_fd)
+            baseline = _unchanged_baseline(
+                account, KIND_SESSIONS, tree, profile, region, bucket, caller=caller
+            )
+            if baseline is not None:
+                record = _record_skip(
+                    account,
+                    KIND_SESSIONS,
+                    baseline,
+                    tree,
+                    layer_b=(layer_b_files > 0 or conversations.members > 0),
+                    conversations_skipped=conversations.skipped,
+                    layer_b_scope=layer_b_scope,
+                )
+                if record is not None:
+                    logger.info(
+                        "aws-control: sessions backup for %s found both session trees unchanged "
+                        "since the archive already in the drive, so it uploaded nothing",
+                        account,
+                    )
+                    # As on the snapshot path, the label follows a push, so a local rename
+                    # reaches the drive on the next real upload rather than on this skip.
+                    # The retention sweep also stays on the path that pushed a new archive.
+                    return record
+                logger.info(
+                    "aws-control: sessions backup for %s could not record its skip because "
+                    "the recorded baseline moved while the archive was being built, so it "
+                    "is uploading a full copy",
+                    account,
+                )
+            key = f"{KIND_SUBPATHS[KIND_SESSIONS]}/{identity['id']}/{name}"
+            # A WITHDRAWAL landing during the build must not ship. The permission is
+            # read once at the top so one answer decides the whole tar, and that
+            # invariant is deliberate -- but it leaves a window: enabled at the
+            # read, withdrawn while the tar is written, and these bytes upload under a
+            # permission the operator has withdrawn. Re-reading and REFUSING closes it
+            # without breaking the invariant, because nothing is uploaded and nothing
+            # is recorded, so there is no record to disagree with anything. Rebuilding
+            # without Layer B instead would be the torn state the read-once rule
+            # exists to prevent.
+            #
+            # Skipped on ONE path -- the attended owner's withheld run -- and when held,
+            # taken BEFORE `_authorize_upload` so the whole decision-to-upload span is one
+            # critical section. `_authorize_upload` states the invariant both halves of that
+            # serve -- no check is separated from the upload by another blocking call.
+            # Acquiring the lock after the authorization would put a blocking wait
+            # between the consent check and `put_file`, because a concurrent account's
+            # backup can hold this lock across its own upload and the recheck below
+            # covers Layer B rather than consent.
+            #
+            # Which path may skip it is decided by what is RE-READ inside the block, not
+            # by `layer_b` alone. The recheck below short-circuits when `layer_b` is
+            # False, so it contributes no second read there -- but `_authorize_upload`
+            # re-reads the unattended grant for a SCHEDULED caller, and that grant's
+            # setter (`set_nightly_sessions`) writes under this same sidecar lock. The
+            # crew display half rides on every run, withheld or not, so a scheduled
+            # withheld run still has a permission that can be withdrawn mid-block and a
+            # payload that ships if the withdrawal is missed. It keeps the lock.
+            #
+            # The attended owner's withheld run is the one shape with neither: both
+            # scheduled-only re-reads are skipped, the recheck short-circuits, and what
+            # remains -- `is_app_enabled`, `aws_consent`, STS -- is not stored in this
+            # module's state file and takes no lock of ours, so an exclusive hold would
+            # order nothing. Taking none satisfies the invariant directly:
+            # `_authorize_upload` and `put_file` sit adjacent with no blocking call
+            # between them. Taking one costs what an exclusive hold costs -- the lock
+            # file is `_state_path()`'s sidecar, one path for every account, so every
+            # state writer of every account (`_record_run`, `set_sessions_layer_b`,
+            # `set_retention_keep`, the nightly loop) waits out this upload up to
+            # `_STATE_LOCK_TIMEOUT_SECS` for a guarantee this one path does not need.
+            # `contextlib.nullcontext` keeps that as one expression, so the body below
+            # reads the same either way.
+            #
+            # `_upload_lock`, not `_state_lock`: the sidecar FILE lock alone, without
+            # `_run_lock`. The setters (`set_sessions_layer_b` and `set_nightly_sessions`,
+            # each -> `_locked_state_update` -> `_state_lock`) take this same file lock
+            # exclusively, so an exclusive hold here still orders a revocation wholly
+            # before or wholly after this block, in this process and in a second install
+            # writing the same state -- the guarantee this gate exists for is untouched.
+            # `_run_lock` ALSO
+            # serializes `last_runs`, which the dashboard's backup-status read goes
+            # through, so holding it across a PUT allowed `_PUSH_TIMEOUT_SECS` would
+            # stall every account's status surface for one account's upload -- which is
+            # why this block does not take it. Same shape, and same reason, as
+            # `_delete_under_the_retention_gate`: it composes the sidecar file lock with
+            # a dedicated gate rather than `_run_lock`, so a purge does not stall the
+            # status read either.
+            #
+            # Nothing inside the block re-enters this lock. `_authorize_upload` reaches
+            # `is_app_enabled`, `aws_consent`, an STS call, `_refuse_upload`, and -- for a
+            # scheduled caller -- the unattended grant readers and
+            # `scheduled_sessions_blocked_reason`. The last two READ this module's state
+            # file, which is what the hold above orders them against, but they read it
+            # without taking the lock, so naming them here costs no reentrancy. The list
+            # is written out in full deliberately: a list that stops at STS reads as
+            # though the withheld path has no permission left to lose, which is the
+            # reasoning the hold above exists to refuse.
+            #
+            # The run record is written after the block. `_record_run` reaches the
+            # same file lock through `_state_lock`, but only after this block has
+            # released, and it holds no `_run_lock` while it waits for it -- so it
+            # cannot deadlock against this block and it cannot drag the status read in
+            # with it. Both halves of that are load-bearing: omitting `_run_lock` HERE
+            # is not enough on its own, because the stall arrives through the contending
+            # writer rather than through this block. See the lock-order note above
+            # `_state_lock`. The
+            # retention sweep takes the same FILE lock under `_RETENTION_GATE`, but it
+            # runs after this block has released, not inside it.
+            #
+            # The cost, on the permitted path, is that a same-account revocation and the
+            # nightly loop wait for the in-flight upload, bounded by
+            # `_PUSH_TIMEOUT_SECS`. A revocation that appears slow is the price of one
+            # that cannot be overtaken, and the exposure it prevents has no recovery.
+            # What does NOT wait is every status read: `last_runs` and
+            # `uploaded_objects` take only `_run_lock`, which neither this block nor a
+            # writer parked on the file lock holds.
+            # Stated in the positive and checked in the negative, so a caller nobody
+            # anticipated holds the lock rather than skipping it -- the direction to be
+            # wrong in, since what the lock orders is unrecoverable once missed.
+            withheld_and_attended = not layer_b and caller == CALLER_OWNER
+            with contextlib.nullcontext() if withheld_and_attended else _upload_lock():
+                # The live checks: the connection still points at this account, the app
+                # is still enabled, and consent still stands. Immediately before the
+                # upload, and under the lock when one is held, so none of them can go
+                # stale between here and the upload.
+                _authorize_upload(
+                    account, profile, region, caller=caller, payload_kind=KIND_SESSIONS
+                )
+                # Only the withdrawn direction refuses. A grant landing mid-build leaves
+                # an archive without Layer B, which is the withholding default and needs
+                # no refusal -- the next run picks the grant up.
+                #
+                # Through `_refuse_upload` rather than a bare raise, so the refusal lands
+                # in the SEL beside every other refused upload. A withdrawn permission is
+                # exactly the denial an incident review looks for, and one refusal path
+                # that leaves no record would make the audited ones look complete. It
+                # takes no state lock itself, so it is safe to reach from in here.
+                if layer_b and not sessions_layer_b_enabled(account):
+                    _refuse_upload(
+                        account,
+                        "the Layer B permission was withdrawn while this archive was being"
+                        " built, so it was not uploaded; start the backup again to store"
+                        " the transcript half",
+                        caller=caller,
+                    )
+                # The SCOPE is rechecked on the same footing, because the grant staying on
+                # does not mean it still covers this payload. A disable followed by an
+                # enable that names no scope leaves the permission ON with the marker gone,
+                # so the check above passes while the conversations already written into
+                # this tar sit outside what the grant now covers -- and the object cannot be
+                # recalled once it is PUT. Same asymmetry as above: only the withdrawn
+                # direction refuses, since a scope granted mid-build leaves an archive
+                # without the
+                # conversations, which is the withholding default and needs no refusal.
+                if layer_b_conversations and not layer_b_grant_covers_conversations(account):
+                    _refuse_upload(
+                        account,
+                        "the Layer B conversation scope was withdrawn while this archive"
+                        " was being built, so it was not uploaded; start the backup again"
+                        " to store the transcript half",
+                        caller=caller,
+                    )
+                version = storage.put_file(
+                    profile,
+                    region,
+                    bucket,
+                    "backup",
+                    key,
+                    str(archive),
+                    account=account,
+                    timeout=_PUSH_TIMEOUT_SECS,
+                    body_fd=archive_fd,
+                )
+            record = _record_run(
                 account,
                 KIND_SESSIONS,
-                baseline,
-                tree,
+                key,
+                os.fstat(archive_fd).st_size,
+                _body_fingerprint(fd=archive_fd),
+                version,
+                tree=tree,
                 layer_b=(layer_b_files > 0 or conversations.members > 0),
                 conversations_skipped=conversations.skipped,
                 layer_b_scope=layer_b_scope,
+                # Records that THIS archive carries a `conversations/` root, so a later run
+                # that carries none knows an older archive is the only copy. Keyed on
+                # MEMBERS rather than rows, because a present-but-empty allowlisted table is
+                # still carried and a restore still needs it.
+                conversations_retained=conversations.members > 0,
             )
-            if record is not None:
-                logger.info(
-                    "aws-control: sessions backup for %s found both session trees unchanged "
-                    "since the archive already in the drive, so it uploaded nothing",
-                    account,
-                )
-                # As on the snapshot path, the label follows a push, so a local rename
-                # reaches the drive on the next real upload rather than on this skip.
-                # The retention sweep also stays on the path that pushed a new archive.
-                return record
-            logger.info(
-                "aws-control: sessions backup for %s could not record its skip because "
-                "the recorded baseline moved while the archive was being built, so it "
-                "is uploading a full copy",
-                account,
-            )
-        key = f"{KIND_SUBPATHS[KIND_SESSIONS]}/{identity['id']}/{archive.name}"
-        # A WITHDRAWAL landing during the build must not ship. The permission is
-        # read once at the top so one answer decides the whole tar, and that
-        # invariant is deliberate -- but it leaves a window: enabled at the
-        # read, withdrawn while the tar is written, and these bytes upload under a
-        # permission the operator has withdrawn. Re-reading and REFUSING closes it
-        # without breaking the invariant, because nothing is uploaded and nothing
-        # is recorded, so there is no record to disagree with anything. Rebuilding
-        # without Layer B instead would be the torn state the read-once rule
-        # exists to prevent.
-        #
-        # Skipped on ONE path -- the attended owner's withheld run -- and when held,
-        # taken BEFORE `_authorize_upload` so the whole decision-to-upload span is one
-        # critical section. `_authorize_upload` states the invariant both halves of that
-        # serve -- no check is separated from the upload by another blocking call.
-        # Acquiring the lock after the authorization would put a blocking wait
-        # between the consent check and `put_file`, because a concurrent account's
-        # backup can hold this lock across its own upload and the recheck below
-        # covers Layer B rather than consent.
-        #
-        # Which path may skip it is decided by what is RE-READ inside the block, not
-        # by `layer_b` alone. The recheck below short-circuits when `layer_b` is
-        # False, so it contributes no second read there -- but `_authorize_upload`
-        # re-reads the unattended grant for a SCHEDULED caller, and that grant's
-        # setter (`set_nightly_sessions`) writes under this same sidecar lock. The
-        # crew display half rides on every run, withheld or not, so a scheduled
-        # withheld run still has a permission that can be withdrawn mid-block and a
-        # payload that ships if the withdrawal is missed. It keeps the lock.
-        #
-        # The attended owner's withheld run is the one shape with neither: both
-        # scheduled-only re-reads are skipped, the recheck short-circuits, and what
-        # remains -- `is_app_enabled`, `aws_consent`, STS -- is not stored in the
-        # engine's state file and takes no lock of ours, so an exclusive hold would
-        # order nothing. Taking none satisfies the invariant directly:
-        # `_authorize_upload` and `put_file` sit adjacent with no blocking call
-        # between them. Taking one costs what an exclusive hold costs -- the lock
-        # file is `_state_path()`'s sidecar, one path for every account, so every
-        # state writer of every account (`_record_run`, `set_sessions_layer_b`,
-        # `set_retention_keep`, the nightly loop) waits out this upload up to
-        # `_STATE_LOCK_TIMEOUT_SECS` for a guarantee this one path does not need.
-        # `contextlib.nullcontext` keeps that as one expression, so the body below
-        # reads the same either way.
-        #
-        # `_upload_lock`, not `_state_lock`: the sidecar FILE lock alone, without
-        # `_run_lock`. The setters (`set_sessions_layer_b` and `set_nightly_sessions`,
-        # each -> `_locked_state_update` -> `_state_lock`) take this same file lock
-        # exclusively, so an exclusive hold here still orders a revocation wholly
-        # before or wholly after this block, in this process and in a second install
-        # writing the same state -- the guarantee this gate exists for is untouched.
-        # `_run_lock` ALSO
-        # serializes `last_runs`, which the dashboard's backup-status read goes
-        # through, so holding it across a PUT allowed `_PUSH_TIMEOUT_SECS` would
-        # stall every account's status surface for one account's upload -- which is
-        # why this block does not take it. Same shape, and same reason, as
-        # `_delete_under_the_retention_gate`: it composes the sidecar file lock with
-        # a dedicated gate rather than `_run_lock`, so a purge does not stall the
-        # status read either.
-        #
-        # Nothing inside the block re-enters this lock. `_authorize_upload` reaches
-        # `is_app_enabled`, `aws_consent`, an STS call, `_refuse_upload`, and -- for a
-        # scheduled caller -- the unattended grant readers and
-        # `scheduled_sessions_blocked_reason`. The last two READ the engine's state
-        # file, which is what the hold above orders them against, but they read it
-        # without taking the lock, so naming them here costs no reentrancy. The list
-        # is written out in full deliberately: a list that stops at STS reads as
-        # though the withheld path has no permission left to lose, which is the
-        # reasoning the hold above exists to refuse.
-        #
-        # The run record is written after the block. `_record_run` reaches the
-        # same file lock through `_state_lock`, but only after this block has
-        # released, and it holds no `_run_lock` while it waits for it -- so it
-        # cannot deadlock against this block and it cannot drag the status read in
-        # with it. Both halves of that are load-bearing: omitting `_run_lock` HERE
-        # is not enough on its own, because the stall arrives through the contending
-        # writer rather than through this block. See the lock-order note above
-        # `_state_lock`. The
-        # retention sweep takes the same FILE lock under `_RETENTION_GATE`, but it
-        # runs after this block has released, not inside it.
-        #
-        # The cost, on the permitted path, is that a same-account revocation and the
-        # nightly loop wait for the in-flight upload, bounded by
-        # `_PUSH_TIMEOUT_SECS`. A revocation that appears slow is the price of one
-        # that cannot be overtaken, and the exposure it prevents has no recovery.
-        # What does NOT wait is every status read: `last_runs` and
-        # `uploaded_objects` take only `_run_lock`, which neither this block nor a
-        # writer parked on the file lock holds.
-        # Stated in the positive and checked in the negative, so a caller nobody
-        # anticipated holds the lock rather than skipping it -- the direction to be
-        # wrong in, since what the lock orders is unrecoverable once missed.
-        withheld_and_attended = not layer_b and caller == CALLER_OWNER
-        with contextlib.nullcontext() if withheld_and_attended else _upload_lock():
-            # The live checks: the connection still points at this account, the app
-            # is still enabled, and consent still stands. Immediately before the
-            # upload, and under the lock when one is held, so none of them can go
-            # stale between here and the upload.
-            _authorize_upload(account, profile, region, caller=caller, payload_kind=KIND_SESSIONS)
-            # Only the withdrawn direction refuses. A grant landing mid-build leaves
-            # an archive without Layer B, which is the withholding default and needs
-            # no refusal -- the next run picks the grant up.
+            # After the archive and after the ledger write, and with its own
+            # authorization: a caption must never delay or endanger the payload.
+            _publish_label(account, profile, region, bucket, identity, caller=caller)
+            # LAST, and after a push that succeeded. This is the only step here that
+            # deletes, so it runs once everything proving this run worked is already
+            # done -- and it cannot fail the run. See _prune_remote_archives.
             #
-            # Through `_refuse_upload` rather than a bare raise, so the refusal lands
-            # in the SEL beside every other refused upload. A withdrawn permission is
-            # exactly the denial an incident review looks for, and one refusal path
-            # that leaves no record would make the audited ones look complete. It
-            # takes no state lock itself, so it is safe to reach from in here.
-            if layer_b and not sessions_layer_b_enabled(account):
-                _refuse_upload(
+            # SKIPPED whenever the conversation export reported ANY reason. Deliberately a
+            # predicate on the field, not membership in a list of reasons: every reason this
+            # module emits belongs in that list, so the list was only a slower way of
+            # writing "any reason at all" -- and a sixth reason added later by someone who
+            # never read this comment cannot be forgotten from a predicate, while it can
+            # absolutely be forgotten from a frozenset. The two lists would have had to be
+            # kept in sync forever, with a silent data-loss bug as the cost of drift.
+            #
+            # This includes a relocation. The relocation flag is read from THIS PROCESS's
+            # environment, so a daemon-launched run and a shell-launched run can disagree
+            # about it with the operator relocating nothing -- which means an earlier archive
+            # really may hold conversations this one does not.
+            #
+            # Retention protects only the key this run just
+            # uploaded, so at `keep=1` retiring the previous archive would erase the one
+            # copy that still held the conversations, and `delete_object_versions` erases
+            # versions outright -- there is no recovery for the retired object, while the
+            # gap here recovers on the next successful run. Keeping one archive too many
+            # costs storage; retiring the last complete one costs the data. The archives
+            # accumulate past the keep count only while the condition persists, and
+            # `conversations_skipped` in the record is what tells the operator why.
+            #
+            # It does NOT over-suppress, but the line is not where it first looks. What may
+            # stay reasonless is a run that READ everything the host holds, or one where the
+            # operator withheld the permission -- a consented withdrawal, and the default,
+            # so an ordinary install prunes exactly as it did before this feature existed.
+            # An ABSENT store does not qualify: the question is whether an earlier archive
+            # holds rows this one does not, and a store missing at nightly-run time may have
+            # been present when that archive was written. The accepted cost is narrow
+            # because the permission is owner-gated and defaults off -- only a host that
+            # opted INTO conversation backup and has no store to back up stops pruning, and
+            # that combination is a misconfiguration the record now names rather than a
+            # working state.
+            #
+            # THE DECLINE IS AUDITED. Suppressing the sweep suppresses the DELETION, never
+            # the record of the decision: `_audit_retention` is only reachable from inside
+            # `_prune_remote_archives`, so an early return here would have filed no SEL
+            # event at all, on the one path in the app that erases object versions for good
+            # -- exactly the invisibility that function exists to prevent, and its contract
+            # says every terminal outcome files one "including the ones that deleted
+            # nothing". A decline is a terminal outcome. It is filed as `failed` with the
+            # reason as `error`, matching the sweep's own refusal-to-act on a listing that
+            # does not show the archive just uploaded: nothing was deleted and the operator
+            # needs to know why, which is not the same as a withdrawn consent (`denied`
+            # belongs to the gate). This is also what keeps the accumulation VISIBLE: while
+            # the condition persists the archives pile up past the keep count, and one event
+            # per run naming the reason is how an auditor sees that rather than inferring it
+            # from a sweep that silently never ran.
+            # TWO independent conditions, not one replacing the other. The first is this
+            # run's own export coming up short, which is the `skipped` reason above. The
+            # second is this run carrying no conversations at all while an older RETAINED
+            # archive carries them -- which the grant's own scope can produce with nothing
+            # wrong: an in-scope run uploads conversations, the scope is then narrowed, and
+            # the next run's archive omits them while the sweep would retire the one that
+            # holds them. That path sets no skip reason, because a scope the operator
+            # narrowed is a policy decline rather than a failed read, so the first condition
+            # cannot see it.
+            #
+            # Expressed as a predicate over one persisted boolean rather than a set of
+            # qualifying cases -- same reason the `skipped` suppression is a predicate: a
+            # second list to keep in sync is a place to forget one, and the cost of
+            # forgetting here is a permanent delete.
+            decline = conversations.skipped
+            if not decline and conversations.members == 0:
+                if a_retained_archive_carries_conversations(account):
+                    decline = "conversations_retained_in_an_older_archive"
+            if decline:
+                logger.warning(
+                    "aws-control: skipping the sessions retention sweep for %s (%s), so an "
+                    "older archive that may hold conversations this one does not is kept",
                     account,
-                    "the Layer B permission was withdrawn while this archive was being"
-                    " built, so it was not uploaded; start the backup again to store"
-                    " the transcript half",
-                    caller=caller,
+                    decline,
                 )
-            # The SCOPE is rechecked on the same footing, because the grant staying on
-            # does not mean it still covers this payload. A disable followed by an
-            # enable that names no scope leaves the permission ON with the marker gone,
-            # so the check above passes while the conversations already written into
-            # this tar sit outside what the grant now covers -- and the object cannot be
-            # recalled once it is PUT. Same asymmetry as above: only the withdrawn
-            # direction refuses, since a scope granted mid-build leaves an archive
-            # without the
-            # conversations, which is the withholding default and needs no refusal.
-            if layer_b_conversations and not layer_b_grant_covers_conversations(account):
-                _refuse_upload(
+                _audit_retention(
                     account,
-                    "the Layer B conversation scope was withdrawn while this archive"
-                    " was being built, so it was not uploaded; start the backup again"
-                    " to store the transcript half",
+                    {
+                        "kind": KIND_SESSIONS,
+                        # "off" is reserved for "no count configured". The count may well be
+                        # set here; this run simply did not act on it, which `result` and
+                        # `error` say. Naming a number would claim a sweep that never ran.
+                        "keep": "declined",
+                        "live": 0,
+                        "retired": 0,
+                        "versions": 0,
+                        "unclaimed": 0,
+                        "unclaimedBytes": 0,
+                        "unrecorded": 0,
+                        "unrecordedBytes": 0,
+                        "skipped": "",
+                    },
                     caller=caller,
+                    result="failed",
+                    error=f"retention declined: {decline}",
                 )
-            version = storage.put_file(
-                profile,
-                region,
-                bucket,
-                "backup",
-                key,
-                str(archive),
-                account=account,
-                timeout=_PUSH_TIMEOUT_SECS,
-            )
-        record = _record_run(
-            account,
-            KIND_SESSIONS,
-            key,
-            archive.stat().st_size,
-            _body_fingerprint(archive),
-            version,
-            tree=tree,
-            layer_b=(layer_b_files > 0 or conversations.members > 0),
-            conversations_skipped=conversations.skipped,
-            layer_b_scope=layer_b_scope,
-            # Records that THIS archive carries a `conversations/` root, so a later run
-            # that carries none knows an older archive is the only copy. Keyed on
-            # MEMBERS rather than rows, because a present-but-empty allowlisted table is
-            # still carried and a restore still needs it.
-            conversations_retained=conversations.members > 0,
-        )
-        # After the archive and after the ledger write, and with its own
-        # authorization: a caption must never delay or endanger the payload.
-        _publish_label(account, profile, region, bucket, identity, caller=caller)
-        # LAST, and after a push that succeeded. This is the only step here that
-        # deletes, so it runs once everything proving this run worked is already
-        # done -- and it cannot fail the run. See _prune_remote_archives.
-        #
-        # SKIPPED whenever the conversation export reported ANY reason. Deliberately a
-        # predicate on the field, not membership in a list of reasons: every reason this
-        # module emits belongs in that list, so the list was only a slower way of
-        # writing "any reason at all" -- and a sixth reason added later by someone who
-        # never read this comment cannot be forgotten from a predicate, while it can
-        # absolutely be forgotten from a frozenset. The two lists would have had to be
-        # kept in sync forever, with a silent data-loss bug as the cost of drift.
-        #
-        # This includes a relocation. The relocation flag is read from THIS PROCESS's
-        # environment, so a daemon-launched run and a shell-launched run can disagree
-        # about it with the operator relocating nothing -- which means an earlier archive
-        # really may hold conversations this one does not.
-        #
-        # Retention protects only the key this run just
-        # uploaded, so at `keep=1` retiring the previous archive would erase the one
-        # copy that still held the conversations, and `delete_object_versions` erases
-        # versions outright -- there is no recovery for the retired object, while the
-        # gap here recovers on the next successful run. Keeping one archive too many
-        # costs storage; retiring the last complete one costs the data. The archives
-        # accumulate past the keep count only while the condition persists, and
-        # `conversations_skipped` in the record is what tells the operator why.
-        #
-        # It does NOT over-suppress, but the line is not where it first looks. What may
-        # stay reasonless is a run that READ everything the host holds, or one where the
-        # operator withheld the permission -- a consented withdrawal, and the default,
-        # so an ordinary install prunes exactly as it did before this feature existed.
-        # An ABSENT store does not qualify: the question is whether an earlier archive
-        # holds rows this one does not, and a store missing at nightly-run time may have
-        # been present when that archive was written. The accepted cost is narrow
-        # because the permission is owner-gated and defaults off -- only a host that
-        # opted INTO conversation backup and has no store to back up stops pruning, and
-        # that combination is a misconfiguration the record now names rather than a
-        # working state.
-        #
-        # THE DECLINE IS AUDITED. Suppressing the sweep suppresses the DELETION, never
-        # the record of the decision: `_audit_retention` is only reachable from inside
-        # `_prune_remote_archives`, so an early return here would have filed no SEL
-        # event at all, on the one path in the app that erases object versions for good
-        # -- exactly the invisibility that function exists to prevent, and its contract
-        # says every terminal outcome files one "including the ones that deleted
-        # nothing". A decline is a terminal outcome. It is filed as `failed` with the
-        # reason as `error`, matching the sweep's own refusal-to-act on a listing that
-        # does not show the archive just uploaded: nothing was deleted and the operator
-        # needs to know why, which is not the same as a withdrawn consent (`denied`
-        # belongs to the gate). This is also what keeps the accumulation VISIBLE: while
-        # the condition persists the archives pile up past the keep count, and one event
-        # per run naming the reason is how an auditor sees that rather than inferring it
-        # from a sweep that silently never ran.
-        # TWO independent conditions, not one replacing the other. The first is this
-        # run's own export coming up short, which is the `skipped` reason above. The
-        # second is this run carrying no conversations at all while an older RETAINED
-        # archive carries them -- which the grant's own scope can produce with nothing
-        # wrong: an in-scope run uploads conversations, the scope is then narrowed, and
-        # the next run's archive omits them while the sweep would retire the one that
-        # holds them. That path sets no skip reason, because a scope the operator
-        # narrowed is a policy decline rather than a failed read, so the first condition
-        # cannot see it.
-        #
-        # Expressed as a predicate over one persisted boolean rather than a set of
-        # qualifying cases -- same reason the `skipped` suppression is a predicate: a
-        # second list to keep in sync is a place to forget one, and the cost of
-        # forgetting here is a permanent delete.
-        decline = conversations.skipped
-        if not decline and conversations.members == 0:
-            if a_retained_archive_carries_conversations(account):
-                decline = "conversations_retained_in_an_older_archive"
-        if decline:
-            logger.warning(
-                "aws-control: skipping the sessions retention sweep for %s (%s), so an "
-                "older archive that may hold conversations this one does not is kept",
-                account,
-                decline,
-            )
-            _audit_retention(
-                account,
-                {
-                    "kind": KIND_SESSIONS,
-                    # "off" is reserved for "no count configured". The count may well be
-                    # set here; this run simply did not act on it, which `result` and
-                    # `error` say. Naming a number would claim a sweep that never ran.
-                    "keep": "declined",
-                    "live": 0,
-                    "retired": 0,
-                    "versions": 0,
-                    "unclaimed": 0,
-                    "unclaimedBytes": 0,
-                    "unrecorded": 0,
-                    "unrecordedBytes": 0,
-                    "skipped": "",
-                },
-                caller=caller,
-                result="failed",
-                error=f"retention declined: {decline}",
-            )
-        else:
-            _prune_remote_archives(
-                account,
-                profile,
-                region,
-                bucket,
-                KIND_SESSIONS,
-                identity["id"],
-                key,
-                caller=caller,
-                # Only when THIS run carried no conversations. A run that carried them
-                # set the fact itself, so re-checking would refuse its own sweep.
-                recheck_conversations_retained=conversations.members == 0,
-            )
-        return record
+            else:
+                _prune_remote_archives(
+                    account,
+                    profile,
+                    region,
+                    bucket,
+                    KIND_SESSIONS,
+                    identity["id"],
+                    key,
+                    caller=caller,
+                    # Only when THIS run carried no conversations. A run that carried them
+                    # set the fact itself, so re-checking would refuse its own sweep.
+                    recheck_conversations_retained=conversations.members == 0,
+                )
+            return record
+        finally:
+            os.close(archive_fd)
 
 
 #: The two Job SDK kinds this app registers. Same strings as ``KIND_*`` so a run
@@ -2252,7 +2373,10 @@ if _typing.TYPE_CHECKING:
         _SNAPSHOT_MANIFEST_NAME,
         _VOLATILE_MANIFEST_FIELDS,
         _archive_entries,
+        _entries_of,
         _manifest_digest,
+        _OffsetReader,
+        _read_at,
     )
     from kiro_crew.apps.builtins.aws_control.backend.backup_parts.identity import (  # noqa: F401
         _INSTALL_ID_RE,

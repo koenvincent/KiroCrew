@@ -107,8 +107,10 @@ interface PeerSlot {
    *  nests under a local session whose key merely matches. `slot` is the child's
    *  own record of who opened it -- the "opened by" glyph on a row placed under
    *  nothing, and the move-detection baseline; a peer whose creator is gone
-   *  sends `slot` with no `key`, the orphan case. */
-  parent?: { slot?: string; key?: string }
+   *  sends `slot` with no `key`, the orphan case. `ancestor` is present and true
+   *  when the peer re-parented the row: `key` is an open ancestor and `slot` is a
+   *  creator that closed, so the two name different sessions. */
+  parent?: { slot?: string; key?: string; ancestor?: boolean }
   /** Present and true while the peer's lineage projection is still seeding, so
    *  this frame's `parent` is provisional. Absent on a settled frame. */
   lineage_pending?: boolean
@@ -155,8 +157,10 @@ export interface InstanceSessionRow {
    *  is kept only when it is a string, and the object only when at least one
    *  half survived. `key` is resolved within this row's `peer_id`, never across
    *  origins (`lineage` in pages/chat-sidebar/conductor.ts); `slot` feeds
-   *  `orphanCitation`, `citesParent` and the `citedCreatorRef` move baseline. */
-  parent?: { slot?: string; key?: string }
+   *  `orphanCitation`, `citesParent` and the `citedCreatorRef` move baseline;
+   *  `ancestor` is what makes `closedCreatorCitation` answer for a peer row, and
+   *  without it a peer's re-parented worker reads as a child of the lead. */
+  parent?: { slot?: string; key?: string; ancestor?: boolean }
   lineage_pending?: boolean
 }
 
@@ -331,10 +335,19 @@ export function useInstanceSessions(
         const cited = s.parent && typeof s.parent === 'object' ? s.parent : undefined
         const parentKey = cited ? str(cited.key) : undefined
         const parentSlot = cited ? str(cited.slot) : undefined
+        // `ancestor` crosses with the pair because it is what tells them apart: on
+        // such a row `key` is an open ANCESTOR and `slot` is a creator that closed,
+        // and a lane that receives the pair without the flag reads the nesting as an
+        // ordinary one and drops the closed-creator glyph. A peer's crew would then
+        // look like sessions the lead opened itself, which is the one reading the
+        // flag exists to prevent -- and the local lane would answer differently about
+        // the same fact. Narrowed to a literal `true` like every other boolean here:
+        // a machine boundary makes it an unvalidated value, not a known one.
         const parent = parentKey || parentSlot
           ? {
             ...(parentSlot ? { slot: parentSlot } : {}),
             ...(parentKey ? { key: parentKey } : {}),
+            ...(cited?.ancestor === true ? { ancestor: true } : {}),
           }
           : undefined
         rows.push({

@@ -1003,6 +1003,14 @@ class MonitorState:
     #: that charges ``floor_ticks`` -- so a refusal and a death both leave it owed,
     #: and a retried delivery is charged exactly once.
     floor_fire_pending: bool = False
+    #: Work-ledger watches only: the worker-report revision the probe read on its
+    #: newest successful observation, and the one it had read when the last turn
+    #: was DELIVERED. While the two are equal no worker has reported since the
+    #: conductor last looked, so the quiet floor waits four times longer. Empty
+    #: means "not known yet", which keeps the shipped floor: an unknown revision
+    #: resolves toward delivering, like every other doubt in the gate.
+    ledger_revision: str = ""
+    ledger_delivered_revision: str = ""
     #: True from just before a probe runs until its verdict has been consumed.
     #:
     #: The kernel commits its dedupe state BEFORE raising a wake, which is right
@@ -1101,6 +1109,12 @@ class MonitorState:
         # lost, and the flag clears itself on the delivery it asks for.
         if not isinstance(self.floor_fire_pending, bool):
             self.floor_fire_pending = True
+        # Normalised toward delivering. An unreadable revision becomes "unknown",
+        # which keeps the shipped floor.
+        if not isinstance(self.ledger_revision, str):
+            self.ledger_revision = ""
+        if not isinstance(self.ledger_delivered_revision, str):
+            self.ledger_delivered_revision = ""
         # The marker carries an outcome name, so an unreadable value cannot be
         # guessed. Keep it PENDING and record the cautious classification: a
         # delivery still happens, and a subject wrongly called blocked prompts a

@@ -8407,10 +8407,24 @@ class TestOrphanForwarderReclaim:
     occupancy of the holder's port is the trigger under test.
     """
 
-    def _mgr(self, tmp_path, *, base_port):
+    @staticmethod
+    def _os_assigned_base_port():
+        """A base port the OS just handed out, so no two cases share one.
+
+        These tests keep the probe REAL, and the probe is a bind. A fixed base
+        port shared by the parametrized cases of one test lets xdist workers
+        probe the same port at the same moment; on Windows the exclusive bind
+        makes one of them see the port as taken and ``connect()`` fail.
+        """
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.bind(("127.0.0.1", 0))
+            return s.getsockname()[1]
+
+    def _mgr(self, tmp_path):
         from kiro_crew.instances.registry import InstancesRegistry
         from kiro_crew.instances.ssh_tunnel_manager import SshTunnelManager
 
+        base_port = self._os_assigned_base_port()
         reg = InstancesRegistry(path=tmp_path / "instances.json")
 
         async def ok_mint(
@@ -8540,7 +8554,7 @@ class TestOrphanForwarderReclaim:
             sign = self._pin_identity_key(monkeypatch)
             start = pc.process_start_time(proc.pid)
             assert start, "test needs a readable start-time identity"
-            reg, mgr = self._mgr(tmp_path, base_port=54300)
+            reg, mgr = self._mgr(tmp_path)
             reg.add(name="CD", ssh_host="cd-1-alias", instance_id="cd-1")
             # What the pre-kill gateway persisted: port + signed child identity.
             reg.update(
@@ -8607,7 +8621,7 @@ class TestOrphanForwarderReclaim:
         holder.listen(1)
         port = holder.getsockname()[1]
         try:
-            reg, mgr = self._mgr(tmp_path, base_port=54350)
+            reg, mgr = self._mgr(tmp_path)
             reg.add(name="CD", ssh_host="cd-1-alias", instance_id="cd-1")
             pid, start = 424242, "12345"
             reg.update(
@@ -8671,7 +8685,7 @@ class TestOrphanForwarderReclaim:
             monkeypatch.setattr(stm, "_RECLAIM_TERM_GRACE_SECS", 0.3)
             start = pc.process_start_time(proc.pid)
             assert start
-            reg, mgr = self._mgr(tmp_path, base_port=54700)
+            reg, mgr = self._mgr(tmp_path)
             reg.add(name="CD", ssh_host="cd-1-alias", instance_id="cd-1")
             reg.update(
                 "cd-1",
@@ -8718,7 +8732,7 @@ class TestOrphanForwarderReclaim:
             # surrogate = the malformed-text shapes that must read as
             # verification failure, never crash the connect path.
             for forged_sig in ("", "deadbeef" * 8, "签名不对", "\udc80bad"):
-                reg, mgr = self._mgr(tmp_path, base_port=55000)
+                reg, mgr = self._mgr(tmp_path)
                 reg.add(name="CD", ssh_host="cd-1-alias", instance_id="cd-1")
                 reg.update(
                     "cd-1",
@@ -8756,7 +8770,7 @@ class TestOrphanForwarderReclaim:
             )
             sign = self._pin_identity_key(monkeypatch)
             start = pc.process_start_time(proc.pid) or "x"
-            reg, mgr = self._mgr(tmp_path, base_port=54900)
+            reg, mgr = self._mgr(tmp_path)
             reg.add(name="CD", ssh_host="cd-1-alias", instance_id="cd-1")
             reg.update(
                 "cd-1",
@@ -8793,7 +8807,7 @@ class TestOrphanForwarderReclaim:
             )
             self._fake_orphan(monkeypatch)
             sign = self._pin_identity_key(monkeypatch)
-            reg, mgr = self._mgr(tmp_path, base_port=54800)
+            reg, mgr = self._mgr(tmp_path)
             reg.add(name="CD", ssh_host="cd-1-alias", instance_id="cd-1")
             reg.update(
                 "cd-1",
@@ -8825,7 +8839,7 @@ class TestOrphanForwarderReclaim:
             self._fake_orphan(monkeypatch)
             sign = self._pin_identity_key(monkeypatch)
             start = pc.process_start_time(proc.pid) or "x"
-            reg, mgr = self._mgr(tmp_path, base_port=54400)
+            reg, mgr = self._mgr(tmp_path)
             reg.add(name="CD", ssh_host="cd-1-alias", instance_id="cd-1")
             # Even with a CORRECT start-time identity the argv gate must still
             # refuse: the real argv builder expects `ssh …`, not python.
@@ -8918,7 +8932,7 @@ class TestOrphanForwarderReclaim:
             assert start and argv_sig, "test needs a readable spawn-time identity"
             # The drift this test is about: the rebuild is not the live argv.
             assert not pc.process_argv_matches_exact(proc.pid, rebuilt)
-            reg, mgr = self._mgr(tmp_path, base_port=54320)
+            reg, mgr = self._mgr(tmp_path)
             if flip_compression:
                 mgr._ssh_compression = not mgr._ssh_compression
             reg.add(name="CD", ssh_host="cd-1-alias", instance_id="cd-1")
@@ -8966,7 +8980,7 @@ class TestOrphanForwarderReclaim:
             sign = self._pin_identity_key(monkeypatch)
             start = pc.process_start_time(proc.pid) or "x"
             other = hashlib.sha256(b"ssh\0-N\0some-other-forward").hexdigest()
-            reg, mgr = self._mgr(tmp_path, base_port=54420)
+            reg, mgr = self._mgr(tmp_path)
             reg.add(name="CD", ssh_host="cd-1-alias", instance_id="cd-1")
             reg.update(
                 "cd-1",
@@ -9008,7 +9022,7 @@ class TestOrphanForwarderReclaim:
             self._fake_orphan(monkeypatch)
             sign = self._pin_identity_key(monkeypatch)
             start = pc.process_start_time(proc.pid) or "x"
-            reg, mgr = self._mgr(tmp_path, base_port=54440)
+            reg, mgr = self._mgr(tmp_path)
             reg.add(name="CD", ssh_host="cd-1-alias", instance_id="cd-1")
             reg.update(
                 "cd-1",
@@ -9065,7 +9079,7 @@ class TestOrphanForwarderReclaim:
             sign = self._pin_identity_key(monkeypatch)
             start = pc.process_start_time(proc.pid) or "x"
             argv_sig = "ab" * 32
-            reg, mgr = self._mgr(tmp_path, base_port=54460)
+            reg, mgr = self._mgr(tmp_path)
             reg.add(name="CD", ssh_host="cd-1-alias", instance_id="cd-1")
             params = stm._TransportParams(method="ssm", ssm_target="i-0123456789abcdef0")
             assert params.forwards_over_ssm
@@ -9217,7 +9231,7 @@ class TestOrphanForwarderReclaim:
             sign = self._pin_identity_key(monkeypatch)
             start = pc.process_start_time(proc.pid)
             assert start, "test needs a readable start-time identity"
-            reg, mgr = self._mgr(tmp_path, base_port=55100)
+            reg, mgr = self._mgr(tmp_path)
             self._record(
                 reg, port=port, pid=proc.pid, start=start, sig=sign("cd-1", proc.pid, start, port)
             )
@@ -9264,7 +9278,7 @@ class TestOrphanForwarderReclaim:
             self._windows_orphan_gate(monkeypatch, parent="older")
             sign = self._pin_identity_key(monkeypatch)
             start = pc.process_start_time(proc.pid) or "x"
-            reg, mgr = self._mgr(tmp_path, base_port=55200)
+            reg, mgr = self._mgr(tmp_path)
             self._record(
                 reg, port=port, pid=proc.pid, start=start, sig=sign("cd-1", proc.pid, start, port)
             )
@@ -9310,7 +9324,7 @@ class TestOrphanForwarderReclaim:
             start = pc.process_start_time(proc.pid) or "x"
             recorded = "not-the-recorded-identity" if mismatch == "start" else start
             sig = "deadbeef" * 8 if mismatch == "sig" else sign("cd-1", proc.pid, recorded, port)
-            reg, mgr = self._mgr(tmp_path, base_port=55300)
+            reg, mgr = self._mgr(tmp_path)
             self._record(reg, port=port, pid=proc.pid, start=recorded, sig=sig)
 
             st = await mgr.connect("cd-1")
@@ -9328,7 +9342,7 @@ class TestOrphanForwarderReclaim:
 
         proc, port, _argv = self._spawn_port_holder()
         try:
-            reg, mgr = self._mgr(tmp_path, base_port=54500)
+            reg, mgr = self._mgr(tmp_path)
             reg.add(name="CD", ssh_host="cd-1-alias", instance_id="cd-1")
             reg.update("cd-1", local_port=port, was_connected=True)  # identity stays unset
 
@@ -9370,7 +9384,7 @@ class TestOrphanForwarderReclaim:
             s.close()
 
             start = pc.process_start_time(proc.pid) or "x"
-            reg, mgr = self._mgr(tmp_path, base_port=54600)
+            reg, mgr = self._mgr(tmp_path)
             reg.add(name="CD", ssh_host="cd-1-alias", instance_id="cd-1")
             reg.update(
                 "cd-1",

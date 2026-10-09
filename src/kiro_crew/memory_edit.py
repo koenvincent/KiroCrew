@@ -24,6 +24,8 @@ MAX_BATCH_BYTES = 32 * 1024 * 1024
 MAX_EXPLICIT_ROWS = 500
 PREVIEW_ROWS = 25
 PREVIEW_TTL = 900
+# Revision ids are SQLite rowids; a larger Python int cannot be bound at all.
+_MAX_SQLITE_INTEGER = 2**63 - 1
 _KINDS = {"all", "fact", "directive", "episode"}
 _PROTECTED_FIELDS = {"repo_scope", "scope", "source", "source_ref", "derived_from", "category"}
 
@@ -132,6 +134,15 @@ def _operation(raw: Any) -> dict:
             "replacement": replacement,
             "match_case": raw.get("match_case", False),
         }
+    if mode == "restore" and set(raw) == {"type", "revision_id"}:
+        revision_id = raw["revision_id"]
+        if (
+            isinstance(revision_id, bool)
+            or not isinstance(revision_id, int)
+            or not 1 <= revision_id <= _MAX_SQLITE_INTEGER
+        ):
+            raise MemoryEditError("Choose a saved version to restore.")
+        return raw
     raise MemoryEditError("Unsupported editing operation.")
 
 
@@ -388,6 +399,39 @@ def _is_shown_form(before: dict, new_value: object, *, episode: bool) -> bool:
         return False
 
 
+def _restored_value(store: Any, before: dict, revision_id: int) -> object:
+    """Read an accepted version's content from the journal, never from the browser.
+
+    The history the browser shows is scrubbed, so a value copied from it could be a
+    display form. Reading the stored snapshot here keeps a restore faithful.
+    """
+    record_id = (before.get("metadata") or {}).get("record_id")
+    row = store.db.execute(
+        "SELECT after_json FROM memory_revisions WHERE id = ? AND record_id = ? "
+        "AND status = 'accepted' AND after_json IS NOT NULL",
+        (revision_id, record_id or ""),
+    ).fetchone()
+    if row is None:
+        raise MemoryEditError(
+            "That version is no longer kept for this memory. Refresh the history.",
+            "memory_revision_missing",
+            404,
+        )
+    saved = json.loads(row["after_json"])
+    if before["kind"] == "episode":
+        return saved.get("text")
+    try:
+        value = json.loads(saved.get("value_json"))
+        # An old snapshot can hold NaN or Infinity, which the edit path cannot
+        # write back. Refuse it here as unreadable instead of crashing later.
+        _json(value)
+        return value
+    except (TypeError, ValueError):
+        raise MemoryEditError(
+            "That version cannot be restored.", "memory_revision_unreadable", 409
+        ) from None
+
+
 def _after(store: Any, before: dict, operation: dict) -> dict | None:
     from kiro_crew.vector_memory import _contains_injection
 
@@ -397,11 +441,14 @@ def _after(store: Any, before: dict, operation: dict) -> dict | None:
     after = dict(before)
     episode = before["kind"] == "episode"
     value = before["text"] if episode else json.loads(before["value_json"])
-    if mode == "set":
-        field = "text" if episode else "value"
-        if field not in operation:
-            raise MemoryEditError(f"This record requires {field}.")
-        new_value = operation[field]
+    if mode in {"set", "restore"}:
+        if mode == "restore":
+            new_value = _restored_value(store, before, operation["revision_id"])
+        else:
+            field = "text" if episode else "value"
+            if field not in operation:
+                raise MemoryEditError(f"This record requires {field}.")
+            new_value = operation[field]
         old_protected = (
             {key: value[key] for key in _PROTECTED_FIELDS if key in value}
             if isinstance(value, dict)
@@ -416,9 +463,10 @@ def _after(store: Any, before: dict, operation: dict) -> dict | None:
             raise MemoryEditError(
                 "Identity, scope and provenance cannot be changed in the content editor."
             )
-        if _is_shown_form(before, new_value, episode=episode):
-            return after
-        _require_editable_record(store, before, episode=episode)
+        if mode == "set":
+            if _is_shown_form(before, new_value, episode=episode):
+                return after
+            _require_editable_record(store, before, episode=episode)
     else:
         pattern = re.compile(re.escape(operation["find"]), 0 if operation["match_case"] else re.I)
         new_value = _replace(value, pattern, operation["replacement"])
@@ -443,10 +491,14 @@ def _after(store: Any, before: dict, operation: dict) -> dict | None:
             raise MemoryEditError(error[1], status=422)
         after["value_json"] = _json(new_value)
         after["text"] = after["value_json"]
+    if mode == "restore":
+        after["_restore"] = True
     return after
 
 
 def _collect(store: Any, selection: dict, operation: dict) -> tuple[str, int, list]:
+    if operation["type"] == "restore" and len(selection.get("items", [])) != 1:
+        raise MemoryEditError("Restoring a version requires exactly one memory.")
     explicit = {(item["kind"], item["id"]): item["revision"] for item in selection.get("items", [])}
     excluded = {(item["kind"], item["id"]) for item in selection.get("exclude", [])}
     query = selection.get("query", _query({}))
@@ -483,7 +535,7 @@ def _collect(store: Any, selection: dict, operation: dict) -> tuple[str, int, li
             "stale_memory_preview",
             409,
         )
-    if operation["type"] == "set" and matched != 1:
+    if operation["type"] in {"set", "restore"} and matched != 1:
         raise MemoryEditError("Single-record correction requires exactly one memory.")
     return digest.hexdigest(), matched, changes
 
@@ -512,11 +564,13 @@ def _preview_offset(value: Any) -> int:
 
 def _operation_label(after: dict | None) -> str:
     """Name what one change does: drop the record, review its pending proposals
-    without touching the content, or replace the content."""
+    without touching the content, bring back a saved version, or replace the content."""
     if after is None:
         return "forget"
     if after.get("_resolution"):
         return "resolve"
+    if after.get("_restore"):
+        return "restore"
     return "correct"
 
 
@@ -537,7 +591,11 @@ def _preview_response(
             {
                 "before": before,
                 "after": (
-                    {key: value for key, value in after.items() if key != "_resolution"}
+                    {
+                        key: value
+                        for key, value in after.items()
+                        if key not in {"_resolution", "_restore"}
+                    }
                     if after is not None
                     else None
                 ),

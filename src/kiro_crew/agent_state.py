@@ -399,6 +399,26 @@ def set_model_managed(name: str, value: bool) -> None:
         _write(data)
 
 
+def claim_model_managed_if_unset(name: str) -> bool:
+    """Record *name* as managed only when it holds no managed flag; True if claimed.
+
+    The read and the write share one cross-process lock, so an explicit pick a
+    model editor records concurrently is never overwritten. Strict: an
+    unreadable sidecar raises rather than reading as unset.
+    """
+    with _locked():
+        data = _read(strict=True)
+        entry = data.get(name)
+        if not isinstance(entry, dict):
+            entry = {}
+        if _MODEL_MANAGED in entry:
+            return False
+        entry[_MODEL_MANAGED] = True
+        data[name] = entry
+        _write(data)
+        return True
+
+
 def get_cc_model(name: str) -> str | None:
     """Return the agent's claude_code-provider model, or ``None`` when unset."""
     with _lock:

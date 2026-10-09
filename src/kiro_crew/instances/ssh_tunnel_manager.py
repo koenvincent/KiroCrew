@@ -1429,7 +1429,10 @@ class _SshTunnel:
                 self._monitor_task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
                     await self._monitor_task
-            await self._finish_stdout_drain(timeout=0.5)
+            # Deliberate teardown: timeout=0 cancels the drain without awaiting
+            # EOF (the buffer is kept). On a stop WE initiated there is no AWS
+            # close cause to name, so paying the drain's timeout buys nothing.
+            await self._finish_stdout_drain(timeout=0)
             await self._terminate()
         except Exception:
             self.status.state = previous

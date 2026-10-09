@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react'
+import { useCallback, useEffect, useRef, useState, type ReactNode, type RefObject } from 'react'
 import { createPortal } from 'react-dom'
 import { Crop, FileText, Loader2, PenLine, Plus, X } from 'lucide-react'
 import { useAnchorRemeasure } from '../../hooks/useAnchorRemeasure'
@@ -13,11 +13,71 @@ import type { ChatInputProps } from './props'
    device, a bare file-input label on touch, and the cancel control that
    stands in for either while an upload is in flight. */
 
-export function usePlusMenu({ pickers, value, onChange, composerControl }: {
+/**
+ * Where focus goes once the "+" -> Upload file picker closes.
+ *
+ * Opening the picker closes the "+" menu, and the menu's Upload file button
+ * was the focused element, so focus falls to <body> and stays there after the
+ * OS dialog closes: the user has to click the composer before typing. The
+ * next step after attaching a file is writing the message, so a chosen file
+ * returns focus to the composer (APG allows a different destination than the
+ * invoker when the workflow calls for it); the composer keeps its own
+ * selection, so the draft's caret is where the user left it. A cancelled
+ * picker returns focus to the "+" trigger, the invoker, so the user can reopen
+ * the menu or Tab on.
+ *
+ * Focus is only reclaimed while it is still parked on what the picker flow
+ * left behind: <body>, the hidden file input, or the trigger. A user who has
+ * moved to another control keeps it. Nothing runs when the upload itself
+ * finishes or fails: by then focus is already in the composer, or wherever the
+ * user put it.
+ *
+ * Pointer path only, keyed on the "+" button existing. On the direct-picker
+ * path (a touch device, or the mobile breakpoint) that button is replaced by a
+ * bare file label with no menu to lose focus to, and focusing the composer
+ * there would raise the soft keyboard, which the composer avoids doing on its
+ * own (see the autoFocusKey effect in ChatInput).
+ */
+function useUploadFocusReturn({ fileInputRef, plusBtnRef, composerControl }: {
+  fileInputRef: RefObject<HTMLInputElement | null>
+  plusBtnRef: RefObject<HTMLButtonElement | null>
+  composerControl: () => ComposerControl | null
+}) {
+  const composerControlRef = useRef(composerControl)
+  composerControlRef.current = composerControl
+  useEffect(() => {
+    const input = fileInputRef.current
+    if (!input) return
+    const parked = () => {
+      const active = document.activeElement
+      return !active || active === document.body || active === input || active === plusBtnRef.current
+    }
+    // Runs before ChatInput's React handler clears `input.value`: a native
+    // listener on the target fires ahead of React's root delegation.
+    const onChange = () => {
+      if (plusBtnRef.current && input.files?.length && parked()) composerControlRef.current()?.focus()
+    }
+    const onCancel = () => {
+      const trigger = plusBtnRef.current
+      if (!trigger || !parked()) return
+      if (!trigger.disabled) trigger.focus()
+      else composerControlRef.current()?.focus()
+    }
+    input.addEventListener('change', onChange)
+    input.addEventListener('cancel', onCancel)
+    return () => {
+      input.removeEventListener('change', onChange)
+      input.removeEventListener('cancel', onCancel)
+    }
+  }, [fileInputRef, plusBtnRef])
+}
+
+export function usePlusMenu({ pickers, value, onChange, composerControl, fileInputRef }: {
   pickers: ReturnType<typeof useComposerPickers>
   value: string
   onChange: (v: string) => void
   composerControl: () => ComposerControl | null
+  fileInputRef: RefObject<HTMLInputElement | null>
 }) {
   const { setSlashMenuOpen, setFilePickerOpen, setFileQuery, setSkillPickerOpen, setSkillQuery } = pickers
   // "+" drop-up menu (upload file / image + browse toggle).
@@ -26,6 +86,7 @@ export function usePlusMenu({ pickers, value, onChange, composerControl }: {
   const plusWrapRef = useRef<HTMLDivElement>(null)
   const plusBtnRef = useRef<HTMLButtonElement>(null)
   const plusMenuRef = useRef<HTMLDivElement>(null)
+  useUploadFocusReturn({ fileInputRef, plusBtnRef, composerControl })
   const [plusRect, setPlusRect] = useState<DOMRect | null>(null)
   useEffect(() => {
     if (!plusOpen) return

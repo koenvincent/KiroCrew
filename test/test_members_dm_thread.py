@@ -769,14 +769,22 @@ class TestMemberRoutes:
             assert slot.memory_store == cfg.agents[CREW].memory_store
 
     @pytest.mark.asyncio
-    async def test_workspace_resolution_does_not_overwrite_a_concurrent_opener(self, tmp_path):
+    async def test_a_concurrent_opener_keeps_its_slot_and_converges_on_the_binding(self, tmp_path):
+        """Two openers racing the same thread end on ONE slot, bound to the crew.
+
+        The slot the other opener published is kept (never re-minted); its
+        workspace and project are the crew's configured binding, which both
+        openers derive from the same config, so the race cannot leave the
+        thread on a directory the crew is not bound to.
+        """
         state = _make_state(tmp_path)
         entered, release = threading.Event(), threading.Event()
+        resolved = str(tmp_path / "resolved")
 
         def resolve(workspace):
             entered.set()
             assert release.wait(timeout=5)
-            return str(tmp_path / "resolved")
+            return resolved
 
         with (
             _patched_config([CREW]),
@@ -795,29 +803,127 @@ class TestMemberRoutes:
                     response = await asyncio.wait_for(pending, timeout=5)
                 assert response.status == 200
         assert state._slots[member_slot_key(CREW)] is slot
-        assert slot.project == str(tmp_path / "chosen")
-        assert slot.workspace == "chosen"
+        assert slot.workspace == "default"
+        assert slot.project == resolved
 
     @pytest.mark.asyncio
-    @pytest.mark.parametrize("project", ["", "chosen-project"])
-    async def test_reopening_live_member_preserves_explicit_project(self, tmp_path, project):
+    @pytest.mark.parametrize("prior", ["", "/somewhere/else"])
+    async def test_reopening_live_member_binds_the_configured_workspace(
+        self, tmp_path, monkeypatch, prior
+    ):
+        """A crewmate's project is its crew's workspace, derived from config on every open.
+
+        Not a per-thread choice read back from the transcript: a thread restored
+        with an empty project (written before member slots inherited one -- the
+        pinned Files tab read "no project directory" for it) and a thread left on
+        another directory by an in-session ``set_project`` both converge on the
+        binding. Resolved through the member's workspace name, not a bare default.
+        """
         state = _make_state(tmp_path)
         slot = state.get_or_create_slot(
             member_slot_key(CREW), agent=CREW, mode=DM_SLOT_MODE, workspace="chosen"
         )
-        slot.project = project
+        slot.project = prior
+        slot.messages.append({"role": "user", "content": "hello"})
+        slot._dirty = False
+        pushes = []
+        monkeypatch.setattr(state, "push_slots_update", lambda **kw: pushes.append(kw))
+        resolved = str(tmp_path / "team-workspace")
         with (
             _patched_config([CREW]),
             patch(
                 "kiro_crew.dashboard.handlers.members.default_project_dir",
-                side_effect=AssertionError("existing project was re-resolved"),
-            ),
+                return_value=resolved,
+            ) as resolve,
         ):
             async with TestClient(TestServer(_make_members_app(state))) as client:
                 response = await client.post(f"/api/members/{CREW}/thread")
                 assert response.status == 200
+        assert resolve.call_args.args == ("default",)
+        assert slot.workspace == "default"
+        assert slot.project == resolved
+        # Reaches disk via the periodic flush and the client via a push.
+        assert slot._dirty is True
+        assert pushes
+        # A warm provider keeps the cwd it was spawned in -- a thread that ran
+        # with NO directory has one warm in the fallback work dir -- so every
+        # directory change arms the deferred reset other project writers arm.
+        assert slot._pending_reset_history_key == f"dashboard:{member_slot_key(CREW)}"
+
+    @pytest.mark.asyncio
+    async def test_reopening_an_already_bound_member_is_a_no_op(self, tmp_path, monkeypatch):
+        """A thread already on its binding is neither re-marked dirty nor re-pushed."""
+        state = _make_state(tmp_path)
+        resolved = str(tmp_path / "team-workspace")
+        slot = state.get_or_create_slot(
+            member_slot_key(CREW), agent=CREW, mode=DM_SLOT_MODE, workspace="default"
+        )
+        slot.project = resolved
+        slot.messages.append({"role": "user", "content": "hello"})
+        slot._dirty = False
+        pushes = []
+        monkeypatch.setattr(state, "push_slots_update", lambda **kw: pushes.append(kw))
+        with (
+            _patched_config([CREW]),
+            patch(
+                "kiro_crew.dashboard.handlers.members.default_project_dir",
+                return_value=resolved,
+            ),
+        ):
+            async with TestClient(TestServer(_make_members_app(state))) as client:
+                assert (await client.post(f"/api/members/{CREW}/thread")).status == 200
+        assert slot.project == resolved
+        assert slot._dirty is False
+        assert not pushes
+        assert slot._pending_reset_history_key is None
+
+    @pytest.mark.asyncio
+    async def test_a_missing_workspace_directory_leaves_the_thread_alone(self, tmp_path):
+        """An unresolvable binding (dir missing or fenced) does not clear a visible directory."""
+        state = _make_state(tmp_path)
+        slot = state.get_or_create_slot(
+            member_slot_key(CREW), agent=CREW, mode=DM_SLOT_MODE, workspace="chosen"
+        )
+        slot.project = str(tmp_path / "chosen")
+        with (
+            _patched_config([CREW]),
+            patch("kiro_crew.dashboard.handlers.members.default_project_dir", return_value=""),
+        ):
+            async with TestClient(TestServer(_make_members_app(state))) as client:
+                assert (await client.post(f"/api/members/{CREW}/thread")).status == 200
         assert slot.workspace == "chosen"
-        assert slot.project == project
+        assert slot.project == str(tmp_path / "chosen")
+
+    @pytest.mark.asyncio
+    async def test_dormant_thread_without_a_project_rehydrates_onto_the_workspace(self, tmp_path):
+        """The reporter's case: an old DM transcript with no ``project`` on its line.
+
+        Rehydrate copies the project only when the line carries a non-empty one,
+        so without the binding step every reopen of such a thread landed
+        project-less. The history still comes back with it.
+        """
+        state = _make_state(tmp_path)
+        write_dm_binding(CREW, member=CREW, slot_key=member_slot_key(CREW))
+        key = f"dashboard:{member_slot_key(CREW)}"
+        log = state.conversation_log
+        log.append(key, "user", "remember the roadmap discussion")
+        log.append(key, "assistant", "noted: roadmap discussion")
+        log.update_metadata(key, {"agent": CREW, "mode": DM_SLOT_MODE})
+        assert member_slot_key(CREW) not in state._slots
+        resolved = str(tmp_path / "team-workspace")
+        with (
+            _patched_config([CREW]),
+            patch(
+                "kiro_crew.dashboard.handlers.members.default_project_dir",
+                return_value=resolved,
+            ),
+        ):
+            async with TestClient(TestServer(_make_members_app(state))) as client:
+                resp = await client.post(f"/api/members/{CREW}/thread")
+                assert resp.status == 200
+        slot = state._slots[member_slot_key(CREW)]
+        assert slot.project == resolved
+        assert any("roadmap discussion" in str(m.get("content", "")) for m in slot.messages)
 
     @pytest.mark.asyncio
     async def test_thread_reopen_rehydrates_dormant_history(self, tmp_path):

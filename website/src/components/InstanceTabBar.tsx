@@ -26,7 +26,8 @@
 import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore, Fragment, type CSSProperties } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import { Home, Loader2, ChevronDown, Pin, Check } from 'lucide-react'
-import { api, ApiError, type InstanceView } from '../api/client'
+import { api, type InstanceView } from '../api/client'
+import { isInstancesDisabledError } from '../utils/instancesDisabled'
 import { useAppSelector } from '../store'
 import { type WarmConn } from '../store/instancesSlice'
 import { isEmbeddedPane } from '../lib/embedded'
@@ -1258,7 +1259,9 @@ export default function InstanceTabBar({
   const embedded = isEmbeddedPane()
   // Shared with InstancesViewport / InstancesPanel via the React Query cache.
   const instancesQuery = useQuery({ queryKey: ['instances'], queryFn: () => api.listInstances(), enabled: !embedded })
-  const disabled = instancesQuery.error instanceof ApiError && instancesQuery.error.status === 403
+  // Only the gateway's own `instances_disabled` 403 means "feature off"; a
+  // non-owner or Slack-origin 403 is a real failure and shows as one.
+  const disabled = isInstancesDisabledError(instancesQuery.error)
   // Memoize so the `[] ` fallback doesn't produce a fresh array identity on every
   // render, which would otherwise churn the `onSelectInstance` useCallback deps.
   const instances = useMemo(() => instancesQuery.data?.instances ?? [], [instancesQuery.data?.instances])

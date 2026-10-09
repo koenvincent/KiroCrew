@@ -2998,7 +2998,11 @@ def traversed_components(path: str | os.PathLike[str]) -> list[Path] | None:
     is asked over a superset of ``resolved.parents`` plus the target. Symlinks
     met on the way are deliberately absent: their mode is meaningless (0777 on
     Linux) and they cannot be edited in place, only replaced, which the directory
-    holding them — present in the result — already governs.
+    holding them — present in the result — governs, except in a sticky directory,
+    where an account that may write the directory replaces only the entries it
+    owns. A question that admits a sticky directory therefore also needs each
+    symlink's owner, and asks :func:`traversed_components_and_links`, the same
+    walk reporting the symlinks as well.
 
     POSIX path semantics (``os.sep``-rooted); Windows callers keep their own
     ACL-driven chains and must not route through here.
@@ -3007,6 +3011,25 @@ def traversed_components(path: str | os.PathLike[str]) -> list[Path] | None:
     :data:`_MAX_SYMLINK_HOPS` expansions. The fail direction is "could not
     enumerate", never a shorter list: a caller that treats ``None`` as anything
     but a refusal is answering a question it did not ask.
+    """
+    walk = traversed_components_and_links(path)
+    return None if walk is None else walk[0]
+
+
+def traversed_components_and_links(
+    path: str | os.PathLike[str],
+) -> tuple[list[Path], list[Path]] | None:
+    """:func:`traversed_components` together with every symlink that walk follows.
+
+    The first list is exactly what :func:`traversed_components` returns. The
+    second names each symlink the walk expands, in visit order and each once,
+    spelled as the directory the walk read it from joined with its name, so the
+    directory holding each link is in the first list. A trust question needs
+    these links when it admits a sticky directory: an account that may write one
+    replaces only the entries it owns there, so a symlink's owner, which neither
+    the directory's owner nor its mode reveals, decides who can retarget it.
+
+    ``None`` exactly when :func:`traversed_components` answers ``None``.
     """
     text = os.fspath(path)
     if not os.path.isabs(text):
@@ -3018,6 +3041,7 @@ def traversed_components(path: str | os.PathLike[str]) -> list[Path] | None:
     resolved = os.sep
     hops = 0
     visited: dict[str, None] = {}
+    links: dict[str, None] = {}
     while pending:
         name = pending.pop()
         if name in ("", os.curdir):
@@ -3037,6 +3061,7 @@ def traversed_components(path: str | os.PathLike[str]) -> list[Path] | None:
         if not is_link:
             resolved = candidate
             continue
+        links[candidate] = None
         hops += 1
         if hops > _MAX_SYMLINK_HOPS:
             return None
@@ -3048,7 +3073,148 @@ def traversed_components(path: str | os.PathLike[str]) -> list[Path] | None:
             resolved = os.sep
         pending.extend(reversed(target.split(os.sep)))
     visited[resolved] = None
-    return [Path(component) for component in visited]
+    return [Path(component) for component in visited], [Path(link) for link in links]
+
+
+def _group_shared_with_another_account(gid: int) -> Optional[str]:
+    """Why group ``gid`` admits an account other than this one, or ``None`` if it does not.
+
+    A group-writable directory is a foreign writer's door only when the GROUP holds
+    somebody else. A host with user-private groups leaves ordinary directories
+    group-writable to a group holding the operator alone, and refusing there would
+    reject a supported layout for no gain -- so the mode bit cannot decide this and
+    the membership has to.
+
+    Membership has two halves and BOTH are needed. ``gr_mem`` lists supplementary
+    members only: an account whose PRIMARY group this is never appears there, so a
+    thoroughly shared group can present an empty ``gr_mem`` and read as private.
+    The passwd database supplies the other half.
+
+    FAILS CLOSED, and that is the whole point of returning a reason rather than a
+    bool. Calling a group private takes a successful read of both databases, so a
+    lookup that raises, or a passwd database that will not enumerate -- SSSD and
+    other directory backends commonly refuse, and a directory host is exactly where
+    groups are shared -- leaves privacy UNPROVEN and refuses. The account's own
+    presence in the enumeration is the control: a passwd database that cannot see
+    this account cannot show that no other account shares the gid, however many
+    rows it returns.
+
+    ``getgrgid`` answers with ONE group entry, but a host may carry several entries
+    with the same gid, and each grants its members that gid as a supplementary
+    group. So the supplementary half reads every entry carrying the gid.
+    """
+    # Local import: neither module exists on Windows, which never reaches here --
+    # only the POSIX arm of the walk calls this; the Windows arm reads the ACL.
+    import grp
+    import pwd
+
+    try:
+        entry = grp.getgrgid(gid)
+    except (KeyError, OSError):
+        return f"a group (gid {gid}) this host cannot resolve"
+    try:
+        me = pwd.getpwuid(os.geteuid()).pw_name
+    except (KeyError, OSError):
+        return f"group {entry.gr_name!r}, which cannot be compared to this account"
+    try:
+        same_gid = [g for g in grp.getgrall() if g.gr_gid == gid]
+    except OSError:
+        return f"group {entry.gr_name!r}, whose entries this host will not enumerate"
+    members = {name for g in [entry, *same_gid] for name in g.gr_mem}
+    supplementary = sorted(members - {me})
+    if supplementary:
+        return f"group {entry.gr_name!r}, shared with {len(supplementary)} other account(s)"
+    try:
+        everyone = pwd.getpwall()
+    except OSError:
+        everyone = []
+    if not any(person.pw_name == me for person in everyone):
+        return f"group {entry.gr_name!r}, whose membership this host will not enumerate"
+    primary = sorted({p.pw_name for p in everyone if p.pw_gid == gid and p.pw_name != me})
+    if primary:
+        return f"group {entry.gr_name!r}, the primary group of {len(primary)} other account(s)"
+    return None
+
+
+_ACL_XATTR_VERSION = 2
+_ACL_USER = 0x02
+_ACL_GROUP = 0x08
+_ACL_MASK = 0x10
+_ACL_WRITE = 0o2
+# A filesystem or kernel that keeps no POSIX ACL answers with one of these.
+_NO_ACL_ERRNOS = frozenset(
+    e for e in (getattr(errno, n, None) for n in ("ENODATA", "ENOTSUP", "EOPNOTSUPP")) if e
+)
+
+
+def _acl_admits_another_account(node: Path, mine: int) -> Optional[str]:
+    """Why ``node``'s POSIX access ACL lets another account write it, or ``None``.
+
+    With an extended ACL the mode's group bits show the ACL mask, so a named entry
+    can give a peer write access behind a group bit that looks private. Only an
+    EFFECTIVE write counts: a named entry's bits are ANDed with the mask. A named
+    user that is ``mine`` (this process's uid) or root is already trusted, and a named group gets
+    the same membership question as the owning group. The default ACL governs what
+    is created inside, not this directory, so it is not read.
+
+    No ACL API (macOS, BSD) or no ACL on this node leaves the mode bits as the test.
+    Any other read failure, or a value this parser does not recognise, fails closed.
+    """
+    getxattr = getattr(os, "getxattr", None)
+    if getxattr is None:
+        return None
+    try:
+        raw = getxattr(node, "system.posix_acl_access")
+    except OSError as exc:
+        if exc.errno in _NO_ACL_ERRNOS:
+            return None
+        return "an ACL this host cannot read"
+    if len(raw) < 4 or (len(raw) - 4) % 8 or struct.unpack_from("<I", raw)[0] != _ACL_XATTR_VERSION:
+        return "an ACL this host cannot read"
+    entries = [struct.unpack_from("<HHI", raw, offset) for offset in range(4, len(raw), 8)]
+    mask = next((perm for tag, perm, _ in entries if tag == _ACL_MASK), 0o7)
+    for tag, perm, ident in entries:
+        if not perm & mask & _ACL_WRITE:
+            continue
+        if tag == _ACL_USER and ident not in (mine, 0):
+            return f"an ACL entry for another account (uid {ident})"
+        if tag == _ACL_GROUP:
+            shared = _group_shared_with_another_account(ident)
+            if shared is not None:
+                return f"an ACL entry for {shared}"
+    return None
+
+
+def group_write_admits_another_account(path: Path, gid: int) -> Optional[str]:
+    """Whom the group write bit on *path* admits besides this account, or ``None``.
+
+    *gid* is the group *path* belongs to, its ``st_gid``. ``None`` means the bit
+    admits this account alone, so a trust question may count it as the owner's own
+    write bit. Any other answer is a noun phrase naming whom the bit may admit, for
+    an operator-facing message, and anything that cannot be read is such an answer.
+
+    Two questions decide it, the first answer winning:
+
+    * :func:`_acl_admits_another_account`: with an extended POSIX ACL the mode's
+      group bits are the ACL's mask, so an entry for another account or a shared
+      group can write behind a bit the owning group alone seems to hold.
+    * :func:`_group_shared_with_another_account`: whether group *gid* holds anyone
+      besides this account.
+
+    Holders neither database shows -- a group password, a service unit's
+    ``SupplementaryGroups=``, a subordinate gid range, a directory account whose ids
+    collide with a local group -- are an administrator's to create, and a trust
+    question that admits root's components already trusts the administrator.
+
+    Every check that credits a group write bit to its owner asks this, so one
+    directory gets one answer: :func:`kiro_crew.cloud.source._first_replaceable`
+    for the chain that holds a staged source tarball, and
+    :func:`kiro_crew.github_runner._who_can_change` for what a provider CLI link's
+    path reads. POSIX only: on Windows the staging walk reads the ACL instead, and
+    the link rule runs only on Linux.
+    """
+    mine = os.geteuid()
+    return _acl_admits_another_account(path, mine) or _group_shared_with_another_account(gid)
 
 
 def _is_root_owned_path(path: str) -> bool:
@@ -7492,6 +7658,15 @@ def unlink_link_or_junction(path: str | os.PathLike) -> None:
 _WIN_GENERIC_READ = 0x80000000
 _WIN_GENERIC_WRITE = 0x40000000
 _WIN_FILE_SHARE_READ_WRITE = 0x00000001 | 0x00000002
+#: ``FILE_SHARE_READ`` alone. Omitting ``FILE_SHARE_WRITE`` as well makes Windows
+#: refuse any OTHER process's attempt to open the object for writing while this
+#: descriptor lives, which is the one thing a descriptor cannot do on POSIX: there
+#: a held descriptor fixes WHICH inode a name reaches and says nothing about that
+#: inode's contents, so a same-UID process can still rewrite the bytes in place.
+#: Callers that hand a filename to a child and need the bytes to be the bytes they
+#: checked ask for this; a read by the child is still allowed, which is what makes
+#: it usable for exactly that case.
+_WIN_FILE_SHARE_READ = 0x00000001
 _WIN_OPEN_EXISTING = 3
 _WIN_FILE_FLAG_BACKUP_SEMANTICS = 0x02000000
 _WIN_FILE_FLAG_OPEN_REPARSE_POINT = 0x00200000
@@ -7858,13 +8033,21 @@ def pinned_directory(path: str | os.PathLike) -> PinnedDirectory:
     return PinnedDirectory(pin_directory(target), target)
 
 
-def _win_open_without_following(path: str | os.PathLike) -> int:
+def _win_open_without_following(path: str | os.PathLike, *, deny_write: bool = False) -> int:
     """``CreateFileW`` *path* for reading, opening a reparse point INSTEAD of following it.
 
     Shared by :func:`pin_directory` and :func:`open_file_no_reparse` so the two do
     not carry separate copies of the same security-critical flags. What each of
     them then asserts about the descriptor differs; how the object is reached must
     not.
+
+    *deny_write* drops ``FILE_SHARE_WRITE`` from the share mode as well, so no other
+    process may open the object for writing while this descriptor lives. A caller
+    that must hand a child process a FILENAME needs it: the child re-resolves the
+    name, and a descriptor alone fixes only which inode that name reaches, so
+    without this a same-UID process rewrites the bytes in place and the child sends
+    them. Reads by the child are still permitted. Not the default, because for a
+    DIRECTORY handle it would also refuse other processes' writes into it.
 
     ``OPEN_REPARSE_POINT`` is the whole point: a junction or symlink at the name is
     opened AS ITSELF, so the caller sees what is really there and the target is
@@ -7901,7 +8084,7 @@ def _win_open_without_following(path: str | os.PathLike) -> int:
     handle = kernel32.CreateFileW(
         os.fspath(path),
         _WIN_GENERIC_READ,
-        _WIN_FILE_SHARE_READ_WRITE,
+        _WIN_FILE_SHARE_READ if deny_write else _WIN_FILE_SHARE_READ_WRITE,
         None,
         _WIN_OPEN_EXISTING,
         _WIN_FILE_FLAG_BACKUP_SEMANTICS | _WIN_FILE_FLAG_OPEN_REPARSE_POINT,
@@ -7915,7 +8098,11 @@ def _win_open_without_following(path: str | os.PathLike) -> int:
 
 
 def open_file_no_reparse(
-    path: str | os.PathLike, *, nonblocking: bool = False, links_only: bool = False
+    path: str | os.PathLike,
+    *,
+    nonblocking: bool = False,
+    links_only: bool = False,
+    deny_write: bool = False,
 ) -> int:
     """Open a regular FILE for reading, refusing a reparse point at the final name.
 
@@ -7946,6 +8133,14 @@ def open_file_no_reparse(
     another name (:func:`win_fd_is_link`), so a regular file carrying a
     cloud-files or dedup tag opens as the file it is. POSIX is unaffected: a
     link is the only thing ``O_NOFOLLOW`` refuses there.
+
+    ``deny_write`` asks that no other process be able to open the file for writing
+    while this descriptor lives. It is honoured on WINDOWS ONLY, and the asymmetry
+    is the point rather than an omission: POSIX has no mandatory locking, so the
+    request cannot be expressed there and is silently not made. A caller whose
+    safety depends on it must therefore not treat a POSIX descriptor as carrying
+    it -- on POSIX the equivalent protection comes from removing the writer, not
+    from refusing its open.
     """
     if IS_POSIX:
         flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
@@ -7953,7 +8148,7 @@ def open_file_no_reparse(
             flags |= getattr(os, "O_NONBLOCK", 0)
         return os.open(os.fspath(path), flags)
 
-    fd = _win_open_without_following(path)
+    fd = _win_open_without_following(path, deny_write=deny_write)
     try:
         attrs = getattr(os.fstat(fd), "st_file_attributes", 0)
         if _win_reparse_refused(fd, attrs, links_only=links_only):
@@ -10616,6 +10811,7 @@ _EXPORTS_BY_OWNER: dict[str, tuple[str, ...]] = {
         "current_user_sid",
         "make_owner_only_dir",
         "local_user_id",
+        "stat_owned_by_current_user",
         "stat_writable_by_current_user",
         "path_writable_by_current_user",
         "restrict_to_owner",
@@ -10751,5 +10947,6 @@ if TYPE_CHECKING:  # the forwarded names, visible to type checkers and IDEs
         process_owner_sid,
         restrict_dir_to_owner,
         restrict_to_owner,
+        stat_owned_by_current_user,
         stat_writable_by_current_user,
     )

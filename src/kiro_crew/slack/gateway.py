@@ -13166,7 +13166,6 @@ class GatewayOrchestrator:
             os.getpid(),
             datetime.now(timezone.utc).isoformat(),
         )
-
         # Raise FD limit — each kiro-cli session uses ~6 FDs (3 pipes)
         # plus MCP server subprocesses. Default macOS limit (256) is too low.
         # No-op on Windows (no per-process descriptor rlimit).
@@ -13380,6 +13379,18 @@ class GatewayOrchestrator:
             logger.debug("Gateway tree liveness hold skipped", exc_info=True)
 
         self._install_shutdown_signal_handlers()
+
+        # Warn when this gateway's code is a git work tree someone could rebase
+        # under it. Past KIROCREW_READY (no-new-work-on-gateway-boot-path),
+        # off-loop, fire-and-forget: it only logs.
+        if not self._test_mode:
+            from kiro_crew.live_checkout import warn_if_running_from_git_checkout
+
+            _checkout_task = asyncio.create_task(
+                asyncio.to_thread(warn_if_running_from_git_checkout)
+            )
+            self._background_tasks.add(_checkout_task)
+            _checkout_task.add_done_callback(self._background_tasks.discard)
 
         # The run directories a PREDECESSOR gateway of this data home left behind
         # (session_work_dir). Ordered after ``cleanup_orphaned_sessions`` above,

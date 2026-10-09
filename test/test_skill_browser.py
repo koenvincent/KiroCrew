@@ -1531,6 +1531,37 @@ class TestSymlinkedSkillLeafContainment:
         catalog = enumerate_skill_catalog(state)
         assert "appy" in catalog and "demo-app/appy" in catalog
 
+    def test_shipped_builtin_skill_resolves_when_dir_and_manifest_names_differ(self, fake_home):
+        """A shipped builtin's package dir need not match its manifest name.
+
+        ``auto_improvement/app.json`` declares ``"name": "auto-improvement"``.
+        The bridge links its declared skills by manifest name, so the browse
+        side must find the app from the package root it resolves into, not by
+        treating the directory name as the app name.
+        """
+        from kiro_crew.apps.execution import _BUILTINS_DIR
+
+        pkg_root = (_BUILTINS_DIR / "auto_improvement").resolve()
+        assert json.loads((pkg_root / "app.json").read_text(encoding="utf-8"))["name"] == (
+            "auto-improvement"
+        )
+        app_skill = (pkg_root / "skills" / "ai-discover").resolve()
+        assert (app_skill / "SKILL.md").is_file()
+
+        skills_root = fake_home / ".kiro" / "crew" / "skills"
+        (skills_root / "auto-improvement").mkdir(parents=True)
+        (skills_root / "ai-discover").symlink_to(app_skill, target_is_directory=True)
+        (skills_root / "auto-improvement" / "ai-discover").symlink_to(
+            app_skill, target_is_directory=True
+        )
+
+        state = MagicMock(_slots={})
+        assert _resolve_skill_root("ai-discover", state) == app_skill
+        assert _resolve_skill_root("auto-improvement/ai-discover", state) == app_skill
+        # Still the declared skill dirs only, never the rest of the package.
+        (skills_root / "peek-pkg").symlink_to(pkg_root, target_is_directory=True)
+        assert _resolve_skill_root("peek-pkg", state) is None
+
     def test_a_link_into_an_apps_private_files_is_refused(self, fake_home, monkeypatch):
         """The exception is the DECLARED skill directories, not the app root.
 

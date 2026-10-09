@@ -16,7 +16,6 @@ every existing patch site.
 
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
 import os
@@ -73,6 +72,7 @@ from kiro_crew.validation import (
     MONITOR_STOP_SCHEMA,
     MONITOR_UPDATE_SCHEMA,
     MONITOR_WATCH_SCHEMA,
+    NOTHING_TO_DO_SCHEMA,
     REGISTER_HOOK_SCHEMA,
     RESET_CONVERSATION_SCHEMA,
     ROUTE_CREW_SCHEMA,
@@ -146,18 +146,6 @@ def _prefers_structured_arming() -> bool:
     tool list for that session's life -- the same limitation
     ``mcp_tools/browser.py`` records for ``dashboard.use_builtin_browser``.
 
-    Skipped entirely when an event loop is running, the same rule
-    ``mcp_tools/spawn.py::_agent_roster_hint`` applies for the same caller: a
-    running loop means this is NOT the stdio server but
-    ``mcp_discovery._managed_tools_in_process``, calling ``_list_tools()`` from
-    ``async def probe_server`` on the gateway's loop. That caller keeps only tool
-    NAMES -- it returns ``t.get("name")`` per entry and discards every
-    description -- so reading config there could not change anything it uses, and
-    the read is skipped rather than charged to the loop. The process that
-    actually serves ``tools/list`` to a model is ``mcp_shared.run_mcp_stdio_loop``,
-    a plain select/readline loop that never imports asyncio, so no loop is running
-    there and the preference IS read.
-
     Fails to the OFF position on any error: off is the shipped behaviour, and a
     config a gateway cannot parse must not silently re-point every arming
     decision it is about to advise on. The catch stays broad because this runs
@@ -166,12 +154,6 @@ def _prefers_structured_arming() -> bool:
     narrowed, which is what keeps a defect here discoverable rather than
     concealed.
     """
-    try:
-        asyncio.get_running_loop()
-    except RuntimeError:
-        pass  # no loop: the stdio server, the one build whose text reaches a model
-    else:
-        return False
     try:
         return bool(KiroCrewConfig.load().monitoring.prefer_structured_arming)
     except Exception:
@@ -184,16 +166,26 @@ def _ending_clause() -> str:
     return ending_phrase()
 
 
-def schemas() -> list[dict[str, Any]]:
-    """Descriptors for the control tools."""
-    prefer_structured = _prefers_structured_arming()
-    # In-process discovery keeps only names; never read disk on its event loop.
-    # A failed descriptive read must not withdraw every control tool. Actual
-    # invocation still validates the current policy at the mutation boundary.
+def schemas(*, names_only: bool = False) -> list[dict[str, Any]]:
+    """Descriptors for the control tools.
+
+    ``names_only`` is set by the in-process discovery read (via
+    ``mcp_tools.build_tool_names``), which keeps only tool NAMES and discards
+    every description. Under it the two reads that exist solely to shape a
+    description -- the structured-arming preference and the monitor runtime
+    ceiling, both config reads -- are skipped, so a names-only caller performs no
+    on-loop disk work for text it throws away. The returned names and their order
+    are unchanged. This is why neither read needs a ``get_running_loop`` guard of
+    its own: the names path never reaches them, and the full-descriptor path (the
+    stdio server serving a model) always wants the live values.
+    """
+    prefer_structured = False if names_only else _prefers_structured_arming()
+    # A failed descriptive read must not withdraw every control tool, and the
+    # actual invocation still validates the current policy at the mutation
+    # boundary -- so a default here is safe. The names-only path skips the read
+    # outright (its result would be discarded).
     runtime_ceiling = DEFAULT_RUNTIME_CEILING_SECS
-    try:
-        asyncio.get_running_loop()
-    except RuntimeError:
+    if not names_only:
         try:
             runtime_ceiling = runtime_ceiling_secs()
         except Exception:
@@ -416,6 +408,35 @@ def schemas() -> list[dict[str, Any]]:
                     # perform. Still accepted for compatibility, never read.
                 },
                 "required": ["questions"],
+            },
+        },
+        {
+            "name": "nothing_to_do",
+            "description": (
+                "End this turn with NO reply. The turn-end contract: after your tool "
+                "calls, a turn ends either with a closing text or with this call — "
+                "never by simply stopping after a tool. Call it when the turn ran tools "
+                "and found nothing the user needs to read: a quiet patrol cycle, a check "
+                "that found no change, a cron wake with nothing to report. It is "
+                "TERMINAL: write nothing and call nothing after it. Never use it to skip "
+                "answering a direct question, to end a turn the user is waiting on, or "
+                "when work is still unfinished — the host REFUSES it on a turn a person "
+                "opened (and on every messaging-channel turn), and the normal empty-reply "
+                "handling then runs. The optional note is recorded as a quiet transcript "
+                "step the user can inspect; it is not a message to them."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "note": {
+                        "type": "string",
+                        "description": (
+                            "Optional one-line reason there is nothing to report, "
+                            "e.g. 'patrol: no new activity on the watched PRs'. Recorded "
+                            "on the transcript step only."
+                        ),
+                    },
+                },
             },
         },
         {
@@ -1526,6 +1547,32 @@ def ask_question(name: str, args: dict[str, Any]) -> str:
     )
 
 
+def nothing_to_do(name: str, args: dict[str, Any]) -> str:
+    """The deliberate quiet exit of a turn, as a session directive.
+
+    Stateless like every directive: the tool validates its one optional field
+    and returns a marker; the session-aware consumer (chat_runner, TurnDriver)
+    applies it against ITS OWN session and records the applied directive as the
+    turn's terminal output, so the empty-response recovery does not treat the
+    textless end as a failed generation. No surface gate and no identity gate:
+    a quiet end is meaningful on every surface (dashboard, channel, cron wake),
+    and it mutates nothing a wrong identity could misdirect — a sub-agent's call
+    flows through the sub-agent's own runner (and a native child's result frame
+    is refused by the consumer's identity gate), so it can never end its
+    parent's turn.
+    """
+    args = validate_tool_args(args, NOTHING_TO_DO_SCHEMA)
+    note = str(args.get("note") or "").strip()
+    payload: dict[str, Any] = {"note": note} if note else {}
+    return _emit_directive(
+        "nothing_to_do",
+        payload,
+        "Quiet end requested for this turn. Write nothing and call nothing "
+        "after this: the turn is over. The consumer records the quiet step; "
+        "if it refuses, the normal empty-reply handling applies instead.",
+    )
+
+
 def monitor_start(name: str, args: dict[str, Any]) -> str:
     args = validate_tool_args(args, MONITOR_START_SCHEMA)
     # STRICT resolution via the shared gate (env-var only, no PID walk):
@@ -2194,6 +2241,7 @@ HANDLERS: dict[str, Callable[[str, dict[str, Any]], str]] = {
     "register_hook": register_hook,
     "autonudge_stop": autonudge_stop,
     "ask_question": ask_question,
+    "nothing_to_do": nothing_to_do,
     "monitor_start": monitor_start,
     "monitor_watch": monitor_watch,
     "monitor_inspect": monitor_inspect,

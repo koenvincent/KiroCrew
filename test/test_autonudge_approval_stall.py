@@ -517,6 +517,68 @@ async def test_a_failed_release_write_keeps_the_hold_and_publishes_nothing(
     await _stop_and_drain(svc)
 
 
+def _observing_writer(svc, loop_id: str, seen: list):
+    """Wrap the snapshot writer: record the live loop and the written row mid-write."""
+    real = svc._write_monitor_snapshot_locked
+
+    async def _write(payload=None):
+        live = svc._loops[loop_id]
+        row = None
+        if payload is not None:
+            row = next(r for r in payload["loops"] if r.get("id") == loop_id)
+        seen.append(
+            (
+                (live.approval_stalled, live.approval_stalled_at, live.created_ts),
+                None if row is None else (row["approval_stalled"], row["approval_stalled_at"]),
+            )
+        )
+        await real(payload)
+
+    return _write
+
+
+@pytest.mark.asyncio
+async def test_the_hold_reaches_the_live_loop_only_after_its_write(svc, _nosleep, monkeypatch):
+    """Readers must not see a hold the store has not accepted yet, even mid-write."""
+    loop = await _armed(svc)
+    seen: list = []
+    monkeypatch.setattr(
+        svc, "_write_monitor_snapshot_locked", _observing_writer(svc, loop.id, seen)
+    )
+    await _stall(svc)
+
+    ((live, row),) = seen
+    assert live[0] is False and live[1] == 0.0, "the live loop published the hold before the write"
+    assert row is not None and row[0] is True and row[1] > 0, "the write must carry the staged hold"
+    assert svc._loops[loop.id].approval_stalled is True
+    assert svc._loops[loop.id].approval_stalled_at == row[1]
+    await _stop_and_drain(svc)
+
+
+@pytest.mark.asyncio
+async def test_the_release_reaches_the_live_loop_only_after_its_write(svc, _nosleep, monkeypatch):
+    """The release side of the same rule: the cleared hold and moved clock wait for the store."""
+    loop = await _armed(svc)
+    await _stall(svc)
+    svc._cancel_timer(loop.id)
+    held_at = loop.approval_stalled_at
+    created = loop.created_ts
+    seen: list = []
+    monkeypatch.setattr(
+        svc, "_write_monitor_snapshot_locked", _observing_writer(svc, loop.id, seen)
+    )
+
+    assert await svc.release_approval_hold("chat-1-123", why="test", arm=False) is True
+
+    ((live, row),) = seen
+    assert live == (True, held_at, created), "the live loop published the release before the write"
+    assert row == (False, 0.0), "the write must carry the staged release"
+    refreshed = svc._loops[loop.id]
+    assert refreshed.approval_stalled is False
+    assert refreshed.created_ts >= created
+    await _stop_and_drain(svc)
+
+
 @pytest.mark.asyncio
 async def test_a_failed_hold_write_leaves_the_loop_running_and_unannounced(
     svc, _nosleep, monkeypatch

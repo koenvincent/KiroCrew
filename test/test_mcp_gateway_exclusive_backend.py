@@ -375,7 +375,7 @@ async def test_private_backends_appear_in_lifecycle_enumerators() -> None:
     lifecycle.
 
     ``all_backends()`` feeds the shutdown drain predicate and the abort handler;
-    ``live_backend_pids()`` feeds the pidfile that stops a SIGKILLed gatewayd
+    ``live_backend_identities()`` feeds the pidfile that stops a SIGKILLed gatewayd
     orphaning children. A private backend missing from either gets its pending
     reply discarded, its in-flight calls left uncancellable, or its process
     leaked.
@@ -386,7 +386,7 @@ async def test_private_backends_appear_in_lifecycle_enumerators() -> None:
     await pool.acquire_exclusive(key, "stub-a", _spawner(private))
 
     assert private in pool.all_backends()
-    assert 4242 in pool.live_backend_pids()
+    assert 4242 in [pid for pid, _ in pool.live_backend_identities()]
 
 
 @pytest.mark.asyncio

@@ -39,7 +39,7 @@ const ACTION_CREATORS = [
   'removeAutomation', 'removeByApprovalId', 'removeQueuedMessage', 'removeThinking',
   'reorderQueuedMessages', 'replaceMessages', 'requestFolderReveal', 'requestSlotReveal',
   'resolveByApprovalId', 'resolveOptimisticSteer', 'resolveQuestionCard', 'selectSubagent',
-  'setActiveSlot', 'setAgentSwitchNotice', 'setAutomations', 'setFolderSuggestion',
+  'setActiveSlot', 'setAgentSwitchNotice', 'setAutomations', 'setCloseRefused', 'setFolderSuggestion',
   'setFollowupCard', 'setPendingInput', 'setQuestionCard', 'setQuestionDraft', 'setSlotRunning',
   'setSlotState', 'setSlotStatusDetail', 'setSlotStopping', 'setStopPressedAt', 'setVoiceAudio',
   'setVoicePlaying', 'settleStopNotRunning', 'sideClose', 'sideOptimisticAppend',
@@ -89,6 +89,8 @@ const CONSTANTS: Record<string, unknown> = {
   OLDER_PAGE_LIMIT: 100,
   OLDER_WALK_PAGE_LIMIT: 100,
   PANE_HYDRATE_LIMIT: 50,
+  QUIET_END_SERVER: 'kirocrew-core',
+  QUIET_END_TOOL: 'nothing_to_do',
   REFRESH_LIMIT_CEILING: 500,
   SLOT_DETAIL_MAX_LIMIT: 500,
   TOOL_OUTPUT_MAX_CHARS: 64000,
@@ -116,6 +118,7 @@ const INITIAL_STATE = {
   slotHistory: [], slotsSnapshotSeen: false, pendingQuestions: {}, followups: {},
   folderSuggestions: {}, stopPressedAt: {}, runEpoch: {}, activeRunEpochAtEntry: 0,
   pendingTurnSlot: null,
+  closeRefused: null,
 }
 
 const surface = chatSlice as unknown as Record<string, unknown>

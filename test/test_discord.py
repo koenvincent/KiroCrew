@@ -1412,14 +1412,20 @@ class TestRotationSplitting:
     ) -> None:
         """Input no cut fits cleanly must finish rather than spin.
 
-        An all-newline tail, a 5000-backtick run, and a budget too small to hold
+        An all-newline tail, a bare backtick run, and a budget too small to hold
         a fence's own scaffolding are the three shapes with no clean cut
         anywhere. Chunks legitimately go over budget in the last of them; what
         matters is that the call returns and makes progress.
+
+        The run is five times the limit: termination does not depend on its
+        length, but the cost does. Every cut of a bare run is two characters
+        wide, and the sever grade reads each boundary against the whole text,
+        so the work grows with the square of the run -- 5000 backticks took
+        about 4 s alone and timed out on a loaded coverage shard.
         """
         for src, limit in [
             ("\n\n", 1),
-            ("`" * 5000, 100),
+            ("`" * 500, 100),
             ("```a-very-long-info-string-indeed\n" + "code\n" * 20, 12),
         ]:
             sealed, tail = await self._rotate(monkeypatch, src, limit)
