@@ -50,6 +50,29 @@ async def _spawn_request_memory_mode(
     return strictest((parent_mode, caller_mode)) or "persistent"
 
 
+def _floored_caller_refusal(state: DashboardState, request: web.Request, parent: str) -> Any:
+    """Refuse a start or continuation asked for by a run that carries the floor.
+
+    The new run would take this gateway's approval posture, so a yolo crew
+    would auto-approve every one of its tools and none would reach the hub.
+    Both the claimed parent and the caller's own session are checked, the same
+    pair the memory mode is read from.
+    """
+    from kiro_crew.subagent_manager.hub_approvals import floored_session
+
+    caller = request.headers.get("X-Session-Key", "")
+    subagents = getattr(state, "subagents", None)
+    if not any(floored_session(subagents, key) for key in {parent, caller} if key):
+        return None
+    return web.json_response(
+        {
+            "error": "a run under an approval floor cannot start or continue another run",
+            "code": "approval_floor_nested_spawn",
+        },
+        status=409,
+    )
+
+
 def _slot_for_parent(state: DashboardState, parent: str) -> Any | None:
     """Return the slot a parent session key names, or one bound to it."""
     slots = getattr(state, "_slots", None)
@@ -148,6 +171,9 @@ async def api_spawn(request: web.Request) -> web.Response:
     )
     if refusal is not None:
         return refusal
+    nested_refusal = _floored_caller_refusal(state, request, parent_session)
+    if nested_refusal is not None:
+        return nested_refusal
     try:
         admitted_mode = await _spawn_request_memory_mode(state, request, parent_session)
     except (OSError, ValueError):
@@ -419,6 +445,7 @@ async def api_spawn(request: web.Request) -> web.Response:
                 batch_total=batch_total,
                 instance_id=instance_id,
                 approval_mode=approval_mode,
+                app=child_app,
             )
         except RemoteSubagentError as exc:
             return web.json_response({"error": str(exc), "code": exc.code}, status=exc.status)
@@ -616,6 +643,9 @@ async def api_spawn_continue(request: web.Request) -> web.Response:
     refusal = await _spawn_scope_refusal(request, claimed_session=parent_session)
     if refusal is not None:
         return refusal
+    nested_refusal = _floored_caller_refusal(state, request, parent_session)
+    if nested_refusal is not None:
+        return nested_refusal
     remote_refusal = await _remote_run_operation_refusal(state, conv_id, "continuation")
     if remote_refusal is not None:
         return remote_refusal

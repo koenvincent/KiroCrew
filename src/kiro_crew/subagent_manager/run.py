@@ -2016,7 +2016,9 @@ class RunEventCoordinator(ManagerComponent):
             narrator=_SubagentNarrator(info, rows, log),
         )
 
-    async def _floored_agent(self, info: SubagentInfo, agent: str, cwd: str) -> str:
+    async def _floored_agent(
+        self, info: SubagentInfo, agent: str, cwd: str
+    ) -> tuple[str, dict[str, Any] | None]:
         """The agent a floored run launches as: its spec with backend grants emptied.
 
         The permission ladder only sees the requests kiro-cli raises. A tool on
@@ -2027,6 +2029,8 @@ class RunEventCoordinator(ManagerComponent):
         and keeps everything else, so every tool call becomes a request the
         ladder sends to a person. The shared template is not changed. A spec that
         cannot be derived refuses the run instead of launching the base agent.
+        Returns the derived name and the base spec it was derived from, whose
+        PreToolUse hooks the run is then gated on.
         """
         from kiro_crew.dashboard.side_readonly_spec import ReadOnlySpecError, publish_readonly_spec
         from kiro_crew.subagent_manager.hub_approvals import floor_enforceable
@@ -2048,7 +2052,7 @@ class RunEventCoordinator(ManagerComponent):
                 f"spawn refused: the approval floor requires agent {base!r} without its "
                 f"backend tool grants, and that spec could not be prepared ({exc.code})"
             ) from exc
-        return published.name
+        return published.name, published.base_spec
 
     async def _run_inner_impl(
         self,
@@ -2279,9 +2283,10 @@ class RunEventCoordinator(ManagerComponent):
         )
         turn_execution = replace(execution, template_id=agent)
         floor_base = ""
+        floor_source: dict[str, Any] | None = None
         if info.approval_floor == "interactive":
             floor_base = agent or "kirocrew"
-            agent = await self._floored_agent(info, agent, effective_cwd)
+            agent, floor_source = await self._floored_agent(info, agent, effective_cwd)
             turn_execution = replace(execution, template_id=agent)
         extra_kwargs: dict[str, Any] = {
             "crew_agent": execution.selection_name if kind == "member" else "",
@@ -2795,7 +2800,7 @@ class RunEventCoordinator(ManagerComponent):
         if floor_base:
             # The derived spec carries no hooks, so the template's PreToolUse
             # denies are fired here, before the hub's person is asked.
-            _spec = await floored_spec_hooks(floor_base, effective_cwd)
+            _spec = await floored_spec_hooks(floor_base, effective_cwd, floor_source)
         # The run's permission ladder. Imported here because this body runs on
         # the facade's globals (bind_component_globals), not this module's.
         from kiro_crew import tool_permission

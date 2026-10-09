@@ -164,7 +164,54 @@ def _open_tracked_file(root: PinnedDirectory, rel: str) -> int | None:
     return fd
 
 
-def _snapshot_project(project: Path) -> tuple[bytes, str, str]:
+def _project_read_check(parent_session: str, app: str = "") -> Callable[[str], bool] | None:
+    """The parent's ``filesystem.read`` decision for one tracked file, or ``None``.
+
+    The snapshot is read by the gateway, so the PreToolUse gate that would stop
+    the parent's own agent from reading a denied path never sees it. This
+    resolves the same ceiling and profile ``governance_permits`` resolves for
+    the parent surface (and the calling app's own profile when *app* is set)
+    once, and returns a check on the file's absolute path, the spelling the
+    gate's ``Reading <path>`` item has once ``_match_path`` normalizes it. ``None``
+    means nothing governs reads, the standalone default. Any evaluation error
+    refuses the snapshot: a wrong permit here uploads the file to another host.
+    """
+    from kiro_crew.platform.context import PlatformCompositionError, current_context
+    from kiro_crew.platform.governance import resolve
+    from kiro_crew.platform.governance_profiles import resolve_active_scope
+
+    unavailable = _SnapshotRefused(
+        "The parent's file-read policy could not be evaluated; nothing was uploaded.",
+        code="remote_project_policy_unavailable",
+        status=409,
+    )
+    try:
+        ceiling = getattr(current_context(), "governance", None)
+        profile = resolve_active_scope(parent_session, app=app)
+    except PlatformCompositionError:
+        raise
+    except Exception:
+        logger.warning("filesystem.read policy unavailable for a remote snapshot", exc_info=True)
+        raise unavailable from None
+    if ceiling is None and profile is None:
+        return None
+
+    def may_read(absolute: str) -> bool:
+        try:
+            decision = resolve(ceiling, profile, "filesystem.read", absolute)
+            return bool(getattr(decision, "permitted", False))
+        except PlatformCompositionError:
+            raise
+        except Exception:
+            logger.warning("filesystem.read evaluation failed for a remote snapshot", exc_info=True)
+            raise unavailable from None
+
+    return may_read
+
+
+def _snapshot_project(
+    project: Path, *, may_read: Callable[[str], bool] | None = None
+) -> tuple[bytes, str, str]:
     """The parent project's tracked files as a gzip tarball, its digest and HEAD.
 
     This runs in the gateway, outside the agent sandbox, on a tree the agent can
@@ -172,8 +219,10 @@ def _snapshot_project(project: Path) -> tuple[bytes, str, str]:
     with every program-running repo setting pinned off, and the files are read by
     this process, never by git: each one is opened without following a symlink at
     any component, must be a regular file, and is checked against the
-    sensitive-path fence and the source builder's credential-name rules. Tracked
-    symlinks and submodules are left out (the peer would skip them anyway).
+    sensitive-path fence, the source builder's credential-name rules and, when
+    *may_read* is given, the parent's ``filesystem.read`` policy. A file any of
+    them refuses is left out unread. Tracked symlinks and submodules are left out
+    (the peer would skip them anyway).
     """
     import gzip
     import io
@@ -243,6 +292,7 @@ def _snapshot_project(project: Path) -> tuple[bytes, str, str]:
                         # No component is a link (checked as it is opened), so
                         # the lexical path is the canonical one.
                         or is_sensitive_resolved_path(str(project / rel))
+                        or (may_read is not None and not may_read(str(project / rel)))
                     ):
                         continue
                     fd = _open_tracked_file(root, rel)
@@ -963,18 +1013,25 @@ class RemoteSubagentService:
         return project
 
     @staticmethod
-    def _build_project_archive(project: Path) -> tuple[bytes, str, str]:
+    def _build_project_archive(
+        project: Path, parent_session: str = "", app: str = ""
+    ) -> tuple[bytes, str, str]:
         try:
-            return _snapshot_project(project)
+            may_read = _project_read_check(parent_session, app)
+            return _snapshot_project(project, may_read=may_read)
         except _SnapshotRefused as exc:
             raise RemoteSubagentError(exc.message, code=exc.code, status=exc.status) from None
 
-    async def _sync_parent_project(self, instance_id: str, parent_session: str) -> str:
+    async def _sync_parent_project(
+        self, instance_id: str, parent_session: str, *, app: str = ""
+    ) -> str:
         project = self._parent_project(parent_session)
         if project is None:
             return ""
         try:
-            payload, digest, commit = await asyncio.to_thread(self._build_project_archive, project)
+            payload, digest, commit = await asyncio.to_thread(
+                self._build_project_archive, project, parent_session, app
+            )
         except RemoteSubagentError:
             raise
         except (OSError, subprocess.SubprocessError, ValueError, AWSError) as exc:
@@ -1051,6 +1108,7 @@ class RemoteSubagentService:
         batch_total: int,
         instance_id: str = "",
         approval_mode: str = "",
+        app: str = "",
     ) -> SubagentInfo:
         await self.ensure_restored()
         if self._closed:
@@ -1069,7 +1127,7 @@ class RemoteSubagentService:
         )
         remote_cwd = cwd
         if include_project and not remote_cwd:
-            remote_cwd = await self._sync_parent_project(selected, parent_session)
+            remote_cwd = await self._sync_parent_project(selected, parent_session, app=app)
 
         peer_body: dict[str, object] = {
             "task": task,

@@ -743,7 +743,7 @@ async def test_remote_spawn_syncs_parent_project_when_no_remote_cwd(
     )
     service = RemoteSubagentService(state, manager)  # type: ignore[arg-type]
     monkeypatch.setattr(
-        service, "_build_project_archive", lambda _path: (payload, digest, "a" * 40)
+        service, "_build_project_archive", lambda _path, *_identity: (payload, digest, "a" * 40)
     )
 
     info = await service.spawn(
@@ -799,7 +799,7 @@ async def test_remote_spawn_without_a_parent_project_runs_without_a_snapshot(
     state = SimpleNamespace(instances_manager=instances, get_slot=lambda _name: slot)
     service = RemoteSubagentService(state, manager)  # type: ignore[arg-type]
 
-    def no_archive(_path: object) -> tuple[bytes, str, str]:
+    def no_archive(_path: object, *_identity: str) -> tuple[bytes, str, str]:
         raise AssertionError("no project, so nothing may be packaged")
 
     monkeypatch.setattr(service, "_build_project_archive", no_archive)
@@ -1378,6 +1378,95 @@ def _names(payload: bytes) -> set[str]:
         return set(archive.getnames())
 
 
+@pytest.fixture
+def read_policy(tmp_path, monkeypatch):
+    """Install a governance ceiling for one test, with no profiles bound."""
+    import dataclasses
+
+    from kiro_crew.config.loader import KiroCrewConfig
+    from kiro_crew.platform import context as ctx_mod
+    from kiro_crew.platform import governance_profiles as gp
+    from kiro_crew.platform.bootstrap import build_default_context
+    from kiro_crew.platform.governance import parse_policy
+
+    profiles = tmp_path / "profiles"
+    profiles.mkdir()
+    monkeypatch.setattr(gp, "_PROFILES_DIR", profiles)
+    gp.reset_store()
+
+    def install(*, deny: tuple[str, ...] = (), allow: tuple[str, ...] = ()) -> None:
+        rules = (
+            {"mode": "allow", "allow": list(allow)}
+            if allow
+            else {"mode": "deny", "deny": list(deny)}
+        )
+        body = {"version": 1, "boot": {"fail_closed": True}, "filesystem": {"read": rules}}
+        base = build_default_context(KiroCrewConfig.load())
+        ctx_mod.set_context(dataclasses.replace(base, governance=parse_policy(body)))
+
+    yield install
+    gp.reset_store()
+    ctx_mod.reset_context()
+
+
+@pytest.mark.parametrize("mode", ["deny", "allow"])
+def test_the_snapshot_leaves_out_a_file_the_parents_read_policy_denies(
+    tmp_path, read_policy, mode
+) -> None:
+    """The gateway reads the snapshot, so the parent's read policy is applied here."""
+    from kiro_crew.dashboard.remote_subagents import RemoteSubagentService
+
+    project = tmp_path / "project"
+    project.mkdir()
+    _git_project(project)
+    (project / "docs").mkdir()
+    (project / "docs" / "private.md").write_bytes(b"keep out\n")
+    (project / "docs" / "public.md").write_bytes(b"fine\n")
+    _commit_all(project, "docs/private.md", "docs/public.md")
+    if mode == "deny":
+        read_policy(deny=("**/private.md",))
+    else:
+        read_policy(allow=(str(project / "app.py"), str(project / "docs" / "public.md")))
+
+    payload, _digest, _commit = RemoteSubagentService._build_project_archive(
+        project, "dashboard:parent", ""
+    )
+
+    names = _names(payload)
+    assert "docs/private.md" not in names
+    assert {"app.py", "docs/public.md"} <= names
+
+
+def test_an_ungoverned_parent_has_no_read_check(tmp_path, read_policy) -> None:
+    from kiro_crew.dashboard.remote_subagents import _project_read_check
+    from kiro_crew.platform import context as ctx_mod
+
+    ctx_mod.reset_context()
+    assert _project_read_check("dashboard:parent") is None
+
+
+def test_an_unevaluable_read_policy_refuses_the_snapshot(
+    tmp_path, read_policy, monkeypatch
+) -> None:
+    """A wrong permit here uploads the file to another host, so an error refuses."""
+    from kiro_crew.dashboard.remote_subagents import RemoteSubagentError, RemoteSubagentService
+    from kiro_crew.platform import governance
+
+    project = tmp_path / "project"
+    project.mkdir()
+    _git_project(project)
+    read_policy(deny=("**/never.md",))
+
+    def broken(*_args: object) -> object:
+        raise RuntimeError("evaluator failed")
+
+    monkeypatch.setattr(governance, "resolve", broken)
+    with pytest.raises(RemoteSubagentError) as caught:
+        RemoteSubagentService._build_project_archive(project, "dashboard:parent", "")
+    assert caught.value.code == "remote_project_policy_unavailable"
+    assert caught.value.status == 409
+
+
 def test_a_planted_fsmonitor_never_runs_on_the_gateway(tmp_path) -> None:
     """An agent-written ``core.fsmonitor`` must not execute while packaging."""
     import subprocess
@@ -1790,7 +1879,7 @@ async def test_a_project_that_cannot_be_packaged_is_a_typed_refusal(
     )
     service = RemoteSubagentService(state, _Manager())  # type: ignore[arg-type]
 
-    def not_git(_path: Path) -> tuple[bytes, str, str]:
+    def not_git(_path: Path, *_identity: str) -> tuple[bytes, str, str]:
         raise AWSError("not a git checkout")
 
     monkeypatch.setattr(service, "_build_project_archive", not_git)
@@ -2641,21 +2730,52 @@ async def test_a_floored_run_keeps_only_its_templates_pre_tool_hooks(
 
     deny = ScriptHook(name="deny-rm", event=HOOK_EVENT_PRE_TOOL_USE, command="exit 2")
     audit = ScriptHook(name="audit", event=HOOK_EVENT_POST_TOOL_USE, command="true")
+    source = {"name": "kirocrew", "hooks": {"preToolUse": [{"command": "exit 2"}]}}
     seen: list[tuple[str, object]] = []
 
-    def fired(agent_id: str, project_dir: object) -> tuple[list[ScriptHook], list[str], int]:
-        seen.append((agent_id, project_dir))
-        return [deny, audit], [], 0
+    def convert(agent_id: str, spec: object) -> tuple[tuple[ScriptHook, ...], int]:
+        seen.append((agent_id, spec))
+        return (deny, audit), 0
 
-    monkeypatch.setattr(spec_hooks, "crew_fired_spec_hooks", fired)
-    gated = await spec_hooks.floored_spec_hooks("kirocrew", "/work/repo")
-    assert seen == [("kirocrew", "/work/repo")]
+    def re_resolved(*_a: object) -> object:
+        raise AssertionError("the floored hooks must come from the derivation's source")
+
+    monkeypatch.setattr(spec_hooks, "_convert", convert)
+    monkeypatch.setattr(spec_hooks, "crew_fired_spec_hooks", re_resolved)
+    gated = await spec_hooks.floored_spec_hooks("kirocrew", "/work/repo", source)
+    assert seen == [("kirocrew", source)]
     assert [hook.name for hook in gated.hooks] == ["deny-rm"]
     assert gated.gated is True and gated.unreadable is False
 
-    def unreadable(*_a: object) -> object:
-        raise ValueError("spec did not parse")
+    def unconvertible(*_a: object) -> object:
+        raise ValueError("hooks did not parse")
 
-    monkeypatch.setattr(spec_hooks, "crew_fired_spec_hooks", unreadable)
-    blocked = await spec_hooks.floored_spec_hooks("kirocrew", None)
+    monkeypatch.setattr(spec_hooks, "_convert", unconvertible)
+    blocked = await spec_hooks.floored_spec_hooks("kirocrew", None, source)
     assert blocked.unreadable is True and blocked.gated is True
+    sourceless = await spec_hooks.floored_spec_hooks("kirocrew", None, None)
+    assert sourceless.unreadable is True and sourceless.gated is True
+
+
+@pytest.mark.asyncio
+async def test_a_floored_project_agents_denying_hook_still_refuses(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    """The derivation reads the PROJECT spec; an untrusted project must not make the
+    hooks fall back to the user-level spec of the same name, which has none."""
+    from kiro_crew.agent_sdk import spec_hooks
+    from kiro_crew.hooks import HOOK_EVENT_PRE_TOOL_USE
+
+    project_spec = {
+        "name": "kirocrew",
+        "hooks": {"preToolUse": [{"matcher": "*", "command": "exit 2"}]},
+    }
+    monkeypatch.setattr(
+        spec_hooks,
+        "crew_fired_spec_hooks",
+        lambda *_a: ([], [], 0),  # what the untrusted-project fallback yields
+    )
+    gated = await spec_hooks.floored_spec_hooks("kirocrew", str(tmp_path), project_spec)
+    assert gated.unreadable is False
+    assert [hook.event for hook in gated.hooks] == [HOOK_EVENT_PRE_TOOL_USE]
+    assert gated.hooks[0].command == "exit 2"

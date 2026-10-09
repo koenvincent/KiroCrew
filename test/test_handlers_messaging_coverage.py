@@ -238,6 +238,39 @@ class TestApiSpawn:
         assert resp.status == 200
         assert mgr.spawn.call_args.kwargs["approval_floor"] == "interactive"
 
+    @staticmethod
+    def _floored_run(**kw: Any) -> Any:
+        fields = {"id": "f1", "approval_floor": "interactive", "conversation_key": ""}
+        return SimpleNamespace(**{**fields, **kw})
+
+    @pytest.mark.parametrize(
+        "run_fields,session",
+        [
+            ({}, "subagent:f1"),
+            ({"conversation_key": "subagent:conv9"}, "subagent:conv9"),
+        ],
+        ids=["run-key", "conversation-key"],
+    )
+    @pytest.mark.parametrize("via", ["parent", "caller"])
+    def test_409_when_a_floored_run_asks_for_another_run(self, run_fields, session, via) -> None:
+        """The new run would take this gateway's yolo posture, so none of its tools
+        would reach the hub; the floored caller is refused instead."""
+        mgr = _mgr(all_agents=[self._floored_run(**run_fields)])
+        body = {"task": "x", "parent_session": session} if via == "parent" else {"task": "x"}
+        req = _Req(_state(subagents=mgr), body)
+        if via == "caller":
+            req.headers["X-Session-Key"] = session
+        resp = _run(mod.api_spawn, req)
+        assert resp.status == 409
+        assert _payload(resp)["code"] == "approval_floor_nested_spawn"
+        mgr.spawn.assert_not_called()
+
+    def test_an_unfloored_run_may_still_spawn(self) -> None:
+        mgr = _mgr(all_agents=[self._floored_run(approval_floor="")])
+        req = _Req(_state(subagents=mgr), {"task": "x"})
+        req.headers["X-Session-Key"] = "subagent:f1"
+        assert mod._floored_caller_refusal(req.app["state"], req, "subagent:f1") is None
+
     def test_400_on_non_alphanumeric_batch_id(self) -> None:
         req = _Req(_state(subagents=_mgr()), {"task": "x", "batch_id": "wave-1"})
         resp = _run(mod.api_spawn, req)
@@ -440,6 +473,15 @@ class TestApiSpawnContinue:
     def test_400_task_required(self) -> None:
         resp = _run(mod.api_spawn_continue, self._req(_mgr(), {"task": ""}))
         assert _payload(resp)["code"] == "task_required"
+
+    def test_409_when_a_floored_run_asks_for_a_continuation(self) -> None:
+        floored = SimpleNamespace(id="f1", approval_floor="interactive", conversation_key="")
+        mgr = _mgr(all_agents=[floored])
+        body = {"task": "x", "parent_session": "subagent:f1"}
+        resp = _run(mod.api_spawn_continue, self._req(mgr, body))
+        assert resp.status == 409
+        assert _payload(resp)["code"] == "approval_floor_nested_spawn"
+        mgr.continue_conversation.assert_not_called()
 
     def test_429_capacity(self) -> None:
         mgr = _mgr()

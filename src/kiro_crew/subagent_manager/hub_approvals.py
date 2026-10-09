@@ -103,6 +103,30 @@ def floor_enforceable() -> bool:
     return backend in ACP_BACKENDS_SIDE_READONLY
 
 
+def floored_session(subagents: Any, session_key: str) -> bool:
+    """Whether *session_key* is the session of a local run that carries the floor.
+
+    A floored run keeps the kirocrew MCP server, so it can ask this gateway to
+    start or continue another run. That run would take its approval posture
+    from this gateway, where yolo or ``auto_approve_subagent_tools`` approve
+    every tool, and its requests would never reach the hub. The spawn routes
+    refuse such a caller instead. A run's session is its continuable
+    conversation key or ``subagent:<id>``, the same key ``run.py`` opens.
+    """
+    if not session_key.startswith("subagent:") or subagents is None:
+        return False
+    try:
+        runs = list(subagents.all_agents)
+    except Exception:
+        logger.warning("run listing is unreadable; treating %s as floored", session_key)
+        return True
+    return any(
+        getattr(info, "approval_floor", "") == "interactive"
+        and (getattr(info, "conversation_key", "") or f"subagent:{info.id}") == session_key
+        for info in runs
+    )
+
+
 def pending_for(run_id: str) -> list[dict[str, str]]:
     """The run's unanswered requests, oldest first, as the status route shows them."""
     return [

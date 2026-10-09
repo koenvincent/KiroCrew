@@ -4018,8 +4018,15 @@ grants, lifecycle hooks): kiro-cli approves those itself, so they never raise a
 request the ladder could hold. The derived spec also drops `hooks`, so the
 template's PreToolUse hooks are fired by Crew on every permission request
 (`spec_hooks.floored_spec_hooks`), before the hub's person is asked: a denying
-hook still refuses, and an unreadable spec refuses every request. Its other
-lifecycle commands do not run. A floored run that switches agents mid-run ends
+hook still refuses, and an unreadable spec refuses every request. Those hooks
+come from the exact spec the derivation read (`PublishedSpec.base_spec`, project
+scope first), never from a second lookup of the name, which for an untrusted
+project would read the user-level spec instead. Its other lifecycle commands do
+not run. A floored run cannot start or continue another run on the peer:
+`/api/spawn` and `/api/spawn/{id}/continue` refuse a caller whose session (the
+claimed parent or `X-Session-Key`) belongs to a floored run with
+`409 approval_floor_nested_spawn`, since the new run would take the peer's own
+posture and none of its requests would reach the hub. A floored run that switches agents mid-run ends
 (`approval_floor_unenforceable`), since the new agent's grants were never
 emptied. The shared template is untouched, and a spec that
 cannot be derived refuses the run (`approval_floor_unenforceable`) rather than
@@ -4096,7 +4103,14 @@ must be a regular file, so a symlinked parent (`cache -> ~/.aws`) or a symlink
 leaf is skipped rather than followed. A project inside a protected directory is
 refused with `403 remote_project_protected`, and each file is checked against the
 same sensitive-path fence and the source builder's credential-name rules
-(`excluded_tracked_path` in `cloud/source.py`). Untracked files, tracked
+(`excluded_tracked_path` in `cloud/source.py`). Because the gateway reads these
+files, the PreToolUse gate that holds the parent's own agent to its
+`filesystem.read` policy never sees them, so the snapshot asks that policy
+itself: the parent surface's ceiling and profile (with the spawning app's own
+profile) are resolved once and each file's absolute path is checked
+(`_project_read_check`). A file the policy denies is left out unread, and an
+evaluation error refuses the upload with `409 remote_project_policy_unavailable`.
+Untracked files, tracked
 symlinks and submodules are excluded; dirty tracked files ship their working-tree
 content.
 The peer verifies the full SHA-256 and installs into a fresh `<digest-prefix>-<nonce>`

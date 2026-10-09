@@ -380,10 +380,13 @@ class TestSubagentInheritsPolicy:
 
             def publish(base, _project=None):
                 captured["published_base"] = base
-                return PublishedSpec(name=f"{base}--readonly", digest="d")
+                return PublishedSpec(
+                    name=f"{base}--readonly", digest="d", base_spec={"name": base}
+                )
 
-        async def floored_hooks(base, cwd):
+        async def floored_hooks(base, cwd, base_spec):
             captured["floored_hooks_base"] = base
+            captured["floored_hooks_source"] = base_spec
             from kiro_crew.agent_sdk.spec_hooks import TurnSpecHooks
 
             return TurnSpecHooks([], cwd, False, True)
@@ -406,6 +409,8 @@ class TestSubagentInheritsPolicy:
         assert captured["agent"] == "kirocrew--readonly"
         # The derived spec drops hooks; the template's PreToolUse ones still gate.
         assert captured["floored_hooks_base"] == "kirocrew"
+        # Gated on the spec the derivation read, never a re-resolved one.
+        assert captured["floored_hooks_source"] == {"name": "kirocrew"}
 
     def test_a_run_without_a_floor_keeps_its_own_spec(self) -> None:
         captured = self._run_inner_and_capture("", parent_session_key="")
