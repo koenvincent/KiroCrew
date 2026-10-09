@@ -2470,13 +2470,11 @@ materialised by narrowing the `acp_backends` registry at gateway start),
 (the `permanent` and `until_shutdown` no-expiry choices), `sandbox.min_level`
 (ordinal floor at `wrap_argv`), `approval_mode` (boot floor only), and every capability
 gate — `capabilities.spawn`, `capabilities.remote_spawn` (placing a sub-agent on
-a remote crew, whose child runs under the peer's approval policy; off by default:
-an installed policy must grant this row explicitly, a policy that leaves it out
-refuses remote placement, and with no policy installed only the operator opt-in
-`instances.remote_subagents` decides; the row declares `ScopeSpec.explicit_grant`,
-so `resolve` itself applies that, `kirocrew policy explain` answers
-`DENIED` with rule `explicit-grant`, and `kirocrew policy validate` lists it as
-denied rather than ungoverned), `capabilities.messaging`,
+a remote crew, whose child runs under the peer's approval policy; the opt-in is
+the operator's `instances.remote_subagents`, default off, and the row follows the
+absent-key contract like every other capability: a policy refuses remote
+placement by naming it with `enabled: false`, and `kirocrew policy validate`
+reports it as ungoverned when left out), `capabilities.messaging`,
 `capabilities.cron`,
 `capabilities.memory_writes`, `capabilities.script_hooks`,
 `capabilities.browse` (the native `browser` MCP tool's dispatch chokepoint —

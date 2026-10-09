@@ -1039,6 +1039,30 @@ the same `aria-hidden` word, read through the same `signalsOf` resolver
 (`isNeedsYou`) — so the full roster, the folded switcher and the status filter
 never disagree about who is parked on a question.
 
+The thread header (`member-thread-header`: the switcher, the identity pill, the
+panel opener) floats OVER the top of the thread (#18325): an absolute row with no
+solid background, so the conversation scrolls under the Glass pill the way it
+scrolls under the composer dock, and the pill reads as a chip on the conversation
+rather than a bar above it. Every control on the row is a Glass chip — the
+switcher and the panel opener wear the pill's material at their own size, the
+phone back button too — because a bare button on a floating row sat on scrolled
+text and read as text printed over text; behind the three, a fade filling the
+header's own box (`from-bg via-bg/70 to-transparent`) dissolves rows toward the
+page colour before they reach the chips, so the chips sit on half-faded ground
+while the pane's top edge stays glass. The pane pays for the band with its
+scroller's top padding — `ChatPane`'s `topInset`, the header's measured height
+(`useMeasuredHeight`, never a constant) plus the pane's own 12px — so at scroll
+top nothing hides under the pill; the pinned-prompt band hangs under it by the
+same offset. Whatever can sit between the header and the pane (notices, the
+greeting cards) stays in flow in one `empty:hidden` box padded below the header
+by that height, and while that box has a height the pane's inset is 0: a card
+with controls is never under the glass, and the pane is under the header only
+when it is the thing directly below it. The row and its cells pass input through
+(`pointer-events-none`); only the controls catch it, so a wheel beside the pill
+reaches the transcript. It sits at z-20 — above the pane's own chrome (its dock
+and pinned prompt), below the floating Profile card (z-30), whose scrim covers
+it. No hairline under it (#9425).
+
 The centred identity pill opens `CrewProfilePanel`, not the editor. It ends in a
 small `ChevronRight` (decorative, `aria-hidden`): the one visible sign that this
 Glass chip is a door, since the switcher chip beside it is another Glass chip
@@ -1671,7 +1695,13 @@ own FILLED gray bubble (`.crewmate-bubble`, no border, `max-w-[72ch]`) in the fu
 text column, left-aligned; the user's bubble opposite is filled with the theme
 ACCENT (`bg-accent` / `text-accent-fg`, the `tone="accent"` variant of
 `UserMessage`), the iMessage pairing #17839 chose, so colour tells the two
-speakers apart before alignment does. `--bg-hover` is the gray because
+speakers apart before alignment does. The `user` entry that carries the tone is
+emitted by `createTranscriptRenderers` whenever the host passes `crewmate` (or
+asks to hide the steer badge); the crewmate is its own trigger, because the
+Members page runs the split busy mode (#16684) and a fill gated on the
+steer-only flag alone never reached it (#18361). The Steered chip is the host's
+call (`hideSteerBadge` passed through), so a steer in a crewmate chat still
+wears it. `--bg-hover` is the gray because
 `--bg-elevated` and `--card` equal the page background in kiro-light,
 highcontrast-light and everforest-light (the bubble would vanish), while
 `--bg-hover` sits above the page in every shipped theme; in forced-colors mode
@@ -1736,7 +1766,7 @@ them. `ChatPane` takes the triple as optional props and hands it to
 `createTranscriptRenderers`, which spreads it across every row it draws: the
 crewmate bubble (through `renderAssistantBubble`'s host options, with the row's
 `ts` so the short form can refuse a slot minted after the text naming it), the
-steer-only user row (through `renderUserContent`), and the sub-agent / workflow
+crewmate / steer-only user row (through `renderUserContent`), and the sub-agent / workflow
 completion cards. A pane host that passes none of it — a side chat, an embedded
 chat — renders those links plainly, as before.
 

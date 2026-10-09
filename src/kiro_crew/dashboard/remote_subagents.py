@@ -222,14 +222,10 @@ def _snapshot_project(
     sensitive-path fence, the source builder's credential-name rules and, when
     *may_read* is given, the parent's ``filesystem.read`` policy. A file any of
     them refuses is left out unread. Tracked symlinks and submodules are left out
-    (the peer would skip them anyway).
+    (the peer would skip them anyway). The project is pinned from the filesystem
+    anchor down before git runs (:func:`_pin_project_root`), and every file is
+    read through that pin.
     """
-    import gzip
-    import io
-    import stat as _stat
-    import tarfile
-
-    from kiro_crew.cloud.source import custom_home_rel_parts, excluded_tracked_path
     from kiro_crew.platform_compat import trusted_git_bin
     from kiro_crew.security.paths import is_sensitive_resolved_path
 
@@ -243,12 +239,79 @@ def _snapshot_project(
             "remote_project_snapshot_failed",
             400,
         )
+    project = Path(os.path.realpath(project))
     if is_sensitive_resolved_path(str(project)):
         raise refused(
             "The parent project is inside a protected directory.",
             "remote_project_protected",
             403,
         )
+    moved = refused(
+        "The parent project directory changed while it was being packaged.",
+        "remote_project_moved",
+        409,
+    )
+    try:
+        root = _pin_project_root(project)
+    except OSError:
+        raise moved from None
+    try:
+        return _snapshot_pinned(project, root, git, may_read)
+    finally:
+        root.close()
+
+
+def _pin_project_root(project: Path) -> PinnedDirectory:
+    """*project*, a resolved absolute path, pinned from the filesystem anchor down.
+
+    Every component is opened through the one above it, refusing a link at the
+    name, so an ancestor swapped for a symlink after the path was resolved and
+    screened (``checkout -> ~/.aws/sso``) makes the open fail instead of
+    redirecting every later read. Only the leaf stays open: on POSIX the file
+    reads are relative to its descriptor, and on Windows its handle keeps it and
+    every ancestor from being renamed.
+    """
+    chain = [PinnedDirectory(pin_directory(project.anchor), project.anchor)]
+    try:
+        for part in project.parts[1:]:
+            chain.append(chain[-1].child(part))
+    except BaseException:
+        for pin in chain:
+            pin.close()
+        raise
+    for pin in chain[:-1]:
+        pin.close()
+    return chain[-1]
+
+
+def _same_directory(path: Path, root: PinnedDirectory) -> bool:
+    """Whether *path* still names the directory *root* holds open."""
+    try:
+        named = os.stat(path)
+        held = os.fstat(root._fd)
+    except OSError:
+        return False
+    return (named.st_dev, named.st_ino) == (held.st_dev, held.st_ino)
+
+
+def _snapshot_pinned(
+    project: Path,
+    root: PinnedDirectory,
+    git: str,
+    may_read: Callable[[str], bool] | None,
+) -> tuple[bytes, str, str]:
+    """Package the tracked files of the pinned *root*; see :func:`_snapshot_project`."""
+    import gzip
+    import io
+    import stat as _stat
+    import tarfile
+
+    from kiro_crew.cloud.source import custom_home_rel_parts, excluded_tracked_path
+    from kiro_crew.security.paths import is_sensitive_resolved_path
+
+    def refused(message: str, code: str, status: int) -> _SnapshotRefused:
+        return _SnapshotRefused(message, code=code, status=status)
+
     head = _project_git(git, project, "rev-parse", "HEAD")
     commit = head.stdout.decode("utf-8", "replace").strip() if head.returncode == 0 else ""
     if not re.fullmatch(r"[a-f0-9]{40,64}", commit):
@@ -264,69 +327,67 @@ def _snapshot_project(
             "remote_project_snapshot_failed",
             400,
         )
+    if not _same_directory(project, root):
+        # git ran by path: a directory swapped in meanwhile gave the listing.
+        raise refused(
+            "The parent project directory changed while it was being packaged.",
+            "remote_project_moved",
+            409,
+        )
     home_parts = custom_home_rel_parts(project)
     buffer = io.BytesIO()
     expanded = 0
     members = 0
     seen: set[str] = set()
-    root = PinnedDirectory(pin_directory(str(project)), str(project))
-    try:
-        with gzip.GzipFile(fileobj=buffer, mode="wb", mtime=0) as gz:
-            with tarfile.open(fileobj=gz, mode="w", format=tarfile.PAX_FORMAT) as tar:
-                for entry in sorted(listing.stdout.split(b"\0")):
-                    if not entry:
-                        continue
-                    meta, _, raw_name = entry.partition(b"\t")
-                    rel = raw_name.decode("utf-8", "surrogateescape")
-                    mode = meta.split(b" ", 1)[0]
-                    if mode not in (b"100644", b"100755"):
-                        continue  # symlink (120000) or submodule (160000)
-                    if rel in seen:
-                        continue  # a conflicted path lists one entry per stage
-                    seen.add(rel)
-                    if (
-                        not rel
-                        or rel.startswith("/")
-                        or any(part in ("", ".", "..") for part in rel.split(posixpath.sep))
-                        or excluded_tracked_path(rel, home_parts)
-                        # No component is a link (checked as it is opened), so
-                        # the lexical path is the canonical one.
-                        or is_sensitive_resolved_path(str(project / rel))
-                        or (may_read is not None and not may_read(str(project / rel)))
-                    ):
-                        continue
-                    fd = _open_tracked_file(root, rel)
-                    if fd is None:
-                        continue
-                    with os.fdopen(fd, "rb") as handle:
-                        size = os.fstat(handle.fileno()).st_size
-                        expanded += size
-                        members += 1
-                        if (
-                            expanded > _MAX_SNAPSHOT_EXPANDED_BYTES
-                            or members > _MAX_SNAPSHOT_MEMBERS
-                        ):
-                            raise refused(
-                                "The tracked project snapshot is too large for remote "
-                                "execution.",
-                                "remote_project_too_large",
-                                413,
-                            )
-                        info = tarfile.TarInfo(rel)
-                        info.size = size
-                        executable = _stat.S_IMODE(os.fstat(handle.fileno()).st_mode) & 0o111
-                        info.mode = 0o755 if executable else 0o644
-                        info.mtime = 0
-                        tar.addfile(info, handle)
-                        if buffer.tell() > _MAX_WORKSPACE_ARCHIVE_BYTES:
-                            raise refused(
-                                "The tracked project snapshot is too large for remote "
-                                "execution.",
-                                "remote_project_too_large",
-                                413,
-                            )
-    finally:
-        root.close()
+    with gzip.GzipFile(fileobj=buffer, mode="wb", mtime=0) as gz:
+        with tarfile.open(fileobj=gz, mode="w", format=tarfile.PAX_FORMAT) as tar:
+            for entry in sorted(listing.stdout.split(b"\0")):
+                if not entry:
+                    continue
+                meta, _, raw_name = entry.partition(b"\t")
+                rel = raw_name.decode("utf-8", "surrogateescape")
+                mode = meta.split(b" ", 1)[0]
+                if mode not in (b"100644", b"100755"):
+                    continue  # symlink (120000) or submodule (160000)
+                if rel in seen:
+                    continue  # a conflicted path lists one entry per stage
+                seen.add(rel)
+                if (
+                    not rel
+                    or rel.startswith("/")
+                    or any(part in ("", ".", "..") for part in rel.split(posixpath.sep))
+                    or excluded_tracked_path(rel, home_parts)
+                    # No component is a link (checked as it is opened), so
+                    # the lexical path is the canonical one.
+                    or is_sensitive_resolved_path(str(project / rel))
+                    or (may_read is not None and not may_read(str(project / rel)))
+                ):
+                    continue
+                fd = _open_tracked_file(root, rel)
+                if fd is None:
+                    continue
+                with os.fdopen(fd, "rb") as handle:
+                    size = os.fstat(handle.fileno()).st_size
+                    expanded += size
+                    members += 1
+                    if expanded > _MAX_SNAPSHOT_EXPANDED_BYTES or members > _MAX_SNAPSHOT_MEMBERS:
+                        raise refused(
+                            "The tracked project snapshot is too large for remote execution.",
+                            "remote_project_too_large",
+                            413,
+                        )
+                    info = tarfile.TarInfo(rel)
+                    info.size = size
+                    executable = _stat.S_IMODE(os.fstat(handle.fileno()).st_mode) & 0o111
+                    info.mode = 0o755 if executable else 0o644
+                    info.mtime = 0
+                    tar.addfile(info, handle)
+                    if buffer.tell() > _MAX_WORKSPACE_ARCHIVE_BYTES:
+                        raise refused(
+                            "The tracked project snapshot is too large for remote execution.",
+                            "remote_project_too_large",
+                            413,
+                        )
     payload = buffer.getvalue()
     if len(payload) > _MAX_WORKSPACE_ARCHIVE_BYTES:
         raise refused(

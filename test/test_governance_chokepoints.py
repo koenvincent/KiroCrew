@@ -380,9 +380,9 @@ class TestHelpers:
         assert _vet_remote_placement_governance("cli_chat")
         assert _vet_spawn_governance("cli_chat", "") is None
 
-    def test_an_installed_policy_must_name_remote_placement_to_grant_it(self):
-        # A policy written before the row existed must not be loosened from
-        # below: omission permits every other scope, but not this one.
+    def test_remote_placement_follows_the_absent_key_contract(self):
+        # Like every capability, an installed policy that leaves the row out
+        # leaves it ungoverned; the operator opt-in is the gate there.
         from kiro_crew.subagent import _vet_remote_placement_governance
 
         _install(
@@ -392,8 +392,7 @@ class TestHelpers:
                 "capabilities": {"spawn": {"enabled": True}},
             }
         )
-        denial = _vet_remote_placement_governance("cli_chat")
-        assert denial and "capabilities.remote_spawn" in denial
+        assert _vet_remote_placement_governance("cli_chat") is None
         _install(
             {
                 "version": 1,

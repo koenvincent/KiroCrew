@@ -1378,6 +1378,52 @@ def _names(payload: bytes) -> set[str]:
         return set(archive.getnames())
 
 
+@pytest.mark.skipif(os.name == "nt", reason="creating a symlink needs a privilege on Windows")
+def test_an_ancestor_swapped_for_a_link_after_resolution_is_refused(tmp_path, monkeypatch) -> None:
+    """The project was resolved and screened, then an ancestor became a link into
+    a masked directory: the pin refuses it instead of reading through it."""
+    from kiro_crew.dashboard.remote_subagents import _snapshot_project
+
+    project = tmp_path / "checkout" / "cache"
+    project.mkdir(parents=True)
+    _git_project(project)
+    masked = tmp_path / "masked" / "cache"
+    masked.mkdir(parents=True)
+    _git_project(masked)
+    (masked / "app.py").write_bytes(b"token\n")
+    (tmp_path / "checkout").rename(tmp_path / "checkout.real")
+    (tmp_path / "checkout").symlink_to(tmp_path / "masked", target_is_directory=True)
+    # Resolution and screening happened before the swap.
+    monkeypatch.setattr(remote_subagents.os.path, "realpath", lambda path: str(path))
+
+    with pytest.raises(remote_subagents._SnapshotRefused) as caught:
+        _snapshot_project(project)
+    assert caught.value.code == "remote_project_moved"
+
+
+@pytest.mark.skipif(os.name == "nt", reason="the pinned handle blocks the rename on Windows")
+def test_a_directory_swapped_in_while_git_runs_is_refused(tmp_path, monkeypatch) -> None:
+    """git lists by path, so a listing taken from a swapped-in tree is not packaged."""
+    from kiro_crew.dashboard.remote_subagents import _snapshot_project
+
+    project = tmp_path / "project"
+    project.mkdir()
+    _git_project(project)
+    real_git = remote_subagents._project_git
+
+    def swapping_git(git: str, root: Path, *argv: str) -> Any:
+        result = real_git(git, root, *argv)
+        if argv[0] == "ls-files":
+            (tmp_path / "project").rename(tmp_path / "project.real")
+            (tmp_path / "project").mkdir()
+        return result
+
+    monkeypatch.setattr(remote_subagents, "_project_git", swapping_git)
+    with pytest.raises(remote_subagents._SnapshotRefused) as caught:
+        _snapshot_project(project)
+    assert caught.value.code == "remote_project_moved"
+
+
 @pytest.fixture
 def read_policy(tmp_path, monkeypatch):
     """Install a governance ceiling for one test, with no profiles bound."""
@@ -1424,7 +1470,8 @@ def test_the_snapshot_leaves_out_a_file_the_parents_read_policy_denies(
     (project / "docs" / "public.md").write_bytes(b"fine\n")
     _commit_all(project, "docs/private.md", "docs/public.md")
     if mode == "deny":
-        read_policy(deny=("**/private.md",))
+        # Path globs match the native spelling of the absolute item.
+        read_policy(deny=(f"**{os.sep}private.md",))
     else:
         read_policy(allow=(str(project / "app.py"), str(project / "docs" / "public.md")))
 

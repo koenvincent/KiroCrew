@@ -2718,22 +2718,12 @@ def _policy(args: argparse.Namespace) -> None:
             # most often get wrong, because a partial `capabilities` block LOOKS
             # like a complete statement. Report the gap so an unpinned row reads
             # as a choice instead of an oversight.
-            omitted = [
-                (scope, spec)
-                for scope, spec in sorted(SCOPE_CATALOG.items())
+            unnamed = sorted(
+                scope
+                for scope, spec in SCOPE_CATALOG.items()
                 if spec.kind == CAPABILITY and scope not in ceiling.controls
-            ]
-            # A row declared ``explicit_grant`` denies when omitted instead.
-            withheld = [scope for scope, spec in omitted if spec.explicit_grant]
-            unnamed = [scope for scope, spec in omitted if not spec.explicit_grant]
-            if withheld:
-                print(
-                    f"   ℹ️  leaves {len(withheld)} explicit-grant row(s) unnamed "
-                    "(therefore DENIED):"
-                )
-                for scope in withheld:
-                    print(f"        {scope}")
-            if unnamed and len(omitted) < sum(
+            )
+            if unnamed and len(unnamed) < sum(
                 1 for spec in SCOPE_CATALOG.values() if spec.kind == CAPABILITY
             ):
                 print(

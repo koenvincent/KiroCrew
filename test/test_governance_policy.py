@@ -2039,8 +2039,7 @@ class TestCapabilityOmissionIsUngoverned:
     def test_unnamed_capability_is_permitted_and_reads_as_ungoverned(self):
         ceiling = parse_policy(_policy_body(capabilities={"script_hooks": {"enabled": False}}))
         for scope in _capability_scopes():
-            # An explicit-grant row denies by omission: TestExplicitGrantScopes.
-            if scope == "capabilities.script_hooks" or SCOPE_CATALOG[scope].explicit_grant:
+            if scope == "capabilities.script_hooks":
                 continue
             decision = resolve(ceiling, None, scope, "")
             assert decision.permitted, f"{scope} must be permitted by omission"
@@ -2072,8 +2071,7 @@ class TestCapabilityOmissionIsUngoverned:
     def test_no_capabilities_block_leaves_every_capability_ungoverned(self):
         ceiling = parse_policy(_policy_body(commands={"mode": MODE_DENY, "deny": ["nc *"]}))
         for scope in _capability_scopes():
-            decision = resolve(ceiling, None, scope, "")
-            assert decision.permitted is not SCOPE_CATALOG[scope].explicit_grant, scope
+            assert resolve(ceiling, None, scope, "").permitted
 
     def test_present_key_without_enabled_uses_the_registered_default(self):
         """The case ``capability_default`` DOES cover — and the only one.
@@ -2126,14 +2124,6 @@ class TestValidateReportsUngovernedCapabilities:
         # The row the author DID name must not be reported as a gap.
         assert "capabilities.script_hooks\n" not in out.split("UNGOVERNED", 1)[1]
 
-    def test_an_explicit_grant_row_is_reported_as_denied_not_ungoverned(self, capsys):
-        ceiling = parse_policy(_policy_body(capabilities={"script_hooks": {"enabled": False}}))
-        out = self._validate(capsys, ceiling)
-        denied, _, rest = out.partition("therefore DENIED")
-        assert "capabilities.remote_spawn" in rest.split("UNGOVERNED", 1)[0]
-        assert "capabilities.remote_spawn" not in rest.split("UNGOVERNED", 1)[1]
-        assert denied
-
     def test_fully_enumerated_block_reports_no_gap(self, capsys):
         body = {scope.split(".", 1)[1]: {"enabled": True} for scope in _capability_scopes()}
         # agentcore requires a known inner posture when enabled.
@@ -2170,37 +2160,3 @@ class TestValidateReportsUngovernedCapabilities:
         assert "'network.egress'" in line
         assert "deny[0]" in line
         assert "https://skills.sh/api" not in line
-
-
-class TestExplicitGrantScopes:
-    """A catalog row with ``explicit_grant`` denies when an installed policy omits it.
-
-    It is declared on the row and applied by ``resolve``, so the evaluator, the
-    CLI's ``explain`` and every call site give the same answer.
-    """
-
-    def test_only_rows_that_hand_work_off_declare_it(self):
-        assert sorted(s for s, spec in SCOPE_CATALOG.items() if spec.explicit_grant) == [
-            "capabilities.remote_spawn"
-        ]
-
-    def test_omission_denies_under_a_policy_and_naming_it_decides(self):
-        ceiling = parse_policy(_policy_body(capabilities={"spawn": {"enabled": True}}))
-        denied = resolve(ceiling, None, "capabilities.remote_spawn", "")
-        assert not denied.permitted
-        assert (denied.rule, denied.layer) == ("explicit-grant", "policy")
-        assert "capabilities.remote_spawn" in denied.reason
-        # The absent-key contract still holds for every other row.
-        assert resolve(ceiling, None, "capabilities.cron", "").permitted
-        for enabled in (True, False):
-            named = parse_policy(
-                _policy_body(capabilities={"remote_spawn": {"enabled": enabled}})
-            )
-            assert resolve(named, None, "capabilities.remote_spawn", "").permitted is enabled
-
-    def test_a_profile_alone_cannot_grant_it_and_no_policy_leaves_it_open(self):
-        ceiling = parse_policy(_policy_body(capabilities={"spawn": {"enabled": True}}))
-        profile = parse_profile({"name": "p", "capabilities": {"remote_spawn": {"enabled": True}}})
-        assert not resolve(ceiling, profile, "capabilities.remote_spawn", "").permitted
-        # With no policy installed the operator opt-in is the only gate.
-        assert resolve(None, None, "capabilities.remote_spawn", "").permitted

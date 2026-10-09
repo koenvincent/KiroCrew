@@ -1268,13 +1268,6 @@ class ScopeSpec:
     # loader's contract is that registering a scope needs no loader edit, and a
     # second scope with a floor should be a catalog entry, not another `if`.
     always_permitted: tuple[str, ...] = ()
-    # Under an installed policy, an omitted row DENIES instead of permitting:
-    # the policy must name the scope to grant it. For a scope whose grant hands
-    # work to a party this gateway cannot govern, where a policy written before
-    # the row existed must not be loosened from below. Data, read by ``resolve``,
-    # so the evaluator, ``kirocrew policy explain``/``validate`` and every call
-    # site agree. With no policy installed it has no effect.
-    explicit_grant: bool = False
 
 
 # ── CAPABILITY-DEFAULT CONTRACT (read before touching any capability_default) ──
@@ -1295,12 +1288,6 @@ class ScopeSpec:
 # not a special case, and making them one would put a namespace-specific rule in
 # a loader whose whole contract is that a newly registered scope family parses
 # without a loader edit.
-#
-# The one declared exception is a catalog row with ``explicit_grant=True``
-# (``capabilities.remote_spawn``): under an installed policy its omission
-# denies, because ``resolve`` reads that property. It is a property of the row,
-# not a rule at a call site, and ``kirocrew policy validate`` lists such rows
-# as denied rather than permitted.
 #
 # Consequence for authors, and the reason a governed fleet should enumerate all of
 # them: a policy cannot deny a capability by leaving it out.  ``kirocrew policy
@@ -1403,15 +1390,11 @@ SCOPE_CATALOG: Dict[str, ScopeSpec] = {
     # Placing a sub-agent on a remote crew (``spawn_run`` with
     # ``executor="remote"``). The child then runs under the PEER's approval
     # policy and profile, not this gateway's, so an administrator must be able
-    # to refuse placement without denying ``capabilities.spawn`` outright.
-    # Default False, and under an installed policy the row must be present
-    # (``explicit_grant``): an omitted row would otherwise permit (the
-    # absent-key contract above), which would let a policy written before this
-    # row loosen from below. With no policy at all, the operator opt-in
-    # ``instances.remote_subagents`` is the only gate.
-    "capabilities.remote_spawn": ScopeSpec(
-        CAPABILITY, capability_default=False, explicit_grant=True
-    ),
+    # to refuse placement without denying ``capabilities.spawn`` outright. The
+    # opt-in is the operator's ``instances.remote_subagents`` (default off);
+    # this row follows the absent-key contract above, so a policy denies by
+    # naming it and ``kirocrew policy validate`` reports it when left out.
+    "capabilities.remote_spawn": ScopeSpec(CAPABILITY, capability_default=False),
     "capabilities.memory_writes": ScopeSpec(CAPABILITY, capability_default=True),
     # Web browsing (the ``browser`` MCP tool driving the native panel, and the
     # playwright-cli fallback it points at) is a governable egress surface: an
@@ -4041,15 +4024,6 @@ def resolve(
     default) and a policy-deny is final regardless of the profile.
     """
     policy_control = ceiling.get(scope) if ceiling is not None else None
-    if ceiling is not None and policy_control is None:
-        spec = SCOPE_CATALOG.get(scope)
-        if spec is not None and spec.explicit_grant:
-            return Decision(
-                False,
-                f"policy does not grant {scope} (this scope needs an explicit row)",
-                rule="explicit-grant",
-                layer="policy",
-            )
     policy_dec = _query_level(policy_control, scope, item)
     if not policy_dec.permitted:
         return Decision(

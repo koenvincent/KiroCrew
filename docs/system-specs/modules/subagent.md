@@ -4054,14 +4054,12 @@ check.
 Two gates decide whether remote placement is allowed at all, and the model
 alone never does. The operator opt-in `instances.remote_subagents` (default
 `false`; `403 remote_subagents_disabled` otherwise) is the first. The policy
-capability `capabilities.remote_spawn` is the ceiling over it. Unlike other
-capabilities it is opt-in under an installed policy: the policy must name the row
-with `enabled: true`, so a policy written before the row existed does not grant
-remote placement by omission. That is declared on the catalog row
-(`ScopeSpec.explicit_grant`) and applied by the evaluator, so `policy explain`,
-`policy validate` and the spawn gate give the same answer. With no policy
-installed the operator opt-in alone
-decides, and an evaluation error denies.
+capability `capabilities.remote_spawn` is the ceiling over it. It follows the
+absent-key contract every capability does (`TestCapabilityOmissionIsUngoverned`):
+a policy refuses remote placement by naming the row with `enabled: false`, a
+policy that leaves it out leaves it ungoverned (`layer="default"`, reported by
+`kirocrew policy validate`), and the operator opt-in decides. An evaluation
+error denies.
 When both permit, `/api/spawn` also runs the same spawn governance
 (`capabilities.spawn` and its agent scope) and parent-spec
 `toolsSettings.subagent.availableAgents` allowlist the local admission path
@@ -4100,7 +4098,13 @@ and with the program-running repo settings pinned off on the argv
 bytes are read by the gateway, never by git: each tracked path is opened
 component by component with `O_NOFOLLOW` from the project's directory fd and
 must be a regular file, so a symlinked parent (`cache -> ~/.aws`) or a symlink
-leaf is skipped rather than followed. A project inside a protected directory is
+leaf is skipped rather than followed. The project root itself is resolved,
+screened, and then pinned from the filesystem anchor down, each component opened
+through the one above it without following a link (`_pin_project_root`), so an
+ancestor swapped for a link after screening (`checkout -> ~/.aws/sso`) fails the
+open with `409 remote_project_moved` instead of redirecting every read. git runs
+by path, so the root's identity is compared with the pinned directory after the
+listing, and a swap in that window is refused the same way. A project inside a protected directory is
 refused with `403 remote_project_protected`, and each file is checked against the
 same sensitive-path fence and the source builder's credential-name rules
 (`excluded_tracked_path` in `cloud/source.py`). Because the gateway reads these

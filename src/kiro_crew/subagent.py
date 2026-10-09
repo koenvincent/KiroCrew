@@ -617,8 +617,6 @@ def _vet_remote_placement_governance(parent_session_key: str, app: str = "") -> 
             app=app,
             fail_closed=True,
         )
-        # Under an installed policy the row must be named to grant it: the
-        # catalog declares ``explicit_grant`` and ``resolve`` applies it.
         if not getattr(gate, "permitted", False):
             return getattr(gate, "reason", "remote sub-agent placement disabled by policy")
         return None
