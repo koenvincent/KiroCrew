@@ -763,6 +763,7 @@ _SUBAGENT_REFUSALS: Mapping[str, tuple[str, str]] = MappingProxyType(
         "child": ("child_interactive_rejected", ""),
         "factory": ("", "factory_rejected"),
         "callback": ("", ""),
+        "hub": ("", "hub_rejected"),
         "headless": ("", "no_policy_deny_default"),
         "turn_limit": ("turn_limit", ""),
         "child_escalation_limit": ("child_escalation_limit", ""),
@@ -778,6 +779,8 @@ _SUBAGENT_APPROVALS: Mapping[str, str] = MappingProxyType(
         "child": "child_interactive_approved",
         "factory": "",
         "callback": "",
+        # A floored run's person, answering through the remote hub that placed it.
+        "hub": "",
     }
 )
 

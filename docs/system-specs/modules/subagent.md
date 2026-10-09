@@ -3994,10 +3994,21 @@ Anything else, including a session store it cannot read, sends
 auto-approves that run's tools. That holds on every rung of the run's
 permission ladder, not only the parent's policy: the yolo and config fallbacks
 no longer make the parent `auto`, the hook gate keeps its denies but loses its
-auto-approve (`auto_approve_tools`), and the request reaches the gateway's
-approval callback marked with `approval_floor`, which skips every non-human
-shortcut there (`auto_approve_sources`, `--approval yolo/reads`, the YOLO
-override, slot trust) and leaves only the person's answer
+auto-approve (`auto_approve_tools`), and nobody on the peer answers. The
+floor's person is in the hub's session, so the ladder parks every request in
+`subagent_manager/hub_approvals.py` instead of asking the factory, the gateway
+callback or a local prompt. The run's `GET /api/spawn/{id}` lists the parked
+requests as `approvals`; the hub's monitor raises each one as an approval card
+in the parent's session and posts the answer to
+`POST /api/spawn/{id}/approvals/{approval_id}` (`{"approved": bool}`, dashboard
+owner only, never an internal MCP caller or an app; SEL
+`subagent.hub_approval`). A request the peer stops listing (answered, or its
+two-hour wait ran out, which is a rejection) is withdrawn on the hub, and an
+answer the peer does not take leaves the request pending for the next poll
+instead of approving it. A floored request that does reach a gateway approval
+callback is marked with `approval_floor`, which skips every non-human shortcut
+there (`auto_approve_sources`, `--approval yolo/reads`, the YOLO override,
+slot trust) and leaves only the person's answer
 (`/api/spawn` accepts `""` or `"interactive"`, refuses any other value or one
 beside `approval_mode=auto`, and keeps the floor in the run's durable queue row
 so a restart cannot drop it). A floored run also launches as `<agent>--readonly`,
@@ -4014,7 +4025,8 @@ Version parity checks major.minor only, so a peer without this change could
 accept the run and silently drop `memory_mode` and `approval_floor`. Before the
 task text leaves the hub, a run with a privacy mode or a floor reads the peer's
 `/api/version`, whose `spawn_enforces` list names the fields that gateway
-applies; a peer that does not list them is refused with
+applies (a floored run also needs `approval_relay`, the parked-request
+handover above); a peer that does not list them is refused with
 `409 remote_peer_unenforced` and gets no request at all, since a peer that drops
 `memory_mode` would already have written the task to its queue row. Both halves
 ship together, so a peer that advertises the fields applies them. A persistent
@@ -4026,7 +4038,10 @@ alone never does. The operator opt-in `instances.remote_subagents` (default
 capability `capabilities.remote_spawn` is the ceiling over it. Unlike other
 capabilities it is opt-in under an installed policy: the policy must name the row
 with `enabled: true`, so a policy written before the row existed does not grant
-remote placement by omission. With no policy installed the operator opt-in alone
+remote placement by omission. That is declared on the catalog row
+(`ScopeSpec.explicit_grant`) and applied by the evaluator, so `policy explain`,
+`policy validate` and the spawn gate give the same answer. With no policy
+installed the operator opt-in alone
 decides, and an evaluation error denies.
 When both permit, `/api/spawn` also runs the same spawn governance
 (`capabilities.spawn` and its agent scope) and parent-spec

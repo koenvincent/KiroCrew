@@ -5036,6 +5036,18 @@ async def _consume_pending_reset(
                 slot.key,
             )
             return torn_down
+        from kiro_crew.dashboard.session_directive_apply import _slot_has_pending_interaction
+
+        if getattr(slot, "_pending_discard_from_wake", False) and _slot_has_pending_interaction(
+            state, slot
+        ):
+            # A patrol wake's reset never lands while a person is being asked
+            # something: the answer would reach a chat with no memory of it.
+            logger.debug(
+                "Deferring queued conversation discard for slot %s: question or approval pending",
+                slot.key,
+            )
+            return torn_down
         try:
             # ``skip_if_busy`` rather than a busy-probe here: the check and the
             # teardown have to be ONE atomic step under the session lock. A
@@ -5066,6 +5078,7 @@ async def _consume_pending_reset(
             slot.forget_session_model_state()
             if slot._pending_discard_conversation_key == discard_key:
                 slot._pending_discard_conversation_key = None
+                slot._pending_discard_from_wake = False
             # The discarded conversation's MCP report describes a session that no
             # longer exists; the fresh one will report for itself.
             if slot.clear_mcp_report():

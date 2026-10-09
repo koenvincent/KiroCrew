@@ -59,6 +59,9 @@ _PRUNE_INTERVAL_SECONDS = 60.0
 # A peer that stays unreachable this long ends the shadow run with an error, so
 # a deleted or dead crew cannot keep its parent busy forever.
 _UNREACHABLE_DEADLINE_SECONDS = 30 * 60.0
+# A peer approval id (``hub_approvals.ask_hub``) and how many one poll relays.
+_APPROVAL_ID_RE = re.compile(r"^[a-f0-9]{16}\Z")
+_MAX_RELAYED_APPROVALS = 8
 _RESULT_NOT_RETAINED = (
     "The run finished, but its incognito/temporary result was held only in memory "
     "and did not survive a gateway restart."
@@ -423,7 +426,9 @@ async def _ensure_peer_supports(
     if memory_mode not in ("", "persistent"):
         needed.add("memory_mode")
     if approval_floor:
-        needed.add("approval_floor")
+        # The floor's person is on this hub, so the peer must hand the run's
+        # tool requests back instead of prompting where nobody is watching.
+        needed.update(("approval_floor", "approval_relay"))
     if not needed:
         return
     try:
@@ -448,6 +453,8 @@ class RemoteSubagentService:
         self._state = state
         self._manager = manager
         self._monitors: dict[str, asyncio.Task[None]] = {}
+        # (local run id, peer approval id) -> the task asking this hub's person.
+        self._relays: dict[tuple[str, str], asyncio.Task[None]] = {}
         self._closed = False
         self._tie_cursor = 0
         self._restore_task: asyncio.Task[None] | None = None
@@ -1198,6 +1205,14 @@ class RemoteSubagentService:
         return _done
 
     async def _monitor(self, info: SubagentInfo) -> None:
+        try:
+            await self._monitor_loop(info)
+        finally:
+            # The run is over (or this hub stops watching it): withdraw any
+            # prompt still open for it, which the person cannot settle now.
+            self._cancel_relays(info.id)
+
+    async def _monitor_loop(self, info: SubagentInfo) -> None:
         missing = 0
         unreachable_since = 0.0
         while not self._closed and not info.done:
@@ -1248,6 +1263,7 @@ class RemoteSubagentService:
             except (TypeError, ValueError):
                 pass
             info.last_tool = redact_peer_text(str(payload.get("last_tool") or ""))
+            self._relay_approvals(info, payload.get("approvals"))
             if payload.get("done") is True:
                 if await self._finish(info, payload):
                     return
@@ -1255,6 +1271,76 @@ class RemoteSubagentService:
                 await asyncio.sleep(_RETRY_SECONDS)
                 continue
             await asyncio.sleep(_POLL_SECONDS)
+
+    def _relay_approvals(self, info: SubagentInfo, listed: object) -> None:
+        """Mirror the peer's pending requests for *info* into its parent session.
+
+        A request missing from the peer's list was settled there (answered, or
+        its wait ran out), so its local prompt is withdrawn.
+        """
+        current: dict[str, dict[str, object]] = {}
+        if info.approval_floor == "interactive" and isinstance(listed, list):
+            for item in listed[:_MAX_RELAYED_APPROVALS]:
+                if isinstance(item, dict) and _APPROVAL_ID_RE.fullmatch(str(item.get("id") or "")):
+                    current[str(item["id"])] = item
+        for key in [k for k in self._relays if k[0] == info.id and k[1] not in current]:
+            self._relays.pop(key).cancel()
+        for approval_id, item in current.items():
+            key = (info.id, approval_id)
+            if key not in self._relays:
+                task = asyncio.create_task(self._relay_one(info, approval_id, item))
+                self._relays[key] = task
+                task.add_done_callback(lambda _t, key=key: self._forget_relay(key, _t))
+
+    def _forget_relay(self, key: tuple[str, str], task: asyncio.Task[None]) -> None:
+        if self._relays.get(key) is task:
+            self._relays.pop(key, None)
+
+    def _cancel_relays(self, run_id: str) -> None:
+        for key in [k for k in self._relays if k[0] == run_id]:
+            self._relays.pop(key).cancel()
+
+    async def _relay_one(
+        self, info: SubagentInfo, approval_id: str, item: dict[str, object]
+    ) -> None:
+        """Ask this hub's person about one peer request and send the answer back."""
+        from kiro_crew.dashboard.chat_utils import dashboard_slot_key
+
+        request = getattr(self._state, "request_approval", None)
+        if not callable(request):
+            return
+        title = redact_peer_text(str(item.get("title") or ""))
+        approved = bool(
+            await request(
+                f"remote:{info.id}:{approval_id}",
+                "subagent",
+                f"[remote crew {info.instance_id}] {title}",
+                tool_input=redact_peer_text(str(item.get("tool_input") or "")),
+                tool_purpose=redact_peer_text(str(item.get("tool_purpose") or "")),
+                slot=dashboard_slot_key(info.parent_session_key),
+                is_background=False,
+            )
+        )
+        try:
+            status, _ = await self._request_json(
+                info.instance_id,
+                "POST",
+                f"api/spawn/{info.remote_id}/approvals/{approval_id}",
+                body={"approved": approved},
+            )
+        except RemoteSubagentError:
+            status = 0
+        if not 200 <= status < 300:
+            # 404: the peer settled it first (its own wait ran out). Anything
+            # else leaves the request pending there, so it is relayed again on
+            # a later poll rather than approved by default.
+            logger.info(
+                "Remote crew %s did not take the answer to approval %s of run %s (HTTP %s)",
+                info.instance_id,
+                approval_id,
+                info.id,
+                status,
+            )
 
     async def _finish(self, info: SubagentInfo, payload: dict[str, object]) -> bool:
         """Commit the run's terminal record, then publish it; True once committed.
@@ -1339,7 +1425,8 @@ class RemoteSubagentService:
     async def close(self) -> None:
         """Stop local monitors without cancelling work that continues remotely."""
         self._closed = True
-        tasks = list(self._monitors.values())
+        tasks = list(self._monitors.values()) + list(self._relays.values())
+        self._relays.clear()
         if self._restore_task is not None and not self._restore_task.done():
             tasks.append(self._restore_task)
         for task in tasks:

@@ -973,9 +973,8 @@ async def api_chat_slot_edit_resend(request: web.Request) -> web.Response:
                 # ``total_messages`` is a LIFETIME counter that survives
                 # trimming, and the prospective ``append`` bumped only the COPY's
                 # int -- so without this the edited row is invisible to every
-                # reader of it: ``_get_active_workspace`` picks the max-counter
-                # slot to resolve which workspace's lessons to load, and the
-                # Slack mirror compares the counter against its own start value
+                # reader of it: the Slack mirror compares the counter against
+                # its own start value
                 # to decide whether anything happened. Incremented by ONE here
                 # rather than adopted from the copy, whose value predates the
                 # arrived rows above (which bumped the live counter themselves).

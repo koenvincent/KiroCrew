@@ -44,7 +44,7 @@ import asyncio
 import json
 import logging
 import uuid
-from collections.abc import Awaitable, Callable, Iterator
+from collections.abc import Awaitable, Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any
@@ -125,6 +125,8 @@ from kiro_crew.members import select_provider_backend
 from kiro_crew.memory_stores import named_store_or_empty
 from kiro_crew.messaging.link import CHAT_TYPE_DIRECT, ChannelLink, parse_session_key
 from kiro_crew.messaging.transport import DM_TARGET_PREFIX, sole_direct_target
+from kiro_crew.metrics.sessions import END_REASON_REMOVED
+from kiro_crew.metrics.turns import turn_outcome
 from kiro_crew.security import redact, redact_and_truncate
 from kiro_crew.sel import sel
 from kiro_crew.session_summary import derive_state
@@ -3319,8 +3321,9 @@ async def fork_session(
     be an eligible CREATOR -- the same refusal set ``create_session`` applies,
     because a fork manufactures a session the caller then owns.
 
-    What the child gets on top of the human fork: ``title`` (else the fork's own
-    ``Fork of <parent>``), ``folder_id`` (else the parent's folder, as the human
+    What the child gets on top of the human fork: ``title`` (final; else the
+    fork's own ``Fork of <parent>``, which the fork's background title pass may
+    rename), ``folder_id`` (else the parent's folder, as the human
     fork inherits it), creator attribution (``created_by`` = the caller, so the
     other verbs reach it afterwards and the per-creator ceiling counts it) and the
     caller's session posture (``_trust`` / ``_trust_reads`` -- the same two
@@ -3544,6 +3547,9 @@ async def fork_session(
         if clean_title:
             child.title = clean_title
             child._titled = True
+            # The caller chose this name, so it is final: the fork's own
+            # background title pass and the refresh both leave it alone.
+            child._title_origin = "user"
         if folder_id:
             child.folder_id = folder_id
 
@@ -4041,9 +4047,12 @@ def authorize_target(
     member) the fence is evaluated inline as before.
 
     ``allow_self`` waives the self-target refusal, and with it the ownership fence for
-    that one case. Exactly one verb passes it: a release, where the target itself is a
+    that one case. Two verbs pass it. A release, where the target itself is a
     legitimate caller because a session taken over must not depend on its holder still
-    running to get out. It waives nothing else -- an ephemeral, app-scoped or
+    running to get out. A close, so a session that has finished its one job can archive
+    its own tab instead of leaving it for the person or its creator to dismiss; the close
+    is the same recoverable archival a peer close is, and it cancels the caller's own
+    running turn, which is the turn asking for it. It waives nothing else -- an ephemeral, app-scoped or
     channel-linked caller is still refused, and a target that is not the caller is
     still judged by every rule above.
     """
@@ -6089,6 +6098,7 @@ async def close_target(
         target=target,
         operation="close",
         precomputed_ownership_fenced=caller_fenced,
+        allow_self=True,
     )
     slot_key = slot.key
     # Deferred for the same import cycle `stop_target` documents.
@@ -6124,6 +6134,7 @@ async def close_target(
                 operation="close",
                 skip_enabled_check=True,
                 precomputed_ownership_fenced=caller_fenced,
+                allow_self=True,
             )
         except SessionControlError as exc:
             # A stale-authorization refusal (mirrored/linked/workspace/caller-gone)
@@ -7927,6 +7938,111 @@ def _created_tree_roster(caller_key: str) -> "tuple[list[str], str]":
     return children, ("incomplete" if reading.incomplete or overflow else "readable")
 
 
+def _gone_slot_lifecycles(slots: "Sequence[str]") -> dict[str, dict[str, Any]]:
+    """Fold each gone slot's lifecycle so a `gone` row can say CLOSED versus LOST.
+
+    The crew log already records a ``session/closed`` edge and the status fold
+    already projects it as ``lifecycle``/``closed_at`` (see
+    :func:`~kiro_crew.crew_log.projection._status_render`). This reads that
+    projection per slot and nothing more -- no new terminal vocabulary, no new
+    verb -- so a worker whose tab was closed after it finished is told apart from
+    one lost with its process.
+
+    The read is slot-keyed (:func:`~kiro_crew.crew_log.projection.read_slot_projection`),
+    so it folds over EVERY unit the slot ran under, newest last, and reports the
+    lifecycle of the slot's current session. A slot that was reopened and later
+    closed again reads ``closed``; the ``session/opened`` of the reopen resets the
+    close the earlier life recorded, which the status fold already handles.
+
+    Returns a map ``{slot: {"status", "closed_at"?}}``. A slot is ``closed`` (and
+    carries its ``closed_at``) only when its fold's newest life ended by the
+    DELIBERATE tab close -- ``close_reason`` is ``removed`` and no turn is still
+    open (see :func:`_lifecycle_is_closed`). Everything else is ``lost``: an
+    ``open``/``unknown`` lifecycle, a read that raised, OR a ``closed`` lifecycle
+    whose edge came from a process recycle (``reset``: idle expiry, RSS recycle,
+    model/provider switch, the watchdogs) or a ``destroy`` (including mid-turn) --
+    teardowns the tab and conversation outlive. "Lost" is the fail-safe reading: it
+    is the state a patrol re-dispatches, and reporting a worker lost when it may
+    have finished is cheaper than reading a recycled or mid-turn worker as
+    ``closed`` and telling a conductor to stop looking for it.
+
+    Touches disk (one slot-keyed fold per slot), so it is called off the event loop.
+    """
+    from kiro_crew.crew_log.projection import read_slot_projection
+
+    out: dict[str, dict[str, Any]] = {}
+    for slot in slots:
+        try:
+            value = read_slot_projection(slot, "status").value
+        except Exception:
+            # A read fault is not evidence the worker closed cleanly, so it reads as
+            # LOST -- the fail-safe answer, the one a patrol acts on by re-dispatching.
+            logger.debug("gone row lifecycle could not be folded for %s", slot, exc_info=True)
+            out[slot] = {"status": "lost"}
+            continue
+        if _lifecycle_is_closed(value):
+            out[slot] = {"status": "closed", "closed_at": value.get("closed_at")}
+        else:
+            out[slot] = {"status": "lost"}
+    return out
+
+
+#: Close reasons that mean "the worker FINISHED and its tab was closed" -- the one
+#: direction a gone row may call ``closed``. Only the deliberate tab ✕ / ``session_close``
+#: teardown (``remove`` -> ``END_REASON_REMOVED``) qualifies. Every OTHER close edge is a
+#: process recycle or a mid-turn teardown that the tab and conversation survive --
+#: ``reset`` (idle expiry, RSS recycle, model/provider switch, the watchdogs),
+#: ``destroyed``/``destroyed_sid_retained`` (``destroy``, including mid-turn) -- and must
+#: read ``lost``, the fail-safe state a patrol re-dispatches. Reading one of those as
+#: ``closed`` is the fail-OPEN harm this split exists to remove: it would tell a conductor
+#: a lost worker finished, so it stops looking for it.
+_FINISHED_CLOSE_REASONS = frozenset({END_REASON_REMOVED})
+
+
+def _lifecycle_is_closed(value: "Mapping[str, Any]") -> bool:
+    """Whether a folded slot status means the worker finished and closed its tab.
+
+    ``True`` only when the fold's newest life is closed by the DELIBERATE end
+    (``close_reason`` in :data:`_FINISHED_CLOSE_REASONS`), no turn is still open,
+    AND the newest completed turn ended cleanly. A ``closed`` lifecycle alone is
+    not enough: the ``session/closed`` edge is also written on every process
+    recycle (``reset``) and on ``destroy`` (including mid-turn), teardowns the tab
+    and conversation outlive.
+
+    The ``last_stop_reason`` guard is the third fail-safe, and it is the one a
+    deliberate MID-TURN close needs: closing a tab with a turn in flight cancels
+    ``slot.task``, and the cancelled turn's ``finally`` writes a real
+    ``turn/completed`` (``stop_reason`` ``cancelled``/``failed``/``error:*``) that
+    CLEARS ``turn_open`` -- so the ``turn_open`` guard above does not catch it, and
+    a worker killed mid-turn would read ``closed`` ("finished, nothing to
+    re-dispatch") when its work did not finish. A newest turn that did not end
+    cleanly (:func:`turn_outcome` other than ``"ok"``) therefore reads ``lost``.
+    A clean ``end_turn`` and the ``None`` of a tab closed before any turn ran both
+    classify ``"ok"`` -- a session that genuinely finished (or never started work)
+    stays ``closed``.
+
+    A close whose reason is a recycle, a close with a turn still open, a newest
+    turn that did not end cleanly, or any non-closed lifecycle all read as
+    not-closed -> the caller reports ``lost``, the fail-safe direction.
+    """
+    if value.get("lifecycle") != "closed":
+        return False
+    if value.get("turn_open"):
+        # A session cut off with a turn in flight did not finish, however it was
+        # torn down -- the projection leaves the open turn set on a close for
+        # exactly this reader to see (crew_log/projection.py::_status_render).
+        return False
+    if turn_outcome(value.get("last_stop_reason")) != "ok":
+        # The newest completed turn did not end cleanly. A deliberate mid-turn
+        # close cancels the running turn, whose ``finally`` records a
+        # ``turn/completed`` with an abnormal ``stop_reason`` and clears
+        # ``turn_open`` -- so this is the only guard that still sees the work was
+        # cut off. ``None``/``end_turn`` are both ``"ok"``, so a clean finish and a
+        # never-worked tab close stay ``closed``.
+        return False
+    return value.get("close_reason") in _FINISHED_CLOSE_REASONS
+
+
 def _bounded_status_title(value: object) -> str:
     """A display-safe title bounded before it is retained in a status row."""
     return sanitize_outbound(str(value or ""))[:MAX_SESSION_STATUS_TITLE_CHARS]
@@ -8042,10 +8158,18 @@ async def created_session_status(
     * ``queued`` — idle, but messages are waiting to run. Also wait, but nothing is
       happening yet, so a steer would land on nothing.
     * ``idle`` — open and doing nothing. This is the one that needs a decision.
-    * ``gone`` — the crew log names it and the dashboard does not hold it: closed,
-      archived, or lost with the process that ran it. Re-dispatch or drop it; there
-      is nothing here to message, and :func:`authorize_target` would answer
-      ``target_not_found``.
+    * ``closed`` — the crew log names it, the dashboard does not hold it, and the
+      log records a ``session/closed`` edge: a worker that FINISHED and closed its
+      tab. Carries ``closed_at``. Ignore it; there is nothing here to message, and
+      :func:`authorize_target` would answer ``target_not_found``.
+    * ``lost`` — the crew log names it, the dashboard does not hold it, and no
+      qualifying clean deliberate close was recorded: either no ``session/closed``
+      edge at all, or the newest one is a ``reset``/``destroy`` teardown or a close
+      whose last turn did not end cleanly — none of which means "finished, nothing
+      to re-dispatch". Lost with the process that ran it (or its opener was retained
+      out of the log). Re-dispatch it. ``closed`` and ``lost`` are the two fates the
+      old single ``gone`` status could not tell apart, and they call for opposite
+      actions.
     * ``unknown`` — history records the creator but neither a live slot nor an
       attested tree edge exists. The row proves the session was created without
       claiming whether it finished or was lost.
@@ -8064,8 +8188,8 @@ async def created_session_status(
     The ownership fence applies to the rows, not just to the verb: a fenced caller
     (a crew member, a cron, an agent-created session) sees the live sessions it
     created and nothing else, so this verb cannot become a way to enumerate the
-    user's own sessions by their titles. A ``gone`` row carries only a slot key the
-    caller already knew, and no title, so it is listed either way.
+    user's own sessions by their titles. A ``closed`` or ``lost`` row carries only
+    a slot key the caller already knew, and no title, so it is listed either way.
     """
     deny = _deny_factory(caller_session_key=caller_session_key, operation="status", target="")
     caller_key = refuse_caller_identity(state, caller_session_key=caller_session_key, deny=deny)
@@ -8114,20 +8238,10 @@ async def created_session_status(
 
     # Live slot state stays on the event loop and is read only after the history
     # worker returns. Reading it inside the worker would let the result go stale
-    # before these rows are built.
+    # before these rows are built. This read only names the caller's own creations
+    # (`_created_by`, not workspace), so it is not the workspace-boundary read --
+    # that is `resolvable_keys`, built below AFTER the last suspension in this verb.
     live_children = broadcast_audience(state, caller_key)
-    # The SAME containment set `session_broadcast` resolves names against, resolved
-    # here once and applied to every live row below. Read after the re-check above,
-    # so a mirror bound during the scan is already reflected in it.
-    resolvable_keys = {
-        slot.key
-        for slot in _broadcast_resolution_slots(
-            state,
-            caller_key=caller_key,
-            caller_slot=caller_slot,
-            ownership_fenced=ownership_fenced,
-        )
-    }
 
     rows: list[dict[str, Any]] = []
     roster = set(tree_children) | set(history_children) | set(live_children)
@@ -8142,7 +8256,51 @@ async def created_session_status(
     # Zero when nothing was cut, so a reader distinguishes "no overflow" from a
     # cut whose size it must know to judge the roster it was handed.
     roster_omitted = max(0, len(roster) - MAX_SESSION_STATUS_ROWS)
-    for key in sorted(roster)[:MAX_SESSION_STATUS_ROWS]:
+    retained = sorted(roster)[:MAX_SESSION_STATUS_ROWS]
+    # A `gone` row -- the tree names it and the dashboard does not hold it -- splits
+    # into `closed` and `lost`, and the two call for OPPOSITE actions: ignore a
+    # worker that finished and closed its tab, re-dispatch one lost with its
+    # process. The split is read from the ``session/closed`` edge the status fold
+    # already projects, so it is a disk fold per gone slot and runs OFF the loop,
+    # the same worker-thread discipline the history scan above keeps. Scoped to the
+    # retained, tree-attested, now-absent slots so no fold is paid for a row that
+    # will not carry the distinction.
+    gone_slots = [key for key in retained if key in tree_children and state.get_slot(key) is None]
+    gone_lifecycles = (
+        await asyncio.to_thread(_gone_slot_lifecycles, gone_slots) if gone_slots else {}
+    )
+    # The gone fold above is the LAST suspension in this verb, and the live-row
+    # containment must be computed after it, not before. A live worker can be moved
+    # across the workspace boundary mid-fold -- `api_chat_slot_workspace` reassigns
+    # `_slot.workspace` on a running slot with no idle requirement -- so a
+    # `resolvable_keys` built before this await would admit a worker on its
+    # pre-move workspace and then carry its `display_title` out of the caller's
+    # workspace in the row loop below. So re-call the caller gate on the same terms
+    # and REBUILD containment here, after the final await, exactly as the block
+    # after the history scan does: the boundary every row is filtered on is read
+    # from the live slots as they stand once nothing else can suspend.
+    refuse_caller_surface(state, caller_key=caller_key, deny=deny)
+    if str(getattr(caller_slot, "workspace", "default")) != caller_workspace:
+        raise deny(
+            "the calling session moved workspace while its roster was being read; " "call again",
+            "caller_changed_mid_read",
+        )
+    # The SAME containment set `session_broadcast` resolves names against, resolved
+    # here once and applied to every live row below. Built AFTER the gone fold's
+    # await (and its re-check), so a worker moved across the boundary during that
+    # fold is already excluded -- its `workspace` is re-read here as it now stands,
+    # and the fail-safe follows: a row the moved worker would carry is dropped by
+    # the `resolvable_keys` membership test below rather than leaked.
+    resolvable_keys = {
+        slot.key
+        for slot in _broadcast_resolution_slots(
+            state,
+            caller_key=caller_key,
+            caller_slot=caller_slot,
+            ownership_fenced=ownership_fenced,
+        )
+    }
+    for key in retained:
         slot = state.get_slot(key)
         from_tree = key in tree_children
         from_history = key in history_children
@@ -8159,7 +8317,37 @@ async def created_session_status(
             if from_tree:
                 # The attested tree still owns this status. History may corroborate
                 # the birth, but it does not turn editable metadata into lineage.
-                rows.append({"target": key, "status": "gone", "source": "+".join(sources)})
+                #
+                # CLOSED vs LOST, read from the ``session/closed`` edge the status
+                # fold projects: a worker that closed its tab after finishing is
+                # ``closed`` and carries its ``closed_at``; one gone without a
+                # recorded close -- lost with its process, or whose opener was
+                # retained out of the log -- is ``lost``. Defaults to ``lost`` when
+                # the fold was not made (a slot absent from the map), the fail-safe
+                # reading a patrol re-dispatches rather than drops.
+                lifecycle = gone_lifecycles.get(key, {"status": "lost"})
+                gone_row: dict[str, Any] = {
+                    "target": key,
+                    "status": lifecycle["status"],
+                    "source": "+".join(sources),
+                }
+                if lifecycle["status"] == "closed":
+                    gone_row["closed_at"] = lifecycle.get("closed_at")
+                rows.append(gone_row)
+                continue
+            if not from_history:
+                # Neither tree nor history, and no live slot. A row reaches here
+                # only because it was in ``retained`` -- read from the creator's
+                # live children BEFORE the gone-fold await -- and its slot has since
+                # gone: a worker the caller created that never took a first turn (so
+                # no tree edge) and left no history row (the history scan filters on
+                # workspace) can have its tab closed WHILE the fold runs on its
+                # worker thread, landing here with ``slot is None`` and both durable
+                # sources absent. Reading ``history_children[key]`` would raise
+                # ``KeyError`` and fail the whole roster. Drop the row: the worker is
+                # gone with no durable record to report, which is the fail-safe
+                # reading -- the same "nothing to say about a slot that vanished with
+                # no attested trace" the ``lost`` default elsewhere takes.
                 continue
             meta = history_children[key]
             rows.append(

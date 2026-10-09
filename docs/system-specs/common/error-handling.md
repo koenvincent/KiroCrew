@@ -245,6 +245,40 @@ alternation. The kiro-cli mid-stream envelope ("Encountered an error in the
 response stream: …") is deliberately NOT a hint — matching it would make the
 branch a catch-all that discards the real cause.
 
+### Provider failures a harness writes as text
+
+codex-acp reports a turn's terminal provider error to a client without JetBrains
+AIR's `sessionFailure` capability as an `agent_message_chunk` (the error message
+plus a blank line) and then answers the prompt with `end_turn`
+(`CodexEventHandler.createErrorEvent`, every release read from 1.11.0 to
+2.1.2-preview.5). Crew does not declare AIR: that one declaration also switches
+the adapter's tool-call, plan and permission frames to AIR shapes. Members of
+`ACP_BACKENDS_UNATTRIBUTED_TERMINAL_ERROR` are handled in
+`AcpSessionHandle._run_turn` instead:
+
+- A text chunk with no `messageId` is adapter-authored. Model text always names
+  its item. The adapter's fixed notices (`Warning: `, `Config warning: `,
+  `*Context compacted`) and every chunk of a prompt the adapter parses as a slash
+  command are delivered as they arrive.
+- Any other such chunk is HELD, together with a steer-consumed report behind it.
+  Content, a permission request or any other terminal after it releases
+  everything held, in order and unchanged. A co-tenant's fanned-out frame
+  (`runtime_global`) on a shared process passes through without releasing it.
+- An `end_turn` right behind held chunks, each a whole chunk ending in a blank
+  line, makes the turn FAIL. The chunks are never delivered as text, duplicates
+  collapse to one message, and the turn raises through `_raise_acp_error` with
+  the provider message (unwrapped from codex's `{"type":"error","status":N,...}`
+  envelope, status kept as `(HTTP N)`). Wording, the transient verdict (a 5xx is
+  transient, a 4xx is not), and the model-substitution and sign-in tags therefore
+  come from the same classifier as every other harness. Withholding the steer
+  report lets the caller queue that steer again.
+- A JSON-RPC error that follows held chunks (codex's `usageLimitExceeded` writes
+  the text and fails the prompt) is raised alone, so the failure is reported once.
+
+The selected model and effort are untouched, and no recovery is added: whether
+the failed turn is retried is decided downstream from the raised error, exactly
+as for any other harness.
+
 ## Model-Side Refusals
 
 A refusal is a turn the model DECLINED, not a turn that failed: the request

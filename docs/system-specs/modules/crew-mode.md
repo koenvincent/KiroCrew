@@ -113,9 +113,19 @@ same name is listed, or the member has no memory of its own (`memory_store` is
 `default` crew is this case). A crewmate no template covers stays pickable: one made
 by hand with its own memory, and one running its own private copy, which the catalog
 never lists as a template. Withholding those left the agent unreachable from any
-chat, since neither group offered it. Turning the key on lists every member and
-restores the two groups; the folded `agents` list and the request contract below
-are unaffected either way.
+chat, since neither group offered it. The member named as the default agent
+(`default_agent` in the catalog response) stays even when covered, unless a listed
+template shares its name: new chats start on the default, and the composer's chip
+and the default badge show its member name, so a user who switched away searches
+for that name and the pop-up has to answer with a row. A same-named template is
+that row (the identical binding under the name searched for; the alias "set as
+default" enrols for a template is this case, and listing it too would show one
+agent twice), while a template of another name is not (the built-in `default` crew
+runs the listed `kirocrew` template, and a search for `default` found nothing). With
+the key off, a stock install's pop-up therefore lists the built-in `default` crewmate
+(wearing the default badge) under **Crewmates** above the **Custom agents** group.
+Turning the key on lists every member; the folded `agents` list and the request
+contract below are unaffected either way.
 A pick sends `agent_kind` with the name on slot create and on
 `/api/chat/slots/{slot}/agent`; the slot stores the committed kind, persists it with
 the other slot-owned metadata (`SLOT_OWNED_META_KEYS`, so a restart restores a
@@ -518,6 +528,18 @@ Duplicate affordance, so the three duplicate entry points read as one flow.
 routes at `/api/agents/{name}/capabilities` use schema version 1. Preview ends
 in `/preview`; PUT requires its opaque preview token and the GET revision.
 Unknown fields, null sets, stale sources and ambiguous names are refused.
+The pane shows its stale notice ("The saved version changed ... Reload from
+server") only for the 409 codes a reload can resolve, which the backend names
+`stale_*` or `*_changed` (`stale_revision`, `stale_binding`,
+`parent_identity_changed`, `materialization_changed`, ...).
+Any other 409 refuses the draft itself and repeats on reload, so the pane
+names it instead: `alternate_permissions_require_review` (an approval edit on
+an agent file whose permission settings Crew did not derive) gets its own
+copy, and every other code is shown by name with the draft kept.
+Only a Review or Save 409 gets that draft-refusal copy. A 409 on the load
+itself (`parent_missing`, `foreign_private_copy`, `private_template_shadowed`,
+`source_unreadable`) can arrive with no draft at all, so it keeps the load
+notice.
 
 Enrollment is explicit. Shared members follow their selected Parent; a legacy
 private snapshot starts with every existing row local and every absent Parent
@@ -945,8 +967,13 @@ and a junk watchdog override collapses to `0`.
 
 When a crewmate conversation is open, the standing roster is hidden at every
 desktop width and the thread receives that space. `CrewmateSwitcher` replaces it
-in the thread header: the closed Glass chip stacks up to three faces plus the
-roster count; its popover searches every crewmate, marks the current one, switches
+in the thread header: the closed Glass chip stacks up to three faces, then the
+page's name as visible text (`pages.membersPage.title`, "Crewmates") and the
+roster count. Faces and a number alone did not read as the crew list to a
+first-time visitor whom a bare `/members` had dropped into a thread, so the
+word names the chip as the roster. The chip's accessible name starts with that
+visible word (label in name) and the action ("Switch crewmate") is its tooltip.
+Its popover searches every crewmate, marks the current one, switches
 the thread through the existing verified `openMember` path, and opens the same
 `NewCrewmateDialog` as the roster's create entry. The stacked faces are the OTHER
 crewmates' in roster order — the open crewmate's face is already the identity
@@ -1067,6 +1094,29 @@ own strip carries the close control. As an overlay it reads a separate
 per-visit flag that starts closed and is reset whenever the panel docks, and
 the opener always stays. The panel chord toggles only while a crewmate is
 open.
+
+The Profile tab holds the crewmate's own settings (`CrewProfileSettings`):
+permission (Normal / Reads / Trust), model and effort. They are changed there,
+never in the chat. Each pick writes the crew record (`approval_mode`, `model`,
+`reasoning_effort` on `PUT /api/agents/{name}`) and then the live DM slot, so
+the open thread follows at once. `approval_mode` is `""` until the user picks
+one; only then does `POST /api/members/{slug}/thread` open the thread in
+`trust`. A stored choice is applied as stored, a grant already on the slot is
+kept, and the seed runs once per in-memory slot (`_member_approval_seeded`).
+YOLO is never a crewmate setting: it is process-global.
+The permission PUT is compare-and-set: the profile sends
+`expected_approval_mode` (the value it last read), and the server refuses a
+stale write with 409 `approval_mode_conflict` carrying the stored value, which
+the profile then shows. An applied write also moves the crewmate's live DM
+slot, in the same handler and under the same config lock, through
+`apply_approval_mode` (the mutation half of `POST /api/chat/mode`); the browser
+never writes a thread's permission. The profile locks its pickers while the
+thread is opening or refused.
+
+The DM's composer is `CrewComposer`, handed to `ChatPane` as `composerInput`.
+It is the shared `ChatInput` (text, attachments, send / stop / steer, queue)
+without the session toolbar line: no agent, model or effort chip, no context
+meter, no approval picker. The ordinary chat composer is unchanged.
 
 Placement is decided when the card opens, and two things revisit it. A window
 that crosses below `md` while the card holds its column re-places it as the
@@ -1208,8 +1258,9 @@ draft guard, so a veto neither remounts the card nor loses its pushed form.
 crewmate can read and act on; a browser-local list it never sees would promise
 the opposite, so none is offered until that record exists.
 
-The chat SidePanel has two standing entries on this page: the leading
-**Dashboard** tab and pinned **Files**. Dashboard is the crewmate's generated HTML
+The chat SidePanel has three standing entries on this page: the leading
+**Dashboard** tab and the chat panel's two pinned views, **Files** and
+**Artifacts**. Dashboard is the crewmate's generated HTML
 report (`GET /api/members/{slug}/panel?member=<exact-name>`) rendered by
 `CrewDashboardFrame`: the full document fills the tab, minted on mount, with no
 summary card, Contained bar, Expand control, identity row or Command Center
@@ -1237,16 +1288,22 @@ set-up control. That sentence names the crewmate by its display name
 (`displayName`, the page's `crewDisplayName`), falling back to the exact
 `member`; the read itself stays keyed on the raw `member`, so a crewmate shown as
 "Atlas" is not told "atlas has not published". Files is the standard SidePanel browser scoped
-to the workspace rule above. Dashboard and Files are the only STANDING tabs.
+to the workspace rule above. Artifacts is the standard SidePanel artifact list
+fed by the DM slot (`session-artifact-records`): what the crewmate saved or
+emitted as a widget in this thread, plus the library section. It was withheld
+by #16317 to keep the standing set at Dashboard + Files, but `SidePanel`
+folds a document tab into its parent view (`isWithheld`: an `artifact` tab is
+withheld when `artifacts` is), so that choice also made every artifact
+document tab unrenderable here — a crewmate's artifacts could be opened from
+nowhere on this page (#18320). A crewmate's output is largely artifacts, so
+the view stands. Dashboard, Files and Artifacts are the only STANDING tabs.
 Side Chat remains available dynamically through selection Ask and the plus
 menu; it is not a standing entry — and the plus menu keeps every other dynamic
 view the chat page offers (Terminal, Browser, Git, Subagents, Workflows, the
 Developer-Mode Logs / Context / Crew log, app-contributed tabs), bound to the
 member's slot once the thread is confirmed. Withheld outright are the
 transcript-fed views (Changes / Issues / Links / Pins, plus the session
-Summary), the chat page's Command Center, and Artifacts — a pinned standing
-tab on the chat page that has no place in this page's Dashboard + Files set
-(`MEMBERS_WITHHELD_VIEWS`).
+Summary) and the chat page's Command Center (`MEMBERS_WITHHELD_VIEWS`).
 
 SidePanel's resting width on this page is 60% of the row after the live navigation
 rail, clamped so `CHAT_PANE_MIN_W` remains; a persisted user drag wins. The shared
@@ -1696,6 +1753,26 @@ key, so a link naming the thread you are reading is inert. And `onSessionOpen`
 navigates to `/chat?sid=…` — the same primitive the drawer's Driving-sessions
 rows use — because a foreign slot belongs to the chat page with its sidebar,
 history paging and composer; the DM never hosts one in its own pane.
+
+**File and artifact links open in the member's side panel.** A crewmate's
+reply names what it made — a backticked path, a `/artifacts/<slug>` link — and
+both open the way they do on the single-chat page: in the side panel docked to
+this page, as a Files document tab or an Artifacts document tab against the DM
+slot (`usePanelDocumentActions`, the chat page's own implementation, bound to
+`confirmedSlot`; in overlay mode the panel reveals itself after the open). The
+pane never resolves either itself: `ChatPane` takes `onFileOpen` (#9487,
+#14458) and `onArtifactOpen` (#18320) as optional props and hands them to
+`ChatMessageList`, whose per-row `MessageRenderContext` carries them to every
+assistant row — the SDK default and the crewmate bubble both go through
+`renderAssistantBubble`, which passes them to `AssistantMessage` and so to the
+markdown renderer. Capability by omission on both: a host that passes nothing
+gets the renderer's own fallback — a path chip asks the OS to reveal the file,
+an artifact link stays a plain `target="_blank"` anchor to the standalone view
+— which is right for a side chat or an embedded chat and was wrong for the DM,
+where the artifact a crewmate just made opened in another browser tab, or
+nowhere at all when the shell swallows the popup. The split-view pane still passes neither,
+for the reason #3300 records (its dock is `activeSlot`-keyed while pane focus
+is not).
 
 ## Selection: the `select_crew` contract
 

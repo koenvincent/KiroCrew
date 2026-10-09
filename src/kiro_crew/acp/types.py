@@ -59,6 +59,7 @@ from kiro_crew.acp_backends import (  # noqa: F401 - re-exported for existing im
     ACP_BACKENDS_STEERING_REQUEST,
     ACP_BACKENDS_STRUCTURED_REFUSAL,
     ACP_BACKENDS_TOOL_SEARCH_OVERLAY,
+    ACP_BACKENDS_UNATTRIBUTED_TERMINAL_ERROR,
     ACP_BACKENDS_USER_LEVEL_AGENT_SPECS_ONLY,
     effort_config_option_id,
     effort_config_option_value,
@@ -868,6 +869,14 @@ class AcpEvent:
     #: layer: a consumer that re-parsed the text would be re-deciding a protocol
     #: question it does not own.
     control_notice: bool = False
+    #: True when this ``agent_message_chunk`` named no ``messageId``. Provenance
+    #: only, and only meaningful for a harness in
+    #: ``ACP_BACKENDS_UNATTRIBUTED_TERMINAL_ERROR``: there model text always names
+    #: its item and the adapter's own chunks never do, so the missing id is what
+    #: tells a provider failure written as text apart from the model's answer
+    #: (``AcpSessionHandle._run_turn``). Other harnesses leave the id off model
+    #: text too, and nothing reads the flag for them.
+    unattributed: bool = False
     #: True when this event was SYNTHESIZED by the client rather than read off a
     #: backend frame. Only the claude compaction terminal sets it: an automatic
     #: compaction sends no terminal of its own, so one is manufactured once the

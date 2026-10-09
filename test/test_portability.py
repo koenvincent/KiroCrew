@@ -2703,3 +2703,141 @@ def test_oversized_imported_command_is_dropped_without_scanning_it(tmp_path):
     names = {job.get("name") for job in remaining}
     assert "oversized" not in names, "the dropped job must be gone from the rewritten store"
     assert "ordinary" in names, "the restore must keep the job it did not reject"
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlink and hardlink fixtures")
+class TestTheCronSanitizerResolvesTheStoreOnce:
+    """The staged ``crons.json`` is read through one descriptor and replaced, never written through.
+
+    A by-name read followed by a by-name rewrite is two resolutions of one path. A
+    link or hardlink alias swapped in between had the rewrite follow it, so the
+    sanitized store landed in whatever file the alias named. The swap is driven
+    from ``_vet_shell_command``, which runs after the read and before the rewrite.
+    """
+
+    VICTIM = b"victim bytes the import was never pointed at\n"
+
+    @staticmethod
+    def _store_with_command() -> str:
+        # Rule 3 pauses this job, so the sanitizer must rewrite the store.
+        return json.dumps(
+            {
+                "jobs": [
+                    {
+                        "id": "j1",
+                        "name": "nightly",
+                        "message": "x",
+                        "command": "df -h",
+                        "schedule": {"kind": "cron", "cron_expr": "0 9 * * *"},
+                    }
+                ]
+            }
+        )
+
+    def _swap_during_vet(self, monkeypatch, store: Path, victim: Path, how: str) -> None:
+        real_vet = portability._vet_shell_command
+
+        def vet_then_swap(command: str):
+            store.unlink()
+            if how == "symlink":
+                store.symlink_to(victim)
+            else:
+                os.link(victim, store)
+            return real_vet(command)
+
+        monkeypatch.setattr(portability, "_vet_shell_command", vet_then_swap)
+
+    @pytest.mark.parametrize("how", ["symlink", "hardlink"])
+    def test_an_alias_swapped_in_before_the_rewrite_is_replaced_not_written_through(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, how: str
+    ) -> None:
+        staged = tmp_path / "staged"
+        staged.mkdir()
+        store = staged / "crons.json"
+        store.write_text(self._store_with_command(), encoding="utf-8")
+        victim = tmp_path / "victim.txt"
+        victim.write_bytes(self.VICTIM)
+        self._swap_during_vet(monkeypatch, store, victim, how)
+
+        dropped, paused = portability._sanitize_imported_crons(store)
+
+        assert dropped == [] and paused == ["nightly"]
+        assert victim.read_bytes() == self.VICTIM, f"the rewrite followed the {how}"
+        assert not store.is_symlink() and store.stat().st_nlink == 1
+        written = json.loads(store.read_text(encoding="utf-8"))
+        assert written["jobs"][0]["user_paused"] is True
+
+    @pytest.mark.parametrize("how", ["symlink", "hardlink"])
+    def test_an_alias_at_read_time_is_refused_and_replaced_with_an_empty_store(
+        self, tmp_path: Path, how: str
+    ) -> None:
+        # The alias's target is a well-formed store, so a reader that follows it
+        # would vet and pause its job and then rewrite the target in place.
+        staged = tmp_path / "staged"
+        staged.mkdir()
+        store = staged / "crons.json"
+        victim = tmp_path / "victim.json"
+        original = self._store_with_command().encode("utf-8")
+        victim.write_bytes(original)
+        if how == "symlink":
+            store.symlink_to(victim)
+        else:
+            os.link(victim, store)
+
+        dropped, paused = portability._sanitize_imported_crons(store)
+
+        assert dropped == [portability._UNREADABLE_STORE] and paused == []
+        assert victim.read_bytes() == original, f"the {how} target was modified"
+        assert not store.is_symlink() and store.stat().st_nlink == 1
+        assert json.loads(store.read_text(encoding="utf-8")) == {"jobs": []}
+
+    @pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="needs mkfifo")
+    def test_a_fifo_at_the_name_does_not_hang_the_import(self, tmp_path: Path) -> None:
+        store = tmp_path / "crons.json"
+        os.mkfifo(store)
+
+        dropped, paused = portability._sanitize_imported_crons(store)
+
+        assert dropped == [portability._UNREADABLE_STORE] and paused == []
+        assert json.loads(store.read_text(encoding="utf-8")) == {"jobs": []}
+
+    def test_a_missing_store_is_left_alone(self, tmp_path: Path) -> None:
+        store = tmp_path / "crons.json"
+        assert portability._sanitize_imported_crons(store) == ([], [])
+        assert not store.exists()
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlink and hardlink fixtures")
+@pytest.mark.parametrize("how", ["symlink", "hardlink"])
+def test_the_staged_notification_settings_are_replaced_not_written_through(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, how: str
+) -> None:
+    """The same staged directory's ``notification_settings.json`` is rewritten by replace.
+
+    The swap runs inside ``parse_imported_settings``, after the read and before the
+    rewrite, so a by-name ``write_text`` would truncate the victim.
+    """
+    snap = tmp_path / "snap"
+    snap.mkdir()
+    staged = snap / "notification_settings.json"
+    staged.write_text(json.dumps({"channel_settings": {}}), encoding="utf-8")
+    victim = tmp_path / "victim.txt"
+    victim_bytes = b"victim bytes the import was never pointed at\n"
+    victim.write_bytes(victim_bytes)
+    real_parse = portability.parse_imported_settings
+
+    def parse_then_swap(text: str):
+        staged.unlink()
+        if how == "symlink":
+            staged.symlink_to(victim)
+        else:
+            os.link(victim, staged)
+        return real_parse(text)
+
+    monkeypatch.setattr(portability, "parse_imported_settings", parse_then_swap)
+
+    portability._vet_archive_settings(snap, {})
+
+    assert victim.read_bytes() == victim_bytes, f"the rewrite followed the {how}"
+    assert not staged.is_symlink() and staged.stat().st_nlink == 1
+    assert "channel_settings" in json.loads(staged.read_text(encoding="utf-8"))

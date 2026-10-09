@@ -54,6 +54,7 @@ from kiro_crew.apps.registry_pipeline.catalog import (
     SOURCE_REGISTRY_PREFIX,
     _is_catalog_row,
     _resolve_install_entry,
+    resolve_installed_trust_repository,
 )
 from kiro_crew.apps.registry_pipeline.checkout import (
     _COMMIT_SHA_RE,
@@ -1483,6 +1484,27 @@ async def _retained_startup_refusal(name: str, log_lines: list[str]) -> dict[str
     }
 
 
+def _trust_grant_would_stay_local(name: str) -> bool:
+    """Whether re-granting trust for *name* would record a local source again.
+
+    The trust grant endpoint binds to the INSTALLED app's provenance. When that
+    provenance is positively local, the dialog can only ever record a local
+    grant, which never covers a registry clone. Any failure to tell answers
+    False, which keeps the existing consent-dialog behaviour.
+    """
+    try:
+        installed = get_app(name)
+        if installed is None:
+            return False
+        resolved, repository = resolve_installed_trust_repository(
+            installed, allow_registry_lookup=False
+        )
+    except Exception:  # noqa: BLE001 - unknown provenance keeps the old path
+        logger.warning("installed app trust provenance could not be resolved")
+        return False
+    return resolved and not repository
+
+
 async def install_from_registry(
     name: str,
     log_lines: list[str] | None = None,
@@ -1588,6 +1610,20 @@ async def install_from_registry(
         # needs the normal consent dialog, whose stable trigger is the execution
         # denial code. Keep both existing wire behaviours explicit.
         code = "app_trust_repository_mismatch" if granted_repository else "app_execution_denied"
+        # An unbound grant over an app still installed from a local folder is
+        # the one case the consent dialog cannot fix: the grant endpoint binds to
+        # the INSTALLED source, so granting again re-records a local grant and
+        # this refusal repeats forever. Answer it with its own code, so the
+        # dialog does not open, and name the route that records a repository.
+        if not granted_repository and _trust_grant_would_stay_local(name):
+            code = "app_trust_local_only"
+            reason = (
+                "this app is trusted for its local source only, and granting trust "
+                "again keeps it local-only, so it cannot be updated from a "
+                "repository. To switch to the repository version, uninstall the "
+                "app (its data is kept) and install it from the App Store, which "
+                "asks you to trust that repository"
+            )
         audit_operation = (
             "trust_repository_mismatch"
             if granted_repository

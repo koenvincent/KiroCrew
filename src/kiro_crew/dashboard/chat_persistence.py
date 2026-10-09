@@ -38,7 +38,7 @@ import re
 import threading
 import time
 from collections import OrderedDict, deque  # noqa: F401
-from collections.abc import Iterable, Iterator, Mapping  # noqa: F401
+from collections.abc import Callable, Iterable, Iterator, Mapping  # noqa: F401
 from itertools import chain, islice  # noqa: F401
 from pathlib import Path
 from typing import Any
@@ -915,8 +915,21 @@ def _pin_private_agent_assignment(
             execution = execution.with_mode(previous.memory_mode)
     if validate_only:
         return store
+    # Establishing, so it vouches. Every caller of this helper has already
+    # authorized the owner's own request (see the docstring), and the store being
+    # published is the one CONFIG resolves for the selected member: `execution`
+    # comes from `resolve_member_execution`, and `previous` is reused above only
+    # when its member AND store equal that config-resolved pair. So the vouched
+    # store is never one the session's own record chose. Without the vouch, a
+    # dashboard tab the owner bound to a member is published but unvouched, and
+    # its own-store `session_create` is refused as `memory_delegation_denied`
+    # ("this process holds no vouched identity for the caller") for its whole life.
     bind_session_execution(
-        session_key, execution, replace_existing=previous is not None, expected=previous
+        session_key,
+        execution,
+        replace_existing=previous is not None,
+        expected=previous,
+        vouch=True,
     )
     return store
 
@@ -2143,6 +2156,8 @@ def _save_slot_to_history(
     expected_slot_name: str | None = None,
     rows_only: bool = False,
     pending_mode_slot: _ChatSlot | None = None,
+    mutes_opened_override: bool | None = None,
+    after_commit_under_lock: Callable[[], None] | None = None,
 ) -> bool:
     """Persist slot messages to JSONL history (append-safe).
 
@@ -2299,6 +2314,8 @@ def _save_slot_to_history(
                 # callers ignore a refused save, so a refusal would leave an
                 # open-shaped line that a restart resurrects.
                 refusal_under_lock=None if closed else _refusal_under_lock,
+                mutes_opened_override=mutes_opened_override,
+                after_commit_under_lock=after_commit_under_lock,
             )
             if refusal is not None:
                 logger.warning("Slot %s empty-window save refused: %s", slot.key, refusal)
@@ -2403,6 +2420,7 @@ def _save_slot_to_history(
                     queue_candidates=queue_candidates,
                     rewrite=rewrite,
                     rows_only=rows_only,
+                    mutes_opened_override=mutes_opened_override,
                 )
             )
             meta_str = json.dumps(meta_line) + "\n"
@@ -2436,6 +2454,14 @@ def _save_slot_to_history(
                     _preserve_mtime = None
 
             atomic_write(path, payload, fsync=True)
+            # The staged value is now durable. Flip the live flag HERE, still
+            # inside the transcript ``_locked`` block, so a concurrent dirty
+            # flush -- which needs this same lock to serialize the slot -- cannot
+            # observe the still-prior flag and overwrite the committed value.
+            # This is the full-save twin of the empty-window merge's
+            # ``after_commit_under_lock`` hook; one or the other runs, never both.
+            if after_commit_under_lock is not None:
+                after_commit_under_lock()
             _record_pending_memory_mode(pending_mode_target, _mode)
             # The write committed: the deferred-note drop records it retired
             # are now safe to consume (see ``build_full_line``). Discard is
@@ -2556,6 +2582,8 @@ async def save_slot_off_loop(
     expected_slot_name: str | None = None,
     rows_only: bool = False,
     issued_by_the_retraction: bool = False,
+    mutes_opened_override: bool | None = None,
+    after_commit_under_lock: Callable[[], None] | None = None,
 ) -> bool:
     """Persist a slot from the event loop without blocking or dropping the save.
 
@@ -2636,6 +2664,8 @@ async def save_slot_off_loop(
             expected_slot_name=expected_slot_name,
             rows_only=rows_only,
             pending_mode_slot=pending_mode_slot,
+            mutes_opened_override=mutes_opened_override,
+            after_commit_under_lock=after_commit_under_lock,
         )
 
     def _begin_guarded_metadata_write() -> None:

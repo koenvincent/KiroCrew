@@ -767,6 +767,16 @@ class StreamRedactor:
         self._buf = ""
         return out
 
+    @property
+    def held(self) -> str:
+        """The raw run withheld so far (``""`` while a value is being dropped)."""
+        return self._buf
+
+    @property
+    def discarding(self) -> bool:
+        """True while the rest of a value is being dropped."""
+        return self._discarding
+
     def reset(self) -> None:
         """Discard the buffer without emitting (segment abandoned/cleared)."""
         self._buf = ""

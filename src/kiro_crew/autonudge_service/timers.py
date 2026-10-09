@@ -253,6 +253,19 @@ async def release_approval_hold(
         staged.approval_stalled = False
         staged.approval_stalled_at = 0.0
         staged.created_ts = created
+        # A person-wait hold that overlaps this one credits its own span on release.
+        # Push its start forward by the overlap just credited here, so those seconds
+        # are handed back once, not twice; its time before the overlap still counts.
+        pw_since = loop.waiting_on_person_at
+        if (
+            held
+            and loop.waiting_on_person
+            and isinstance(pw_since, (int, float))
+            and not isinstance(pw_since, bool)
+            and 0 < pw_since < now
+        ):
+            pw_since += now - max(pw_since, since)
+        staged.waiting_on_person_at = pw_since
         try:
             await self._write_monitor_snapshot_locked(
                 self._monitor_snapshot_with_replacement(loop, staged)
@@ -260,8 +273,10 @@ async def release_approval_hold(
         except asyncio.CancelledError:
             # Settled before the re-raise: the release is durable, so keep it.
             loop.approval_stalled, loop.approval_stalled_at, loop.created_ts = False, 0.0, created
+            loop.waiting_on_person_at = pw_since
             raise
         loop.approval_stalled, loop.approval_stalled_at, loop.created_ts = False, 0.0, created
+        loop.waiting_on_person_at = pw_since
     logger.warning(
         "AutoNudge: loop %s resumed after %.0fs paused for approval (%s)",
         loop.id,
@@ -329,6 +344,9 @@ def notify_cycle_start_failed(self: AutoNudgeService, slot_key: str) -> None:
     if not loop or not loop.active:
         return
     loop.consecutive_start_failures += 1
+    # The conductor never read the ledger on this cycle, so the person-wait hold
+    # must not treat it as seen: the next tick fires and tries again.
+    loop.ledger_seen_fp = ""
     logger.warning(
         "AutoNudge: loop %s's cycle never got a model session "
         "(%d consecutive); it will back off at %d and stand down at %d",
@@ -428,6 +446,9 @@ async def notify_cycle_failed(
         #     the cancellation propagate with the increment intact.
         prior = loop.consecutive_failed_cycles
         loop.consecutive_failed_cycles = prior + 1
+        # A failed turn read nothing, so the person-wait hold must not count its
+        # ledger as seen; in memory only -- losing it on a restart costs one turn.
+        loop.ledger_seen_fp = ""
         try:
             # ``_write_monitor_snapshot_locked`` offloads the fsyncing
             # ``_write_state`` to a worker thread and ABSORBS cancellation until

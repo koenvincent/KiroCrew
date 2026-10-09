@@ -331,12 +331,48 @@ the tick is for silence, and silence is measured in hours.
 ### 3.4 Coalescing
 
 Several workers reporting inside one cadence produce several `fire_now` calls
-on the same loop. `_arm_timer` cancels the previous timer and arms a new one at
-delay zero, so the loop ticks once and the probe reads every item's newest
-event in that one tick; this is the coalescing the draft asked for, obtained
-from the existing timer rather than from a queue of envelopes. A `fire_now`
-that arrives while the loop is in `_run_fire_cycle` is refused, and the
-re-arm at the end of that cycle covers the report that caused it.
+on the same loop. The loop ticks ONCE for all of them and the probe reads every
+item's newest event in that one tick; this is the coalescing the draft asked
+for, obtained from the existing timer rather than from a queue of envelopes. A
+`fire_now` that arrives while the loop is in `_run_fire_cycle` is refused, and
+the re-arm at the end of that cycle covers the report that caused it.
+
+**A SHORT HOLDING WINDOW IS ADOPTED, replacing the delay-zero arm this section
+first specified.** The original rule was that each `fire_now` cancels the
+previous timer and arms a new one at delay zero. It coalesced only the reports
+that happened to land inside one tick's own execution, so reports seconds or
+tens of seconds apart each armed and ran their own tick: a burst of N reports
+cost the conductor N turns, each one re-reading the whole board for one item's
+news. One conductor was woken 8 times in 13 minutes during a burst of `done`
+reports, one item per wake.
+
+So the first waking report now arms its tick one WINDOW ahead
+(`conductor_wake.DEFAULT_WAKE_BATCH_SECS`), and a report arriving while that
+window is open rides the tick already armed instead of arming a second one. The
+tick reads the ledger when it RUNS, so it observes every report that reached it,
+and the zero kernel window below then folds all of them into one delivered wake.
+N reports close together therefore cost ONE turn naming all N items.
+
+The window is **10 s, a starting value with no measured basis** -- no
+distribution of inter-report gaps has been measured. It is deliberately kept at
+seconds scale so the §4 latency promise still holds: an isolated `question`
+reaches its conductor in seconds, not in a cadence and not in a minute. It is
+tunable through `KIROCREW_WORK_LEDGER_WAKE_BATCH_SECS`, and `0` restores the
+delay-zero arm exactly.
+
+Three rules keep the window from costing news. It is clamped to the loop's own
+deadline, so a push still only ever moves a fire EARLIER -- an arm replaces the
+armed timer, and an unclamped window on a loop about to fire anyway would push
+its scheduled tick out. A report inside an open window arms NOTHING rather than
+re-arming, or a steady stream would restart the window for as long as it lasted
+and the batch would never be delivered. And the window counts as open only while
+the armed timer is still live, so a report arriving after a cancel (a user
+message in the watched session cancels the timer without clearing the push mark)
+arms a window of its own instead of joining one nothing will close.
+
+Reports that land while the conductor is already mid-turn are NOT this window's
+to carry: they are covered by the steer in #17582, which folds them into the
+running turn.
 
 A pulled-forward tick is extra, and two rules keep it from costing more than
 the news it carries. It never spends the post-wake follow-up tick: that free
@@ -380,8 +416,9 @@ the loop and resets on restart.
 | | Phase 3 alone | with this RFC |
 |---|---|---|
 | conductor turns per worker report | gate decides | gate decides (unchanged) |
-| delay from `question` to conductor turn | up to `idle_secs` | seconds |
-| delay from worker close to conductor turn | `idle_secs` + staleness window | seconds |
+| conductor turns for N reports arriving inside one window | one per report | ONE, naming all N (3.4) |
+| delay from `question` to conductor turn | up to `idle_secs` | seconds (the batching window, 10 s by default) |
+| delay from worker close to conductor turn | `idle_secs` + staleness window | seconds (same window) |
 | delay from a worker turn that never reported | `idle_secs` + staleness window | staleness window |
 | patrol cadence the skill can set | minutes | hours |
 | new timers, stores, maps | none | no timer and no store; five in-memory structures on the service, all per loop, released with the loop and lost on restart: three loop-id sets (`_pulled_forward`, a deferred pull-forward for an in-flight cycle; `_pushed_ticks`, an armed tick a push set; `_pushed_running`, a running tick a push set) and the pull-forward cap's `_pull_forward_counts` (item -> times in the last hour) and `_pull_forward_capped` (pairs already logged) (3.2c, 3.5) |

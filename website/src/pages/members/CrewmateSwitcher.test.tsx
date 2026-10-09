@@ -55,7 +55,12 @@ describe('CrewmateSwitcher closed chip', () => {
     // duplicate rather than as "the rest of the crew".
     expect(faces).toEqual(['oncall', 'Radar One', 'fixer'])
     expect(screen.getByTestId('crewmate-switcher-count')).toHaveTextContent('4')
-    expect(chip()).toHaveAccessibleName('Switch crewmate')
+    // The chip names itself as the roster in visible text, so a bare /members
+    // that reopened a thread still shows where the crew list is; the action
+    // stays in the tooltip.
+    expect(screen.getByTestId('crewmate-switcher-label')).toHaveTextContent('Crewmates')
+    expect(chip()).toHaveAccessibleName('Crewmates')
+    expect(chip()).toHaveAttribute('title', 'Switch crewmate')
     expect(chip()).toHaveAttribute('aria-expanded', 'false')
   })
 
@@ -232,7 +237,7 @@ describe('CrewmateSwitcher live signals', () => {
     setup()
     const list = await open()
     expect(within(options(list)[1]).getByTestId('crewmate-switcher-presence-dot')).toBeInTheDocument()
-    expect(chip()).toHaveAccessibleName('Switch crewmate')
+    expect(chip()).toHaveAccessibleName('Crewmates')
     expect(screen.queryByTestId('crewmate-switcher-needs-you')).toBeNull()
   })
 
@@ -242,7 +247,7 @@ describe('CrewmateSwitcher live signals', () => {
     )
     expect(screen.getByTestId('crewmate-switcher-needs-you')).toBeInTheDocument()
     expect(chip()).toHaveAttribute('data-needs-you', 'true')
-    expect(chip()).toHaveAccessibleName('Switch crewmate, Needs your approval or answer')
+    expect(chip()).toHaveAccessibleName('Crewmates, Needs your approval or answer')
     unmount()
 
     // Only the OPEN crewmate needs you: its thread is on screen, so the chip
@@ -252,7 +257,7 @@ describe('CrewmateSwitcher live signals', () => {
     )
     expect(screen.queryByTestId('crewmate-switcher-needs-you')).toBeNull()
     expect(chip()).not.toHaveAttribute('data-needs-you')
-    expect(chip()).toHaveAccessibleName('Switch crewmate')
+    expect(chip()).toHaveAccessibleName('Crewmates')
   })
 
   it('working and unread elsewhere do not light the chip — only needs-you does', () => {
@@ -260,6 +265,6 @@ describe('CrewmateSwitcher live signals', () => {
       <CrewmateSwitcher members={MEMBERS} activeName="scribe" onPick={vi.fn()} signals={signalsBy({ oncall: { running: true, unread: true } })} />,
     )
     expect(screen.queryByTestId('crewmate-switcher-needs-you')).toBeNull()
-    expect(chip()).toHaveAccessibleName('Switch crewmate')
+    expect(chip()).toHaveAccessibleName('Crewmates')
   })
 })

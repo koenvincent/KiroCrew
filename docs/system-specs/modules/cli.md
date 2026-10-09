@@ -358,6 +358,19 @@ returned summary, with a logged warning. Snapshot and restore keep refusing, bec
 copy opens `O_NOFOLLOW` and the walk rejects links and reparse points — so what the import
 path gives up is ancestor-swap resistance, not link resistance.
 
+The import's cron sanitizer (`portability._sanitize_imported_crons`) resolves the staged
+`crons.json` once in the same way: its parent is pinned where the platform can, the
+store is opened `O_NOFOLLOW|O_NONBLOCK` (through `platform_compat.open_file_no_reparse`
+where there is no pinning) and read through that descriptor, and anything that is not
+one regular file — a link, a FIFO, a hardlink alias — is reported as an unreadable store
+and replaced with an empty one. Every rewrite is an `atomic_write` into the pinned
+directory, so a link or hardlink alias swapped in after the read is replaced, never
+written through. A missing store, or a directory at that name, is left alone as before.
+The staged `notification_settings.json` in the same directory is rewritten by
+`atomic_write` too, for the same reason.
+The merge that consumes the sanitized store reads it again by name; closing that second
+resolution is the merge's job, not the sanitizer's.
+
 The dashboard import's Merge follows the same never-overwrite rule as
 `kirocrew restore --mode merge` for the settings documents (`config.json`,
 `config.local.json`, `ui-prefs.json`, `notification_settings.json`): it installs one
@@ -407,6 +420,7 @@ module outside the snapshot family imports an owner.
 | `kirocrew memory export/import/migrate` | Export one store's rows to JSON, import them back, or migrate legacy markdown memory into the vector store. Both `export` and `import` take `--store <name>` (default: the default store), so a named store's rows are reachable in either direction as they already are for `backups`, `restore` and `carve`. `--include-markdown` adds the markdown layer and is DEFAULT-STORE ONLY: a named store's markdown root is under the fenced `memory_stores/` subtree, whose refusal `markdown_snapshot` cannot distinguish from an empty file, so the combination is refused rather than reported as empty. `export` writes at most 10,000 episodes and 1,000 events (`_EXPORT_EPISODIC_LIMIT`, `_EXPORT_EVENTS_LIMIT`) and warns on stderr when it stops at a cap |
 | `kirocrew memory backup/backups/restore` | Take hot copies of Global, declared named V1 and actively owned V2 stores (`--keep <n>`), list a store's copies newest-first (`--store`), or stage a restore (`--store`, `--from <file>`, defaulting to that store's newest). Both V1 and V2 activate restoration at gateway restart. Archived V2 stores are excluded from routine backups. `restore --store <member-store> --cancel-pending` cancels a staged intent while preserving current memory and its backup; it is mutually exclusive with `--from`. A failed activation still requires restart after cancellation. All three dispatch BEFORE the shared vector store is opened, because opening it raises on exactly the corrupt file these verbs recover. See [memory-skills-hooks](memory-skills-hooks.md#automatic-backups-memory_backuppy) |
 | `kirocrew memory retired` | List the episodes a semantic write superseded and restore one (`--restore <id>`, `--limit`). Default store only — it has no `--store`, so restoring a retirement inside a silo is a dashboard action. See [memory-skills-hooks](memory-skills-hooks.md#supersession-retirement-and-why-it-is-bounded) |
+| `kirocrew memory create-store <name>` | Create the directory of a named V1 store declared in `memory_stores` (`memory_stores.create_declared_store`). This is the only creator of such a directory: use never creates one, because `require_memory_store` refuses a missing directory before `ensure_memory_store_dir` is reached, so a deleted store stays missing rather than coming back empty. An existing directory is left untouched. Refuses the default store, an undeclared name and a V2 member store (provisioned with its member). `kirocrew doctor` names this command for a declared V1 binding whose only defect is the missing directory. It does not move a pre-`memory_stores/` tree; that stays a manual step |
 | `kirocrew memory carve --store <name>` | Filter or count a crew store's rows by their carve facets: one flag per facet (`--scope/--surface/--crew/--session-key/--derived-from`), `--kind`, `--count-by <axis>` for grouped counts, `--limit`/`--offset`. Facets exist only on a crew memory store, so the default store answers with a named refusal rather than an empty list. See [memory-skills-hooks](memory-skills-hooks.md#who-reads-a-facet) |
 | `kirocrew policy show/validate/explain/profile` | Inspect the effective enterprise security policy, load-check it and all profiles, explain one tool/scope decision for a surface, or print a profile. `show` also summarizes the built-in denied-command catalog as grouped counts (`--ids` lists each category's rule ids), on every install regardless of whether an enterprise policy is active — the one place an agent can learn a class of work is hard-denied before planning around it. |
 | `kirocrew pod up/down/ls/prune/status/token/url/scenarios/api/logs/exec/install/provision` | Isolated worktree test gateways. `pod prune` reclaims orphaned pod HOMEs in bulk (`--older-than`, default `3d`; `--all`; `--dry-run`; `--json`); see [dev-fleet](dev-fleet.md). Three per-user, no-elevation backends: Linux `systemd --user`, macOS `launchd`, Windows Task Scheduler (`schtasks.exe`). On a host with none of them every service-manager-touching verb refuses with a one-line message. `pod api` is additionally Linux + macOS only, because its authenticated request goes over an AF_UNIX socket with no TCP fallback and CPython on Windows has none. See `src/kiro_crew/pod/README.md` → Platform for the per-backend capability table and the two ceilings (memory/CPU, crash restart) that only systemd enforces. |
@@ -1508,7 +1522,11 @@ no signal and exit 1. Without `--expect-pid` the command is unchanged:
    whose start job completes the moment the process is forked, so a gateway
    that exits on start still gets exit 0. `service.linux.restart()` therefore
    re-reads the unit (`systemctl show`) for `_RESTART_SETTLE_SECS` (2 s, one
-   read per 0.25 s) and returns a per-scope `RestartReport`: a scope is
+   read per 0.25 s; each read also carries `ExecMainStartTimestampMonotonic`,
+   and a stamp that changes inside the window is a death and re-exec the reads
+   fell between — a `RestartSec` shorter than the read interval — reported as
+   NOT UP; a manager answering `0` or no stamp leaves that check off) and
+   returns a per-scope `RestartReport`: a scope is
    restarted only if the unit is `active` at the end of the window; one seen
    in `activating (auto-restart)`, `failed`, `inactive` or `deactivating`
    inside it is reported at once with that state and its `Result` (`exit-code`,
@@ -1949,12 +1967,40 @@ on crash, and starts on boot. Implemented in `src/kiro_crew/service/`.
     `systemd-journal` / `adm`. See [Logs Command](#logs-command).
 - **macOS** (`current_platform() == LAUNCHD`):
   - Plist: `~/Library/LaunchAgents/dev.kirocrew.gateway.plist`
-  - Install: `launchctl load -w <plist>`. `RunAtLoad=true` and
+  - Install: `launchctl enable gui/<uid>/<label>` then
+    `launchctl bootstrap gui/<uid> <plist>`. `RunAtLoad=true` and
     `KeepAlive` ensure auto-start and crash recovery. `KeepAlive` relaunches
     EVERY exit, including the live-holder refusal (exit 78); the exemption for
     that exit (`RestartPreventExitStatus`) is systemd-only.
   - Stdout and stderr are written to
     `~/Library/Logs/KiroCrew/gateway.{log,err}`.
+  - Install, restart, stop and uninstall name the domain explicitly, so an
+    install from SSH lands where `restart` and `stop` address it; the legacy
+    `load`/`unload` verbs act on the caller's domain (`user/<uid>` from SSH).
+    `is_active` and `status` still read the caller's domain with
+    `launchctl list`, so from SSH they do not see a `gui/<uid>` job. With
+    nobody logged in at the desktop,
+    there is no `gui/<uid>` domain: when `bootstrap gui/<uid>` answers
+    `125: Domain does not support specified action`, install enables and
+    bootstraps into `user/<uid>` instead and logs which domain it used. Any
+    other bootstrap refusal fails the install.
+    Reinstall first boots out an agent an older `load -w` left in
+    `gui/<uid>` or `user/<uid>` and waits for it to leave (`bootout` is
+    asynchronous); `enable` clears the persistent disabled override an older
+    `uninstall`'s `unload -w` wrote.
+  - Restart, stop and uninstall: `launchctl kickstart -k` / `bootout` on
+    `<domain>/<label>`, trying `gui/<uid>` then `user/<uid>`; a domain that
+    answers "not found" or `125` holds no job and the next one is tried.
+    Removing the job leaves nothing for
+    `KeepAlive` to respawn; stop keeps the plist and its enabled state for
+    the next login. `stop()` returns whether launchd accepted the bootout
+    and `stop_service()` passes that on, so `kirocrew stop` never reports a
+    refused bootout as a stop.
+  - `restart_service()` gates on `is_loaded()` (`launchctl print
+    <domain>/<label>` over `gui/<uid>` then `user/<uid>`), not on the
+    caller-domain `is_active()`, so `kirocrew restart` over SSH kickstarts the
+    service job instead of falling to the foreground SIGTERM-and-spawn path
+    beside it.
 - **Other platforms**: install/uninstall return exit code 2 with a
   message pointing to manual setup.
 

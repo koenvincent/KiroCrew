@@ -36,7 +36,7 @@ from kiro_crew.autonudge import (
     is_channel_key,
     scrub_loop_text,
 )
-from kiro_crew.autonudge_selfarm import forget_self_arm, record_self_arm
+from kiro_crew.autonudge_selfarm import WAKE_RESET_AGENTS, forget_self_arm, record_self_arm
 from kiro_crew.config.loader import workspace_dir_for
 from kiro_crew.monitoring.limits import validate_runtime_secs
 from kiro_crew.monitoring.models import (
@@ -960,6 +960,11 @@ async def authorize_and_add_nudge(
     # Set only on the dashboard branch, when a crew/member slot is armed by its
     # own turn; channel-bound loops have no slot mode and stay False.
     self_armed = False
+    # Whether the keystone-gated self-arm record is written for this loop: a
+    # crew/member self-arm, or a conductor slot armed by its own turn -- the
+    # record is what lets that loop's wake reset the conversation
+    # (``session_directive_apply``). The ``self_armed`` bit's meaning is unchanged.
+    self_recorded = False
     if is_channel_key(slot_key):
         # Channel-bound loop (Slack / Discord ...). Validate the session is
         # routable so a nudge fired later has somewhere to reply.
@@ -1074,6 +1079,10 @@ async def authorize_and_add_nudge(
                 return _deny(external_arm_refusal(slot_mode), 409)
             self_armed = True
             _audit("self_armed")
+        self_recorded = self_armed or (
+            str(getattr(authorized_slot, "agent", "") or "") in WAKE_RESET_AGENTS
+            and is_self_arm(slot_key, initiator_slot_key)
+        )
         if str(getattr(authorized_slot, "memory_mode", "persistent")) != "persistent":
             return _deny("incognito and temporary sessions cannot host automation loops", 403)
 
@@ -1234,7 +1243,7 @@ async def authorize_and_add_nudge(
     ):
         return _deny("monitor authorization requires a rollback-capable loop store", 503)
     reserved_loop_id: str | None = None
-    if self_armed or owner_credentials_grant:
+    if self_recorded or owner_credentials_grant:
         # Reserve a COLLISION-FREE id before touching the trust record. The
         # record is an upsert keyed by loop id, so an id already held by a live
         # loop would overwrite that loop's entry -- and the add's conflict
@@ -1253,13 +1262,18 @@ async def authorize_and_add_nudge(
                 break
         if reserved_loop_id is None:
             return _deny("could not reserve a loop id — loop not armed", 503)
-    if self_armed:
+    if self_recorded:
         try:
             assert reserved_loop_id is not None
             await asyncio.to_thread(record_self_arm, reserved_loop_id, slot_key)
         except OSError:
-            logger.error("self-arm record unavailable; loop not armed", exc_info=True)
-            return _deny("self-arm record unavailable — loop not armed", 503)
+            if self_armed:
+                logger.error("self-arm record unavailable; loop not armed", exc_info=True)
+                return _deny("self-arm record unavailable — loop not armed", 503)
+            # An ordinary slot needs no record to be armed: without one, its
+            # wakes are simply refused a conversation reset (fail closed there).
+            logger.warning("self-arm record unavailable; loop armed unrecorded", exc_info=True)
+            self_recorded = False
 
     if owner_credentials_grant:
         assert monitor is not None and reserved_loop_id is not None
@@ -1272,7 +1286,7 @@ async def authorize_and_add_nudge(
                 monitor.target,
             )
         except OSError:
-            if self_armed:
+            if self_recorded:
                 await asyncio.to_thread(forget_self_arm, reserved_loop_id)
             logger.error("monitor credential provenance unavailable; loop not armed", exc_info=True)
             return _deny("monitor credential authorization unavailable — loop not armed", 503)
@@ -1280,7 +1294,7 @@ async def authorize_and_add_nudge(
     def _forget_orphaned_trust() -> None:
         if reserved_loop_id is None:
             return
-        if self_armed:
+        if self_recorded:
             forget_self_arm(reserved_loop_id)  # never raises
         if owner_credentials_grant:
             autonudge_provider_trust.forget_monitor_owner_credentials(reserved_loop_id)

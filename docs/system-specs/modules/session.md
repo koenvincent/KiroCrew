@@ -353,6 +353,20 @@ do their work, and release — the process stays warm.
 It checks context usage and **recycles** (kill + fresh spawn) the session
 if needed — no compaction, since background tasks are stateless:
 
+- A turn refused as too long for the model's window → recycle, whatever
+  percentage is reported, on the shared-conversation path only (backends outside
+  `_bg_runtime_backends()`). After a refusal the reported percentage is still the
+  last successful turn's, so the threshold alone kept a conversation that every
+  later turn was refused on until the gateway restarted. The verdict reaches
+  `recycle_background()` two ways: `run_bg_oneliner()` passes
+  `context_overflowed=True` when its own turn raised it, and `stream_and_collect()`
+  leaves it on the provider (`mark_context_overflowed`) because its callers, such
+  as history consolidation, may swallow the error before `background_turn()`'s
+  recycle runs. `llm_helpers.is_context_overflow_error()` is the one predicate: the
+  classifier's `context_overflow` tag, or the backends' "Prompt is too long" /
+  "context window overflowed" / "maximum context length" text, since the claude
+  adapter puts its refusal in the JSON-RPC `message` the classifier does not read.
+  Runtime-capable backends keep the criteria below unchanged.
 - At ≥ 70% context → recycle (same threshold as chat's default compaction)
 - A reported 0% that the provider flags as *unknown* (`context_usage_unknown` —
   the backend compacted in place) → recycle
@@ -370,7 +384,13 @@ if needed — no compaction, since background tasks are stateless:
   bounded either way.
 - Below thresholds → no-op (session stays warm)
 
-Callers: heartbeat callback, taskrunner lesson extraction.
+Callers: heartbeat callback, taskrunner lesson extraction, `background_turn()`,
+and `run_bg_oneliner()` whenever its handle is a `_ProviderBgSession` (marked
+`shares_background_conversation`). That handle's `destroy()` only releases the
+turn semaphore, so without this call one-liner traffic (titles, nav labels,
+folder icons, summaries) grew the shared conversation for the whole gateway
+uptime with no criterion ever evaluated (#18230). A runtime handle's session is
+ephemeral and carries no marker, so it is not followed by a recycle.
 
 ### Multiplexed _bg runtime
 
@@ -4115,7 +4135,7 @@ Security properties (enforced in `session_directive.decode` plus the applier):
 - **Native sub-agent calls refused**: they surface as flat events in the parent loop but have no independently bindable slot, so the applier declines them.
 - **SEL audit on every application**: `apply_session_directive` emits a tool-invocation event tagged `source="mcp-directive"` with outcome `success` / `denied` (e.g. a `set_project` sensitive-path block) / `error`, since the effect now runs in the consumer rather than in the tool body or an HTTP endpoint.
 
-The applier reuses the SAME effect cores the HTTP endpoints call — `authorize_and_add_nudge` / `authorize_and_update_nudge` / `svc.remove` for the monitor trio, `slot.project` plus the recent-projects save for `set_project`, `deliver_ws_owners` for `suggest_followup`, and `post_question_card` for `ask_question` — so behavior is unchanged except that `ask_question` is now non-blocking (full contract in `learn-cron-dashboard.md` → "Agent Questions"). `reset_conversation` is the one directive whose core is not reachable inline: it queues `SessionManager.discard_conversation` on the slot for `chat_runner._consume_pending_reset` to apply at a turn boundary, because the discard is a full provider teardown and the producer is mid-turn — the same deferral `set_project` uses, and the reason the immediate route (`POST /api/chat/slots/{slot}/reset-conversation`) answers 409 on a busy slot rather than tearing down a turn mid-write. It queues the session key THIS TURN ran on, passed in by the consumer, never re-resolved from the slot: `linked_session_key` is mutable, so a cron or workflow injection that rebinds the slot between the request and the consume would otherwise discard whatever the slot points at by then and leave the caller's conversation alone. Only the END-OF-TURN consume may apply a discard (`allow_discard`); the two earlier consume points run just before a turn acquires the session, where a teardown lands under a channel turn already streaming on it. Even at that boundary it does not assume: the discard goes through `discard_conversation(..., skip_if_busy=True)`, which refuses under the same session lock that pops the session, mirroring `reset`'s own guard. Probing from the consumer and tearing down afterwards would leave a window in which a channel message acquires the session's semaphore and begins streaming a reply the teardown then destroys — and the semaphore is the stricter signal anyway, since `provider.has_active_turn()` cannot see a turn holding the semaphore with no prompt in flight yet. A refusal returns False and changes nothing, replay flag and session map included, so the consumer leaves the flag armed for a later boundary. The sid clear runs in the SAME tick as the pop, with no await between them — deferring it past the shutdown awaits lets a concurrent channel turn map a SUCCESSOR session under the key while the old provider is still shutting down, and the clear then erases the successor's pointer instead of the discarded one. Sub-agent children are the other wait — `discard_conversation` releases the shared runtime they run on, so a running or queued child, or an in-flight completion-event delivery, also leaves the flag ARMED rather than killing the child's work. Both that consume and the route's 409 read one predicate, `chat_utils.subagents_attached_async`, so the two cannot drift. The queued flag is in-memory slot state: a gateway restart while it sits armed drops the reset the confirmation promised, which is accepted rather than persisted — the cost is one un-applied reset the caller can ask for again, against durable state for a transient intent. `set_project` and `reset_conversation` additionally require structural user-turn provenance: injected cron, task-runner, sub-agent, auto-nudge, orchestration, app-authenticated unattended turns, and app-authored Spec Builder seed/handoff prompts cannot retarget a borrowed destination slot even when its session key is user-facing. Spec Builder rejects app-token message and decision submissions before they can enter its human-provenance relay or durable decision ledger. Queue entries preserve this provenance, replacement text adopts the editor's provenance, and mixed or untagged merges fail closed.
+The applier reuses the SAME effect cores the HTTP endpoints call — `authorize_and_add_nudge` / `authorize_and_update_nudge` / `svc.remove` for the monitor trio, `slot.project` plus the recent-projects save for `set_project`, `deliver_ws_owners` for `suggest_followup`, and `post_question_card` for `ask_question` — so behavior is unchanged except that `ask_question` is now non-blocking (full contract in `learn-cron-dashboard.md` → "Agent Questions"). `reset_conversation` is the one directive whose core is not reachable inline: it queues `SessionManager.discard_conversation` on the slot for `chat_runner._consume_pending_reset` to apply at a turn boundary, because the discard is a full provider teardown and the producer is mid-turn — the same deferral `set_project` uses, and the reason the immediate route (`POST /api/chat/slots/{slot}/reset-conversation`) answers 409 on a busy slot rather than tearing down a turn mid-write. It queues the session key THIS TURN ran on, passed in by the consumer, never re-resolved from the slot: `linked_session_key` is mutable, so a cron or workflow injection that rebinds the slot between the request and the consume would otherwise discard whatever the slot points at by then and leave the caller's conversation alone. Only the END-OF-TURN consume may apply a discard (`allow_discard`); the two earlier consume points run just before a turn acquires the session, where a teardown lands under a channel turn already streaming on it. Even at that boundary it does not assume: the discard goes through `discard_conversation(..., skip_if_busy=True)`, which refuses under the same session lock that pops the session, mirroring `reset`'s own guard. Probing from the consumer and tearing down afterwards would leave a window in which a channel message acquires the session's semaphore and begins streaming a reply the teardown then destroys — and the semaphore is the stricter signal anyway, since `provider.has_active_turn()` cannot see a turn holding the semaphore with no prompt in flight yet. A refusal returns False and changes nothing, replay flag and session map included, so the consumer leaves the flag armed for a later boundary. The sid clear runs in the SAME tick as the pop, with no await between them — deferring it past the shutdown awaits lets a concurrent channel turn map a SUCCESSOR session under the key while the old provider is still shutting down, and the clear then erases the successor's pointer instead of the discarded one. Sub-agent children are the other wait — `discard_conversation` releases the shared runtime they run on, so a running or queued child, or an in-flight completion-event delivery, also leaves the flag ARMED rather than killing the child's work. Both that consume and the route's 409 read one predicate, `chat_utils.subagents_attached_async`, so the two cannot drift. The queued flag is in-memory slot state: a gateway restart while it sits armed drops the reset the confirmation promised, which is accepted rather than persisted — the cost is one un-applied reset the caller can ask for again, against durable state for a transient intent. `set_project` and `reset_conversation` additionally require structural user-turn provenance: injected cron, task-runner, sub-agent, auto-nudge, orchestration, app-authenticated unattended turns, and app-authored Spec Builder seed/handoff prompts cannot retarget a borrowed destination slot even when its session key is user-facing. One auto-nudge case is admitted for `reset_conversation` only: a `kirocrew-conductor` slot's own patrol wake, when that wake's loop is the slot's current active loop, the keystone-gated self-arm record (`autonudge_selfarm`) vouches the slot armed it itself, and no question card or tool approval is pending. Such a queued discard also waits at the consume while a question or approval is pending (`_pending_discard_from_wake`). Spec Builder rejects app-token message and decision submissions before they can enter its human-provenance relay or durable decision ledger. Queue entries preserve this provenance, replacement text adopts the editor's provenance, and mixed or untagged merges fail closed.
 
 Gateway-off (the default topology this targets), the model's tool result is the tool's OWN returned line delivered over kiro-cli's MCP pipe; the applier's confirmation string and SEL audit are recorded on KiroCrew's own surfaces (transcript / WS / hooks) and do NOT rewrite the model's tool result. Each tool therefore phrases its own message as a *request* that the consumer applies (and may refuse — no interactive session, invalid/sensitive path, capped/paused loop) rather than asserting the effect already landed.
 
@@ -4154,16 +4174,51 @@ PID in `kiro_session_pids.txt` at spawn. These two runtime kinds live outside
 untracked orphans and SIGKILLed them mid-chat (surfacing as
 `process exited (rc=-9)`).
 
+**The active set is a pre-filter, not the authority.** It is a set gathered an
+event-loop hop before the decision, so it cannot see a party that started using a
+pid after it was read. What authorizes a signal on the periodic PID sweep
+(`_sweep_periodic_pids`) and on the orphan MCP sweep (`_sweep_untracked_mcps`) is the
+runtime ownership gate, asked once per pid at the decision point:
+`SessionCleanup._kill_authorized` calls `authorize_runtime_kill(pid, reason=...,
+caller="session_cleanup sweep")` for each candidate that survived the phase-2
+re-check. The gate refuses while either ownership table claims the pid: the lease
+table (`RuntimeOwnership`) or the tenancy table (`RuntimeTenancy`). A gate that raises
+is a refusal. A refusal withholds that pid only: it is dropped from the confirmed
+list, the rest of the pass continues, and the pid is asked about again on the next
+tick. Both verdicts are audited (`allowed` / `refused`), and `allowed` is never
+written as `killed`; the kill phase records what the signal actually did.
+
+The confirmed pids then pass through `teardown_barriers(confirmed, who="Sweep")`,
+which commits a tenancy teardown barrier for each one immediately before the
+kill phase runs and releases it when the phase exits, whether it returned or
+raised. The barrier closes the window between the gate's verdict and the signal (a
+thread hop, a pid-file read, token reads, a descendant walk): a tenant that claims
+the pid inside that window makes the barrier refuse it, and only the pids the
+barrier granted are signalled. The rest are left for the next tick. A new sweep
+that signals a pid must ask the gate per pid and take the barrier the same way;
+consulting the active set alone is the defect this section describes. The gate,
+the two tables and the barrier are specified in
+[runtime-ownership.md](runtime-ownership.md#the-one-kill-gate), and the
+kernel-against-registry reconciler that runs last on the same tick, with its
+`unowned_alive` / `owned_dead` counters, in
+[runtime-ownership.md](runtime-ownership.md#reconciliation-the-kernel-against-the-registry).
+
 ### Cross-platform process management (platform_compat)
 
 ### Reclaim identity: a projected marker set, and a subtractive token
 
 `kiro_session_pids.txt` entries are swept by `_sweep_pid_entries` (periodic, in two
 phases) and `cleanup_orphaned_session_roots` (run from the periodic cleanup loop;
-the startup/shutdown reclaim is `cleanup_orphaned_sessions`). What authorizes a signal in
-both is `_is_managed_agent_process(pid)` — does this PID still name the kind of process
+the startup/shutdown reclaim is `cleanup_orphaned_sessions`). What identifies the process
+in both is `_is_managed_agent_process(pid)` — does this PID still name the kind of process
 the entry described — plus each arm's own condition: a dead owning gateway, and for a
-token-less entry a reparent to init or to the dead gateway.
+token-less entry a reparent to init or to the dead gateway. On the periodic sweep that is
+not the whole authority: a pid that passes it still needs the ownership gate's per-pid
+allow and a committed teardown barrier before it is signalled (see
+[Orphan Sweep Active Set](#orphan-sweep-active-set)). `cleanup_orphaned_session_roots` and
+`cleanup_orphaned_sessions` do not ask the ownership gate: they reclaim entries whose
+owning gateway is dead, and the identity test and arm conditions here are the whole of
+their authority.
 
 That gate is per-TOKEN and exact wherever a command line can be read (Linux `/proc`,
 macOS `ps`), never a substring of the whole line: the projected names include

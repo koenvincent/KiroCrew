@@ -57,17 +57,21 @@ from kiro_crew.config.loader import (
     ConfigReadError,
     ConfigWriteRefused,
     KiroCrewConfig,
+    _clamp_compact_wait_secs,
     coerce_dict_section,
     config_path,
     update_config_locked,
 )
 from kiro_crew.config.sections import (
+    COMPACT_WAIT_SECS_MAX,
+    COMPACT_WAIT_SECS_MIN,
     DECISION_BUCKET_MAX,
     DECISION_BUCKET_MIN,
     DECISION_MODEL_ROUTE_TIERS,
     FOLDER_SORT_MODES,
     JUDGE_PROVIDERS,
     STT_LANGUAGE_AUTO,
+    TITLE_REFRESH_EVERY_TURNS_MAX,
     transcribe_vocabulary_name,
 )
 from kiro_crew.context_management import RESULT_FILE_MAX_BYTES
@@ -532,10 +536,15 @@ async def api_version(request: web.Request) -> web.Response:
     ``spawn_enforces`` names the ``/api/spawn`` fields this gateway applies to a
     run's permissions and privacy. A hub reads it before dispatching task text,
     since a peer in the same ``major.minor`` series without them would accept the
-    run and silently drop the field.
+    run and silently drop the field. ``approval_relay`` says a floored run's tool
+    requests are handed to the hub (``approvals`` on the run's status, answered on
+    ``/api/spawn/{id}/approvals/{approval_id}``) instead of prompting here.
     """
     return web.json_response(
-        {"version": kiro_crew.__version__, "spawn_enforces": ["approval_floor", "memory_mode"]}
+        {
+            "version": kiro_crew.__version__,
+            "spawn_enforces": ["approval_floor", "approval_relay", "memory_mode"],
+        }
     )
 
 
@@ -2758,6 +2767,17 @@ _EDITABLE_CONFIG: dict[str, dict] = {
         "min": AUTOCOMPACT_PCT_MIN,
         "max": AUTOCOMPACT_PCT_MAX,
     },
+    # ``0`` (the built-in budget) or 60-3600 s. Not one contiguous range, so the
+    # write CLAMPS through the load path's own coercion instead of rejecting:
+    # the stored value is exactly what a load of it would produce, and the
+    # response's ``clamp_notice`` lets the Settings row say what was saved.
+    # ``min``/``max`` are the positive band, reported in that notice.
+    "session.compact_wait_secs": {
+        "type": "float",
+        "min": COMPACT_WAIT_SECS_MIN,
+        "max": COMPACT_WAIT_SECS_MAX,
+        "clamp_fn": lambda v: _clamp_compact_wait_secs(v, 0.0),
+    },
     "session.pool_size": {"type": "int", "min": 0, "max": 10},
     "session.pool_agent": {"type": "str", "values_fn": _agent_values},
     "session.pool_ttl_secs": {"type": "int", "min": POOL_TTL_SECS_MIN, "max": POOL_TTL_SECS_MAX},
@@ -2783,6 +2803,17 @@ _EDITABLE_CONFIG: dict[str, dict] = {
         "type": "int",
         "min": RECENT_TINT_COUNT_MIN,
         "max": RECENT_TINT_COUNT_MAX,
+    },
+    # Auto-title refresh cadence (Settings → Chat → Sessions). The gate admits
+    # the loader's whole domain, 0 (the built-in schedule) through MAX, and the
+    # loader raises a stored 1-3 to MIN, the same as it does for a value
+    # `kirocrew config set` wrote. The row reads back the LOADED value, so it
+    # shows the cadence that runs. chat_title reads the key on every turn, so a
+    # save applies from the next turn with no restart.
+    "dashboard.title_refresh_every_turns": {
+        "type": "int",
+        "min": 0,
+        "max": TITLE_REFRESH_EVERY_TURNS_MAX,
     },
     # The sidebar's folder sort mode. A view preference the sidebar menu writes and
     # the kirocrew-dashboard MCP server reads back, so the two draw the tree in
@@ -3107,6 +3138,7 @@ async def api_kirocrew_config_patch(request: web.Request) -> web.Response:
 
     path_key: str = body.get("path", "")
     value: Any = body.get("value")
+    clamp_notice: dict | None = None
 
     spec = _EDITABLE_CONFIG.get(path_key)
     if not spec:
@@ -3134,7 +3166,8 @@ async def api_kirocrew_config_patch(request: web.Request) -> web.Response:
     elif spec["type"] == "int":
         try:
             value = int(value)
-        except (TypeError, ValueError):
+        # int() raises OverflowError on a non-finite float, which aiohttp's json.loads accepts.
+        except (TypeError, ValueError, OverflowError):
             return _deny("must be an integer", f"{path_key}={value}")
         lo, hi = spec.get("min", 0), spec.get("max", 999999)
         if value < lo or value > hi:
@@ -3143,6 +3176,10 @@ async def api_kirocrew_config_patch(request: web.Request) -> web.Response:
         if not isinstance(value, bool):
             return _deny("must be a boolean", f"{path_key}={value}")
     elif spec["type"] == "float":
+        clamp_fn = spec.get("clamp_fn")
+        if clamp_fn is not None and isinstance(value, bool):
+            # bool is an int subclass: `true` must not save as a 1 s budget.
+            return _deny("must be a number", f"{path_key}={value}")
         try:
             value = float(value)
         except (TypeError, ValueError):
@@ -3150,7 +3187,18 @@ async def api_kirocrew_config_patch(request: web.Request) -> web.Response:
         if not math.isfinite(value):
             return _deny("must be a finite number", f"{path_key}={value}")
         lo, hi = spec.get("min", 0.0), spec.get("max", 999999.0)
-        if value < lo or value > hi:
+        if clamp_fn is not None:
+            stored = float(clamp_fn(value))
+            if stored != value:
+                clamp_notice = {
+                    "path": path_key,
+                    "requested": value,
+                    "stored": stored,
+                    "min": float(lo),
+                    "max": float(hi),
+                }
+            value = stored
+        elif value < lo or value > hi:
             return _deny(f"must be between {lo} and {hi}", f"{path_key}={value}")
     elif spec["type"] == "str":
         if not isinstance(value, str):
@@ -3437,7 +3485,10 @@ async def api_kirocrew_config_patch(request: web.Request) -> web.Response:
                     },
                     status=503,
                 )
-    return web.json_response(_masked_config_dict(applied))
+    payload = _masked_config_dict(applied)
+    if clamp_notice is not None:
+        payload["clamp_notice"] = clamp_notice
+    return web.json_response(payload)
 
 
 # ── Local token bootstrap (Electron / local apps) ─────────────────────

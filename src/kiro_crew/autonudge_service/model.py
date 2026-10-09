@@ -496,6 +496,19 @@ class NudgeLoop:
     # held time is added to ``created_ts``, so a hold does not spend the runtime
     # budget: a loop held overnight resumes with the budget it had left.
     approval_stalled_at: float = 0.0
+    # The person-wait hold of a work-ledger watch (``_holds_for_person_wait``).
+    # ``ledger_seen_fp`` is the ledger's fingerprint read at the top of the tick that
+    # delivered the last turn, set only while every open item waited on a person
+    # ("" otherwise). A later tick whose ledger still matches it holds, and sets
+    # ``waiting_on_person`` so the popover and ``monitor_inspect`` can say so. A
+    # worker's report changes the fingerprint and releases it. Persisted, so a
+    # restart's replay tick holds again when nothing moved meanwhile.
+    ledger_seen_fp: str = ""
+    waiting_on_person: bool = False
+    # When the current person-wait hold began (0 = not held). On release the held
+    # time is added to ``created_ts``, so the hold spends neither the runtime budget
+    # nor the backstop, the same credit ``approval_stalled_at`` gives.
+    waiting_on_person_at: float = 0.0
     # How many of this loop's cycles in a row ended without ever getting a model
     # session (``session/new`` timed out or otherwise failed). Raised by
     # ``notify_cycle_start_failed`` and zeroed by ``notify_cycle_landed``, both

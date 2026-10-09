@@ -493,7 +493,24 @@ def test_the_workflow_runs_this_script_from_a_sparse_checkout() -> None:
     doc = yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))
     steps = doc["jobs"]["sweep"]["steps"]
     checkout = next(s for s in steps if str(s.get("uses", "")).startswith("actions/checkout@"))
-    assert checkout["with"]["sparse-checkout"] == ".github/scripts/readiness_sweep_scan.py"
+    # The scan script, the withheld-verdict republisher, and the
+    # disposition gate the republisher shells out to plus the two sibling
+    # modules pr_status.py loads. All are required at run time, so a dropped
+    # entry here is a run-time ImportError the sweep would only hit in
+    # production.
+    sparse = {
+        line.strip()
+        for line in str(checkout["with"]["sparse-checkout"]).splitlines()
+        if line.strip()
+    }
+    assert sparse == {
+        ".github/scripts/readiness_sweep_scan.py",
+        ".github/scripts/republish_withheld_verdict.py",
+        "src/kiro_crew/builtin_skills/kirocrew-dev/kirocrew-prepare-pr/scripts/pr_status.py",
+        "src/kiro_crew/builtin_skills/kirocrew-dev/kirocrew-prepare-pr/scripts/_review_contract.py",
+        "src/kiro_crew/builtin_skills/kirocrew-dev/kirocrew-prepare-pr/scripts/green_age.py",
+    }
+    assert checkout["with"]["sparse-checkout-cone-mode"] is False
     assert checkout["with"]["persist-credentials"] is False
     run = "\n".join(str(s.get("run", "")) for s in steps)
     # Comments may name the old shape; the assertions are on code lines only.
@@ -506,3 +523,6 @@ def test_the_workflow_runs_this_script_from_a_sparse_checkout() -> None:
     assert "gh pr list" not in code
     assert "issues/$pr_number/comments" in code
     assert "gh workflow run pr-readiness.yml" in code
+    # The withheld-verdict recovery re-runs the owing lane via the republisher,
+    # not by dispatching the aggregator.
+    assert "python3 .github/scripts/republish_withheld_verdict.py" in code

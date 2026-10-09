@@ -2755,18 +2755,26 @@ def _lesson_jsonl_store(
     silo: str,
     scope: str = "global",
     workspace: str | None = None,
+    session_key: str = "",
 ) -> LessonStore:
     """Return only a V1 JSONL learning tier using the recorded store binding.
 
     Member V2 callers use their SQLite handle even when it contains no lessons.
     Workspace selection applies only to Global V1, preserving its existing
-    global/workspace fallback and list union.
+    global/workspace fallback and list union. A workspace-scoped write that
+    names no workspace resolves to the REQUESTING session's workspace
+    (*session_key*), never to another session's.
     """
     if silo:
         return ContextBuilder.get_lessons_for(memory_store=silo)
     if scope == "workspace":
-        return _get_lessons(state, workspace)
+        return _get_lessons(state, workspace, session_key=session_key)
     return state.lessons
+
+
+def _load_workspace_lessons(state: DashboardState, workspace: str) -> list[Lesson]:
+    """Every row in *workspace*'s JSONL lessons file."""
+    return _get_lessons(state, workspace).load_all()
 
 
 async def _prepare_member_lesson_store(store: str) -> web.Response | None:
@@ -2995,6 +3003,26 @@ async def api_lessons_create(request: web.Request) -> web.Response:
                 state._background_tasks.add(task)
                 task.add_done_callback(state._background_tasks.discard)
     else:
+        # A workspace-scoped write that names no workspace takes the requesting
+        # session's. When that resolves to "default" -- no key, or a key with no
+        # live slot -- the write would land in the GLOBAL file, which every
+        # workspace reads. Refuse it, like the delete route refuses
+        # scope='workspace' without a name, rather than widen its reach.
+        if (
+            not _lesson_silo
+            and scope == "workspace"
+            and not cleaned.get("workspace")
+            and _get_active_workspace(state, sk) == "default"
+        ):
+            return web.json_response(
+                {
+                    "error": "scope='workspace' requires a workspace name: this "
+                    "session has no workspace of its own; use scope='global' or "
+                    "name the workspace",
+                    "code": "workspace_required",
+                },
+                status=400,
+            )
         lesson = Lesson(
             rule=rule,
             category=category,
@@ -3003,7 +3031,9 @@ async def api_lessons_create(request: web.Request) -> web.Response:
             applies=applies,
             ts=datetime.now(timezone.utc).isoformat(),
         )
-        store = _lesson_jsonl_store(state, _lesson_silo, scope, cleaned.get("workspace"))
+        store = _lesson_jsonl_store(
+            state, _lesson_silo, scope, cleaned.get("workspace"), session_key=sk
+        )
         # save_or_enrich, not save: a re-submit of a stored rule carrying a new
         # NOT-clause has to attach it rather than be skipped as a duplicate.
         # Off the loop because it reads the file and rewrites it whole -- the
@@ -3858,13 +3888,41 @@ async def api_lessons(request: web.Request) -> web.Response:
             (le, ("global", None)) for le in rows
         ]
         if not _lesson_silo:
-            # Merge global + workspace-scoped lessons
-            ws = workspace or _get_active_workspace(state)
-            if ws != "default":
+            # Merge global + workspace-scoped lessons. A named workspace wins; a
+            # session sees only its own slot's workspace. The all-workspaces
+            # union -- every configured workspace's rows, so each one stays
+            # visible and deletable from the operator's Memory tab -- is for the
+            # operator's own BROWSER surface ONLY: no key (or the shared
+            # ``dashboard:ui`` key, which names no slot) AND positively
+            # authenticated as the dashboard user.
+            #
+            # ``is_dashboard_user`` is set by the token-auth middleware to
+            # ``not app`` on every path that reaches a mixed-internal route
+            # like this one, so it is ``True`` only for a pure cookie/session
+            # browser caller (the operator) and ``False`` for an app token.
+            # Gating on it (rather than on ``internal_auth is not True``) means
+            # a keyless APP TOKEN -- which carries no ``internal_auth`` but is
+            # not the operator either -- falls through to the per-session branch
+            # and, with no resolvable slot, sees the global rows only. A keyless
+            # internal-secret agent (``internal_auth`` set) likewise never
+            # reaches the union. That is the cross-workspace data-isolation harm
+            # this PR removes: only the operator's own browser sees every
+            # workspace.
+            sk = request.headers.get("X-Session-Key", "")
+            if workspace:
+                union = [workspace]
+            elif sk in ("", "dashboard:ui") and request.get("is_dashboard_user") is True:
+                cfg = await asyncio.to_thread(KiroCrewConfig.load)
+                union = sorted(cfg.workspaces)
+            else:
+                union = [_get_active_workspace(state, sk)]
+            for ws in union:
+                if ws == "default":
+                    continue
                 # Every workspace row is listed, a same-text global row
                 # notwithstanding: the tier fields tell the two apart, and a row
                 # this list hides is a row the UI can never delete.
-                ws_lessons = await asyncio.to_thread(lambda: _get_lessons(state, ws).load_all())
+                ws_lessons = await asyncio.to_thread(_load_workspace_lessons, state, ws)
                 tiered.extend((le, ("workspace", ws)) for le in ws_lessons)
         total = len(tiered)
         # ``load_all()`` is file append order, so the newest rows are at the

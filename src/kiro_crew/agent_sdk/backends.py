@@ -164,6 +164,9 @@ with no row here.
      - pre-session registry query (whether the dashboard may skip a session reset)
    * - ``ACP_BACKENDS_STRUCTURED_REFUSAL``
      - driver-internal (whether the metadata refusal parser is consulted)
+   * - ``ACP_BACKENDS_UNATTRIBUTED_TERMINAL_ERROR``
+     - driver-internal (whether an adapter-authored text chunk that ends a turn
+       is the turn's provider failure rather than an answer)
    * - ``ACP_BACKENDS_HOOKS_LIST``
      - driver-internal (whether this harness's agent asks its client for the hooks
        matching a trigger and to run one, read by the session dispatch loop that
@@ -2220,6 +2223,34 @@ ACP_BACKENDS_SERIAL_SESSION_STARTS = frozenset({ACP_BACKEND_KIRO})
 # keeps provider-specific detail off the wire, so its refusal card has no category
 # line either.
 ACP_BACKENDS_STRUCTURED_REFUSAL = frozenset({ACP_BACKEND_KIRO, ACP_BACKEND_KAS})
+
+# Backends that report a TERMINAL provider failure of a prompt turn as an
+# ``agent_message_chunk`` with no ``messageId``, and then answer the prompt with
+# ``stopReason: "end_turn"`` as though the turn had succeeded.
+#
+# codex-acp is the member, on every release read so far (1.11.0, 2.0.1, 2.1.1,
+# 2.1.2-preview.5). Its ``CodexEventHandler.createErrorEvent`` takes this path for
+# a client that did not declare JetBrains AIR's ``sessionFailure`` capability: a
+# native ``error`` notification for the current turn with ``willRetry: false``
+# becomes ``createAgentTextMessageChunk(message + "\n\n")``, and nothing on the
+# prompt response says the turn failed. Crew cannot take the typed path instead:
+# the same ``_meta.jetbrains.air`` declaration flips the adapter into AIR
+# rendering for every tool call, plan and permission request.
+#
+# What makes the chunk recognisable is the missing ``messageId``. Model text
+# always names its item (``createTextEvent`` passes the native item id), and the
+# chunks the adapter writes itself never do. Membership lets the session hold such
+# a chunk until the turn ends and, when the turn ended on it, turn it into the
+# turn's failure (``AcpSessionHandle._run_turn``). It is read only there.
+# kiro-cli is not a member: a provider failure ends its prompt with a JSON-RPC
+# error, and model text there carries no ``messageId``, so the missing id would
+# say nothing.
+# kas is not a member: a provider failure ends its prompt with a JSON-RPC error.
+# claude is not a member: claude-agent-acp ends a failed turn with a JSON-RPC
+# error rather than with text.
+# opencode, goose, pi and deepseek are not members: none of them was read writing a
+# provider failure as message text.
+ACP_BACKENDS_UNATTRIBUTED_TERMINAL_ERROR = frozenset({ACP_BACKEND_CODEX})
 
 # Backends whose child may ask THIS host for an access token over the
 # ``_kiro/auth/getAccessToken`` connection-level request, to be answered from Kiro

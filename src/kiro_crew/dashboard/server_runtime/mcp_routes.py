@@ -84,6 +84,8 @@ def _deferred(module_name: str, handler_name: str) -> Callable:
       (``opt_in``) and which most installs never publish to.
     * ``mcp_apps`` -- feature-flagged (``mcp_gateway.apps_enabled``); its module
       scope imports the gateway backend, which must never load on dashboard boot.
+    * ``remote_approvals`` -- answered only for runs a remote hub placed with an
+      approval floor, which most gateways never host.
 
     ``module_name`` is a submodule of ``kiro_crew.dashboard.handlers``, not a
     dotted path, so this cannot be pointed at an arbitrary module.
@@ -160,6 +162,10 @@ def _register_mcp_routes(app: web.Application) -> None:
     app.router.add_post("/api/spawn/{agent_id}/continue", handlers.api_spawn_continue)
     app.router.add_post("/api/spawn/{agent_id}/steer", handlers.api_spawn_steer)
     app.router.add_post("/api/spawn/{agent_id}/release", handlers.api_spawn_release)
+    app.router.add_post(
+        "/api/spawn/{agent_id}/approvals/{approval_id}",
+        _deferred("remote_approvals", "api_spawn_approval_answer"),
+    )
     app.router.add_get("/api/lessons", handlers.api_lessons)
     app.router.add_post("/api/lessons", handlers.api_lessons_create)
     app.router.add_delete("/api/lessons", handlers.api_lessons_delete)

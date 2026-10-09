@@ -197,6 +197,24 @@ class BackgroundRuntimeDeps:
     session_closing_error: Callable[[str], BaseException]
 
 
+#: Attribute ``mark_context_overflowed`` leaves on a provider; read only by
+#: ``recycle_background`` and gone with the provider it recycles.
+_CONTEXT_OVERFLOWED_ATTR = "_kc_bg_context_overflowed"
+
+
+def mark_context_overflowed(provider: object) -> None:
+    """Record that ``provider``'s last turn was refused as too long for its window.
+
+    Best-effort: a provider that refuses the attribute simply keeps the
+    threshold criteria. Harmless on a provider that is not the ``_bg`` entry,
+    since nothing else reads it.
+    """
+    try:
+        setattr(provider, _CONTEXT_OVERFLOWED_ATTR, True)
+    except Exception:
+        pass
+
+
 class _ProviderBgSession:
     """``AcpSessionHandle``-compatible handle over the shared background entry.
 
@@ -204,6 +222,12 @@ class _ProviderBgSession:
     existing per-session semaphore.  The adapter is plumbing only: event parsing
     remains the provider's responsibility.
     """
+
+    #: Every turn through this handle is appended to the ONE persistent ``_bg``
+    #: conversation, so the caller must run ``recycle_background()`` after it or
+    #: that conversation grows for the whole gateway uptime. A runtime handle
+    #: owns an ephemeral session and carries no such marker.
+    shares_background_conversation = True
 
     def __init__(self, sess: _BackgroundSessionEntry) -> None:
         self._sess = sess
@@ -923,8 +947,17 @@ class BackgroundSessionRuntime:
             return None
         return f"tree rss={rss}MB exceeds {ceiling}MB"
 
-    async def recycle_background(self) -> None:
-        """Recycle the persistent background provider when context is full."""
+    async def recycle_background(self, *, context_overflowed: bool = False) -> None:
+        """Recycle the persistent background provider when context is full.
+
+        ``context_overflowed`` says the turn just taken was refused as too long
+        for the model's window (the caller saw it); a turn driven through
+        ``stream_and_collect`` leaves the same verdict on the provider instead
+        (``mark_context_overflowed``). Either forces the recycle on a
+        non-runtime backend: after a refusal the reported percentage is still the
+        last successful turn's, so the threshold below can keep a conversation
+        every later turn will be refused on, until the gateway restarts.
+        """
         background_key = self._deps.background_key
         background_agent = self._deps.background_agent
         logger = self._deps.logger
@@ -944,9 +977,16 @@ class BackgroundSessionRuntime:
             # background entry, so count its completed turn here.
             session.prompt_count += 1
 
+            # Scoped to the shared-conversation path: runtime-capable backends
+            # keep exactly the criteria they had.
+            overflowed = (
+                context_overflowed or getattr(provider, _CONTEXT_OVERFLOWED_ATTR, False) is True
+            ) and not self._owner._bg_backend_supports_runtime()
             pct = provider.context_usage_pct()
             post_compaction = pct == 0.0 and self._deps.context_pct_is_unknown(provider)
-            if pct >= self._deps.bg_recycle_pct:
+            if overflowed:
+                reason = f"prompt too long for the model window (context reported at {pct:.0f}%)"
+            elif pct >= self._deps.bg_recycle_pct:
                 reason = f"context at {pct:.0f}%"
             elif post_compaction:
                 reason = "compacted in place (context size unknown)"

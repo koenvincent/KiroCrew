@@ -7433,7 +7433,7 @@
       "sensitive": false,
       "tags": [],
       "label": "Crewmates in the chat agent picker",
-      "help": "List crewmates in the chat composer's agent picker, beside the agent templates, so a chat can be switched onto a crewmate (and its own workspace and memory) without opening it from the Crew page. Off by default: the picker lists templates plus any crewmate no listed template already covers. Takes effect when the dashboard is reloaded; no gateway restart.",
+      "help": "List crewmates in the chat composer's agent picker, beside the agent templates, so a chat can be switched onto a crewmate (and its own workspace and memory) without opening it from the Crew page. Off by default: the picker lists templates plus any crewmate no listed template already covers; the default agent stays even when covered, unless a template shares its name. Takes effect when the dashboard is reloaded; no gateway restart.",
       "hasChildren": false,
       "enumValues": null,
       "defaultValue": false
@@ -8822,6 +8822,20 @@
       "tags": [],
       "label": "Reasoning Effort",
       "help": "Default reasoning effort for sessions on this crew. Empty inherits: the global agent.reasoning_effort (or, for a background worker crew, its role effort). A per-session pick still overrides this. Only reasoning-capable models accept a level; on any other model the pin is ignored, exactly as the global default is.",
+      "hasChildren": false,
+      "enumValues": null,
+      "defaultValue": ""
+    },
+    {
+      "path": "agents.*.approval_mode",
+      "kind": "core",
+      "type": "string",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [],
+      "label": "Approval Mode",
+      "help": "Tool approval for this crewmate's own Crewmates-page thread: normal, trust_reads or trust. Empty means the user never chose one, and the thread opens in trust.",
       "hasChildren": false,
       "enumValues": null,
       "defaultValue": ""

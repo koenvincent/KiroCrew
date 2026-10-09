@@ -18,11 +18,11 @@ from unittest.mock import AsyncMock
 import pytest
 
 import kiro_crew
+from kiro_crew.dashboard import remote_subagents, remote_workspaces
 from kiro_crew.dashboard.remote_subagents import (
     RemoteSubagentError,
     RemoteSubagentService,
 )
-from kiro_crew.dashboard import remote_workspaces
 from kiro_crew.dashboard.remote_workspaces import (
     WorkspaceArchiveRejected,
     api_remote_workspace_upload,
@@ -122,7 +122,7 @@ class _Instances:
         assert path == "/api/version"
         body: dict[str, object] = {"version": kiro_crew.__version__}
         if self._advertises:
-            body["spawn_enforces"] = ["approval_floor", "memory_mode"]
+            body["spawn_enforces"] = ["approval_floor", "approval_relay", "memory_mode"]
         return True, body
 
     @asynccontextmanager
@@ -593,6 +593,7 @@ def test_a_platform_without_pinned_creates_refuses_the_install(
         install_workspace(payload, hashlib.sha256(payload).hexdigest(), "a" * 40, root=tmp_path)
 
     assert list(tmp_path.iterdir()) == []
+
 
 @_PINNED_INSTALL
 def test_workspace_prune_spares_snapshots_in_use(tmp_path) -> None:
@@ -2326,3 +2327,261 @@ async def test_a_lost_private_result_is_redelivered_as_an_error_not_an_empty_suc
     assert errors["abcdef23"] == ""  # already delivered: nothing to redeliver
     assert errors["abcdef24"] == ""  # persistent: its result is on disk when it exists
     await service.close()
+
+
+# ── Floored runs: tool requests relayed back to the hub's person ─────────────
+
+
+@pytest.mark.asyncio
+async def test_a_parked_hub_request_is_listed_answered_and_cleared() -> None:
+    from kiro_crew.subagent_manager import hub_approvals
+
+    event = SimpleNamespace(
+        title="execute_bash: ls", tool_input='{"command": "ls"}', tool_purpose=""
+    )
+    waiting = asyncio.create_task(hub_approvals.ask_hub("run-p1", event))
+    for _ in range(100):
+        listed = hub_approvals.pending_for("run-p1")
+        if listed:
+            break
+        await asyncio.sleep(0)
+    assert [item["title"] for item in listed] == ["execute_bash: ls"]
+    assert hub_approvals.resolve("run-p1", "f" * 16, True) is False
+    assert hub_approvals.resolve("run-p1", listed[0]["id"], True) is True
+    assert await waiting is True
+    assert hub_approvals.pending_for("run-p1") == []
+    # A request nobody answers is a rejection once its wait runs out.
+    assert await hub_approvals.ask_hub("run-p2", event, timeout=0.01) is False
+    assert hub_approvals.pending_for("run-p2") == []
+
+
+class _AnswerRequest(_WorkspaceRequest):
+    def __init__(self, body: object, *, approval_id: str = "a" * 16, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self.match_info = {"agent_id": "run-q1", "approval_id": approval_id}
+        self._body = body
+
+    async def json(self) -> object:
+        return self._body
+
+
+@pytest.mark.asyncio
+async def test_only_the_owner_answers_a_hub_request(monkeypatch: pytest.MonkeyPatch) -> None:
+    from kiro_crew.dashboard.handlers.remote_approvals import api_spawn_approval_answer
+    from kiro_crew.subagent_manager import hub_approvals
+
+    audited: list[dict[str, object]] = []
+    monkeypatch.setattr(
+        "kiro_crew.sel.sel", lambda: SimpleNamespace(log_api_access=lambda **kw: audited.append(kw))
+    )
+    resolved: list[tuple[str, str, bool]] = []
+    monkeypatch.setattr(
+        hub_approvals, "resolve", lambda run, aid, ok: resolved.append((run, aid, ok)) or True
+    )
+    # An agent on this gateway (internal MCP caller, an app) or another user never answers.
+    for request in (
+        _AnswerRequest({"approved": True}, user="owner", internal_auth=True),
+        _AnswerRequest({"approved": True}, user="owner", app="notes"),
+        _AnswerRequest({"approved": True}, user="other"),
+    ):
+        assert (await api_spawn_approval_answer(cast(Any, request))).status == 403
+    for request in (
+        _AnswerRequest({"approved": True}, user="owner", approval_id="../x"),
+        _AnswerRequest({"approved": "yes"}, user="owner"),
+    ):
+        assert (await api_spawn_approval_answer(cast(Any, request))).status == 400
+    assert resolved == [] and audited == []
+
+    response = await api_spawn_approval_answer(
+        cast(Any, _AnswerRequest({"approved": False}, user="owner"))
+    )
+    assert response.status == 200
+    assert resolved == [("run-q1", "a" * 16, False)]
+    assert audited[0]["operation"] == "subagent.hub_approval"
+    assert audited[0]["outcome"] == "rejected"
+
+    monkeypatch.setattr(hub_approvals, "resolve", lambda *_a: False)
+    response = await api_spawn_approval_answer(
+        cast(Any, _AnswerRequest({"approved": True}, user="owner"))
+    )
+    assert response.status == 404
+
+
+@pytest.mark.asyncio
+async def test_registered_approval_route_reaches_the_real_handler(monkeypatch) -> None:
+    from aiohttp import web
+
+    from kiro_crew.dashboard import server
+    from kiro_crew.dashboard.handlers import remote_approvals
+
+    sentinel = web.json_response({"reached": True})
+
+    async def _stub(_request: Any) -> web.Response:
+        return sentinel
+
+    monkeypatch.setattr(remote_approvals, "api_spawn_approval_answer", _stub)
+    app = web.Application()
+    server._register_mcp_routes(app)
+    route = next(
+        r
+        for r in app.router.routes()
+        if r.method == "POST"
+        and r.resource is not None
+        and r.resource.canonical == "/api/spawn/{agent_id}/approvals/{approval_id}"
+    )
+    assert await route.handler(cast(Any, object())) is sentinel
+
+
+def _floored_info(**overrides: object) -> SubagentInfo:
+    values: dict[str, object] = {
+        "id": "local-r1",
+        "task": "t",
+        "parent_session_key": "dashboard:chat-1",
+        "executor": "remote",
+        "instance_id": "crew-a",
+        "remote_id": "peer01",
+        "approval_floor": "interactive",
+    }
+    values.update(overrides)
+    return SubagentInfo(**values)  # type: ignore[arg-type]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("answer", [True, False])
+async def test_the_hub_asks_its_person_and_posts_the_answer_back(answer: bool) -> None:
+    from kiro_crew.dashboard.chat_utils import dashboard_slot_key
+
+    asked: list[tuple[tuple[object, ...], dict[str, object]]] = []
+
+    async def request_approval(*args: object, **kwargs: object) -> bool:
+        asked.append((args, kwargs))
+        return answer
+
+    instances = _Instances([(200, {"approved": answer})])
+    state = SimpleNamespace(instances_manager=instances, request_approval=request_approval)
+    service = RemoteSubagentService(state, _Manager())  # type: ignore[arg-type]
+    info = _floored_info()
+    listed = [{"id": "a" * 16, "title": "execute_bash: ls", "tool_input": "ls", "tool_purpose": ""}]
+
+    service._relay_approvals(info, listed)
+    service._relay_approvals(info, listed)  # the next poll does not ask twice
+    assert len(service._relays) == 1
+    await asyncio.wait_for(asyncio.gather(*service._relays.values()), timeout=5)
+
+    assert len(asked) == 1
+    args, kwargs = asked[0]
+    assert args[1] == "subagent" and "execute_bash: ls" in str(args[2])
+    assert kwargs["slot"] == dashboard_slot_key("dashboard:chat-1")
+    assert kwargs["is_background"] is False
+    assert instances.calls == [
+        ("crew-a", "POST", f"api/spawn/peer01/approvals/{'a' * 16}", {"approved": answer})
+    ]
+    assert service._relays == {}
+    await service.close()
+
+
+@pytest.mark.asyncio
+async def test_a_request_the_peer_settled_is_withdrawn_on_the_hub() -> None:
+    gate = asyncio.Event()
+    cancelled: list[bool] = []
+
+    async def request_approval(*_args: object, **_kwargs: object) -> bool:
+        try:
+            await gate.wait()
+        except asyncio.CancelledError:
+            cancelled.append(True)
+            raise
+        return True
+
+    instances = _Instances([])
+    state = SimpleNamespace(instances_manager=instances, request_approval=request_approval)
+    service = RemoteSubagentService(state, _Manager())  # type: ignore[arg-type]
+    info = _floored_info()
+    service._relay_approvals(info, [{"id": "b" * 16, "title": "write"}])
+    await asyncio.sleep(0)
+    (task,) = service._relays.values()
+
+    service._relay_approvals(info, [])
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(task, timeout=5)
+    assert cancelled == [True]
+    assert instances.calls == []
+    await service.close()
+
+
+@pytest.mark.asyncio
+async def test_only_a_floored_run_relays_and_only_well_formed_ids() -> None:
+    asked: list[object] = []
+
+    async def request_approval(*args: object, **_kwargs: object) -> bool:
+        asked.append(args)
+        return True
+
+    state = SimpleNamespace(instances_manager=_Instances([]), request_approval=request_approval)
+    service = RemoteSubagentService(state, _Manager())  # type: ignore[arg-type]
+    service._relay_approvals(_floored_info(approval_floor=""), [{"id": "c" * 16, "title": "x"}])
+    service._relay_approvals(
+        _floored_info(), [{"id": "../../steer", "title": "x"}, "junk", {"title": "no id"}]
+    )
+    assert service._relays == {} and asked == []
+    await service.close()
+
+
+@pytest.mark.asyncio
+async def test_a_floored_run_needs_a_crew_that_relays_approvals() -> None:
+    instances = _Instances([])
+
+    async def older_peer(_instance_id: str, _path: str) -> tuple[bool, object]:
+        return True, {
+            "version": kiro_crew.__version__,
+            "spawn_enforces": ["approval_floor", "memory_mode"],
+        }
+
+    instances.peer_capability = older_peer  # type: ignore[method-assign]
+    with pytest.raises(RemoteSubagentError) as refused:
+        await remote_subagents._ensure_peer_supports(
+            instances, "crew-a", memory_mode="", approval_floor="interactive"
+        )
+    assert refused.value.code == "remote_peer_unenforced"
+    # A run without a floor still goes to that crew.
+    await remote_subagents._ensure_peer_supports(
+        instances, "crew-a", memory_mode="temporary", approval_floor=""
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_floored_runs_status_lists_its_parked_requests(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from kiro_crew.dashboard.messaging_api import run_views
+    from kiro_crew.subagent_manager import hub_approvals
+
+    runs = {
+        "run-s1": SubagentInfo(id="run-s1", task="t", approval_floor="interactive"),
+        "run-s2": SubagentInfo(id="run-s2", task="t"),
+    }
+
+    async def _restored() -> None:
+        return None
+
+    monkeypatch.setattr(
+        "kiro_crew.dashboard.remote_subagents.get_remote_subagent_service",
+        lambda _state: SimpleNamespace(ensure_restored=_restored),
+    )
+    state = SimpleNamespace(subagents=SimpleNamespace(get=runs.get))
+    event = SimpleNamespace(title="execute_bash: ls", tool_input="ls", tool_purpose="")
+    waits = [asyncio.create_task(hub_approvals.ask_hub(run, event)) for run in runs]
+    await asyncio.sleep(0)
+
+    async def _status(run_id: str) -> dict[str, object]:
+        request = SimpleNamespace(app={"state": state}, match_info={"agent_id": run_id}, query={})
+        response = await run_views.api_spawn_status(cast(Any, request))
+        return json.loads(response.body)
+
+    floored, normal = await _status("run-s1"), await _status("run-s2")
+    assert [item["title"] for item in floored["approvals"]] == ["execute_bash: ls"]
+    assert "approvals" not in normal
+    for run in runs:
+        for item in hub_approvals.pending_for(run):
+            hub_approvals.resolve(run, str(item["id"]), False)
+    assert await asyncio.gather(*waits) == [False, False]

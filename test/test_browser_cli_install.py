@@ -726,6 +726,23 @@ def test_cli_env_layers_node_dirs_over_the_broad_path(monkeypatch: pytest.Monkey
     assert mod.cli_env()["PATH"] == "/node/bin:/home/.local/bin:/usr/bin"
 
 
+def test_cli_env_trusts_the_os_certificate_store(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Node children verify TLS against the OS store as well as Node's bundled roots.
+
+    A GUI-launched gateway has no shell profile, so a corporate proxy CA that the
+    OS already trusts would otherwise never reach the browser-download child.
+    """
+    monkeypatch.delenv("NODE_USE_SYSTEM_CA", raising=False)
+
+    assert mod.cli_env()["NODE_USE_SYSTEM_CA"] == "1"
+
+
+def test_cli_env_keeps_a_user_set_system_ca_choice(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("NODE_USE_SYSTEM_CA", "0")
+
+    assert mod.cli_env()["NODE_USE_SYSTEM_CA"] == "0"
+
+
 @pytest.mark.skipif(
     os.name == "nt",
     reason="POSIX ~ expansion and the ~/.local/bin (mise) layout; Windows uses a different PATH set",
@@ -1132,6 +1149,106 @@ class TestCliPathTrust:
         cli = self._executable(crew / "playwright-cli" / "bin" / mod.CLI_BIN)
 
         assert mod.cli_path() == str(cli.resolve())
+
+    def test_install_refuses_up_front_when_the_workspace_contains_the_data_home(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        home, crew = self._isolate(tmp_path, monkeypatch)
+        monkeypatch.setattr(mod, "_agent_writable_roots", lambda: (home.resolve(),))
+        calls = _wire(monkeypatch, {"npm": "/n/npm"})
+
+        result = mod.install()
+
+        assert result["ok"] is False
+        assert [s["name"] for s in result["steps"]] == ["check-install-boundary"]
+        detail = result["steps"][0]["stderr"]
+        assert f"{home.resolve()} contains the Kiro Crew data home ({crew})" in detail
+        assert "agent-writable" in detail
+        assert calls == []
+
+    def test_install_proceeds_over_the_data_home_when_a_vetted_system_launcher_resolves(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        home, _crew = self._isolate(tmp_path, monkeypatch)
+        system = self._executable(tmp_path / "opt" / "bin" / mod.CLI_BIN)
+        monkeypatch.setattr(mod, "_agent_writable_roots", lambda: (home.resolve(),))
+        monkeypatch.setattr(mod, "_system_cli_candidates", lambda: (system,))
+        monkeypatch.setattr(mod, "_gateway_writable_component", lambda candidate, resolved: None)
+        _wire(monkeypatch, {"npm": "/n/npm"})
+
+        result = mod.install()
+
+        assert result["steps"][0]["name"] == "npm-install-global"
+
+    def test_install_proceeds_when_the_workspace_is_beside_the_data_home(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        self._isolate(tmp_path, monkeypatch)
+        workspace = tmp_path / "workplace" / "kirocrew-workspace"
+        workspace.mkdir(parents=True)
+        monkeypatch.setattr(mod, "_agent_writable_roots", lambda: (workspace.resolve(),))
+        _wire(monkeypatch, {"npm": "/n/npm"})
+
+        result = mod.install()
+
+        assert result["steps"][0]["name"] == "npm-install-global"
+
+    def test_a_refused_launcher_found_after_install_names_it_and_the_reason(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        _home, crew = self._isolate(tmp_path, monkeypatch)
+        leaf = crew / "playwright-cli"
+        cli = self._executable(leaf / "bin" / mod.CLI_BIN)
+        monkeypatch.setattr(mod, "_agent_writable_roots", lambda: (leaf.resolve(),))
+        _wire(monkeypatch, {"npm": "/n/npm"})
+
+        result = mod.install()
+
+        step = result["steps"][-1]
+        assert step["name"] == "resolve-binary"
+        assert step["stderr"] == (
+            f"{mod.CLI_BIN} was installed at {cli} but refused: "
+            f"the resolved executable is inside the agent-writable tree {leaf.resolve()}"
+        )
+
+    def test_install_reports_an_absent_managed_launcher_as_not_found(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        self._isolate(tmp_path, monkeypatch)
+        _wire(monkeypatch, {"npm": "/n/npm"})
+
+        result = mod.install()
+
+        step = result["steps"][-1]
+        assert step["name"] == "resolve-binary"
+        assert step["stderr"] == (
+            f"{mod.CLI_BIN} was not found in the managed tools leaf after a successful install"
+        )
+
+    def test_a_user_local_refusal_names_the_boundary(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        home, _crew = self._isolate(tmp_path, monkeypatch)
+        crew = home / ".local" / "share" / "crew"
+        crew.mkdir(parents=True)
+        monkeypatch.setattr(mod, "config_dir", lambda: crew)
+        self._executable(crew / "playwright-cli" / "bin" / mod.CLI_BIN)
+
+        reason = mod._managed_leaf_unresolved_reason()
+
+        assert "under the user-local tree" in reason
 
     def test_a_path_first_shim_is_not_resolved(
         self,

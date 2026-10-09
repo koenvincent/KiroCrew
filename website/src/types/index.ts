@@ -987,6 +987,14 @@ export interface McpSessionReport {
    * gateway from before the guard shipped sends no such key.
    */
   unresolved_refs?: string[]
+  /**
+   * Servers that started but gave this session no tools — usually a tool name
+   * that clashes with another server's, so the backend kept only one. Optional
+   * because an older gateway sends no such key.
+   */
+  no_tools?: string[]
+  /** How many more such servers there were than `no_tools` lists (bucket cap). */
+  no_tools_omitted?: number
   /** Reported initialized. */
   ready: string[]
   /** Reported a startup failure. */
@@ -1177,6 +1185,14 @@ export interface ChatSlot {
    * before nesting a row that has no session-tree node yet — a child between
    * `session_create` and its first turn, which has no crew log to fold. */
   lineage_minted?: boolean
+  /** The user-owned "mute sessions it opens" rule. When true on a creating
+   * session, every session it opens -- and anything those open, down the
+   * `created_by` chain -- is muted for attention: no turn-done chime,
+   * background-finished toast or unread badge, from the first turn. The
+   * creator keeps all of its own signals, and a tool-approval prompt from a
+   * muted session still surfaces. Set only by the user (never an agent);
+   * durable, so it survives a gateway restart. */
+  mutes_opened?: boolean
   /** The session tree's parent edge for this slot, attached to every row by
    * `_attach_slot_parents`: `{slot, key}`, or null when this slot has no parent.
    * `slot` is the parent's own citation and `key` names the parent's row IN THIS

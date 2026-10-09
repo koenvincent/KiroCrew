@@ -12722,12 +12722,30 @@ class TestForkGptLaneKeepsCredentialsOutOfTheModelShell:
         return _fork_gpt_cli_config(tmp_path)
 
     def test_the_bedrock_provider_still_resolves(self, tmp_path: Path) -> None:
-        # The exclusions must not cost the lane its model: the provider reads its
-        # credentials from the codex PROCESS environment, which the shell policy
-        # does not touch.
+        # The credentials live outside the codex PROCESS environment. codex is
+        # pointed at a loopback signing proxy that runs as a DIFFERENT UID, holds
+        # the credentials, and SigV4-signs each request. So the config names a
+        # CUSTOM provider on 127.0.0.1 with the responses wire API, and carries no
+        # AWS credential of any kind -- there is nothing in codex's environment or
+        # any file its UID can read for a prompt-injected reviewer to exfiltrate.
         config = self._config(tmp_path)
-        assert config["model_provider"] == "amazon-bedrock"
         assert config["model"] == "openai.gpt-6.1-sol"
+        assert config["model_provider"] == "bedrock-signer", (
+            "the fork GPT lane must route the model through the loopback signing "
+            "proxy, not the amazon-bedrock provider that reads credentials from "
+            "the codex process environment"
+        )
+        provider = config["model_providers"]["bedrock-signer"]
+        assert provider["base_url"].startswith(
+            "http://127.0.0.1:"
+        ), f"the signer endpoint must be loopback, got {provider['base_url']!r}"
+        assert provider["wire_api"] == "responses"
+        # The provider carries no `env_key`: codex is given only the endpoint,
+        # never a credential variable to read. The signing proxy supplies auth.
+        assert "env_key" not in provider, (
+            "the loopback signer provider must not name an env_key; codex holds "
+            "no credential, the proxy does (#8789)"
+        )
 
     def test_every_aws_credential_variable_is_excluded(self, tmp_path: Path) -> None:
         filters = self._config(tmp_path)["shell_environment_policy"]["filters"]
@@ -12868,19 +12886,41 @@ class TestForkModelStepsDenyReadingTheEnvironment:
 
 
 class TestModelStepsRunAfterTheCredentialFilesAreScrubbed:
-    """The environment fences do not cover the runner's on-disk copy.
+    """Every model step is directly preceded by a step that removes the runner's
+    on-disk credential copy.
 
     ``configure-aws-credentials`` exports through ``core.exportVariable``, which
-    writes each value into ``$RUNNER_TEMP/_runner_file_commands/set_env_*``. Both
-    other fences guard the ENVIRONMENT -- the codex lane drops the AWS variables
-    from its shell tool's env, and the Opus steps deny ``Read(//proc/**)`` -- so
-    neither reaches a file sitting under a directory these lanes legitimately
-    read. A model told to open it can emit the value in chunks that match no
-    shape rule, which is why the value is removed rather than filtered.
+    writes each value into ``$RUNNER_TEMP/_runner_file_commands/set_env_*``. A
+    model told to open that file can emit the value in chunks that match no shape
+    rule, so the value is REMOVED rather than filtered.
+
+    Two step shapes satisfy this, by design:
+
+    * The Opus adjudication steps (both lanes) run a SHELL-LESS model
+      (``--allowedTools "Read,Grep,Glob"``) that still holds Bedrock credentials
+      in its own environment, so the "Scrub persisted credential files" step runs
+      directly before each of them and truncates the ``set_env_*`` files.
+    * The fork GPT lane's two ``codex exec`` passes hand the model a real SHELL,
+      so they go further: a credential-boundary step (start/refresh the loopback
+      signer) runs directly before each pass. It moves the credential across a
+      UID boundary into the signer process, BLANKS it in ``$GITHUB_ENV`` so codex
+      inherits nothing, AND truncates the same ``set_env_*`` files -- a superset
+      of the scrub. codex itself holds no credential at all.
     """
 
     WORKFLOWS = ("fork-gpt-review.yml", "fork-opus-review.yml")
     SCRUB = "Scrub persisted credential files before the model runs"
+    # Steps that establish/refresh the UID boundary before a shell-bearing codex
+    # pass. Each truncates set_env_* AND removes the credential from the job env.
+    BOUNDARY = (
+        "Start the loopback signing proxy (holds the credentials)",
+        "Refresh the signer's credentials (keep them behind the UID boundary)",
+    )
+    # A read-only probe that runs between the boundary step and the first codex
+    # pass: it reads no credential into the env and reintroduces nothing, so it
+    # is an allowed direct predecessor of a codex pass PROVIDED a boundary step
+    # still ran earlier in the same job.
+    SANDBOX_VERIFY = "Verify the review sandbox fails closed (no sudo, no credential read)"
 
     def _jobs(self, workflow: str) -> list[list[dict]]:
         import yaml
@@ -12889,12 +12929,16 @@ class TestModelStepsRunAfterTheCredentialFilesAreScrubbed:
         return [job.get("steps") or [] for job in (doc.get("jobs") or {}).values()]
 
     @staticmethod
-    def _is_model_step(step: dict) -> bool:
+    def _is_codex_pass(step: dict) -> bool:
+        return "/.bin/codex" in str(step.get("run") or "")
+
+    @classmethod
+    def _is_model_step(cls, step: dict) -> bool:
         if "anthropics/claude-code-action" in str(step.get("uses") or ""):
             return True
         # The codex lane invokes the model from a run block, so the `uses` test
         # alone would miss both of its passes.
-        return "/.bin/codex" in str(step.get("run") or "")
+        return cls._is_codex_pass(step)
 
     def _scrub_bodies(self) -> list[str]:
         bodies = []
@@ -12903,6 +12947,14 @@ class TestModelStepsRunAfterTheCredentialFilesAreScrubbed:
                 for step in steps:
                     if step.get("name") == self.SCRUB:
                         bodies.append(step.get("run") or "")
+        return bodies
+
+    def _boundary_bodies(self) -> list[str]:
+        bodies = []
+        for steps in self._jobs("fork-gpt-review.yml"):
+            for step in steps:
+                if step.get("name") in self.BOUNDARY:
+                    bodies.append(step.get("run") or "")
         return bodies
 
     def test_every_model_step_is_directly_preceded_by_the_scrub(self) -> None:
@@ -12915,18 +12967,67 @@ class TestModelStepsRunAfterTheCredentialFilesAreScrubbed:
                     seen += 1
                     where = f"{workflow}:{step.get('name') or step.get('id') or index}"
                     assert index > 0, f"{where}: model step is first, so nothing scrubbed"
-                    assert steps[index - 1].get("name") == self.SCRUB, (
-                        f"{where}: the step before it is "
-                        f"{steps[index - 1].get('name')!r}, not the scrub"
-                    )
+                    prev = steps[index - 1].get("name")
+                    # A shell-bearing codex pass must be preceded by a UID-boundary
+                    # step (which truncates set_env_* AND removes the credential
+                    # from the job env); every other model step by the scrub. The
+                    # read-only sandbox fail-closed probe may sit directly before a
+                    # codex pass, but only when a boundary step still ran earlier
+                    # in the same job -- it removes nothing itself.
+                    if self._is_codex_pass(step):
+                        if prev == self.SANDBOX_VERIFY:
+                            # The read-only probe sits between the boundary step
+                            # and the pass, so the boundary step must be exactly
+                            # TWO places back. "A boundary step anywhere earlier"
+                            # would let a later edit slot `configure-aws-credentials`
+                            # + the verify step in front of a pass while an
+                            # earlier pass's boundary step still satisfied the
+                            # check, leaking fresh credentials into the job env.
+                            assert index >= 2, (
+                                f"{where}: sandbox-verify precedes the pass but there "
+                                f"is no boundary step two places back"
+                            )
+                            two_back = steps[index - 2].get("name")
+                            assert two_back in self.BOUNDARY, (
+                                f"{where}: the step two before the codex pass is "
+                                f"{two_back!r}, not a credential-boundary step "
+                                f"{self.BOUNDARY!r}"
+                            )
+                        else:
+                            assert prev in self.BOUNDARY, (
+                                f"{where}: the step before a shell-bearing codex pass is "
+                                f"{prev!r}, not a credential-boundary step {self.BOUNDARY!r} "
+                                f"or the sandbox-verify step"
+                            )
+                    else:
+                        assert (
+                            prev == self.SCRUB
+                        ), f"{where}: the step before it is {prev!r}, not the scrub"
         # Guard the enumeration itself: a rename that makes `_is_model_step` match
         # nothing would otherwise turn this into a vacuous pass.
         assert seen == 5, f"expected 5 model steps across both lanes, found {seen}"
 
     def test_the_scrub_is_byte_identical_at_every_site(self) -> None:
+        # Three scrub sites remain: the fork GPT lane's Opus adjudication pass and
+        # both fork Opus lane model passes. The two GPT codex passes are now
+        # fronted by the stronger UID-boundary steps instead.
         bodies = self._scrub_bodies()
-        assert len(bodies) == 5, f"expected 5 scrub steps, found {len(bodies)}"
+        assert len(bodies) == 3, f"expected 3 scrub steps, found {len(bodies)}"
         assert len(set(bodies)) == 1, "the scrub bodies have drifted apart"
+
+    def test_every_boundary_step_also_truncates_the_set_env_files(self) -> None:
+        # The UID-boundary steps REPLACE the scrub before the codex passes, so
+        # each must still truncate the on-disk set_env_* copies the scrub did.
+        bodies = self._boundary_bodies()
+        assert len(bodies) == 2, f"expected 2 credential-boundary steps, found {len(bodies)}"
+        for body in bodies:
+            assert (
+                "_runner_file_commands" in body and "set_env_*" in body
+            ), "a credential-boundary step does not truncate the set_env_* files"
+            # It must also remove the credential from the job env for later steps.
+            assert (
+                "AWS_ACCESS_KEY_ID=" in body and "$GITHUB_ENV" in body
+            ), "a credential-boundary step does not blank the AWS vars in GITHUB_ENV"
 
     def test_the_scrub_truncates_set_env_files_and_nothing_else(self, tmp_path: Path) -> None:
         bash = _bash()
@@ -12976,6 +13077,78 @@ class TestModelStepsRunAfterTheCredentialFilesAreScrubbed:
             env={**os.environ, "RUNNER_TEMP": str(tmp_path / "absent")},
         )
         assert proc.returncode == 0, proc.stderr
+
+
+class TestReviewSandboxFailsClosed:
+    """The fork GPT lane proves its UID credential boundary before the model runs.
+
+    The boundary's defence against ``sudo cat /tmp/bedrock-signer.env`` is that
+    codex's read-only sandbox (``no_new_privs``) denies the review subprocess
+    any escalation. The job user has passwordless ``sudo`` and the sysctl that
+    enables the sandbox substrate ends in ``|| true``, so if that sandbox fails
+    to come up -- or a codex upgrade changes what ``read-only`` enforces --
+    nothing else would go red. This step runs the escalation attempts through
+    ``codex sandbox`` (the same Landlock+seccomp confinement the passes use) and
+    fails the job closed when the boundary does not hold.
+    """
+
+    STEP = "Verify the review sandbox fails closed (no sudo, no credential read)"
+
+    def _step(self) -> dict:
+        return _step("fork-gpt-review.yml", self.STEP)
+
+    def _script(self) -> str:
+        return _step_script(_workflow("fork-gpt-review.yml"), self.STEP)
+
+    def test_the_step_exists_and_runs_before_both_codex_passes(self) -> None:
+        doc = yaml.safe_load(_workflow("fork-gpt-review.yml"))
+        for job in (doc.get("jobs") or {}).values():
+            steps = job.get("steps") or []
+            names = [s.get("name") for s in steps]
+            if self.STEP not in names:
+                continue
+            verify_at = names.index(self.STEP)
+            codex_passes = [
+                i
+                for i, s in enumerate(steps)
+                if "/.bin/codex" in str(s.get("run") or "") and " exec " in str(s.get("run") or "")
+            ]
+            assert codex_passes, "no codex exec pass found in the job"
+            assert all(
+                verify_at < i for i in codex_passes
+            ), "the sandbox-verify step must run before every codex pass"
+            return
+        raise AssertionError(f"no job contains the step {self.STEP!r}")
+
+    def test_it_probes_sudo_and_credential_read_through_the_codex_sandbox(self) -> None:
+        script = self._script()
+        # It must drive the probes through `codex sandbox` (the real confinement),
+        # not a bare shell, or it would test the job user instead of the sandbox.
+        # The pinned @openai/codex selects the mode via `-c sandbox_mode=...`.
+        assert "sandbox -c sandbox_mode=read-only --" in script
+        assert "sudo -n true" in script, "the step does not probe privilege escalation"
+        # It reads the signer credential file the boundary is meant to protect.
+        assert 'cat "$CRED_FILE"' in script
+        env = _step_env("fork-gpt-review.yml", self.STEP)
+        assert env.get("CRED_FILE") == "/tmp/bedrock-signer.env"
+
+    def test_each_probe_failure_exits_nonzero(self) -> None:
+        # The three guard clauses each `exit 1`: a broken sandbox (control
+        # command fails), a successful sudo, and a readable credential file.
+        script = self._script()
+        assert script.count("exit 1") >= 3, (
+            "the step must fail closed on a broken sandbox, a successful sudo, "
+            "and a readable credential file"
+        )
+        # The control command (`$SANDBOX true`) must be REQUIRED to succeed, so a
+        # probe that fails only because codex sandbox is broken is not a false pass.
+        assert "if ! $SANDBOX true;" in script
+
+    def test_it_runs_as_the_same_binary_the_passes_use(self) -> None:
+        # The probe must exercise the SAME codex binary the review passes run,
+        # or it proves nothing about the sandbox those passes get.
+        env = _step_env("fork-gpt-review.yml", self.STEP)
+        assert env.get("CODEX_BIN") == "${{ runner.temp }}/review-cli/node_modules/.bin/codex"
 
 
 class TestTheScopeSurfaceIsResolvedOnce:
@@ -15212,29 +15385,36 @@ class TestForkLaneBubblewrapBootstrapEgress:
 
 
 class TestForkGptLaneMantleEgress:
-    """The GPT passes call Bedrock on the mantle host, not the runtime host.
+    """The GPT passes reach Bedrock on the mantle host, not the runtime host.
 
-    The two review passes run a CLI configured with
-    `model_provider = "amazon-bedrock"`, whose provider posts to
+    The two review passes run a CLI configured to talk to a loopback signing
+    proxy; that proxy SigV4-signs each request and forwards it to
     `https://bedrock-mantle.us-east-1.api.aws/openai/v1/responses` -- the URL a
     real job log shows the lane calling. The classic
     `bedrock-runtime.*.amazonaws.com` hosts in the allowlist do not cover it, so
-    under blocking egress each pass retries five times, ends
-    `Connection failed: error sending request`, and the lane fails closed with
-    `review incomplete` -- a separate failure from the bun one above, on the
-    same lane.
+    under blocking egress the proxy cannot connect, each pass retries five times,
+    ends `Connection failed: error sending request`, and the lane fails closed
+    with `review incomplete`.
 
-    Only the job that configures that provider gets the host: the Opus, Design,
-    UX, First-Principles and Security-Scope lanes talk to Bedrock through the
-    runtime host and must not carry it.
+    Only the job that runs that proxy gets the host: the Opus, Design, UX,
+    First-Principles and Security-Scope lanes talk to Bedrock through the runtime
+    host and must not carry it.
     """
 
     ENDPOINT = "bedrock-mantle.us-east-1.api.aws:443"
+    # The lane that reaches the mantle host does so either by configuring the
+    # built-in amazon-bedrock provider or by running the loopback signing proxy
+    # that forwards to mantle (the UID-boundary design).
     PROVIDER = 'model_provider = "amazon-bedrock"'
+    PROXY_MARKER = "bedrock-signing-proxy.py"
 
     @classmethod
     def _configures_the_mantle_provider(cls, job: dict) -> bool:
-        return any(cls.PROVIDER in str(step.get("run") or "") for step in job.get("steps") or ())
+        for step in job.get("steps") or ():
+            run = str(step.get("run") or "")
+            if cls.PROVIDER in run or cls.PROXY_MARKER in run:
+                return True
+        return False
 
     def test_the_gpt_lane_model_job_allows_the_mantle_endpoint(self) -> None:
         checked = 0
@@ -15246,10 +15426,10 @@ class TestForkGptLaneMantleEgress:
                 continue
             checked += 1
             assert self.ENDPOINT in endpoints, (
-                f"fork-gpt-review.yml job {name!r} points the review CLI at "
+                f"fork-gpt-review.yml job {name!r} reaches "
                 f"Bedrock's mantle endpoint behind a blocking egress policy but "
-                f"does not allow {self.ENDPOINT}, so both passes fail to connect "
-                "and the lane posts `review incomplete`"
+                f"does not allow {self.ENDPOINT}, so the signing proxy fails to "
+                "connect and the lane posts `review incomplete`"
             )
         assert checked, "fork-gpt-review.yml has no blocking-egress mantle job to check"
 

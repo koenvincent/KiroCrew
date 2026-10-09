@@ -167,11 +167,14 @@ The consent surface is the **detail page**: the update notice and the Permission
 card. The trust dialog opens only when repo trust is missing, so re-enabling an
 already-trusted app from a store card shows no dialog. At first install the
 dialog's session row comes from the catalog or registry projection, not from the
-cloned manifest, so a projection that omits the flag under-discloses. Two sibling
-grants are also live-enforced and are not re-gated on update today
-(`permissions.api`, `permissions.events`). A generic widened-permission check
-across install, update and enable, and a structured enable-route refusal that
-drives the dialog, are tracked in issue #11212.
+cloned manifest, so a projection that omits the flag under-discloses. The two
+sibling grants that are live-enforced, `permissions.api` and
+`permissions.events`, are held back on update instead of disabling the app: the
+app stores the set the owner approved in its own `approved-grants.json`, every enforcement point grants
+only declared entries in that set, and the owner approves added entries from
+the detail page (App Kit platform contracts §13). The first-install disclosure of those
+two lists, and a structured enable-route refusal that drives the dialog, are
+not covered.
 
 A `permissions.api` entry is a prefix match, so declaring `/api/approvals` or
 `/api/sessions` would otherwise reach every session on the instance. The

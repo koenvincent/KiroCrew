@@ -64,6 +64,7 @@ from kiro_crew.config.paths import config_dir
 from kiro_crew.mcp_provenance import is_marked
 from kiro_crew.platform.admission import (
     canonical_signing_bytes,
+    ed25519_verify,
     hmac_signature,
     read_policy_trust_root,
 )
@@ -1267,6 +1268,13 @@ class ScopeSpec:
     # loader's contract is that registering a scope needs no loader edit, and a
     # second scope with a floor should be a catalog entry, not another `if`.
     always_permitted: tuple[str, ...] = ()
+    # Under an installed policy, an omitted row DENIES instead of permitting:
+    # the policy must name the scope to grant it. For a scope whose grant hands
+    # work to a party this gateway cannot govern, where a policy written before
+    # the row existed must not be loosened from below. Data, read by ``resolve``,
+    # so the evaluator, ``kirocrew policy explain``/``validate`` and every call
+    # site agree. With no policy installed it has no effect.
+    explicit_grant: bool = False
 
 
 # ── CAPABILITY-DEFAULT CONTRACT (read before touching any capability_default) ──
@@ -1287,6 +1295,12 @@ class ScopeSpec:
 # not a special case, and making them one would put a namespace-specific rule in
 # a loader whose whole contract is that a newly registered scope family parses
 # without a loader edit.
+#
+# The one declared exception is a catalog row with ``explicit_grant=True``
+# (``capabilities.remote_spawn``): under an installed policy its omission
+# denies, because ``resolve`` reads that property. It is a property of the row,
+# not a rule at a call site, and ``kirocrew policy validate`` lists such rows
+# as denied rather than permitted.
 #
 # Consequence for authors, and the reason a governed fleet should enumerate all of
 # them: a policy cannot deny a capability by leaving it out.  ``kirocrew policy
@@ -1390,12 +1404,14 @@ SCOPE_CATALOG: Dict[str, ScopeSpec] = {
     # ``executor="remote"``). The child then runs under the PEER's approval
     # policy and profile, not this gateway's, so an administrator must be able
     # to refuse placement without denying ``capabilities.spawn`` outright.
-    # Default False, and under an installed policy the row must be present: an
-    # omitted row would otherwise permit (the absent-key contract below), which
-    # would let a policy written before this row loosen from below.
-    # ``_vet_remote_placement_governance`` enforces that. With no policy at
-    # all, the operator opt-in ``instances.remote_subagents`` is the only gate.
-    "capabilities.remote_spawn": ScopeSpec(CAPABILITY, capability_default=False),
+    # Default False, and under an installed policy the row must be present
+    # (``explicit_grant``): an omitted row would otherwise permit (the
+    # absent-key contract above), which would let a policy written before this
+    # row loosen from below. With no policy at all, the operator opt-in
+    # ``instances.remote_subagents`` is the only gate.
+    "capabilities.remote_spawn": ScopeSpec(
+        CAPABILITY, capability_default=False, explicit_grant=True
+    ),
     "capabilities.memory_writes": ScopeSpec(CAPABILITY, capability_default=True),
     # Web browsing (the ``browser`` MCP tool driving the native panel, and the
     # playwright-cli fallback it points at) is a governable egress surface: an
@@ -3012,15 +3028,22 @@ def policy_signing_payload(data: Mapping[str, object]) -> bytes:
 
 
 def _policy_signature_state(
-    data: Mapping[str, object], trust_keys: Mapping[str, str]
+    data: Mapping[str, object],
+    trust_keys: Mapping[str, str],
+    public_keys: Optional[Mapping[str, str]] = None,
 ) -> Tuple[str, str]:
     """Classify a policy document's signature.  Returns ``(state, detail)``.
 
     Pure and I/O-free: the caller supplies the trust keys, so this is directly
     unit-testable and the loader keeps the single responsibility of deciding what
-    to DO with the verdict.  Mirrors ``admission._signature_valid`` — HMAC-SHA256
-    over the canonical payload, compared with ``hmac.compare_digest`` — with the
-    key selected by ``identity.issuer`` instead of a plugin ``publisher``.
+    to DO with the verdict.  The key is selected by ``identity.issuer``.
+
+    An issuer with an entry in *public_keys* (``trust_public_keys``) is verified
+    with Ed25519 over the canonical payload and with nothing else: it NEVER falls
+    back to its ``trust_keys`` secret, because a fallback would let anyone who can
+    read that secret mint a document the asymmetric key was provisioned to stop.
+    An issuer without a public key keeps the HMAC-SHA256 check, compared with
+    ``hmac.compare_digest`` like ``admission._signature_valid``.
     """
     identity = data.get("identity")
     identity_map: Mapping[str, object] = identity if isinstance(identity, dict) else {}
@@ -3031,6 +3054,17 @@ def _policy_signature_state(
     if not issuer:
         # A signature with no issuer names no key, so nothing can verify it.
         return SIGNATURE_UNVERIFIED, "identity.signature present but identity.issuer is empty"
+    # Select by MEMBERSHIP, not by a truthy value: an issuer named with an unusable
+    # key (``""`` from ``_coerce_public_keys``) must still never reach the HMAC path.
+    public_keys = public_keys or {}
+    if issuer in public_keys:
+        public_key = public_keys[issuer]
+        if ed25519_verify(public_key, policy_signing_payload(data), signature):
+            return SIGNATURE_VERIFIED, f"issuer {issuer!r} (ed25519)"
+        return (
+            SIGNATURE_UNVERIFIED,
+            f"signature does not verify against the Ed25519 public key for issuer {issuer!r}",
+        )
     secret = trust_keys.get(issuer)
     if not secret:
         return SIGNATURE_UNVERIFIED, f"no trust key for issuer {issuer!r}"
@@ -3057,8 +3091,12 @@ def _policy_signature_state(
     return SIGNATURE_UNVERIFIED, f"signature does not match trust key for issuer {issuer!r}"
 
 
-def _policy_trust_settings() -> Tuple[bool, Dict[str, str]]:
-    """Read the operator-controlled trust root: ``(require_policy_signature, keys)``.
+def _policy_trust_settings() -> Tuple[bool, Dict[str, str], Dict[str, str]]:
+    """Read the operator-controlled trust root.
+
+    Returns ``(require_policy_signature, trust_keys, trust_public_keys)`` from ONE
+    read, so a verification never pairs a symmetric map and a public-key map taken
+    from two different versions of a trust root mid-push.
 
     Sourced from the **admission policy** (``KIROCREW_ADMISSION_POLICY`` env path,
     else ``<data home>/admission_policy.json``) rather than from a new key store,
@@ -3088,10 +3126,14 @@ def _policy_trust_settings() -> Tuple[bool, Dict[str, str]]:
     """
     try:
         adm = read_policy_trust_root()
-        return bool(adm.require_policy_signature), dict(adm.trust_keys)
+        return (
+            bool(adm.require_policy_signature),
+            dict(adm.trust_keys),
+            dict(adm.trust_public_keys),
+        )
     except Exception:
         logger.debug("policy trust settings unavailable", exc_info=True)
-        return False, {}
+        return False, {}, {}
 
 
 def _policy_signature_required() -> bool:
@@ -3180,8 +3222,8 @@ def _verify_policy_signature(data: Mapping[str, object], *, source: str) -> str:
 
     Returns the state to record on the ceiling.  Never raises.
     """
-    _, trust_keys = _policy_trust_settings()
-    state, detail = _policy_signature_state(data, trust_keys)
+    _, trust_keys, public_keys = _policy_trust_settings()
+    state, detail = _policy_signature_state(data, trust_keys, public_keys)
     _audit_policy_signature(state, detail, source)
     return state
 
@@ -3999,6 +4041,15 @@ def resolve(
     default) and a policy-deny is final regardless of the profile.
     """
     policy_control = ceiling.get(scope) if ceiling is not None else None
+    if ceiling is not None and policy_control is None:
+        spec = SCOPE_CATALOG.get(scope)
+        if spec is not None and spec.explicit_grant:
+            return Decision(
+                False,
+                f"policy does not grant {scope} (this scope needs an explicit row)",
+                rule="explicit-grant",
+                layer="policy",
+            )
     policy_dec = _query_level(policy_control, scope, item)
     if not policy_dec.permitted:
         return Decision(

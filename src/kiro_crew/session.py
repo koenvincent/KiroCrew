@@ -2581,9 +2581,9 @@ class SessionManager:
         cache[agent] = (model, dir_mtime, now)
         return model
 
-    async def recycle_background(self) -> None:
+    async def recycle_background(self, *, context_overflowed: bool = False) -> None:
         """Delegate context-driven background-provider recycling."""
-        await self._background_runtime.recycle_background()
+        await self._background_runtime.recycle_background(context_overflowed=context_overflowed)
 
     async def recycle_heartbeat(self) -> None:
         """Delegate cycle-scoped heartbeat-provider recycling."""

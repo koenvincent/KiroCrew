@@ -351,14 +351,16 @@ strict-read shape as the `boot` gate flags in
 **This policy is also the trust root for the security ceiling.**
 `require_policy_signature` (default `false`) additionally demands a *verified*
 `identity.signature` on `security_policy.json`, keyed by that document's
-`identity.issuer` in the same `trust_keys` map — one key store, not two. It is a
+`identity.issuer` in `trust_public_keys` (a base64 Ed25519 public key, policy
+issuers only) or else in the same `trust_keys` map — one key store, not two. An
+issuer with a public key never falls back to its `trust_keys` secret. It is a
 **separate** flag from `require_signature` on purpose: a fleet that signs its
 plugins has not thereby promised to sign its governance ceiling, and conflating
 them would break managed fleets on upgrade. The flag lives here rather than inside
 the security policy because a document cannot be the authority on whether it must
 be authentic. `canonical_signing_bytes` / `hmac_signature` are shared by both
 checks so the two trust roots cannot drift apart. The governance loader reads
-these two fields through `read_policy_trust_root()` — a **side-effect-free**
+these fields through `read_policy_trust_root()` — a **side-effect-free**
 reader that records no posture and emits no SEL, because unlike
 `load_admission_policy` (once per process at boot) it runs on a repeating path.
 See `governance.md` → "Policy authenticity".

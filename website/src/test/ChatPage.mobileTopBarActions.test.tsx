@@ -74,7 +74,6 @@ function props(over: Partial<Props> = {}): Props {
     currentSlot: { key: 'slot-a', title: 'Release notes' } as ChatSlot,
     sidebarAutoHidden: { current: true },
     openSidebar: vi.fn(),
-    menuAutoTitleInFlight: { current: false },
     effectiveMode: 'normal',
     sidebarOnScreen: false,
     activePoppedOut: false,
@@ -171,7 +170,6 @@ describe('session menu actions', () => {
     expect(p.setActionError).toHaveBeenCalledWith(null)
     await act(async () => { resolve({ title: 'Shipping plan' }) })
     expect(p.dispatch).toHaveBeenCalledWith(sseSlotTitle({ key: 'slot-a', title: 'Shipping plan' }))
-    expect(p.menuAutoTitleInFlight.current).toBe(false)
   })
 
   it('auto-title narrates a failure through the page, titled', async () => {
@@ -181,7 +179,6 @@ describe('session menu actions', () => {
     fireEvent.click(screen.getByText('auto-title'))
     await waitFor(() => expect(p.showActionError).toHaveBeenCalledWith('model offline', i18nT('pages.chatPage.could_not_generate_title')))
     expect(p.dispatch).not.toHaveBeenCalled()
-    expect(p.menuAutoTitleInFlight.current).toBe(false)
   })
 
   it('the open title editor drives the page state', () => {

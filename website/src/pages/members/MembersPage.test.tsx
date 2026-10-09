@@ -194,12 +194,21 @@ vi.mock('../../utils/terminalRegistry', () => ({
 }))
 vi.mock('../../hooks/useDevMode', () => ({ useDevMode: () => false }))
 
+// The profile settings write the live slot; the stub shows which slot the page
+// handed it, so a refused thread is proven to get none.
+vi.mock('./CrewProfileSettings', () => ({
+  default: ({ slotKey, waiting }: { slotKey?: string | null; waiting?: boolean }) => (
+    <div data-testid="profile-settings-slot" data-waiting={waiting ? '1' : '0'}>{slotKey ?? ''}</div>
+  ),
+}))
+/** The page's own composer, read lazily so the ChatPane stub can compare identity. */
+const CrewComposerRef = vi.hoisted(() => ({ current: null as unknown }))
 /* ChatPane is the full chat stack (WS, Redux slot machinery). The page's own
  * contract is only "mount it with the thread's slot key", so a stub that
  * ECHOES the slot key is the strongest cheap assertion available. */
 vi.mock('../../components/ChatPane', () => ({
-  default: ({ slotKey, agentLocked, followContentWidth, busyMode, onOpenCommandCenter }: { slotKey: string; agentLocked?: boolean; followContentWidth?: boolean; busyMode?: string; onOpenCommandCenter?: () => void }) => (
-    <div data-testid="chat-pane-stub" data-agent-locked={agentLocked ? '1' : '0'} data-follow-content-width={followContentWidth ? '1' : '0'} data-busy-mode={busyMode ?? 'split'}>
+  default: ({ slotKey, agentLocked, followContentWidth, busyMode, onOpenCommandCenter, composerInput }: { slotKey: string; agentLocked?: boolean; followContentWidth?: boolean; busyMode?: string; onOpenCommandCenter?: () => void; composerInput?: unknown }) => (
+    <div data-testid="chat-pane-stub" data-agent-locked={agentLocked ? '1' : '0'} data-follow-content-width={followContentWidth ? '1' : '0'} data-busy-mode={busyMode ?? 'split'} data-crew-composer={composerInput === CrewComposerRef.current ? '1' : '0'}>
       {slotKey}
       {onOpenCommandCenter && <button onClick={onOpenCommandCenter}>Open task dashboard</button>}
     </div>
@@ -825,6 +834,7 @@ describe('MembersPage thread', () => {
   })
 
   it('opens the pinned DM thread on click: creates the thread and mounts the chat stack on its slot', async () => {
+    CrewComposerRef.current = (await import('./CrewComposer')).default
     await renderPage()
     fireEvent.click(await rosterRow('oncall'))
     await waitFor(() => expect(api.memberThread).toHaveBeenCalledWith('oncall'))
@@ -843,6 +853,9 @@ describe('MembersPage thread', () => {
     // A send while the member is working gets the main chat's Steer / Queue /
     // Jev auto split, so the Members page must NOT ask for 'steer-only'.
     expect(pane).toHaveAttribute('data-busy-mode', 'split')
+    // The Crew page draws its own composer (no model / effort / permission /
+    // context toolbar), not the ordinary chat one.
+    expect(pane).toHaveAttribute('data-crew-composer', '1')
     // The pin is an invariant of every member thread, so the header does NOT
     // announce it — no chip, no term for a state that cannot be otherwise.
     expect(screen.queryByTestId('member-pin-chip')).toBeNull()
@@ -1238,6 +1251,50 @@ describe('MembersPage side panel (Dashboard / Work log / Notes / Schedules) and 
     expect(screen.getByTestId('member-pill-face')).not.toHaveStyle({ visibility: 'hidden' })
   })
 
+  it('the profile settings write only the confirmed thread slot', async () => {
+    localStorage.setItem(PANEL_OPEN_KEY, '0')
+    await renderPage([row({ bound: true, slot_key: 'member-oncall' })])
+    fireEvent.click(await rosterRow('oncall'))
+    await screen.findByTestId('chat-pane-stub', undefined, PANE_READY)
+    fireEvent.click(await screen.findByTestId('member-identity-pill'))
+    // The card opens on Sessions (#18245); the settings live on the Profile tab.
+    fireEvent.click(await screen.findByRole('tab', { name: 'Profile' }))
+    // Awaits the lazy CrewProfileSettings import under the opened Profile card.
+    const settings = await screen.findByTestId('profile-settings-slot', undefined, PANE_READY)
+    expect(settings).toHaveTextContent('member-oncall')
+    expect(settings).toHaveAttribute('data-waiting', '0')
+  })
+
+  it('a refused thread hands the profile settings no slot, even with a cached key', async () => {
+    localStorage.setItem(PANEL_OPEN_KEY, '0')
+    await renderPage([row({ bound: true, slot_key: 'member-oncall' })], 'kirocrew', { thread: new Error('member_slot_conflict') })
+    fireEvent.click(await rosterRow('oncall'))
+    fireEvent.click(await screen.findByTestId('member-identity-pill'))
+    // The card opens on Sessions (#18245); the settings live on the Profile tab.
+    fireEvent.click(await screen.findByRole('tab', { name: 'Profile' }))
+    // Awaits the lazy CrewProfileSettings import, then the refused POST.
+    await screen.findByTestId('profile-settings-slot', undefined, PANE_READY)
+    await waitFor(() => expect(screen.getByTestId('profile-settings-slot')).toBeEmptyDOMElement(), PANE_READY)
+    // No confirmed thread, so the pickers wait instead of saving a record the
+    // thread would not follow.
+    expect(screen.getByTestId('profile-settings-slot')).toHaveAttribute('data-waiting', '1')
+  })
+
+  it('a first open still in flight makes the profile settings wait', async () => {
+    localStorage.setItem(PANEL_OPEN_KEY, '0')
+    // Never answers: the thread stays unconfirmed for the whole test.
+    const pending = new Promise<never>(() => {})
+    await renderPage([row({ bound: false, slot_key: '' })], 'kirocrew', { thread: pending as unknown as Record<string, unknown> })
+    fireEvent.click(await rosterRow('oncall'))
+    fireEvent.click(await screen.findByTestId('member-identity-pill'))
+    // The card opens on Sessions (#18245); the settings live on the Profile tab.
+    fireEvent.click(await screen.findByRole('tab', { name: 'Profile' }))
+    // Awaits the lazy CrewProfileSettings import under the opened Profile card.
+    const settings = await screen.findByTestId('profile-settings-slot', undefined, PANE_READY)
+    expect(settings).toBeEmptyDOMElement()
+    expect(settings).toHaveAttribute('data-waiting', '1')
+  })
+
   it('opening the side panel folds a docked profile away and restores the pill', async () => {
     localStorage.setItem(PANEL_OPEN_KEY, '0')
     await renderPage([row({ bound: true, slot_key: 'member-oncall' })])
@@ -1394,15 +1451,18 @@ describe('MembersPage side panel (Dashboard / Work log / Notes / Schedules) and 
     expect(navigateSpy).not.toHaveBeenCalled()
   })
 
-  it('withholds only the unfed views, Command Center and Artifacts: Dashboard + Files stand, the + menu keeps its dynamic views', async () => {
+  it('withholds only the unfed views and Command Center: Dashboard + Files + Artifacts stand, the + menu keeps its dynamic views', async () => {
     // The set is the contract: every view fed by ChatPage-owned transcript
-    // indexes plus the session Summary (MEMBERS_UNFED_VIEWS), the chat page's
-    // Command Center (the Dashboard tab is the one dashboard entrance here) and
-    // Artifacts — pinned on the chat page, but this page's standing set is
-    // Dashboard + Files. Nothing else: Terminal, Browser, Git, Subagents,
-    // Workflows, the Developer-Mode views and app tabs stay reachable from +.
+    // indexes plus the session Summary (MEMBERS_UNFED_VIEWS) and the chat
+    // page's Command Center (the Dashboard tab is the one dashboard entrance
+    // here). Nothing else: Artifacts stands (withholding the view also
+    // withholds every artifact document tab, which left a crewmate's
+    // artifacts unopenable on this page, #18320), and Terminal, Browser, Git,
+    // Subagents, Workflows, the Developer-Mode views and app tabs stay
+    // reachable from +.
     expect([...MEMBERS_UNFED_VIEWS].sort()).toEqual(['changes', 'issues', 'links', 'pins', 'summary'])
-    expect([...MEMBERS_WITHHELD_VIEWS].sort()).toEqual([...MEMBERS_UNFED_VIEWS, 'command-center', 'artifacts'].sort())
+    expect([...MEMBERS_WITHHELD_VIEWS].sort()).toEqual([...MEMBERS_UNFED_VIEWS, 'command-center'].sort())
+    expect(MEMBERS_WITHHELD_VIEWS).not.toContain('artifacts')
     expect(MEMBERS_WITHHELD_VIEWS).not.toContain('terminal')
     expect(MEMBERS_WITHHELD_VIEWS).not.toContain('app')
     expect(MEMBERS_WITHHELD_VIEWS).not.toContain('side')
@@ -1422,8 +1482,9 @@ describe('MembersPage side panel (Dashboard / Work log / Notes / Schedules) and 
     act(() => {
       store.dispatch(sseSlots([{ key: 'member-oncall', mode: 'member', running: false, messages: 0 }] as never))
     })
-    // Standing tabs: Dashboard (leading) + Files (pinned) — no Artifacts, no Changes.
-    expect(screen.getAllByRole('tab').map((t) => t.getAttribute('aria-label'))).toEqual(['Dashboard', 'Files'])
+    // Standing tabs: Dashboard (leading) + the chat panel's pinned Artifacts and
+    // Files, in the chat page's own order — no Changes.
+    expect(screen.getAllByRole('tab').map((t) => t.getAttribute('aria-label'))).toEqual(['Dashboard', 'Artifacts', 'Files'])
     fireEvent.pointerDown(
       screen.getByRole('button', { name: 'Open side panel tab' }),
       { button: 0, ctrlKey: false, pointerType: 'mouse' },
@@ -1432,7 +1493,7 @@ describe('MembersPage side panel (Dashboard / Work log / Notes / Schedules) and 
     for (const name of ['Side Chat', 'Terminal', 'Browser', 'Git', 'Subagents', 'Workflows']) {
       expect(within(menu).getByRole('menuitem', { name })).toBeInTheDocument()
     }
-    for (const name of ['Pins', 'Issues', 'Links', 'Summary', 'Artifacts', 'Changes', 'Command Center']) {
+    for (const name of ['Pins', 'Issues', 'Links', 'Summary', 'Changes', 'Command Center']) {
       expect(within(menu).queryByRole('menuitem', { name })).toBeNull()
     }
   })

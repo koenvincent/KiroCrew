@@ -5483,16 +5483,52 @@ def test_close_archives_a_peer_and_removes_the_slot(tmp_path):
     state.sessions.remove.assert_awaited()
 
 
-def test_close_refuses_a_self_target(tmp_path):
-    """Close routes through ``authorize_target`` like stop and read, so a session
-    cannot close itself (the guard is operation-agnostic)."""
+def test_close_archives_the_caller_itself(tmp_path):
+    """A session that has finished its one job can close its own tab: close waives
+    the self-target refusal, on its admission gate AND its pre-pop re-check, and
+    runs the same archival a peer close does. Its own running turn is the turn
+    asking for the close, and it is cancelled through the shared teardown."""
+    state = _make_state(tmp_path)
+    caller = _busy(_slot(state, "chat-1"))
+    running_turn = caller.task
+
+    result = asyncio.run(sc.close_target(state, caller_session_key=_key(caller), target=caller.key))
+
+    assert result == {"ok": True, "target": caller.key}
+    assert caller.key not in state._slots
+    running_turn.cancel.assert_called()
+    state.sessions.remove.assert_awaited()
+
+
+def test_close_lets_a_session_another_session_created_close_itself(tmp_path):
+    """The reported case: a session opened by another one (``_created_by`` names
+    its creator) and fenced to what it created can still close ITSELF, because
+    addressing itself reaches no peer -- the same waiver release relies on."""
+    state = _make_state(tmp_path)
+    parent = _slot(state, "chat-1")
+    child = _slot(state, "chat-2")
+    child._created_by = parent.key
+
+    result = asyncio.run(
+        sc.close_target(state, caller_session_key=_key(child), target=child.key, caller_fenced=True)
+    )
+
+    assert result == {"ok": True, "target": child.key}
+    assert child.key not in state._slots
+    assert parent.key in state._slots
+
+
+def test_close_still_refuses_a_channel_linked_caller_closing_itself(tmp_path):
+    """The self waiver is the self-target refusal only: a caller that may not use
+    session control at all is still refused, and its slot survives."""
     state = _make_state(tmp_path)
     caller = _slot(state, "chat-1")
+    caller.linked_session_key = "slack:1786300000.000200"
 
     with pytest.raises(sc.SessionControlError) as exc:
         asyncio.run(sc.close_target(state, caller_session_key=_key(caller), target=caller.key))
-    assert exc.value.code == "self_target"
-    # The self-close was refused, so the caller's own slot survives.
+    # The caller IS the target, so the target-side link refusal answers first.
+    assert exc.value.code == "linked_session_target"
     assert caller.key in state._slots
 
 

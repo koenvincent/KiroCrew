@@ -45,6 +45,18 @@ def _doctor_data_home() -> None:
     # launcher row prints: one install reached through a ``current`` symlink and
     # through its versioned directory must not read as two installs.
     print(f"  location:    ✅ {os.path.realpath(home)}")
+    from kiro_crew.browser_cli.install import agent_writable_root_over_data_home
+
+    if (overlap := agent_writable_root_over_data_home(Path(home))) is not None:
+        print(
+            f"  workspace:   ⚠️  {render._safe_display(str(overlap))} contains the data home, "
+            "so it is agent-writable and the managed browser launcher cannot run"
+        )
+        print(
+            "               Point the workspace root (KIROCREW_WORKSPACE or "
+            "<data-home>/workspace_dir) and any KIROCREW_PROJECT_DIR outside the "
+            "data home, then restart the gateway."
+        )
 
     legacy = Path.home() / cli_doctor.LEGACY_CONFIG_DIR_NAME
     if not legacy.is_dir():

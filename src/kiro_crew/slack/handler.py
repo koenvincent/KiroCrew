@@ -299,13 +299,16 @@ from kiro_crew.slack.handler_runtime.reactions import (  # noqa: F401
     refresh_phase_emojis,
 )
 from kiro_crew.slack.handler_runtime.stream import (  # noqa: F401
+    _add_to_rich_text,
     _AnswerStream,
     _at_tag_line_start,
+    _blocks_with_run,
     _comment_hold_is_protocol,
     _filter_options_brackets,
     _resolve_comment_hold,
     _safe_final_update,
     _safe_update,
+    _ts_before,
 )
 from kiro_crew.slack.handler_runtime.turn_context import (  # noqa: F401
     _thread_context,
@@ -2118,6 +2121,8 @@ async def handle_message(
 
             elif event.kind == EVENT_COMPLETE:
                 status_ctrl.on_progress()
+                # The turn ended: text carried across a final ``wait`` is answer.
+                answer.take_carried()
                 _stop_reason = event.stop_reason
                 _completion_observed = True
                 if (
@@ -2808,11 +2813,12 @@ async def handle_message(
                 # clobbering ``_answer_reached`` to False there would book an
                 # ordinary reasoning/tool-only turn a failure. Only apply the
                 # wholly-refused-stream predicate when there WAS answer text.
-                if _answer_text_to_send:
-                    _answer_reached = answer.delivered
+                # Read after the seal: it sends the last held run of text.
                 await answer.seal(
                     clean_text, redacted=bool(_render_redacted or exfil_warnings or cred_warnings)
                 )
+                if _answer_text_to_send:
+                    _answer_reached = answer.delivered
             elif answer.stream_ts:
                 # Legacy fallback (chat.startStream unavailable): the "Thinking…"
                 # placeholder is replaced with the clean text. Answer-carrying —

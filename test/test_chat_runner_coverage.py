@@ -2004,6 +2004,39 @@ class TestConsumePendingReset:
         assert slot._pending_discard_conversation_key is None
 
     @pytest.mark.asyncio
+    async def test_a_wake_discard_waits_while_a_question_is_pending(self, tmp_path):
+        """A patrol wake's reset is refused at queue time while someone is being
+        asked something; it must not land later into that state either."""
+        state, slot = _state(tmp_path), _slot()
+        slot._pending_discard_conversation_key = "dashboard:chat-cov-1"
+        slot._pending_discard_from_wake = True
+        slot._question_pending = {"card-1": {"blocking": False}}
+
+        torn_down = await chat_runner._consume_pending_reset(state, slot, allow_discard=True)
+
+        assert torn_down is False
+        state.sessions.discard_conversation.assert_not_awaited()
+        assert slot._pending_discard_conversation_key == "dashboard:chat-cov-1"
+
+        slot._question_pending = {}
+        await chat_runner._consume_pending_reset(state, slot, allow_discard=True)
+
+        state.sessions.discard_conversation.assert_awaited_once()
+        assert slot._pending_discard_conversation_key is None
+        assert slot._pending_discard_from_wake is False
+
+    @pytest.mark.asyncio
+    async def test_a_persons_discard_does_not_wait_on_a_pending_question(self, tmp_path):
+        state, slot = _state(tmp_path), _slot()
+        slot._pending_discard_conversation_key = "dashboard:chat-cov-1"
+        slot._question_pending = {"card-1": {"blocking": False}}
+
+        await chat_runner._consume_pending_reset(state, slot, allow_discard=True)
+
+        state.sessions.discard_conversation.assert_awaited_once()
+        assert slot._pending_discard_conversation_key is None
+
+    @pytest.mark.asyncio
     async def test_the_discard_always_asks_for_no_replay(self, tmp_path):
         """One value, not a plumbed choice: replaying the transcript into the
         fresh conversation returns most of what the reset reclaimed. The manager

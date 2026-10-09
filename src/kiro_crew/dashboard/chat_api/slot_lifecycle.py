@@ -924,6 +924,45 @@ async def _close_slot(
         # that landed during the save gets the marker re-derived from ITSELF instead
         # of inheriting the original's.
         _resettle_restricted_key(state, name)
+        # Record the DELIBERATE close as a ``session/closed`` crew-log edge with
+        # ``END_REASON_REMOVED`` so a later ``session_status`` gone row for this
+        # worker reads ``closed`` ("finished, nothing to re-dispatch") rather than
+        # ``lost``. This lives HERE, in the one deliberate-close caller, not in
+        # ``SessionManager.remove``: ``remove`` has many callers (archive sweeps,
+        # mid-handshake teardowns, Slack command paths) that are NOT a worker
+        # finishing, and stamping ``removed`` from inside it would make a reaped or
+        # torn-down worker read ``closed`` too. The sid is resolved from the session
+        # MAP (``mapped_sid``, in-memory, no prune), not from a live provider,
+        # because a worker that finished and sat idle may already have been
+        # process-recycled by ``reset`` -- which pops the live session and wrote a
+        # ``reset`` close -- before its tab was closed; the map still names the sid,
+        # and this ``removed`` edge, written after that ``reset``, is the newest
+        # lifecycle entry, so the gone row reads ``closed``.
+        #
+        # AWAITED before the wake below, not fire-and-forget: the conductor is woken
+        # on the strength of this close, and a ``session_status`` it runs then folds
+        # this worker's lifecycle. If the ``removed`` edge had not yet landed, that
+        # fold would read the earlier ``reset`` and report ``lost`` -- a redundant
+        # re-dispatch of a worker that is actually finished. So we hand the append to
+        # ``awaiting_commit`` and only wake once it has committed. Key-scoped
+        # ``_slot_still_ours`` guard first: a recreate can land between the save and
+        # here, and ``_history_key_for(name)`` is the session an unbound replacement
+        # runs on, so emitting for it would mis-stamp a live replacement. Fail-soft
+        # and bounded: a drop or timeout from ``awaiting_commit`` leaves the edge
+        # unwritten and the row reads ``lost`` -- the fail-safe direction (a transient
+        # redundant re-dispatch, never a lost worker), so we wake regardless.
+        if _slot_still_ours(state, name, slot):
+            close_sid = state.sessions.mapped_sid(_history_key_for(name))
+            if close_sid:
+                from kiro_crew.crew_log import emit as crew_log_emit
+                from kiro_crew.metrics.sessions import END_REASON_REMOVED
+
+                await crew_log_emit.awaiting_commit(
+                    lambda on_settled: crew_log_emit.on_session_closed(
+                        close_sid, END_REASON_REMOVED, on_settled=on_settled
+                    ),
+                    what=f"session/closed(removed) for {close_sid}",
+                )
         # Durable, so no rollback can retract this frame — a client pruning its
         # per-slot cards on it can never be pruning a slot that comes back.
         state.push_slot_removed(name)

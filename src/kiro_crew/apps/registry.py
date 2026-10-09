@@ -735,6 +735,7 @@ if _typing.TYPE_CHECKING:
         _retained_startup_refusal,
         _roll_back_post_script_refusal,
         _set_aside_new_layout_files,
+        _trust_grant_would_stay_local,
         _unpoison_rejected_checkout,
         app_admission_denied,
         app_name_error,

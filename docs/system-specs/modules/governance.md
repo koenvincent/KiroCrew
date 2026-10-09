@@ -1307,8 +1307,8 @@ inventing a second scheme.
 | Piece | Where | Notes |
 |---|---|---|
 | Canonical payload | `policy_signing_payload()` | Routes through `admission.canonical_signing_bytes` — the **same** sorted-keys/compact-separators/UTF-8 canonicalization `PluginManifest.signing_payload` uses, so the two trust roots cannot drift |
-| Primitive | `admission.hmac_signature` | HMAC-SHA256 + `hmac.compare_digest`. POC symmetric; an asymmetric verify swaps in behind the same helper |
-| Trust key | admission policy `trust_keys[<issuer>]` | The **existing** operator-controlled key store — one store, not two |
+| Primitive | `admission.ed25519_verify` / `admission.hmac_signature` | Ed25519 when the issuer has a public key; otherwise HMAC-SHA256 + `hmac.compare_digest`. `ed25519_verify` never raises: malformed base64, wrong length (32-byte key, 64-byte signature) or a missing `cryptography` wheel is one `False` |
+| Trust key | admission policy `trust_public_keys[<issuer>]` (base64 Ed25519 public key), else `trust_keys[<issuer>]` (shared secret) | The **existing** operator-controlled trust root, read once per verification. An issuer **named** in `trust_public_keys` is verified with Ed25519 alone and **never** falls back to its `trust_keys` secret, even when its value is `null`, empty or not base64: such an entry is kept (as `""`) rather than dropped, so a migration placeholder makes every policy from that issuer `unverified` (refused under `require_policy_signature`) instead of silently re-enabling HMAC |
 | Opt-in | admission policy `require_policy_signature` | Separate from the plugin-facing `require_signature` |
 | Verdict | `GovernanceCeiling.signature_state` | `verified` / `unverified` / `unsigned` / `unchecked` |
 
@@ -1432,8 +1432,12 @@ can edit the admission policy (clearing the opt-in) as easily as the security
 policy. The `is_sensitive_path` keystone remains the control that stops the
 *agent* from reaching either file; signing is what makes a fleet-pushed ceiling
 tamper-**evident** to the host that loads it. Symmetric HMAC also means the
-verifier holds a secret capable of *producing* signatures, so key distribution is
-the residual weakness an asymmetric successor removes.
+verifier holds a secret capable of *producing* signatures, so anyone who can read
+`trust_keys` can mint a document that verifies. `trust_public_keys` removes that:
+the host holds only the public half, the private half never sits on a managed
+host, and because a public key disables the issuer's symmetric fallback, provisioning
+it is what stops an HMAC forgery from verifying. To stop accepting an issuer's
+symmetric proof without provisioning a public key, delete its `trust_keys` entry.
 
 `kirocrew policy show` prints the verdict verbatim
 (`GovernanceCeiling.signature_summary()`) so an operator can tell an established
@@ -2469,7 +2473,10 @@ gate — `capabilities.spawn`, `capabilities.remote_spawn` (placing a sub-agent 
 a remote crew, whose child runs under the peer's approval policy; off by default:
 an installed policy must grant this row explicitly, a policy that leaves it out
 refuses remote placement, and with no policy installed only the operator opt-in
-`instances.remote_subagents` decides), `capabilities.messaging`,
+`instances.remote_subagents` decides; the row declares `ScopeSpec.explicit_grant`,
+so `resolve` itself applies that, `kirocrew policy explain` answers
+`DENIED` with rule `explicit-grant`, and `kirocrew policy validate` lists it as
+denied rather than ungoverned), `capabilities.messaging`,
 `capabilities.cron`,
 `capabilities.memory_writes`, `capabilities.script_hooks`,
 `capabilities.browse` (the native `browser` MCP tool's dispatch chokepoint —
@@ -3495,7 +3502,8 @@ carve-out stay as code. It expects `CONTRACT_VERSION == 1` (pinned pre-launch).
   per-process tier state: the remembered bundled tier and the two once-per-process
   latches).
 - `platform/admission.py` — `canonical_signing_bytes` / `hmac_signature` (shared
-  by both trust roots), `require_policy_signature` / `trust_keys`, and
+  by both trust roots), `ed25519_verify` (policy issuers only),
+  `require_policy_signature` / `trust_keys` / `trust_public_keys`, and
   `read_policy_trust_root` (the side-effect-free trust-root reader).
 - `platform/update_governance.py` — the shared update seam (`resolve_remote_url`,
   `update_blocked_reason`, `update_required`, `min_version`) called by

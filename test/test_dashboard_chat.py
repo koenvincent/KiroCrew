@@ -22212,6 +22212,59 @@ class TestRunChatTransientRetry:
         state.sessions.reset.assert_not_awaited()
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("partial", ["", "Here is the first half"])
+    async def test_codex_provider_failure_renders_as_an_error_row(
+        self, tmp_path, monkeypatch, partial
+    ):
+        """codex-acp writes a terminal provider error as message text and answers
+        ``end_turn``. The session handle turns that into the turn's AcpError
+        (``test_codex_terminal_error_fidelity``); here the error the handle
+        actually raises is fed to the chat loop, which must show an error row,
+        keep any partial answer, never store the provider error as assistant
+        text, and not retry a 400."""
+        from test_codex_terminal_error_fidelity import (
+            _PROVIDER_MESSAGE,
+            END_TURN,
+            ERROR_CHUNK_2_0,
+            _handle,
+            _run,
+        )
+
+        from kiro_crew.dashboard.chat import _run_chat
+        from kiro_crew.providers.base import EVENT_TEXT_CHUNK, LLMEvent
+
+        _events, failure = await _run(_handle([ERROR_CHUNK_2_0, END_TURN]))
+        assert failure is not None
+        call_count = 0
+
+        async def _stream(msg):
+            nonlocal call_count
+            call_count += 1
+            if partial:
+                yield LLMEvent(kind=EVENT_TEXT_CHUNK, text=partial)
+            raise failure
+
+        state = self._make_state(tmp_path, monkeypatch)
+        monkeypatch.setattr("kiro_crew.dashboard.chat_runner._agent_fallback_chain", lambda: ())
+        self._wire_sessions(state, self._client(_stream))
+        slot = state.get_or_create_slot("s1")
+        slot._titled = True
+
+        with patch("asyncio.sleep", new_callable=AsyncMock):
+            await _run_chat(state, slot, "hello")
+            await self._drain_bg(state)
+
+        assert call_count == 1, "a deterministic 400 was retried"
+        errors = self._err_texts(slot)
+        assert any(_PROVIDER_MESSAGE in t for t in errors), errors
+        assistant = self._assistant_texts(slot)
+        assert not any(_PROVIDER_MESSAGE in t for t in assistant), assistant
+        assert not any("invalid_request_error" in t for t in assistant), assistant
+        if partial:
+            assert any(partial in t for t in assistant), assistant
+        state.sessions.reset.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_transient_exhausts_budget_then_clean_error_resumable(
         self, tmp_path, monkeypatch
     ):

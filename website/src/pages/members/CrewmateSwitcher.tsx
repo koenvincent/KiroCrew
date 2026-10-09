@@ -29,9 +29,9 @@ const rowOnlySignals = (m: MemberRosterRow): MemberSignals => ({
  * The Crewmates page used to keep the whole roster as a standing left column.
  * That column is gone from the DM view (product decision, crewmate-panel IA):
  * the thread and the crewmate's own panel get the width, and the roster is
- * reached on demand from this chip. Closed, it stacks the first faces and the
- * crewmate count; open, it is a searchable list of every crewmate, the current
- * one marked, and a "New crewmate" footer that opens the same create dialog the
+ * reached on demand from this chip. Closed, it shows the page's name, the first
+ * faces and the crewmate count; open, it is a searchable list of every
+ * crewmate, the current one marked, and a "New crewmate" footer that opens the same create dialog the
  * old column's "+" did (one write path, one more front door). A second footer
  * action, "Show the full roster", brings the roster column back beside the
  * thread: this list holds crewmates only, and the column is where the team
@@ -92,11 +92,16 @@ export default function CrewmateSwitcher({
     () => members.some((m) => m.name !== activeName && signals(m).needsYou),
     [members, activeName, signals],
   )
+  // The chip carries the page's own name as visible text: a bare /members opens
+  // the last crewmate's thread, so this chip is the roster a first look sees,
+  // and faces plus a number alone did not read as "the crew list". The
+  // accessible name starts with that visible word (label in name), then the
+  // signal when there is one; the action stays in the tooltip.
+  const rosterLabel = t('pages.membersPage.title')
   const switchLabel = t('pages.membersPage.switch_crewmate')
   const needsYouLabel = t('pages.membersPage.filter_status_needs_you')
-  // The chip's one name: the action, then the signal when there is one. Joined
-  // by the locale's list formatter, not a literal separator (i18n-catalog).
-  const chipLabel = othersNeedYou ? fmtList([switchLabel, needsYouLabel], { type: 'unit' }) : switchLabel
+  // Joined by the locale's list formatter, not a literal separator (i18n-catalog).
+  const chipLabel = othersNeedYou ? fmtList([rosterLabel, needsYouLabel], { type: 'unit' }) : rosterLabel
   const shown = useMemo(
     () =>
       q
@@ -136,7 +141,7 @@ export default function CrewmateSwitcher({
             className,
           )}
           aria-label={chipLabel}
-          title={chipLabel}
+          title={switchLabel}
           aria-haspopup="dialog"
           aria-expanded={open}
           data-testid="crewmate-switcher"
@@ -162,7 +167,8 @@ export default function CrewmateSwitcher({
               />
             )}
           </span>
-          <span className="text-[12.5px] font-semibold tabular-nums" data-testid="crewmate-switcher-count">{members.length}</span>
+          <span className="text-[12.5px] font-semibold" aria-hidden="true" data-testid="crewmate-switcher-label">{rosterLabel}</span>
+          <span className="text-[12.5px] text-muted tabular-nums" aria-hidden="true" data-testid="crewmate-switcher-count">{members.length}</span>
           <ChevronDown size={13} className={cn('text-muted transition-transform', open && 'rotate-180')} aria-hidden="true" />
         </button>
       </PopoverTrigger>

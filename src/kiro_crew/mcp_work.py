@@ -332,7 +332,12 @@ def _tool_definitions() -> list[dict[str, Any]]:
                 "reads without interpreting it. Call it at each real milestone rather "
                 "than on a timer. 'progress' is informational; 'blocked' means an "
                 "external dependency stopped the work; 'question' means the conductor's "
-                "own decision is needed (the two differ by who must act); 'done' claims "
+                "own decision is needed (the two differ by who must act). On 'blocked' "
+                "or 'question', set reason when only a person can move it: 'approval' "
+                "when a tool approval timed out or is waiting, 'needs_human' when only "
+                "a person can unblock you; leave it unset for a build or service. A "
+                "ledger whose open items all wait on a person holds the conductor's "
+                "patrol until something changes. 'done' claims "
                 "the acceptance condition is met — put the evidence in artifacts and any "
                 "pull-request number in pr. A 'done' with neither is refused "
                 "done_without_evidence; a check that could not run is still recorded "
@@ -380,6 +385,14 @@ def _tool_definitions() -> list[dict[str, Any]]:
                             "so naming a number does not move your own bar."
                         ),
                     },
+                    "reason": {
+                        "type": "string",
+                        "enum": ["approval", "needs_human"],
+                        "description": (
+                            "On 'blocked' or 'question': the person this waits on. Refused "
+                            "with 'progress' or 'done'. Each report replaces it."
+                        ),
+                    },
                 },
                 "required": ["status", "summary"],
             },
@@ -395,7 +408,7 @@ def _tool_definitions() -> list[dict[str, Any]]:
                 "accept_eval.py. The ledger is your own. With no arguments that is the "
                 "whole board, each item with its last 20 events; every argument NARROWS "
                 "it. compact=true is the cheap patrol read: per item only item_id, title, "
-                "state, created_at, status, summary, decision, verdict, pr, worker_session_key, "
+                "state, created_at, status, reason, summary, decision, verdict, pr, worker_session_key, "
                 "last_report_at and the four flags — no events, acceptance or "
                 "accept_batch. item_id=<id> reads one item in full; state= and since= "
                 "select rows (accept_batch is always the whole board); events=<n> "
@@ -630,7 +643,9 @@ def _call_tool_inner(name: str, args: dict[str, Any]) -> str:
         return redact(json.dumps(brief, indent=2, ensure_ascii=False))
 
     if name == "work_report":
-        payload = {k: v for k, v in args.items() if k in ("status", "summary", "artifacts", "pr")}
+        payload = {
+            k: v for k, v in args.items() if k in ("status", "summary", "artifacts", "pr", "reason")
+        }
         resp = _post(_REPORT_PATH, payload, session_key=caller_key)
         if resp.get("error"):
             return _refusal("could not record your report", resp)

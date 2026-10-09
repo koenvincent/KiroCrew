@@ -60,6 +60,8 @@ declare global {
     getAppMenuItems: (id: string) => Promise<ElectronAppMenuItem[]>
     executeAppMenuItem: (id: string, index: number) => void
     onNavigate: (cb: (path: string) => void) => () => void
+    /** View > Toggle Focus Mode. Optional: absent on a shell older than the menu item. */
+    onToggleFocusMode?: (cb: () => void) => () => void
     onFullScreenChanged: (cb: (isFullScreen: boolean) => void) => () => void
     setBadgeCount: (count: number) => void
     reportMicDenied: () => void

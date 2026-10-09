@@ -990,7 +990,7 @@ class TestBootDispositions:
         """The other half, so the refusal above cannot pass for the wrong reason."""
         secret = "fleet-trust-key"
         monkeypatch.setattr(
-            governance, "_policy_trust_settings", lambda *_a: (False, {"fleet-control": secret})
+            governance, "_policy_trust_settings", lambda *_a: (False, {"fleet-control": secret}, {})
         )
         signed = _sign(_doc("fleet-control"), secret)
         source = transport(
@@ -3287,7 +3287,9 @@ class TestASignatureMandateBoundsAForgedCache:
         )
         body = json.dumps(doc).encode("utf-8")
         pd.write_cache(body, source=_TEST_SOURCE, etag="v1")
-        monkeypatch.setattr(governance, "_policy_trust_settings", lambda *_a: (True, {issuer: key}))
+        monkeypatch.setattr(
+            governance, "_policy_trust_settings", lambda *_a: (True, {issuer: key}, {})
+        )
 
         ceiling = pd.parse_distributed_policy(body, source=_TEST_SOURCE)
         assert ceiling.signature_state == governance.SIGNATURE_VERIFIED

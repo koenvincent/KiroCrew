@@ -1123,6 +1123,20 @@ _HOST_READ_ONLY_BUILTIN_TOOLS: frozenset[str] = frozenset(
     {"fs_read", "glob", "grep", "web_fetch", "web_search"}
 )
 
+# kiro-cli's own spellings of the names above. It stamps its file-read built-in
+# ``read``; ``fs_read`` is the alias a spec may still use, and the spelling the
+# allowlist and ``BUILTIN_TOOL_SCOPES`` carry. ``_is_host_read_only_builtin``
+# resolves the stamped name through this table before the membership test, so
+# a value here must be an allowlist name (never a new proof of its own). Only
+# the read-only aliases are spelled here, because the table that owns the
+# mapping (``acp.kas_permissions.KIRO_TOOL_ALIASES``) lives under ``acp`` and
+# the agent-SDK boundary keeps application code off that layer;
+# ``test_host_read_only_aliases_agree_with_kiro_tool_aliases``
+# (``test/test_hooks.py``) joins the two, so a ``write`` or ``shell`` alias
+# cannot join by mistake and a renamed one breaks there rather than silently
+# refusing every file read on a surface with no approver.
+_HOST_READ_ONLY_BUILTIN_ALIASES: Mapping[str, str] = {"read": "fs_read"}
+
 
 # Semantic kinds known to mutate/execute. DOCUMENTATION ONLY — the gate does not
 # branch on this set, and must not start: `tool_kind` arrives verbatim from the ACP

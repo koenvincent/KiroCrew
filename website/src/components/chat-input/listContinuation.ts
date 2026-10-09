@@ -1,5 +1,5 @@
 import { useCallback, useRef } from 'react'
-import { listLineBreakEdit } from '../composerListContinuation'
+import { listLineBreakEdit, listMarkerBackspaceEdit } from '../composerListContinuation'
 import { findTokenRanges, type PasteBlock } from '../../utils/pasteTokens'
 import type { useImeGuard } from '../../hooks/useImeGuard'
 
@@ -38,6 +38,32 @@ export function applyTextareaListBreak(
   textarea.setSelectionRange(caret, caret)
   textarea.dispatchEvent(new Event('input', { bubbles: true }))
   return true
+}
+
+/** Remove the list marker in front of a collapsed caret in `textarea` in one
+ *  Backspace (`listMarkerBackspaceEdit`). The same write path and undo step as
+ *  the line break above; false leaves the ordinary one-character delete. */
+export function applyTextareaListBackspace(
+  textarea: HTMLTextAreaElement,
+  blocks: readonly PasteBlock[],
+  endUndoBurst?: () => void,
+): boolean {
+  const { selectionStart, selectionEnd, value } = textarea
+  if (selectionStart !== selectionEnd) return false
+  const chips = findTokenRanges(value, [...blocks]).map(({ start, end }) => ({ start, end }))
+  const edit = listMarkerBackspaceEdit(value, selectionStart, chips)
+  if (!edit) return false
+  endUndoBurst?.()
+  setNativeValue(textarea, value.slice(0, edit.start) + edit.insert + value.slice(edit.end))
+  textarea.setSelectionRange(edit.start, edit.start)
+  textarea.dispatchEvent(new Event('input', { bubbles: true }))
+  return true
+}
+
+/** True on Android, where Chromium can ignore preventDefault on a
+ *  `deleteContentBackward` beforeinput. */
+function isAndroid(): boolean {
+  return typeof navigator !== 'undefined' && /Android/i.test(navigator.userAgent ?? '')
 }
 
 function setNativeValue(textarea: HTMLTextAreaElement, next: string) {
@@ -97,6 +123,17 @@ export function useTextareaListContinuation(
     const onBeforeInput = (event: InputEvent) => {
       const commitEnter = declineNextBreakRef.current
       declineNextBreakRef.current = false
+      // Backspace takes the same route. A composing delete edits the IME's
+      // candidate, not the list. Android is left to the browser: Chromium
+      // Android can ignore preventDefault on this event, so removing the
+      // marker here would be followed by the browser's own one-character
+      // delete and merge the line into the one above. The same fallback as
+      // the Lexical composer: one character per press, never an overshoot.
+      if (event.inputType === 'deleteContentBackward') {
+        if (event.isComposing || !event.cancelable || isAndroid()) return
+        if (applyTextareaListBackspace(textarea, blocksRef.current ?? [], endUndoBurst)) event.preventDefault()
+        return
+      }
       // A composing newline, or the WebKit commit Enter's, belongs to the IME;
       // it is not a new list item.
       if (commitEnter || event.isComposing || !NEW_LINE_INPUT_TYPES.has(event.inputType)) return

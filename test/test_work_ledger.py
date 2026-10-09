@@ -489,7 +489,7 @@ def test_apply_worker_report_has_no_conductor_field_parameter():
     import inspect
 
     names = set(inspect.signature(wl.apply_worker_report).parameters)
-    assert names == {"slot_key", "item_id", "status", "summary", "artifacts", "pr"}
+    assert names == {"slot_key", "item_id", "status", "summary", "artifacts", "pr", "reason"}
     assert not names & {"verdict", "state", "acceptance", "decision", "fails", "round_number"}
 
 

@@ -273,6 +273,11 @@ export default [
       'src/apps/mochi/src/shared/shortcut.ts',
       // CSS text injected through <style>; a stylesheet is not translatable copy.
       'src/apps/spec-builder/inlineStyles.ts',
+      // Inline `style.cssText` declarations for the fixed auth banners in
+      // `api/client.ts`. The module imports nothing and touches no DOM; the
+      // banners' words stay in `client.ts`, still gated. False-negative class:
+      // copy added here would not be checked, so keep it declaration-only.
+      'src/api/authBannerStyles.ts',
       // The theme stylesheet builders, extracted out of `hooks/useTheme.tsx` so
       // they COULD be exempted by path. Every literal in the module is handed to
       // the CSS parser: the `--*` custom-property allowlist, the

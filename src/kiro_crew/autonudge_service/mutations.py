@@ -1053,6 +1053,9 @@ async def _update_unserialized(
                     # silence this stop exists to end.
                     if not was_active:
                         loop.approval_stalled = False
+                        loop.waiting_on_person = False
+                        loop.waiting_on_person_at = 0.0
+                        loop.ledger_seen_fp = ""
                         # Same rule, same reason: the streaks are evidence
                         # about a PAST run, and a revival starts a fresh one.
                         loop.consecutive_start_failures = 0
@@ -1219,6 +1222,7 @@ def remove_sync(
     self._pulled_forward.discard(loop_id)
     self._pushed_ticks.discard(loop_id)
     self._pushed_running.discard(loop_id)
+    self._ledger_tick_fp.pop(loop_id, None)
     self._pull_forward_counts.pop(loop_id, None)
     self._pull_forward_capped = {pair for pair in self._pull_forward_capped if pair[0] != loop_id}
     self._accepted_monitor_turns.pop(loop_id, None)

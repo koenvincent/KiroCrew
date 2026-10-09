@@ -4138,6 +4138,64 @@ class TestInstallFromRegistryRefusals:
         assert secret not in str(audit.log_api_access.call_args)
 
     @pytest.mark.asyncio
+    async def test_local_grant_over_local_install_names_the_reinstall_route(
+        self, tmp_path, monkeypatch
+    ):
+        """A re-grant here would record the local source again, so the refusal
+        must not carry the code that reopens the consent dialog."""
+        from kiro_crew.config.loader import _invalidate_config_cache
+
+        home = tmp_path / "home"
+        home.mkdir()
+        monkeypatch.setenv("KIROCREW_HOME", str(home))
+        (home / "config.json").write_text(
+            json.dumps(
+                {
+                    "agent": {
+                        "apps_trusted": ["demo"],
+                        "apps_trusted_local": ["demo"],
+                        "apps_trusted_repositories": {},
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        _invalidate_config_cache()
+        resolved = "https://example.test/owner/demo.git"
+        monkeypatch.setattr(
+            registry,
+            "_resolve_install_entry",
+            lambda name: ({"name": "demo", "gitUrl": resolved}, ""),
+        )
+        monkeypatch.setattr(
+            registry,
+            "get_app",
+            lambda name: {"name": "demo", "source": str(tmp_path / "src" / "demo")},
+        )
+
+        async def _never_fetch(*args, **kwargs):
+            raise AssertionError("local-only trust must refuse before manifest fetch")
+
+        monkeypatch.setattr(registry, "_fetch_app_manifest", _never_fetch)
+        audit = MagicMock()
+        monkeypatch.setattr(registry, "sel", lambda: audit)
+
+        result = await registry.install_from_registry("demo")
+
+        assert result["ok"] is False
+        assert result["code"] == "app_trust_local_only"
+        assert "uninstall the app (its data is kept)" in result["error"]
+        assert "App Store" in result["error"]
+        assert resolved not in result["error"]
+        audit.log_api_access.assert_called_once_with(
+            caller="app_install_from_registry",
+            operation="trust_repository_binding_required",
+            outcome="rejected",
+            resources="name='demo'",
+            error=result["error"],
+        )
+
+    @pytest.mark.asyncio
     async def test_admission_denial_stops_before_the_clone(self, monkeypatch):
         monkeypatch.setattr(
             registry,

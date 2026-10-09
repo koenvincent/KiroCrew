@@ -2718,12 +2718,22 @@ def _policy(args: argparse.Namespace) -> None:
             # most often get wrong, because a partial `capabilities` block LOOKS
             # like a complete statement. Report the gap so an unpinned row reads
             # as a choice instead of an oversight.
-            unnamed = sorted(
-                scope
-                for scope, spec in SCOPE_CATALOG.items()
+            omitted = [
+                (scope, spec)
+                for scope, spec in sorted(SCOPE_CATALOG.items())
                 if spec.kind == CAPABILITY and scope not in ceiling.controls
-            )
-            if unnamed and len(unnamed) < sum(
+            ]
+            # A row declared ``explicit_grant`` denies when omitted instead.
+            withheld = [scope for scope, spec in omitted if spec.explicit_grant]
+            unnamed = [scope for scope, spec in omitted if not spec.explicit_grant]
+            if withheld:
+                print(
+                    f"   ℹ️  leaves {len(withheld)} explicit-grant row(s) unnamed "
+                    "(therefore DENIED):"
+                )
+                for scope in withheld:
+                    print(f"        {scope}")
+            if unnamed and len(omitted) < sum(
                 1 for spec in SCOPE_CATALOG.values() if spec.kind == CAPABILITY
             ):
                 print(
@@ -3827,6 +3837,25 @@ def _settle_created_database(
         )
 
 
+def _memory_create_store(args: argparse.Namespace) -> None:
+    """``kirocrew memory create-store <name>``: create a declared V1 store's directory.
+
+    Use never creates a store's directory (a deleted store must stay a visible
+    loss), so this explicit step is how a declared store becomes usable. A
+    refusal raises ``UnknownMemoryStore`` (a ``ValueError``), which
+    :func:`_memory_cmd` prints as one line with exit 1.
+    """
+    from kiro_crew.memory_stores import create_declared_store
+
+    name = args.name
+    path, created = create_declared_store(name)
+    safe = _TERMINAL_CTRL_RE.sub("", name)
+    if created:
+        print(f"Created memory store {safe!r} at {path}.")
+    else:
+        print(f"Memory store {safe!r} already exists at {path}; nothing changed.")
+
+
 def _memory_cmd(args: argparse.Namespace) -> None:
     """Manage the memory system (vector store + markdown layer).
 
@@ -3873,6 +3902,11 @@ def _memory_verb(args: argparse.Namespace) -> None:
     # store dispatches before anything opens one.
     if action == "carve":
         _memory_carve(args)
+        return
+    # "create-store" makes a declared store's directory, so it must run before any
+    # store is opened -- the store it names is the one that does not exist yet.
+    if action == "create-store":
+        _memory_create_store(args)
         return
     cfg = KiroCrewConfig.load()
     # `export` and `import` are the only verbs reaching this shared open that name a

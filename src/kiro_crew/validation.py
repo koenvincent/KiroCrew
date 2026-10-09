@@ -77,7 +77,13 @@ from kiro_crew.monitoring.registry import (
     publicly_armable_objectives,
 )
 from kiro_crew.project_scope import SCOPE_FRAGMENT_RE
-from kiro_crew.work_vocab import WORK_ITEM_STATES, WORK_VERDICTS, WORK_WORKER_STATUSES
+from kiro_crew.work_vocab import (
+    WORK_BLOCKED_REASONS,
+    WORK_ITEM_STATES,
+    WORK_REASON_STATUSES,
+    WORK_VERDICTS,
+    WORK_WORKER_STATUSES,
+)
 
 # ── Constants ──
 
@@ -4555,8 +4561,12 @@ WORK_REPORT_SCHEMA = ToolSchema(
         FieldSpec("summary", str, required=True, max_len=500, clamp_to_max=True),
         FieldSpec("artifacts", dict),
         FieldSpec("pr", int, min_val=1, max_val=1_000_000_000),
+        # Why a blocked/question report is stuck. Typed so the patrol can tell a
+        # wait on a person (which holds it) from one on a build (which does not);
+        # the pairing with ``status`` is ``_validate_work_report``'s check.
+        FieldSpec("reason", str, allowed=frozenset(WORK_BLOCKED_REASONS)),
     ],
-    custom_validator=lambda cleaned: _validate_work_artifacts(cleaned.get("artifacts")),
+    custom_validator=lambda cleaned: _validate_work_report(cleaned),
 )
 
 #: Every parameter of ``work_ledger_read`` narrows or shapes the read; none is
@@ -4596,6 +4606,17 @@ WORK_LEDGER_RECORD_SCHEMA = ToolSchema(
         FieldSpec("fails", int, min_val=0, max_val=1_000_000),
     ],
 )
+
+
+def _validate_work_report(cleaned: dict[str, Any]) -> None:
+    """A report's cross-field checks: the artifacts map, and ``reason``'s status.
+
+    ``reason`` says why a report is stuck, so it rides only on ``blocked`` or
+    ``question``; on ``progress`` or ``done`` it would claim a wait that is not one.
+    """
+    _validate_work_artifacts(cleaned.get("artifacts"))
+    if cleaned.get("reason") is not None and cleaned.get("status") not in WORK_REASON_STATUSES:
+        raise ValidationError("reason", "is allowed only with status blocked or question")
 
 
 def _validate_work_artifacts(artifacts: object) -> None:

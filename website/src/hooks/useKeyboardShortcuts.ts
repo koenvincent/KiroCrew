@@ -1109,7 +1109,11 @@ export function useKeyboardShortcuts({ onToggleShortcutsModal, onNewChat, onCycl
       // the old isInput gate, so this exclusion preserves, not adds, the
       // shipped terminal behavior). The composer chained-jump fix above is
       // about ordinary text fields, never the PTY.
-      if (jumpIdx >= 0 && (jumpIdx < 9 || (mapped && (!isInput || !IS_MAC) && !isTerminalTarget(e.target)))) {
+      // On macOS digits get the same text-field gate as letters: Option+digit
+      // types a character (Option+3 = # on a UK layout, Option+4 = ¢ on US),
+      // so claiming it while a field has focus ate the typed character.
+      const typingOnMac = IS_MAC && isInput
+      if (jumpIdx >= 0 && ((jumpIdx < 9 && !typingOnMac) || (mapped && !typingOnMac && !isTerminalTarget(e.target)))) {
         e.preventDefault()
         if (mapped) kbSwitch(orderedSlots[jumpIdx].key)
         return

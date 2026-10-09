@@ -349,6 +349,9 @@ def _autonudge_loop_reading(loop: Any) -> dict[str, Any]:
         # Active but holding: a cycle's approval went unanswered and it fires
         # nothing until a person answers one, sends a message or fires it.
         "paused_for_approval": bool(loop.approval_stalled) and not is_structured_monitor_loop(loop),
+        # Active but holding: every open work-ledger item waits on a person, and it
+        # fires nothing until the ledger moves.
+        "waiting_on_person": bool(getattr(loop, "waiting_on_person", False)),
         "has_banner": bool(loop.banner),
     }
 

@@ -10,6 +10,7 @@ import asyncio
 import json
 import logging
 import random
+import re
 import time
 import weakref
 from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
@@ -242,6 +243,33 @@ def is_prompt_busy(exc: BaseException) -> bool:
     """
     return isinstance(exc, AcpPromptBusy) or (
         isinstance(exc, AcpError) and "already in progress" in str(exc)
+    )
+
+
+# The provider's refusal of a request larger than the model's window, in the
+# spellings the ACP backends answer with: kiro's typed "context window
+# overflowed", the claude adapter's "Prompt is too long", and the OpenAI-style
+# "maximum context length" a compatible endpoint returns through it.
+_RE_CONTEXT_OVERFLOW_TEXT = re.compile(
+    r"prompt is too long|context window overflowed|maximum context length",
+    re.IGNORECASE,
+)
+
+
+def is_context_overflow_error(exc: BaseException) -> bool:
+    """True when *exc* is a turn refused as too long for the model's window.
+
+    Structural first (the raise-time classifier's ``context_overflow`` tag), then
+    the text: the classifier reads only the error's ``data`` field, and the claude
+    adapter puts its "Prompt is too long" refusal in ``message``. Scoped to
+    ``AcpError`` so an unrelated exception mentioning a long prompt never counts.
+    The only consumer forces a ``_bg`` recycle, so a false positive costs one
+    provider respawn.
+    """
+    if not isinstance(exc, AcpError):
+        return False
+    return getattr(exc, "context_overflow", False) is True or bool(
+        _RE_CONTEXT_OVERFLOW_TEXT.search(str(exc))
     )
 
 
@@ -1784,6 +1812,10 @@ async def run_bg_oneliner(
             return await asyncio.wait_for(_drive(model_to_use), timeout)
         return await _drive(model_to_use)
 
+    # Set when this turn (or its one fallback retry) was refused as too long for
+    # the model's window; the recycle in the teardown below then forces a fresh
+    # provider instead of trusting the reported percentage.
+    overflowed = False
     try:
         try:
             return await _run(model)
@@ -1809,6 +1841,9 @@ async def run_bg_oneliner(
                 "bg oneliner: model %r rejected; retrying once with %r", rejected, fallback
             )
             return await _run(fallback)
+    except BaseException as exc:
+        overflowed = is_context_overflow_error(exc)
+        raise
     finally:
         # Account BEFORE destroy(): the turn's billing lives on the session this
         # tears down. Every caller of this helper — titles, link labels, folder
@@ -1870,6 +1905,16 @@ async def run_bg_oneliner(
                 logger.debug("bg oneliner accounting failed source=%s", sel_source, exc_info=True)
         finally:
             await session.destroy()
+            # A provider-backed handle appended this turn to the ONE shared ``_bg``
+            # conversation; ``destroy()`` only released its semaphore. Without the
+            # recycle no criterion bounds that conversation for one-liner traffic,
+            # so it grows until the provider refuses it as too long. A runtime
+            # handle's session was ephemeral and carries no marker: unchanged.
+            if getattr(session, "shares_background_conversation", False) is True:
+                try:
+                    await sessions.recycle_background(context_overflowed=overflowed)
+                except Exception:
+                    logger.debug("bg oneliner recycle failed source=%s", sel_source, exc_info=True)
 
 
 def _background_crew_log_owner(sessions: Any, crew_log_session_key: str, crew_log_kind: str) -> str:
@@ -2612,6 +2657,14 @@ async def stream_and_collect(
             return result_text
         except AcpError as exc:
             msg = str(exc)
+            if is_context_overflow_error(exc):
+                # Left on the provider for ``recycle_background``: a caller that
+                # swallows this error (history consolidation does) still has its
+                # shared ``_bg`` conversation replaced rather than kept at a size
+                # every later turn is refused on.
+                from kiro_crew.session_background import mark_context_overflowed
+
+                mark_context_overflowed(provider)
             # See is_prompt_busy for why this is structural rather than a
             # substring test. Both arms below (cancel+retry and
             # PromptBusyExhaustedError) hang off it, and the unattended callers

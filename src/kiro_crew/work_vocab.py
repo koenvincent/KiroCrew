@@ -35,6 +35,13 @@ WORK_ACTIONS: tuple[str, ...] = (
 WORK_ITEM_STATES: tuple[str, ...] = ("open", "accepted", "rejected", "abandoned")
 WORK_VERDICTS: tuple[str, ...] = ("pass", "fail", "pending", "refused", "error")
 WORK_WORKER_STATUSES: tuple[str, ...] = ("progress", "done", "blocked", "question")
+#: When a ``blocked`` or ``question`` report waits on a person, as data rather than
+#: prose: ``approval`` (a tool approval timed out or waits) or ``needs_human`` (only a
+#: person can unblock it). A work-ledger watch whose open items all carry one,
+#: unchanged since its last turn, holds. A wait on anything else carries no reason.
+WORK_BLOCKED_REASONS: tuple[str, ...] = ("approval", "needs_human")
+#: The statuses a ``reason`` may ride on.
+WORK_REASON_STATUSES: tuple[str, ...] = ("blocked", "question")
 WORK_EVENT_KINDS: tuple[str, ...] = ("create", "bind", "report", "decision", "verdict", "close")
 #: Items one board may CREATE over its life, open and closed together -- and the
 #: number of item records the crew log's ``work`` fold retains per board. ONE value
@@ -104,6 +111,8 @@ class WorkBoardItem(TypedDict):
     fails: int
     #: One of :data:`WORK_WORKER_STATUSES`, or unset.
     status: str | None
+    #: One of :data:`WORK_BLOCKED_REASONS` on a blocked/question report, or unset.
+    reason: str | None
     summary: str
     artifacts: dict[str, str]
     pr: int | None

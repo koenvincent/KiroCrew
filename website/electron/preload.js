@@ -118,6 +118,13 @@ contextBridge.exposeInMainWorld("electronAPI", {
     ipcRenderer.on("navigate", handler);
     return () => ipcRenderer.removeListener("navigate", handler);
   },
+  // View > Toggle Focus Mode: main.js asks the dashboard to flip focus mode,
+  // whose own toggle is hidden while it is on.
+  onToggleFocusMode: (cb) => {
+    const handler = () => cb();
+    ipcRenderer.on("focus-mode:toggle", handler);
+    return () => ipcRenderer.removeListener("focus-mode:toggle", handler);
+  },
   onFullScreenChanged: (callback) => {
     const handler = (_event, isFullScreen) => callback(!!isFullScreen);
     ipcRenderer.on("fullscreen-changed", handler);

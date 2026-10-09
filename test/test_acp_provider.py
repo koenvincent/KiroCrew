@@ -302,7 +302,12 @@ class TestToLlmEventFieldParity:
 
     # Fields that are intentionally NOT forwarded through _to_llm_event.
     # Each entry must document why it is excluded.
-    _INTENTIONALLY_DROPPED: set[str] = set()
+    #
+    # ``unattributed``: provenance read off the raw codex frame and consumed by
+    # ``AcpSessionHandle._run_turn`` before the event leaves the ACP layer. By
+    # then the held chunk has been delivered as ordinary text or turned into the
+    # turn's error, so no provider consumer has a decision left to make with it.
+    _INTENTIONALLY_DROPPED: set[str] = {"unattributed"}
 
     @staticmethod
     def _distinguishable(field: "dataclasses.Field") -> object | None:

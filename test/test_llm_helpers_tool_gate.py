@@ -936,18 +936,42 @@ async def _run_read_only(
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("tool", "kind"),
-    [("fs_read", "read"), ("web_fetch", "fetch"), ("grep", "")],
-    ids=["fs_read+read", "web_fetch+fetch", "grep+kindless"],
+    [("fs_read", "read"), ("read", "read"), ("web_fetch", "fetch"), ("grep", "")],
+    ids=["fs_read+read", "read+read", "web_fetch+fetch", "grep+kindless"],
 )
 async def test_read_only_policy_approves_a_host_known_read_tool(tool, kind):
     """The positive path: a `_HOST_READ_ONLY_BUILTIN_TOOLS` name on the
     host-stamped identity, no MCP server, provenance verified. The kind may
-    agree or be absent — it is not what proves the call."""
+    agree or be absent — it is not what proves the call. `read` is the name
+    kiro-cli stamps for the same built-in; it reaches the allowlist through
+    `_HOST_READ_ONLY_BUILTIN_ALIASES`."""
     provider = await _run_read_only(
         _read_only_event(tool_kind=kind, tool_name=tool, mcp_identity_trusted=True)
     )
     assert provider.approved == ["r1"]
     assert provider.rejected == []
+
+
+@pytest.mark.asyncio
+async def test_read_only_policy_denies_an_aliased_read_the_rule_names_canonically():
+    """The deny tiers run before the proof. `auto_deny_tools=["fs_read"]`
+    against kiro-cli's `read` stamp: the alias the proof resolves is also a
+    deny target, so the rule wins and READ_ONLY rejects instead of approving
+    the call the operator refused."""
+    from kiro_crew.hooks import HookManager, HooksConfig
+
+    provider = _ScriptedProvider(
+        _permission_script(_read_only_event(tool_name="read", mcp_identity_trusted=True))
+    )
+    await stream_and_collect(
+        provider,  # type: ignore[arg-type]
+        "q",
+        approval_policy=ToolApprovalPolicy.READ_ONLY,
+        hooks=HookManager(HooksConfig(auto_deny_tools=["fs_read"])),
+        retry_transient=False,
+    )
+    assert provider.rejected == ["r1"]
+    assert provider.approved == []
 
 
 @pytest.mark.asyncio

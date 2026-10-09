@@ -144,6 +144,7 @@ from kiro_crew.session_ledger import LEDGER_ENTRY_TYPE
 from kiro_crew.session_ledger import SCHEMA_VERSION as LEDGER_SCHEMA_VERSION
 from kiro_crew.session_ledger import TERMINAL_PHASES as LEDGER_TERMINAL_PHASES
 from kiro_crew.work_vocab import (
+    WORK_BLOCKED_REASONS,
     WORK_CONDUCTOR_FIELDS,
     WORK_STORED_ITEM_LIMIT,
     WorkBoardItem,
@@ -5646,6 +5647,7 @@ _WORK_BASELINE_FIELDS: Final[tuple[str, ...]] = (
     "round",
     "fails",
     "status",
+    "reason",
     "summary",
     "artifacts",
     "pr",
@@ -5710,6 +5712,7 @@ def _work_new_item(item_id: str, stamp_ms: int) -> dict[str, Any]:
         "round": 0,
         "fails": 0,
         "status": None,
+        "reason": None,
         "summary": "",
         "artifacts": {},
         "pr": None,
@@ -5942,6 +5945,9 @@ def _work_apply(item: dict[str, Any], data: Mapping[str, Any], stamp_ms: int) ->
         for name in _WORK_WORKER_FIELDS:
             if name in data:
                 item[name] = _work_field(name, data[name])
+        # Every report REPLACES the reason, so an absent one is a cleared one rather
+        # than "unchanged" -- the one worker field read that way.
+        item["reason"] = _work_reason(data.get("reason"))
         item["last_report_at"] = _work_stamp(data.get("last_report_at"), stamp_ms)
     else:
         allowed = _WORK_CONDUCTOR_FIELDS.get(action)
@@ -5979,6 +5985,11 @@ def _work_apply(item: dict[str, Any], data: Mapping[str, Any], stamp_ms: int) ->
     )
 
 
+def _work_reason(value: Any) -> str | None:
+    """A report's ``reason`` when it is one of the closed vocabulary, else unset."""
+    return value if isinstance(value, str) and value in WORK_BLOCKED_REASONS else None
+
+
 def _work_field(name: str, value: Any) -> Any:
     """*value* in the shape the record holds for *name*; the fold's own shape gate."""
     if name in ("acceptance", "artifacts"):
@@ -5989,6 +6000,8 @@ def _work_field(name: str, value: Any) -> Any:
         return dict(value)
     if name in ("round", "fails", "pr"):
         return _as_int(value) if value is not None else None
+    if name == "reason":
+        return _work_reason(value)
     if name in ("verdict", "worker_session_key", "status"):
         return _work_text(name, value) if value is not None else None
     return _work_text(name, value)

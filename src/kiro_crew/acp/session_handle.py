@@ -35,6 +35,7 @@ from kiro_crew.acp._dispatch import (
     error_is_refusal_terminal,
     identified_mcp_call,
     is_mcp_tool_approval,
+    is_unattributed_error_candidate,
     parse_codex_compaction_update,
     parse_metadata,
     parse_prompt_token_usage,
@@ -43,11 +44,13 @@ from kiro_crew.acp._dispatch import (
     parse_text_chunk,
     parse_usage_cost,
     parse_usage_update,
+    prompt_is_adapter_command,
     redact_text,
     reject_option_id,
     scoped_tool_cache_key,
     set_mode_params,
     set_model_params,
+    unattributed_terminal_error,
 )
 from kiro_crew.acp.client import (
     _COMPACTION_FAILED_TURN_BUDGET,
@@ -118,6 +121,7 @@ from kiro_crew.acp.types import (
     ACP_BACKENDS_STEER,
     ACP_BACKENDS_STEERING_REQUEST,
     ACP_BACKENDS_STRUCTURED_REFUSAL,
+    ACP_BACKENDS_UNATTRIBUTED_TERMINAL_ERROR,
     EVENT_AGENT_SWITCHED,
     EVENT_CLEAR_STATUS,
     EVENT_COMPACTION_STATUS,
@@ -230,6 +234,11 @@ _READ_PATH_REPROBE_MIN_INTERVAL_SECS = 300.0
 # instances/constants.py: 5 + 10 + 3 < 20) so proxied /api/models never times
 # out mid-revalidation.
 _READ_PATH_PROBE_DEADLINE_SECS = 3.0
+
+# How long AcpSessionHandle.set_model waits for a ``session/set_model`` reply.
+# kiro-cli 2.28 answers in well under a second (measured: 0.03-0.04s), so this
+# bounds only an adapter that never answers; that silence is read as accepted.
+_SET_MODEL_REPLY_TIMEOUT = 3.0
 
 
 # The stopReason values the pre-turn drain may NAME in its warning: the closed
@@ -2012,6 +2021,21 @@ class AcpSessionHandle:
         # logged by whoever caused them.
         _yielded_terminal = False
         _exhausted_clean = False
+        # A provider failure that codex-acp wrote as text (see
+        # ``ACP_BACKENDS_UNATTRIBUTED_TERMINAL_ERROR``). A candidate chunk is
+        # HELD, together with a steer-consumed report behind it, until the turn
+        # shows what it was: an ``end_turn`` right after it means the turn ended
+        # on the adapter's error, and the turn raises that error instead of
+        # completing; any other event of this turn releases everything held, in
+        # order and unchanged. A slash-command prompt is
+        # never held, because its output is unattributed text by design.
+        _hold_unattributed = getattr(
+            self._runtime, "acp_backend", ""
+        ) in ACP_BACKENDS_UNATTRIBUTED_TERMINAL_ERROR and not prompt_is_adapter_command(_params)
+        _held: list[AcpEvent] = []
+        _dispatch = self._dispatch_events(
+            req_id, timeout, extract_command_result=extract_command_result
+        )
         try:
             # Surface any drain-time rejections (see the pre-turn drain above)
             # as crew-card activity before the turn's own events — the user
@@ -2034,48 +2058,107 @@ class AcpSessionHandle:
                         f"{redact_text(str(_n_title)[:4096])[:120]}"
                     ),
                 )
-            async for event in self._dispatch_events(
-                req_id, timeout, extract_command_result=extract_command_result
-            ):
-                # Park accounting. The consumer holds this event from here until
-                # it comes back for the next one, and that interval is CONSUMER
-                # time, not backend silence: the dispatch loop is suspended at
-                # its own yield throughout, so its idle clocks would otherwise
-                # charge a consumer-side await to the runtime. Measured at this
-                # single choke point because `_dispatch_events` yields from 15
-                # places and every one of them funnels through this `async for`.
-                self._parked_since = time.monotonic()
-                if event.kind == EVENT_COMPLETE:
-                    # A codex compaction that errors sends no terminal of its own,
-                    # so close it out HERE -- before the turn's terminal, so a
-                    # consumer that reads a compaction terminal to leave its
-                    # compacting state sees it inside the turn it belongs to.
-                    #
-                    # This site rather than the dispatch loop's own terminals:
-                    # ``_dispatch_events`` yields EVENT_COMPLETE from eight places
-                    # (including its timeout arm) and every one funnels through
-                    # this ``async for``, which is the same reason the park
-                    # accounting above is measured here. Settling at each producer
-                    # would be eight edits and one of them would be missed.
-                    _codex_settle = self._settle_codex_compaction(event.stop_reason)
-                    if _codex_settle is not None:
-                        yield _codex_settle
-                    # Set BEFORE the yield: a consumer that closes the stream ON
-                    # the terminal still received it, and marking it after would
-                    # report a lost terminal that was in fact delivered.
-                    _yielded_terminal = True
-                try:
-                    yield event
-                finally:
-                    # `finally`, not a trailing statement: an abandoned generator
-                    # unwinds with GeneratorExit and would otherwise leave
-                    # `_parked_since` set forever, which reads from outside as a
-                    # turn parked since the abandonment.  Guard against None:
-                    # a turn boundary (line ~517) may reset _parked_since before
-                    # a lingering generator's finally fires on GC.
-                    if self._parked_since is not None:
-                        self._parked_total += time.monotonic() - self._parked_since
-                        self._parked_since = None
+            async for _incoming in _dispatch:
+                _out: list[AcpEvent] = [_incoming]
+                _failure: dict[str, Any] | None = None
+                if _hold_unattributed:
+                    if is_unattributed_error_candidate(_incoming) or (
+                        _held and _incoming.kind == EVENT_STEER_CONSUMED
+                    ):
+                        # Held, not dropped. A steer the turn reports consumed is
+                        # held with it: if the turn failed, that steer was not
+                        # consumed, and leaving the report out is what lets the
+                        # caller queue it again.
+                        _held.append(_incoming)
+                        continue
+                    if _held and _incoming.runtime_global:
+                        # Another tenant's fanned-out frame on a shared process
+                        # says nothing about how THIS turn ended: pass it through
+                        # and keep holding.
+                        pass
+                    elif _held:
+                        if (
+                            _incoming.kind == EVENT_COMPLETE
+                            and _incoming.stop_reason == STOP_REASON_END_TURN
+                            and not _incoming.synthetic_completion
+                        ):
+                            _failure = unattributed_terminal_error(
+                                [e.text for e in _held if is_unattributed_error_candidate(e)]
+                            )
+                        if _failure is not None:
+                            # The adapter's error is the turn's failure: none of
+                            # the held text is delivered as an answer, and the
+                            # turn's ``end_turn`` is not delivered as a success.
+                            _out = [
+                                e
+                                for e in _held
+                                if not is_unattributed_error_candidate(e)
+                                and e.kind != EVENT_STEER_CONSUMED
+                            ]
+                            _codex_settle = self._settle_codex_compaction(_incoming.stop_reason)
+                            if _codex_settle is not None:
+                                _out.append(_codex_settle)
+                        else:
+                            # Anything else after the held text -- more content,
+                            # a permission request, another terminal -- means it
+                            # was not the turn's failure. Delivered as it was.
+                            _out = [*_held, _incoming]
+                        _held = []
+                for event in _out:
+                    # Park accounting. The consumer holds this event from here until
+                    # it comes back for the next one, and that interval is CONSUMER
+                    # time, not backend silence: the dispatch loop is suspended at
+                    # its own yield throughout, so its idle clocks would otherwise
+                    # charge a consumer-side await to the runtime. Measured at this
+                    # single choke point because `_dispatch_events` yields from 15
+                    # places and every one of them funnels through this `async for`.
+                    self._parked_since = time.monotonic()
+                    if event.kind == EVENT_COMPLETE:
+                        # A codex compaction that errors sends no terminal of its own,
+                        # so close it out HERE -- before the turn's terminal, so a
+                        # consumer that reads a compaction terminal to leave its
+                        # compacting state sees it inside the turn it belongs to.
+                        #
+                        # This site rather than the dispatch loop's own terminals:
+                        # ``_dispatch_events`` yields EVENT_COMPLETE from eight places
+                        # (including its timeout arm) and every one funnels through
+                        # this ``async for``, which is the same reason the park
+                        # accounting above is measured here. Settling at each producer
+                        # would be eight edits and one of them would be missed.
+                        _codex_settle = self._settle_codex_compaction(event.stop_reason)
+                        if _codex_settle is not None:
+                            yield _codex_settle
+                        # Set BEFORE the yield: a consumer that closes the stream ON
+                        # the terminal still received it, and marking it after would
+                        # report a lost terminal that was in fact delivered.
+                        _yielded_terminal = True
+                    try:
+                        yield event
+                    finally:
+                        # `finally`, not a trailing statement: an abandoned generator
+                        # unwinds with GeneratorExit and would otherwise leave
+                        # `_parked_since` set forever, which reads from outside as a
+                        # turn parked since the abandonment.  Guard against None:
+                        # a turn boundary (line ~517) may reset _parked_since before
+                        # a lingering generator's finally fires on GC.
+                        if self._parked_since is not None:
+                            self._parked_total += time.monotonic() - self._parked_since
+                            self._parked_since = None
+                if _failure is not None:
+                    await _dispatch.aclose()
+                    # The same state the backend's own error response leaves:
+                    # no stop reason, because the turn did not complete.
+                    self._last_stop_reason = ""
+                    _raise_acp_error(
+                        _failure,
+                        self._advertised_model_ids(),
+                        backend=getattr(self._runtime, "acp_backend", ""),
+                    )
+            for event in _held:
+                # The dispatch loop returned with no terminal behind the held
+                # text, so nothing showed it was a failure: deliver it as text.
+                yield event
+            _held = []
             # Reached only when the dispatch loop returned on its own — not on a
             # close, a cancel, or an exception.
             _exhausted_clean = True
@@ -2575,10 +2658,38 @@ class AcpSessionHandle:
             # a refusal into a silent stay-on-default where today it raises.
             await self.set_config_option(MODEL_CONFIG_ID, resolved)
         else:
-            await self._runtime.send_request(
+            # Waits for the adapter's answer so an ERROR reply is not dropped by
+            # the pre-turn drain while the bookkeeping below records a model the
+            # session is not serving. A refusal follows the contract of the
+            # config-option branch above: the session stays on what it serves
+            # and the refused id is recorded for the caller to read back, so the
+            # dashboard answers the pick with a 4xx instead of a reset. Silence is
+            # not a refusal: an adapter that never answers this request kept the
+            # unawaited behaviour, so a timeout records the switch as before.
+            req_id = await self._send_awaited(
                 METHOD_SET_MODEL,
                 set_model_params(self._session_id, resolved),
             )
+            try:
+                await self._wait_for_response(req_id, timeout=_SET_MODEL_REPLY_TIMEOUT)
+            except AcpTimeoutError:
+                logger.info(
+                    "session/set_model(%s) on %s got no reply within %.0fs; recording it",
+                    resolved,
+                    self._session_id,
+                    _SET_MODEL_REPLY_TIMEOUT,
+                )
+            except AcpProcessDied:
+                raise
+            except AcpError as exc:
+                logger.warning(
+                    "session/set_model(%s) on %s was refused: %s",
+                    resolved,
+                    self._session_id,
+                    redact_log_via_context(str(exc)),
+                )
+                self.model_pin_refused = resolved
+                return
         self._model = resolved
         self.model_pin_refused = ""
         # Parity with AcpClient.set_model: keep _resolved_model_id in sync so
@@ -3221,6 +3332,23 @@ class AcpSessionHandle:
             return text
         except AcpTimeoutError:
             return ""
+
+    async def command_result(self, command: str) -> dict[str, Any]:
+        """Execute a native kiro command and return its structured result.
+
+        Mirrors :meth:`AcpClient.command_result`: for internal callers whose
+        contract is the command's ``data`` object (the ``/mcp`` and ``/tools``
+        inventories). The result is backend output, so a caller must reduce it
+        to bounded, typed values before anything reaches an external surface.
+        """
+        cmd_name, cmd_args = parse_slash_command(command)
+        req_id = await self._send_awaited(
+            METHOD_COMMANDS_EXECUTE,
+            {"sessionId": self._session_id, "command": {"command": cmd_name, "args": cmd_args}},
+        )
+        msg = await self._wait_for_response(req_id, timeout=60.0)
+        result = msg.result
+        return result if isinstance(result, dict) else {}
 
     async def set_config_option(self, config_id: str, value: str) -> None:
         """Set a session config option (e.g. effort level).
@@ -4264,7 +4392,7 @@ class AcpSessionHandle:
 
     async def _dispatch_events(
         self, req_id: int, timeout: float, *, extract_command_result: bool = False
-    ) -> AsyncIterator[AcpEvent]:
+    ) -> AsyncGenerator[AcpEvent, None]:
         """Core event dispatch loop. Yields AcpEvent objects from the session queue.
 
         ``extract_command_result`` (commands/execute turns): the command's
@@ -6741,6 +6869,18 @@ class AcpSessionHandle:
             harness_tool_name_cache=self._tool_call_harness_tool_name,
             cache_scope=self._session_id,
         )
+        if (
+            session_update == "agent_message_chunk"
+            and not update.get("messageId")
+            and self._runtime.acp_backend in ACP_BACKENDS_UNATTRIBUTED_TERMINAL_ERROR
+        ):
+            # Provenance for the terminal-failure hold in ``_run_turn``. Read off
+            # the raw frame here rather than in the shared parser, so the parser's
+            # events (and the captured frame corpus) stay the same for every
+            # harness that leaves the id off its model text.
+            for ev in events:
+                if ev.kind == EVENT_TEXT_CHUNK:
+                    ev.unattributed = True
         filtered_events: list[AcpEvent] = []
         for ev in events:
             if ev.kind == EVENT_TODO_UPDATE and ev.tool_call_id:

@@ -53,7 +53,9 @@ from kiro_crew.acp_backends import (
 from kiro_crew.agent import (  # noqa: F401
     AGENT_FILENAME,
     OWNED_KIRO_AGENT_FILES,
+    SharedAgentHomeRefused,
     _atomic_json_write,
+    _declined_foreign_spec_write,
     _is_confirmed_managed_dashboard_author,
     _refresh_forked_templates,
     _spec_path_is_safe,
@@ -220,6 +222,7 @@ from kiro_crew.dashboard.agent_admin.crew_removal import (  # noqa: F401
     api_kirocrew_agent_delete,
 )
 from kiro_crew.dashboard.agent_admin.crew_update import (  # noqa: F401
+    _apply_member_approval_to_live_thread,
     _effort_inputs,
     api_kirocrew_agent_update,
 )

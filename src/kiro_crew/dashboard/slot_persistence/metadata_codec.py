@@ -432,6 +432,16 @@ class SaveFolds:
     channel_folder_filed: bool = False
     tab_id: object = None
     rotation_generation: int | None = None
+    # Staged ``mutes_opened`` value. ``None`` (the default) means "read the live
+    # ``slot.mutes_opened``", which every caller but the mute endpoint relies on.
+    # The mute endpoint persists its NEW value through this fold while leaving the
+    # live flag at its committed value across the save, then flips the live flag
+    # only after the write commits under the transcript lock -- so a concurrent
+    # slots broadcast during the save window never observes the provisional value.
+    # Honored by BOTH the full ``build_full_line`` path and the empty-window
+    # ``merge_empty_window`` path (a message-less newborn), so a staged value
+    # reaches disk whichever branch the save takes.
+    mutes_opened: bool | None = None
 
 
 @dataclass
@@ -754,6 +764,11 @@ def _read_artifact(r: _Read) -> None:
 def _read_pinned(r: _Read) -> None:
     if r.meta.get("pinned"):
         r.slot.pinned = True
+
+
+def _read_mutes_opened(r: _Read) -> None:
+    if r.meta.get("mutes_opened"):
+        r.slot.mutes_opened = True
 
 
 def _read_color_index(r: _Read) -> None:
@@ -1184,6 +1199,21 @@ FIELDS: tuple[Field, ...] = (
         read=_read_pinned,
     ),
     Field(
+        "mutes_opened",
+        _ALL,
+        attr="mutes_opened",
+        # Prefer the staged fold value when the save supplies one (the mute
+        # endpoint persisting its NEW value while the live flag still holds the
+        # committed value); otherwise read the live slot, as every other save
+        # does. Same choice in both forms so the full line and the empty-window
+        # merge agree on what reaches disk.
+        line=lambda s, f: (
+            True if (s.mutes_opened if f.mutes_opened is None else f.mutes_opened) else OMIT
+        ),
+        merge=lambda s, f: bool(s.mutes_opened if f.mutes_opened is None else f.mutes_opened),
+        read=_read_mutes_opened,
+    ),
+    Field(
         "color_index",
         _ALL,
         attr="color_index",
@@ -1393,6 +1423,7 @@ LINE_ORDER: tuple[str, ...] = (
     "created_by",
     "artifact",
     "pinned",
+    "mutes_opened",
     "color_index",
     "color_hex",
     "color_theme",
@@ -1415,6 +1446,7 @@ MERGE_ORDER: tuple[str, ...] = (
     "folder_id",
     "tags",
     "pinned",
+    "mutes_opened",
     "mode",
     "artifact",
     "reasoning_effort",

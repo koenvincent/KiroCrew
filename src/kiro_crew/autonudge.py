@@ -820,6 +820,10 @@ class AutoNudgeService:
         #: free follow-up belongs to the loop's own cadence), and a quiet answer keeps
         #: the loop's earlier deadline rather than pushing it out. Reset at every tick.
         self._pushed_running: set[str] = set()
+        #: ``loop id -> ledger fingerprint`` read by the running tick's person-wait
+        #: check ("" when not every open item waits on a person). The delivered turn
+        #: copies it to ``ledger_seen_fp``; see ``_holds_for_person_wait``.
+        self._ledger_tick_fp: dict[str, str] = {}
         #: ``loop id -> item id -> wall-clock times`` of the pull-forwards that item
         #: bought its conductor in the last hour, and the ``(loop id, item id)`` pairs
         #: whose cap has already been logged in the current window. Read and written by
@@ -1929,6 +1933,7 @@ class AutoNudgeService:
     # autonudge_service.firing
     _timer = _firing._timer
     _extend_for_open_ledger = _firing._extend_for_open_ledger
+    _holds_for_person_wait = _firing._holds_for_person_wait
     _run_fire_cycle = _firing._run_fire_cycle
     fire_now = _firing.fire_now
     # autonudge_service.mutations

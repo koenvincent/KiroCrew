@@ -181,7 +181,11 @@ from an old install is never read, migrated, or deleted; it is left in place —
 still credential-gated by the `.kirocrew` security-path spelling — and `kirocrew
 doctor` reports it, warning rather than advising deletion when it still holds a
 virtual environment (`venv`/`.venv`/`venvs`), since that may be the running
-interpreter.
+interpreter. The same section warns, without failing, when the workspace root or
+`KIROCREW_PROJECT_DIR` is the data home or one of its parents (`$HOME` is the
+usual case): that puts the managed browser launcher inside the agent-writable
+tree, where the launcher fence refuses it, so the one-click browser install
+refuses up front (see the browser module).
 
 **Repository-controlled uninstall contract.** Every uninstall path owned by this
 repository preserves the Kiro Crew data home by default. `kirocrew service

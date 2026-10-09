@@ -567,12 +567,48 @@ interface SettingsStepperProps {
   max?: number
   suffix?: string
   disabled?: boolean
+  /**
+   * Disables the − button alone, for a value at the floor of its range: a
+   * button that looks clickable and does nothing reads as broken. The + button
+   * and the readout follow `disabled` only.
+   */
+  decrementDisabled?: boolean
+  /**
+   * The values the readout must fit, so its width, and the + button beside it,
+   * stay put as the value changes: a localized "Default" and the largest
+   * number, say. Each is rendered in the readout as an invisible, `aria-hidden`
+   * copy stacked in one grid cell with the shown value, so the box takes the
+   * width of the widest of them in whatever locale and font the reader has. A
+   * fixed `ch` floor fits one language's word and still shifts for a longer
+   * translation. The typed-input readout (`onSet`) ignores it: the input sizes
+   * that box.
+   */
+  reserveWidthFor?: Array<string | number>
   /** Backend config key this stepper writes. */
   configKey?: string
 }
 
 /** Shared box of the centre readout, whether it is a reset button or plain text. */
 const STEPPER_READOUT_CLASS = 'min-w-[56px] h-8 rounded-md border border-border bg-bg-elevated text-text-strong text-sm font-bold flex items-center justify-center px-2 transition-all'
+
+/**
+ * The readout's text. With `reserve`, the shown value and an invisible,
+ * `aria-hidden` copy of each reserved value stack in one grid cell, so the cell
+ * is as wide as the widest of them and the + button beside the box stays put as
+ * the value changes; the copies take width and nothing else. Without `reserve`
+ * the text renders bare, so a stepper that does not pass it keeps its DOM.
+ */
+function StepperReadoutText({ value, suffix, reserve }: { value: number | string; suffix: string; reserve?: Array<string | number> }) {
+  if (!reserve?.length) return <>{value}{suffix}</>
+  return (
+    <span className="grid text-center">
+      {reserve.map((reserved, i) => (
+        <span key={i} className="col-start-1 row-start-1 invisible" aria-hidden="true">{reserved}{suffix}</span>
+      ))}
+      <span className="col-start-1 row-start-1">{value}{suffix}</span>
+    </span>
+  )
+}
 
 function StepperValueInput({ label, value, onSet, min, max, suffix, disabled }: { label: string; value: number | string; onSet: (value: number) => void; min?: number; max?: number; suffix: string; disabled?: boolean }) {
   const [draft, setDraft] = React.useState(String(value))
@@ -612,13 +648,13 @@ function StepperValueInput({ label, value, onSet, min, max, suffix, disabled }: 
   )
 }
 
-export function SettingsStepper({ label, description, hint, value, onIncrement, onDecrement, onReset, onSet, min, max, suffix = '', disabled, configKey }: SettingsStepperProps) {
+export function SettingsStepper({ label, description, hint, value, onIncrement, onDecrement, onReset, onSet, min, max, suffix = '', disabled, decrementDisabled = false, reserveWidthFor, configKey }: SettingsStepperProps) {
   return (
     <SettingsField label={label} description={description} hint={hint} configKey={configKey}>
       <div className="flex items-center gap-2">
         <button
           type="button"
-          disabled={disabled}
+          disabled={disabled || decrementDisabled}
           className="w-8 h-8 rounded-md border border-border bg-bg-elevated text-text text-sm font-bold cursor-pointer hover:border-border-strong hover:bg-bg-hover transition-all disabled:opacity-40 disabled:cursor-not-allowed flex items-center justify-center"
           onClick={onDecrement}
           aria-label={i18nT('components.settings.decrease')}
@@ -632,13 +668,13 @@ export function SettingsStepper({ label, description, hint, value, onIncrement, 
             className={`${STEPPER_READOUT_CLASS} cursor-pointer hover:border-accent hover:text-accent disabled:opacity-40 disabled:cursor-not-allowed`}
             onClick={onReset}
             title={i18nT('components.settings.click_to_reset')}
-          >{value}{suffix}</button>
+          ><StepperReadoutText value={value} suffix={suffix} reserve={reserveWidthFor} /></button>
         ) : (
           // A readout with nothing to click is text, not a disabled button: a
           // `<button disabled>` draws dimmed with a not-allowed cursor and reads
           // to assistive tech as an action that is refused, when nothing was
           // ever on offer. It only dims with the rest of the control.
-          <span className={`${STEPPER_READOUT_CLASS} cursor-default${disabled ? ' opacity-40' : ''}`}>{value}{suffix}</span>
+          <span className={`${STEPPER_READOUT_CLASS} cursor-default${disabled ? ' opacity-40' : ''}`}><StepperReadoutText value={value} suffix={suffix} reserve={reserveWidthFor} /></span>
         )}
         <button
           type="button"

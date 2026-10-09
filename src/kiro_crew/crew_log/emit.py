@@ -4680,7 +4680,12 @@ def on_crew_report(store: str, data: dict[str, Any], *, cite_unit: str) -> int:
         return 0
 
 
-def on_session_closed(session_id: str, reason: str) -> None:
+def on_session_closed(
+    session_id: str,
+    reason: str,
+    *,
+    on_settled: "Callable[[bool], None] | None" = None,
+) -> None:
     """Record a session teardown and drop its cached state.
 
     ``reason`` is the caller's own word for the teardown, recorded verbatim rather
@@ -4709,6 +4714,15 @@ def on_session_closed(session_id: str, reason: str) -> None:
     drops only what a successor must not inherit; the live-turn records and the open
     tool calls of turns still running are left to their own release, so a turn whose
     session closed under it can still close its calls.
+
+    ``on_settled`` lets a caller WAIT for this edge to commit before it publishes on
+    the strength of it -- the same contract as :func:`on_session_adopted`. It is
+    called once, off the caller's thread, with ``True`` once the entry is on disk and
+    ``False`` when the write was dropped or there was no log to write to. Not awaited
+    here (``_submit`` must never block the loop), so the bounding is the caller's --
+    see :func:`awaiting_commit`. The deliberate-close path uses it so the ``removed``
+    edge lands before the conductor is woken; every other caller omits it and keeps
+    the fire-and-forget behaviour.
     """
 
     def _forget() -> None:
@@ -4759,6 +4773,7 @@ def on_session_closed(session_id: str, reason: str) -> None:
         {"reason": reason},
         src=_SRC_GATEWAY,
         after=_forget,
+        on_settled=on_settled,
     )
 
 

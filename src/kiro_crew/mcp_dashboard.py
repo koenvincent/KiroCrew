@@ -763,7 +763,8 @@ def _session_tools() -> tuple[Tool, ...]:
                         "type": "string",
                         "description": (
                             "Short name for the new session, shown in the sidebar. Omit to "
-                            "keep the fork's own `Fork of <source title>`."
+                            "start from `Fork of <source title>`, which is then renamed "
+                            "automatically after the latest question the copy holds."
                         ),
                     },
                     "folder": {
@@ -967,7 +968,9 @@ def _session_tools() -> tuple[Tool, ...]:
                 "(a finished watcher, a workstream you handed off), not to interrupt one "
                 "you might still need — for that, session_stop only cancels the turn and "
                 "leaves the tab open. Read the session first when you are unsure what it "
-                "is doing."
+                "is doing. You may also pass your OWN session key to close yourself once "
+                "your one job is finished; that cancels this turn, so make it your last "
+                "call and write anything the person should read before it."
             ),
             schema={
                 "type": "object",
@@ -1155,21 +1158,25 @@ def _session_tools() -> tuple[Tool, ...]:
                 "now — the roster a conductor patrols. Each row is `working` (a "
                 "turn is in flight, wait), `queued` (idle with messages waiting), "
                 "`idle` (open and doing nothing — this is the one that needs a "
-                "decision), `gone` (the crew log remembers the session and the "
-                "dashboard no longer holds it: closed, archived, or lost with the "
-                "process that ran it — re-dispatch it or drop it, there is nothing "
-                "left to message), or `unknown` (birth metadata records that you "
+                "decision), `closed` (the crew log recorded a DELIBERATE tab close "
+                "and the dashboard no longer holds it: a worker that FINISHED and "
+                "closed its tab — ignore it, it carries `closed_at`), `lost` (the "
+                "crew log remembers the session, the dashboard no longer holds it, "
+                "and it did NOT close cleanly — a turn was still open, a process "
+                "recycle or destroy tore it down, or its lifecycle could not be "
+                "read: treat it as lost with the process that ran it and "
+                "re-dispatch it), or `unknown` (birth metadata records that you "
                 "created it, but neither a live session nor an attested crew-log "
                 "edge exists — it was created and its fate is not recorded, so "
                 "read it before you re-dispatch it). A row with "
                 "`pending_approval: true` is parked on a tool approval a person "
                 "must answer (`pending_approval_tool` names the tool when known): "
-                "it still reads `working`, but waiting will not move it. `gone` is "
-                "the reason to use "
-                "this instead of "
+                "it still reads `working`, but waiting will not move it. `closed` "
+                "and `lost` are the reason to use this instead of "
                 "reading sessions one at a time: a worker that vanished is absent "
-                "from any live list, so a live list cannot tell a worker that died "
-                "from one you never dispatched. Read both quality fields before "
+                "from any live list, so a live list cannot tell a worker that "
+                "finished from one lost mid-task from one you never dispatched. "
+                "Read both quality fields before "
                 "trusting the count: `tree` describes the crew-log roster and "
                 "`history` describes transcript birth metadata. For either one, "
                 "`readable` means that source was read completely, `incomplete` "
@@ -2573,6 +2580,20 @@ def _summary_time(value: object) -> str:
         return "at an unknown time"
 
 
+def _closed_at_display(value: object) -> str:
+    """A gone row's ``closed_at`` (crew-log epoch MILLISECONDS) as UTC ISO-8601.
+
+    The close edge stamps ``entry.time`` from ``now_ms()``, so the value is in
+    milliseconds; render it human-readable rather than as a raw epoch number. Falls
+    back to the value's own string form when it is not a finite millisecond count,
+    so a malformed stamp still shows something rather than raising in the renderer.
+    """
+    try:
+        return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(float(value) / 1000.0))  # type: ignore[arg-type]
+    except (TypeError, ValueError, OverflowError, OSError):
+        return str(value)
+
+
 def _render_session_summary(resp: dict[str, Any]) -> str:
     """Render a ``/api/session-control/summary`` body as compact text.
 
@@ -3039,10 +3060,20 @@ def _run_session_status(args: dict[str, Any], ctx: ToolContext) -> str:
     for row in rows:
         target = str(row.get("target", ""))
         status = str(row.get("status", ""))
-        if status == "gone":
+        if status == "closed":
+            closed_at = row.get("closed_at")
+            when = f" at {_closed_at_display(closed_at)}" if closed_at else ""
             status_lines.append(
-                f"  \U0001faa6 `{target}` — gone (the crew log has it, the "
-                "dashboard does not: closed, archived, or lost)"
+                f"  \u2705 `{target}` — closed (finished and closed its tab{when}; "
+                "nothing to re-dispatch)"
+            )
+            continue
+        if status == "lost":
+            status_lines.append(
+                f"  \U0001faa6 `{target}` — lost (the crew log has it, the "
+                "dashboard does not, and it did not close cleanly — a turn was "
+                "open, a recycle or destroy tore it down, or the lifecycle could "
+                "not be read: re-dispatch it)"
             )
             continue
         title = str(row.get("title", ""))

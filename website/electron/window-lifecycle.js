@@ -1324,6 +1324,11 @@ function createWindowLifecycle(options) {
       }),
       alwaysOnTop: !!(store.get("windowState") || {}).alwaysOnTop,
       toggleAlwaysOnTop,
+      toggleFocusMode: () => {
+        const win = focusedDashboardWindow();
+        const wc = win && win._mcView.webContents;
+        if (wc && !wc.isDestroyed()) wc.send("focus-mode:toggle");
+      },
       openNewSessionWindow: () => openNewSessionWindow(),
       openNewConnectionWindow: () => openNewConnectionWindow(),
       renameCurrentWindow: () => renameCurrentWindow(),

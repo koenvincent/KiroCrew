@@ -1948,6 +1948,43 @@ class RunEventCoordinator(ManagerComponent):
                 return _factory_approver()(event)
             return _ask_parent(event)
 
+        def _ask_hub(event: LLMEvent) -> Awaitable[object]:
+            from kiro_crew.subagent_manager import hub_approvals
+
+            return hub_approvals.ask_hub(info.id, _mark(event))
+
+        # A floored run's person is in the remote hub's session, not on this
+        # gateway: every request is parked for the hub to relay, and nothing
+        # here (the factory, the gateway callback, a local prompt) answers it.
+        hub = CallbackResponder(lambda: _ask_hub, attended=lambda: True, name="hub", watch=prompt)
+        local_responders = (
+            CallbackResponder(
+                _factory_approver,
+                attended=lambda: bool(manager._on_tool_approval_factory),
+                name="factory",
+                watch=prompt,
+            ),
+            CallbackResponder(
+                lambda: _ask_parent,
+                attended=lambda: bool(manager._on_tool_approval),
+                name="callback",
+                watch=prompt,
+            ),
+        )
+        child_responder = (
+            hub
+            if floored
+            else CallbackResponder(
+                lambda: _ask_for_child,
+                attended=lambda: bool(
+                    manager._on_tool_approval_factory or manager._on_tool_approval is not None
+                ),
+                name="child",
+                watch=prompt,
+                on_error=lambda: log.exception("child approval callback failed"),
+            )
+        )
+
         return Policy(
             gate=DenyOnlyGate(HookGate(consult)) if floored else HookGate(consult),
             audit=SelAudit(rows, on_refusal_failure="answer", sel=sel, log=log),
@@ -1964,20 +2001,7 @@ class RunEventCoordinator(ManagerComponent):
                 ),
             ),
             grants=(GATE_GRANT, ParentPolicyAuto(parent_policy)),
-            responders=(
-                CallbackResponder(
-                    _factory_approver,
-                    attended=lambda: bool(manager._on_tool_approval_factory),
-                    name="factory",
-                    watch=prompt,
-                ),
-                CallbackResponder(
-                    lambda: _ask_parent,
-                    attended=lambda: bool(manager._on_tool_approval),
-                    name="callback",
-                    watch=prompt,
-                ),
-            ),
+            responders=(hub,) if floored else local_responders,
             child=ChildRule.enforce(
                 # For such a child the unconditional grant is tried BEFORE the
                 # gate's (identity-keyed) one.
@@ -1985,15 +2009,7 @@ class RunEventCoordinator(ManagerComponent):
                 unattended=Refusal.host(
                     "child_unattended", _LOW_FIDELITY_DENY_REASON, DENY_CAUSE_SURFACE_POLICY
                 ),
-                responder=CallbackResponder(
-                    lambda: _ask_for_child,
-                    attended=lambda: bool(
-                        manager._on_tool_approval_factory or manager._on_tool_approval is not None
-                    ),
-                    name="child",
-                    watch=prompt,
-                    on_error=lambda: log.exception("child approval callback failed"),
-                ),
+                responder=child_responder,
                 annotate=_unverified_title,
             ),
             narrator=_SubagentNarrator(info, rows, log),

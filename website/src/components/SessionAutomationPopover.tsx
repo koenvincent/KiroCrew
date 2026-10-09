@@ -136,6 +136,7 @@ function legacyWire(loop: LegacyGoalLoop): AutoNudgeLoop {
     monitor_kind: loop.monitorKind,
     // A held loop reads and acts paused only when this rides along.
     ...(loop.approvalStalled ? { approval_stalled: true } : {}),
+    ...(loop.waitingOnPerson ? { waiting_on_person: true } : {}),
     ...(loop.stopSentinelPath !== undefined ? { stop_sentinel_path: loop.stopSentinelPath } : {}),
     ...(loop.judge !== undefined ? { judge: loop.judge } : {}),
     ...(loop.judge_last_verdict !== undefined

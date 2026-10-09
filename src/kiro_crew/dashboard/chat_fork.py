@@ -16,6 +16,12 @@ from kiro_crew.dashboard.chat_persistence import (
     save_slot_off_loop,
     session_was_deleted,
 )
+from kiro_crew.dashboard.chat_title import (
+    _TITLE_ORIGIN_AUTO,
+    _TITLE_ORIGIN_USER,
+    FORK_TITLE_MARKER,
+    refresh_forked_title,
+)
 from kiro_crew.dashboard.chat_utils import (
     _sync_dashboard_slots,
     drained_to_thread,
@@ -47,8 +53,6 @@ if TYPE_CHECKING:
     from kiro_crew.dashboard.state import _ChatSlot
 
 logger = logging.getLogger(__name__)
-
-_FORK_TITLE_MARKER = "↳ "
 
 # Fork direction: "head" copies messages up to and including the fork point
 # (the default); "tail" copies only the messages after it.
@@ -204,6 +208,19 @@ async def resolve_fork_source(
     except (OSError, ValueError) as exc:
         return _store_unavailable_response(source_memory_identity[2], exc)
     return ForkSource(slot=slot, execution=inherited_execution, identity=source_memory_identity)
+
+
+def _schedule_fork_title(state: DashboardState, child: "_ChatSlot") -> None:
+    """Start the child's one background title pass (``refresh_forked_title``).
+
+    Called once per acknowledged fork, after the child is saved and broadcast,
+    so the fork answers immediately and the new name arrives as an ordinary
+    ``slot_title`` push. Held in ``state._background_tasks`` like the other
+    titling tasks so the loop cannot drop it.
+    """
+    task = asyncio.create_task(refresh_forked_title(state, child))
+    state._background_tasks.add(task)
+    task.add_done_callback(state._background_tasks.discard)
 
 
 def _inherit_pin(parent: "_ChatSlot") -> "Callable[[_ChatSlot], None]":
@@ -1012,10 +1029,21 @@ async def fork_slot(
     parent_title, _ = redact_credentials(parent_title)
     # Strip a leading marker from the parent so it never compounds on a
     # fork-of-a-fork.
-    parent_title = parent_title.removeprefix(_FORK_TITLE_MARKER)
+    parent_title = parent_title.removeprefix(FORK_TITLE_MARKER)
     fork_word = "Tail of" if direction == _FORK_DIRECTION_TAIL else "Fork of"
-    new_slot.title = f"{_FORK_TITLE_MARKER}{fork_word} {parent_title}"
+    new_slot.title = f"{FORK_TITLE_MARKER}{fork_word} {parent_title}"
     new_slot._titled = True
+    # The fork name is derived, not typed: it stays inside the automatic title
+    # lifecycle (refreshable, and renamed below from the child's own question)
+    # unless the name it wraps is final. A parent with a manual name, or a
+    # legacy one, hands the child a final title too. Persisted by the birth
+    # save, so a reload keeps the provenance instead of treating the fork name
+    # as an untyped legacy title.
+    new_slot._title_origin = (
+        _TITLE_ORIGIN_USER
+        if slot._titled and slot._title_origin != _TITLE_ORIGIN_AUTO
+        else _TITLE_ORIGIN_AUTO
+    )
 
     try:
         if stamp is not None:
@@ -1143,4 +1171,5 @@ async def fork_slot(
     )
     _sync_dashboard_slots(state)
     state.push_slots_update()
+    _schedule_fork_title(state, new_slot)
     return ForkResult(slot=new_slot, messages=len(visible), direction=direction)

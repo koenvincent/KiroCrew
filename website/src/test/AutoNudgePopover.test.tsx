@@ -677,6 +677,15 @@ describe('AutoNudgePopover status line and Pause | Play controls', () => {
     expect(clearAction()).toBeNull()
   })
 
+  it('an active work-ledger watch waiting on a person says so, and Nudge now still fires it', () => {
+    renderWith(running({ waiting_on_person: true }))
+    expect(status()!.textContent).toBe('Waiting on you · every open task needs your answer in this chat. Nudges resume when a worker reports back.')
+    // The next move is the user's, so it reads in the warn tone, not the running green.
+    expect(status()!.className).toMatch(/\bbg-warn-subtle\b/)
+    expect(title()).toBe('Goal active (cycle 1/3)')
+    expect(clearAction()).toBeNull()
+  })
+
   it('a running loop reads its countdown in the ok box and its cycle in the title; no loop has neither', () => {
     renderWith(running({ cycle_count: 2 }))
     expect(status()!.textContent).toMatch(/^Next cycle in .+$/)

@@ -116,6 +116,16 @@ describe('automation transport normalizer', () => {
     expect(normalizeAutomationRecord({ ...base, approval_stalled: 'true' })).not.toHaveProperty('approvalStalled')
   })
 
+  it('carries a work-ledger watch\'s waiting_on_person, and only when it is true', () => {
+    const base = {
+      id: 'legacy-1', slot_key: 'chat-1', message: 'Keep going', idle_secs: 60,
+      max_cycles: 0, cycle_count: 7, active: true, last_fire_ts: 123,
+    }
+    expect(normalizeAutomationRecord({ ...base, waiting_on_person: true }))
+      .toMatchObject({ kind: 'legacy_goal_loop', waitingOnPerson: true })
+    expect(normalizeAutomationRecord({ ...base, waiting_on_person: false })).not.toHaveProperty('waitingOnPerson')
+  })
+
   it('folds channel session keys into dashboard slot keys', () => {
     const record = normalizeAutomationRecord({
       id: 'legacy-1', slot_key: 'slack:1785370133.085469', message: 'Keep going',

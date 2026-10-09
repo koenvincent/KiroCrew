@@ -69,7 +69,7 @@ use `session_fork` instead.
 | Argument | Required | Meaning |
 |---|---|---|
 | `source` | no | The session to copy from: a session key, slot key, or its exact unique title. Omit to fork **your own** session |
-| `title` | no | Short sidebar name. Omit to keep the fork's own `Fork of <source title>` |
+| `title` | no | Short sidebar name, kept as given. Omit to start from `Fork of <source title>`, which is then renamed automatically after the latest question the copy holds |
 | `folder` | no | Sidebar folder id or `/`-separated path, created if missing (`mkdir -p`), as for `session_create`. Omit to leave the child in the source's folder |
 | `at_message_index` | no | Fork point: the position of the LAST message to carry, counting the source's user and assistant messages from 0. Omit to carry the whole transcript |
 
@@ -222,10 +222,12 @@ Takes no arguments. The roster of sessions you stood up, and what each is doing.
 | `working` | A turn is in flight | Wait |
 | `queued` | Idle, messages waiting to run | Wait; a steer would land on nothing |
 | `idle` | Open and doing nothing | This is the one that needs a decision |
-| `gone` | The crew log has it, the dashboard does not | Re-dispatch or drop it |
+| `closed` | The crew log has it, the dashboard does not, and its last life ended by a deliberate tab close (carries `closed_at`) | It finished and closed its tab; nothing to re-dispatch |
+| `lost` | The crew log has it, the dashboard does not, and it did not close cleanly — a turn was open, a process recycle or destroy tore it down, or its lifecycle could not be read | Re-dispatch it |
 | `unknown` | History has its birth metadata, but no live slot or crew-log edge exists | Inspect or re-dispatch without assuming it finished or was lost |
 
-`gone` and `unknown` are why this tool exists rather than reading sessions one at
+`closed`, `lost` and `unknown` are why this tool exists rather than reading
+sessions one at
 a time. Live slots forget a session the moment it is closed or lost with the
 process that ran it. The crew log preserves a gateway-attested edge after a
 session starts its first turn. History metadata fills the earlier window because
@@ -246,10 +248,10 @@ app-scoped, ephemeral, or moved to another workspace. Rows carry titles, and a
 linked session's title is derived from a conversation other people are in.
 
 The containment covers LIVE rows. A session the attested tree recorded still
-leaves its titleless `gone` row once its slot is gone, which carries no title and
-no live state — it says only that a session on your own tree is not live. That
-tree follows the CURRENT parent edge, so it covers a session you adopted as well
-as one you created.
+leaves its titleless `closed`/`lost` row once its slot is gone, which carries no
+title and no live state — it says only that a session on your own tree is not
+live, and whether it finished or was lost. That tree follows the CURRENT parent
+edge, so it covers a session you adopted as well as one you created.
 
 The two quality fields describe the durable sources independently:
 
@@ -389,7 +391,7 @@ Both take only `target`. They are not interchangeable.
 | The tab afterwards | Still open, idle | Archived to history, reopenable |
 | A running turn | Cancelled, its work discarded | Cancelled first, then archived |
 | Queued messages | Kept by the first stop; an escalated stop clears them | Saved with the archive and handed back when the conversation is reopened |
-| Use it when | A peer is working on something wrong or already done | You are finished with a peer session you created |
+| Use it when | A peer is working on something wrong or already done | You are finished with a peer session you created, or with your own session |
 
 `session_stop` is **cooperative and safe to re-send**. A repeat within
 `stop_retry.WINDOW_SECS` (120 seconds) of your own first stop of that target
@@ -407,6 +409,13 @@ cancel is still in flight.
 `session_close` is not a permanent delete — the conversation is archived and
 `session_revive` brings it back — but it does discard a running turn's work. Read the session first
 when you are not sure what it is doing.
+
+A session may close **itself**: pass your own session key as `target`. This is
+for a session that was opened for one job and has finished it, so it does not
+leave a tab for the person to dismiss. It is the same archival as closing a
+peer, and it cancels the turn that asked for it, so make it your last call and
+write whatever the person should read before it. `session_close` is the only
+verb (besides `session_release`) that accepts its own caller as the target.
 
 ### `session_end_wait`
 
@@ -728,7 +737,7 @@ gateway-issued key counts. Refusals you should expect, by code:
 | `target_not_found` | No open session matches that key or title. A closed tab is out of scope for every verb except session_revive, whose target is precisely an archived session |
 | `target_already_live` | session_revive only: the session is open already. The message carries its live key — address it directly |
 | `ambiguous_target` | The string matches more than one session across the three forms below. Address it by its session key |
-| `self_target` | A session cannot control itself |
+| `self_target` | A session cannot control itself. session_close and session_release are the exceptions: both accept the caller as the target |
 | `not_creator` | The caller is fenced to sessions it created itself (a crew member's DM slot, a scheduled run, and anything either of them created) |
 | `workspace_mismatch` | Peers must be in the same workspace — that is the memory boundary |
 | `ephemeral_target` | Incognito and temporary sessions are not addressable |

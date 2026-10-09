@@ -1,0 +1,102 @@
+"""Tool approvals a floored run hands back to the remote hub that placed it.
+
+A run carries ``approval_floor="interactive"`` only when a remote hub placed it
+and the hub's own posture for that child is not auto. The person who may answer
+is in the hub's session, not on this crew's dashboard, so the permission ladder
+parks each request here instead of prompting locally. The hub reads the pending
+requests from the run's status (``GET /api/spawn/{id}``), asks its person, and
+answers through ``POST /api/spawn/{id}/approvals/{approval_id}``.
+
+Nothing here is persisted: a pending request lives only as long as the turn
+that raised it, and an unanswered one is a rejection when its wait runs out.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import secrets
+from dataclasses import dataclass
+from typing import Any
+
+logger = logging.getLogger(__name__)
+
+#: A person on the hub answers; give them the interactive window, not the
+#: deny-fast background one (``DashboardState._APPROVAL_TIMEOUT``).
+HUB_APPROVAL_TIMEOUT_SECS = 7200.0
+_MAX_TITLE_CHARS = 500
+_MAX_INPUT_CHARS = 4000
+_MAX_PURPOSE_CHARS = 500
+
+
+def _clean(text: object, limit: int) -> str:
+    # Bounded only: the status route that lists these scrubs them on the way
+    # out, and the hub scrubs them again on receipt.
+    return str(text or "")[:limit]
+
+
+@dataclass
+class _Pending:
+    approval_id: str
+    title: str
+    tool_input: str
+    tool_purpose: str
+    future: asyncio.Future[bool]
+
+
+# run id -> approval id -> pending request. Run ids are unique per gateway, and
+# an entry is removed as soon as its wait ends, so the map holds only live waits.
+_PENDING: dict[str, dict[str, _Pending]] = {}
+
+
+async def ask_hub(run_id: str, event: Any, *, timeout: float | None = None) -> bool:
+    """Park *event* for the hub's person; True only on their explicit approval."""
+    loop = asyncio.get_running_loop()
+    approval_id = secrets.token_hex(8)
+    pending = _Pending(
+        approval_id=approval_id,
+        title=_clean(getattr(event, "title", ""), _MAX_TITLE_CHARS),
+        tool_input=_clean(getattr(event, "tool_input", ""), _MAX_INPUT_CHARS),
+        tool_purpose=_clean(getattr(event, "tool_purpose", ""), _MAX_PURPOSE_CHARS),
+        future=loop.create_future(),
+    )
+    _PENDING.setdefault(run_id, {})[approval_id] = pending
+    try:
+        return await asyncio.wait_for(
+            asyncio.shield(pending.future),
+            timeout=HUB_APPROVAL_TIMEOUT_SECS if timeout is None else timeout,
+        )
+    except asyncio.TimeoutError:
+        logger.info("Hub approval %s for run %s went unanswered; rejected", approval_id, run_id)
+        return False
+    finally:
+        waits = _PENDING.get(run_id)
+        if waits is not None:
+            waits.pop(approval_id, None)
+            if not waits:
+                _PENDING.pop(run_id, None)
+        if not pending.future.done():
+            pending.future.cancel()
+
+
+def pending_for(run_id: str) -> list[dict[str, str]]:
+    """The run's unanswered requests, oldest first, as the status route shows them."""
+    return [
+        {
+            "id": p.approval_id,
+            "title": p.title,
+            "tool_input": p.tool_input,
+            "tool_purpose": p.tool_purpose,
+        }
+        for p in list(_PENDING.get(run_id, {}).values())
+        if not p.future.done()
+    ]
+
+
+def resolve(run_id: str, approval_id: str, approved: bool) -> bool:
+    """Answer one pending request of *run_id*; False when it is not pending."""
+    pending = _PENDING.get(run_id, {}).get(approval_id)
+    if pending is None or pending.future.done():
+        return False
+    pending.future.set_result(bool(approved))
+    return True

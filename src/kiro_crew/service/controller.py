@@ -323,10 +323,10 @@ def stop_service() -> bool:
             return True
         return False
     if plat == Platform.LAUNCHD:
-        if macos.is_active():
-            macos.stop()
-            return True
-        return False
+        # No is_active() gate: its ``list`` probe reads the CALLER's domain, so
+        # from SSH it misses a gui/<uid> job. stop() searches both domains and
+        # returns False when nothing is loaded or launchd refused the bootout.
+        return macos.stop()
     return False
 
 
@@ -348,7 +348,11 @@ def restart_service() -> RestartReport:
             return linux.restart()
         return RestartReport()
     if plat == Platform.LAUNCHD:
-        if macos.is_active():
+        # Gated on is_loaded(), not is_active(): the latter's ``list`` probe
+        # reads the CALLER's domain and from SSH misses a gui/<uid> job, which
+        # would send `kirocrew restart` to the foreground path and spawn an
+        # unmanaged gateway beside the KeepAlive one.
+        if macos.is_loaded():
             ok = macos.restart()
             return RestartReport(
                 (

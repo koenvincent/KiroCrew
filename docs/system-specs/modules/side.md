@@ -436,6 +436,12 @@ HOST-TRUSTED proof of read-only. Exactly two sources qualify:
   `hooks._HOST_READ_ONLY_BUILTIN_TOOLS` (`fs_read`, `glob`, `grep`,
   `web_fetch`, `web_search`), matched on the non-model-authored
   `_meta.kiro.toolName` identity with no `_meta.kiro.mcpServerName` behind it.
+  The stamped name is read through `hooks._HOST_READ_ONLY_BUILTIN_ALIASES`
+  first: kiro-cli stamps its file-read built-in as `read` (`fs_read` is the
+  spelling a spec may still use), and the allowlist carries the spec spelling.
+  The resolved spelling is also offered to the deny rules and to governance,
+  which run before this proof, so a rule written `fs_read` reaches a `read`
+  stamp and wins.
 
 The agent-influenced inputs — the ACP `kind` field (passed through verbatim
 from the agent) and the model-authored title — may narrow but never prove: a

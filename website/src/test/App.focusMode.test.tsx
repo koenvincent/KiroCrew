@@ -302,6 +302,32 @@ describe('focus mode — shell layout', () => {
     }
   })
 
+  it('flips focus mode from the native View menu item, and unsubscribes on unmount', async () => {
+    let fromMenu: (() => void) | null = null
+    const unsubscribe = vi.fn()
+    const onToggleFocusMode = vi.fn((cb: () => void) => { fromMenu = cb; return unsubscribe })
+    ;(window as Window & { electronAPI?: unknown }).electronAPI = { setFocusModeChrome: vi.fn(), onToggleFocusMode }
+    try {
+      const { unmount } = renderWithProviders(<App />, { route: '/chat' })
+      await screen.findByTestId('focus-mode-toggle')
+      expect(onToggleFocusMode).toHaveBeenCalledTimes(1)
+
+      // The way back out is the case the item exists for: with the top bar
+      // hidden, the menu is the only visible control left.
+      await act(async () => { fromMenu!() })
+      expect(focusModeEnabled()).toBe(true)
+      expect(document.body.classList.contains('mc-focus-mode')).toBe(true)
+      await act(async () => { fromMenu!() })
+      expect(focusModeEnabled()).toBe(false)
+      expect(document.body.classList.contains('mc-focus-mode')).toBe(false)
+
+      unmount()
+      expect(unsubscribe).toHaveBeenCalled()
+    } finally {
+      delete (window as Window & { electronAPI?: unknown }).electronAPI
+    }
+  })
+
   it('opens the overlay when the pointer overshoots OUT of the window through its edge', async () => {
     // The edge-slam reveal is NOT gated on the desktop shell: this suite runs
     // un-mocked (`isElectron` is false — the browser case, which is also what

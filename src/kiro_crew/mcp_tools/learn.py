@@ -16,6 +16,7 @@ every existing patch site.
 
 from __future__ import annotations
 
+import re
 from collections.abc import Callable
 from typing import Any
 from urllib.parse import urlencode
@@ -249,8 +250,20 @@ def memory_recall(name: str, args: dict[str, Any]) -> str:
     )
 
 
+# Leaked tool-call markup leaves tags like ``</rule></invoke>`` at the ends of an
+# argument. Only wrapper-tag runs touching an EDGE are removed, so a bracket inside
+# a sentence is kept. Each run has one way to match and one start (the
+# lookbehind), so the scan stays linear on any input.
+_TAG = r"</?(?:[\w-]+:)?(?:parameter|invoke|function_calls|rule|negative)(?=\s|/?>)[^<>]*>"
+_EDGE_TAGS = re.compile(rf"^\s*(?:{_TAG}\s*)+|(?<![>\s])(?:\s*{_TAG})+\s*$")
+
+
+def _strip_wrapper_tags(value: Any) -> Any:
+    return _EDGE_TAGS.sub("", value).strip() if isinstance(value, str) else value
+
+
 def learn_add(name: str, args: dict[str, Any]) -> str:
-    rule = args.get("rule", "")
+    rule = _strip_wrapper_tags(args.get("rule", ""))
     category = args.get("category", "knowledge")
     if not rule:
         return "Error: rule is required"
@@ -284,7 +297,7 @@ def learn_add(name: str, args: dict[str, Any]) -> str:
     # clause -- but this payload never forwarded it, so the clause was dropped
     # client-side before /api/lessons could see it. The route validates the
     # field via LEARN_ADD_SCHEMA and passes it through to write_lesson.
-    negative = args.get("negative", "")
+    negative = _strip_wrapper_tags(args.get("negative", ""))
     if negative:
         payload["negative"] = negative
     repo_scope = args.get("repo_scope", "")

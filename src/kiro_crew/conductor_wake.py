@@ -10,12 +10,21 @@ is likely (an item's acceptance promoted by a human, say), so the copy count is 
 to bound.
 
 WHAT THE PUSH IS. :meth:`AutoNudgeService.fire_now`, and nothing else. It re-arms the
-loop's own timer at delay zero, so the cycle runs inside the ordinary ``_timer`` body --
-the stop sentinel, the cycle cap, the wall-clock budget, the approval stall and the
-probe gate all apply exactly as on a scheduled tick. So this module moves a DEADLINE and
-decides nothing: whether a turn is spent is still the gate's answer, read under the
-conductor's own identity. The worker gains no handle on its conductor and sends it no
-payload.
+loop's own timer, so the cycle runs inside the ordinary ``_timer`` body -- the stop
+sentinel, the cycle cap, the wall-clock budget, the approval stall and the probe gate all
+apply exactly as on a scheduled tick. So this module moves a DEADLINE and decides
+nothing: whether a turn is spent is still the gate's answer, read under the conductor's
+own identity. The worker gains no handle on its conductor and sends it no payload.
+
+REPORTS ARRIVING TOGETHER SHARE ONE TURN. The arm is one WINDOW ahead
+(:func:`wake_batch_secs`), not at once, and a report landing while that window is open
+rides the tick already armed instead of arming a second one. The tick reads the ledger
+when it runs, so it sees every report that reached it, and the probe folds all of them
+into one delivered wake. A conductor whose workers finish together is therefore woken
+once and told about all of them, rather than once per report for a board each turn
+re-reads whole. The window only ever moves WHEN a report is read: whatever misses the
+tick is read by the next one, and the loop's own scheduled tick reads the ledger
+regardless.
 
 WHAT IT KNOWS, AND WHERE FROM. Only what the ``work`` fold's rendered board says. A
 :class:`~kiro_crew.crew_log.bus.FoldAdvanced` for ``(slot, <board>, "work")`` carries the
@@ -63,6 +72,8 @@ import asyncio
 import hashlib
 import json
 import logging
+import math
+import os
 import time
 from typing import Any, Callable
 
@@ -509,6 +520,100 @@ ITEM_PULLS_PER_HOUR = 12
 _ITEM_WINDOW_SECS = 3600.0
 
 
+#: How long a work-ledger wake window stays open, in seconds.
+#:
+#: WHAT IT BUYS. The first waking report arms a tick this far ahead instead of at once,
+#: and every report that lands before that tick starts rides it: the tick reads the
+#: ledger when it RUNS, so a report that arrived after the arm is as visible to it as
+#: the one that armed it, and the probe folds every fresh report of a tick into one
+#: delivered wake (``probes.work_ledger.WorkLedgerProbe.tuning`` sets the kernel's
+#: coalescing floor to zero for exactly that). Several workers finishing together
+#: therefore cost their conductor ONE turn naming all of them instead of one turn each.
+#:
+#: WHAT IT COSTS. The window IS the added latency of an isolated report, so it is kept
+#: inside the seconds-scale latency
+#: ``docs/request-for-change/rfc-crew-log-wake.md`` promises for a ``question``: ten
+#: seconds batches workers that finish together while a lone report still reaches its
+#: conductor in seconds.
+#:
+#: TEN SECONDS IS A STARTING VALUE WITH NO MEASURED BASIS. Nothing here is derived from a
+#: distribution of inter-report gaps, because none has been measured. It is the smallest
+#: window that can batch at all, chosen so the cost of being wrong is one isolated
+#: report waiting ten seconds rather than a minute. Tune it against observed burst
+#: spacing: a window shorter than the gap between two workers' reports batches nothing,
+#: and a longer one buys fewer turns at a latency every isolated report pays.
+#:
+#: NOTHING IS LOST AT ANY VALUE. A report that misses the tick entirely (it landed while
+#: the tick was running) is the ``defer_if_firing`` path's, whose tail arms at delay zero
+#: and reads the ledger again; and the loop's own scheduled tick reads the same ledger
+#: regardless. The window moves WHEN a report is read, never WHETHER.
+DEFAULT_WAKE_BATCH_SECS = 10.0
+
+#: Environment override for :data:`DEFAULT_WAKE_BATCH_SECS`. ``0`` restores the
+#: fire-on-first-report behaviour that shipped before the window existed, which is what
+#: an operator who wants the old latency back should reach for.
+WAKE_BATCH_ENV = "KIROCREW_WORK_LEDGER_WAKE_BATCH_SECS"
+
+
+def wake_batch_secs() -> float:
+    """:data:`DEFAULT_WAKE_BATCH_SECS`, or the override in :data:`WAKE_BATCH_ENV`.
+
+    Read per push rather than at import, so an operator changing the value does not have
+    to restart the gateway to see it, and so a test can set it without reloading this
+    module.
+
+    GUARDED PARSE, and NaN is rejected by name. ``float("nan")`` parses happily and then
+    loses every comparison, so it would be neither disabled (``nan <= 0`` is False) nor
+    clamped (``min(nan, x)`` is nan), and ``asyncio.sleep(nan)`` returns at once -- a
+    window that silently disables itself while reading as configured. Malformed input
+    falls back to the default; a negative value reads as the explicit opt-out zero.
+    """
+    raw = os.environ.get(WAKE_BATCH_ENV)
+    if raw is None or not raw.strip():
+        return DEFAULT_WAKE_BATCH_SECS
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        logger.debug("conductor wake: %s is not a number; using the default window", WAKE_BATCH_ENV)
+        return DEFAULT_WAKE_BATCH_SECS
+    if math.isnan(value):
+        logger.debug("conductor wake: %s is NaN; using the default window", WAKE_BATCH_ENV)
+        return DEFAULT_WAKE_BATCH_SECS
+    return max(value, 0.0)
+
+
+def _window_open(svc: Any, loop_id: str) -> bool:
+    """Whether a pushed tick for *loop_id* is armed, LIVE, and has not started yet.
+
+    THE BATCH, read off state the service already keeps rather than a second table of
+    this module's own. ``_pushed_ticks`` holds a loop from the moment a push arms its
+    tick until that tick's body begins, and both edges are the ones a batch needs: an
+    arm of any kind clears the mark (``_arm_timer``) so it never names a timer the arm
+    replaced, and the tick clears it as it starts, so a report arriving from then on is
+    news that tick may not see and is free to arm the next window.
+
+    THE MARK ALONE IS NOT ENOUGH, and the timer table is the other half of the answer. A
+    CANCEL retires the timer task and leaves the mark standing (``_cancel_timer`` drops
+    the wake and floor-tick claims, not this one), and a user message in the watched
+    session cancels exactly that way. Were the mark read on its own, every report
+    arriving before that user's turn ends would join a window nothing will ever close --
+    each would arm nothing and wait out the loop's whole cadence, which is the one thing
+    a batch must not cost. ``_cancel_timer`` POPS the task, so a live entry in
+    ``_timers`` is the authoritative answer to "is the armed tick still coming"; a report
+    that finds none arms a window of its own.
+
+    Both tables are read with an EMPTY default rather than a branch of their own. The
+    service always defines both, so a missing one is reachable only from a stand-in, and
+    empty is the answer that needs no special case: it is what the service itself holds
+    when no tick is armed, and it makes the push louder (one tick per report) rather than
+    folding a report into a window nothing would close.
+    """
+    if loop_id not in getattr(svc, "_pushed_ticks", ()):
+        return False
+    armed = getattr(svc, "_timers", {}).get(loop_id)
+    return armed is not None and not armed.done()
+
+
 def _admit(svc: Any, loop_id: str, item_id: str, now: float) -> bool:
     """Whether *item_id* may pull *loop_id* forward now, recording it when it may.
 
@@ -649,6 +754,13 @@ def work_ledger_loop_id(svc: Any, conductor_slot_key: str) -> str:
 async def _fire(svc: Any, conductor_slot_key: str, item_id: str = "") -> str:
     """Fire *conductor_slot_key*'s work-ledger loop for *item_id*. The loop id, or ``""``.
 
+    THE BATCH. The first report arms a tick one window ahead (:func:`wake_batch_secs`)
+    rather than at once; a report that arrives while that window is still open rides the
+    tick already armed and arms nothing. So N workers reporting close together spend ONE
+    of their conductor's turns, and that turn reads every one of their reports, because
+    the tick reads the ledger when it runs. With the window at zero this is the
+    fire-on-first-report behaviour that shipped.
+
     Refused without calling ``fire_now`` once *item_id* has spent its hourly budget of
     pull-forwards on this loop (:func:`_admit`). The write still landed in the ledger and
     the loop's own tick still reads it, so a refusal here costs latency, never news.
@@ -663,6 +775,20 @@ async def _fire(svc: Any, conductor_slot_key: str, item_id: str = "") -> str:
         return ""
     if not _admit(svc, loop_id, item_id, time.time()):
         return ""
+    window = wake_batch_secs()
+    if window > 0 and _window_open(svc, loop_id):
+        # JOINED, not dropped. The armed tick has not read the ledger yet, so this
+        # report is already part of the batch it will deliver, and there is nothing to
+        # arm. Arming again is what this branch exists to prevent: ``_arm_timer``
+        # replaces the armed timer, so a steady stream of reports would each restart the
+        # window and the batch would never be delivered at all. The loop id is returned
+        # because a push that produced the tick this report rides is not a refusal.
+        logger.debug(
+            "conductor wake: item %s joined loop %s's open wake window",
+            item_id or "?",
+            loop_id,
+        )
+        return loop_id
     try:
         # ``defer_if_firing``: a refusal because the loop is mid-fire is the one refusal
         # worth remembering. The cycle in flight read the ledger BEFORE this write landed,
@@ -676,7 +802,7 @@ async def _fire(svc: Any, conductor_slot_key: str, item_id: str = "") -> str:
         # package defines one ``fire_now`` and it ships with this caller in the same
         # commit -- so the branch could only ever be entered by a test stub, while
         # silently retrying a genuine ``TypeError`` raised INSIDE ``fire_now``.
-        _loop, reason, status = await svc.fire_now(loop_id, defer_if_firing=True)
+        _loop, reason, status = await svc.fire_now(loop_id, defer_if_firing=True, delay=window)
     except Exception:  # pragma: no cover - a push must never reach its trigger
         logger.debug("conductor wake: fire_now raised for loop %s", loop_id, exc_info=False)
         return ""

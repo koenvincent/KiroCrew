@@ -1090,7 +1090,8 @@ def _sanitize_imported_crons(crons_path: Path) -> tuple[list[str], list[str]]:
     Returns ``(dropped, paused)`` — two lists, because they are two different
     outcomes and a caller that conflates them tells the user the wrong thing. A
     dropped job is gone; a paused one is fully restored and simply waiting to be
-    switched on. Rewrites *crons_path* in place. A missing file is left alone.
+    switched on. Replaces *crons_path* atomically when it changes anything; a
+    missing file, or a directory at that name, is left alone.
 
     The store is read and written as UTF-8, never through the locale codepage.
     Cron job names are operator-authored text and routinely non-ASCII — the same
@@ -1128,15 +1129,93 @@ def _sanitize_imported_crons(crons_path: Path) -> tuple[list[str], list[str]]:
        the first run an explicit human action. Message-only jobs are untouched:
        they prompt an agent, they do not execute anything on the host.
     """
-    if not crons_path.is_file():
-        return [], []
+    # The store is resolved ONCE for the read and published by an atomic replace
+    # in the same pinned directory. A by-name read followed by a by-name rewrite is
+    # two resolutions: a link or hardlink alias swapped in between would have the
+    # rewrite follow it and truncate whatever it names. A rename replaces the
+    # directory entry and never follows it, so what lands is what was judged.
+    dir_fd: int | None = None
     try:
-        data = json.loads(crons_path.read_text(encoding="utf-8"))
-    except (ValueError, OSError):
+        if pinned_fs.supports_pinned_walk():
+            dir_fd = pinned_fs.pin_parent(
+                os.path.realpath(crons_path.parent), what="imported cron store", refusal=OSError
+            )
+        try:
+            text = _read_staged_cron_store(crons_path, dir_fd)
+        except FileNotFoundError:
+            return [], []
+        except IsADirectoryError:
+            # Not a file at all: left alone exactly as the by-name `is_file()` did.
+            return [], []
+        return _sanitize_cron_text(text, crons_path, dir_fd)
+    finally:
+        if dir_fd is not None:
+            os.close(dir_fd)
+
+
+def _read_staged_cron_store(crons_path: Path, dir_fd: int | None) -> str | None:
+    """Open the staged store once, judge the descriptor, and read through it.
+
+    Returns ``None`` when the name holds something that is not one regular file
+    (a link, a FIFO, a hardlink alias): that is unreadable as a store and is
+    replaced, never followed. ``O_NONBLOCK`` keeps a FIFO from hanging the
+    import. Raises ``FileNotFoundError`` for a missing store and
+    ``IsADirectoryError`` for a directory, which the caller leaves alone.
+    """
+    try:
+        if dir_fd is not None:
+            flags = (
+                os.O_RDONLY
+                | getattr(os, "O_NOFOLLOW", 0)
+                | getattr(os, "O_NONBLOCK", 0)
+                | getattr(os, "O_CLOEXEC", 0)
+            )
+            fd = os.open(crons_path.name, flags, dir_fd=dir_fd)
+        else:
+            fd = platform_compat.open_file_no_reparse(crons_path, nonblocking=True)
+    except (FileNotFoundError, IsADirectoryError):
+        raise
+    except OSError:
+        return None
+    try:
+        seen = os.fstat(fd)
+        if stat.S_ISDIR(seen.st_mode):
+            raise IsADirectoryError(str(crons_path))
+        if not stat.S_ISREG(seen.st_mode) or seen.st_nlink != 1:
+            return None
+        chunks = []
+        try:
+            while chunk := os.read(fd, 1024 * 1024):
+                chunks.append(chunk)
+            # UTF-8, never the locale codepage: see _sanitize_imported_crons.
+            return b"".join(chunks).decode("utf-8")
+        except (OSError, UnicodeDecodeError):
+            return None
+    finally:
+        os.close(fd)
+
+
+def _publish_staged_cron_store(crons_path: Path, dir_fd: int | None, data: object) -> None:
+    """Replace the staged store's directory entry with *data*, never writing through it."""
+    from kiro_crew.atomic_write import pinned_parent_replace_supported
+
+    pinned = dir_fd if dir_fd is not None and pinned_parent_replace_supported() else None
+    atomic_write(crons_path, json.dumps(data, indent=2), parent_dir_fd=pinned)
+
+
+def _sanitize_cron_text(
+    text: str | None, crons_path: Path, dir_fd: int | None
+) -> tuple[list[str], list[str]]:
+    """Apply the three rules of :func:`_sanitize_imported_crons` to the bytes read once."""
+    try:
+        if text is None:
+            raise ValueError("the staged cron store is not one regular file")
+        data = json.loads(text)
+    except ValueError:
         # Unparseable bytes are not installable as a cron store either, but they
         # are also not something this function can reason about — an empty store
         # is the only safe thing to hand the loader.
-        crons_path.write_text(json.dumps({"jobs": []}, indent=2), encoding="utf-8")
+        _publish_staged_cron_store(crons_path, dir_fd, {"jobs": []})
         return [_UNREADABLE_STORE], []
     # A store whose top level is not an object, or whose `jobs` is not a list, is
     # REPLACED rather than left alone. `CronService._load` treats such a document
@@ -1144,7 +1223,7 @@ def _sanitize_imported_crons(crons_path: Path) -> tuple[list[str], list[str]]:
     # user is TOLD the store was unreadable at import time, instead of the
     # gateway silently starting with an empty schedule later.
     if not isinstance(data, dict) or not isinstance(data.get("jobs"), list):
-        crons_path.write_text(json.dumps({"jobs": []}, indent=2), encoding="utf-8")
+        _publish_staged_cron_store(crons_path, dir_fd, {"jobs": []})
         return [_UNREADABLE_STORE], []
     jobs = data["jobs"]
 
@@ -1210,7 +1289,7 @@ def _sanitize_imported_crons(crons_path: Path) -> tuple[list[str], list[str]]:
 
     if changed:
         data["jobs"] = kept
-        crons_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        _publish_staged_cron_store(crons_path, dir_fd, data)
     return dropped, paused
 
 
@@ -1401,9 +1480,10 @@ def _vet_archive_settings(snap: Path, summary: dict) -> dict[str, object]:
                     channels, dropped = parse_imported_settings(text)
                 except (OSError, ValueError) as exc:
                     raise _SettingsRefused(f"the archive's {name} is unusable ({exc})") from None
-                src.write_text(
-                    json.dumps({"channel_settings": channels}, indent=2), encoding="utf-8"
-                )
+                # An atomic replace, as the ui-prefs branch above: a by-name
+                # write_text would follow a link or hardlink alias planted at the
+                # staged name since the read. No mode, matching the live writer.
+                atomic_write(src, json.dumps({"channel_settings": channels}, indent=2))
                 vetted[name] = (channels, dropped)
             else:
                 vetted[name] = _read_archive_object(src)

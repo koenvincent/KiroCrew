@@ -407,6 +407,9 @@ def test_only_a_vocabulary_the_writer_clamps_is_enforced():
         ("work/recorded", "state"),
         ("work/recorded", "verdict"),
         ("work/recorded", "status"),
+        # A worker's blocked reason: the tool schema and the store both refuse a
+        # value outside the vocabulary before the entry is built.
+        ("work/recorded", "reason"),
         ("work/recorded", "event_kind"),
         # The dashboard instance store clamps its action the same way, and imports the
         # vocabulary from the declaration beside the type, so the closed enum and the

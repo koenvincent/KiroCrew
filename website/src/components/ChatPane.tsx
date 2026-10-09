@@ -1,4 +1,4 @@
-import { useState, useRef, useCallback, useEffect, useLayoutEffect, useMemo } from 'react'
+import { useState, useRef, useCallback, useEffect, useLayoutEffect, useMemo, type ComponentType } from 'react'
 import { createPortal } from 'react-dom'
 import { useNavigate } from 'react-router-dom'
 import { X } from 'lucide-react'
@@ -11,6 +11,7 @@ import type { ThreadHooks } from '../app-sdk/messageRenderers'
 import { EdgeFade, JumpToBottomButton } from '../app-sdk/ChatScrollChrome'
 import { createTranscriptRenderers } from '../pages/chat/transcriptRenderers'
 import ChatInput, { type ComposerBusyMode } from './ChatInput'
+import type { ChatInputProps } from './chat-input/props'
 import { busySteerFlag } from './chat-input/busySend'
 import { filterCrewmateChat } from './chat/crewmateBubbles'
 import CrewmateLiveActivity from './chat/CrewmateLiveActivity'
@@ -132,12 +133,14 @@ export default function ChatPane({
   onSplitDown,
   onOpenFull,
   agentLocked,
+  composerInput: ComposerInput = ChatInput,
   frameless,
   followContentWidth,
   hideEmptyHint,
   openSideChat,
   leading,
   onFileOpen,
+  onArtifactOpen,
   busyMode = 'split',
   crewmate,
   onOpenCrewWorkLog,
@@ -162,6 +165,10 @@ export default function ChatPane({
    *  the agent picker is not offered at all, instead of offering a control
    *  whose every selection the backend 409s. */
   agentLocked?: boolean
+  /** The input the pane's composer draws, fed every ChatInput prop. Absent:
+   *  the ordinary ChatInput. The Crewmates page passes its own CrewComposer,
+   *  which reuses ChatInput without the session toolbar line. */
+  composerInput?: ComponentType<ChatInputProps>
   /** Split view: this pane owns the surface's top-left corner, where the shell
    *  keeps the sessions-sidebar toggle. `inset` reserves that toggle's column
    *  (desktop: the toggle is the shell's absolutely positioned button, and the
@@ -198,6 +205,15 @@ export default function ChatPane({
    *  the pane shows every attachment but cannot open one. Capability by
    *  omission, like `openSideChat`. */
   onFileOpen?: (path: string, opts?: { line?: number; endLine?: number }) => void
+  /** Open an artifact named in a reply (`/artifacts/<slug>` link) in the
+   *  host's side panel, the way the main chat does. Without it the link is a
+   *  plain `target="_blank"` anchor to the standalone artifact view -- a
+   *  crewmate's reply that names the artifact it just made then opens it in
+   *  another browser tab, or nowhere when the shell swallows the popup
+   *  (#18320). Capability by omission, like
+   *  `onFileOpen`: the Members page wires its panel's artifact opener, a
+   *  split-view pane passes nothing (its dock is `activeSlot`-keyed). */
+  onArtifactOpen?: (slug: string) => void
   /** What the composer's send does while the slot is busy. Defaults to
    *  `'split'` — the same Steer/Queue split button as the main chat, which
    *  split-view (⌘D) panes keep: they are the main chat's own sessions seen
@@ -1713,6 +1729,7 @@ export default function ChatPane({
           onAsk={onAsk}
           threads={threads}
           onFileOpen={onFileOpen}
+          onArtifactOpen={onArtifactOpen}
           transcript={{
             sessionId: `pane:${slotKey}`,
             scrollerRef,
@@ -2025,7 +2042,7 @@ export default function ChatPane({
           voice={composerVoiceOptions}
           pastes={composerPastes}
         >
-        <ChatInput
+        <ComposerInput
           value={input}
           onChange={handleUserInput}
           onSend={doSend}

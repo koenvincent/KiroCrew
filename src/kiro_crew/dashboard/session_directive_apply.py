@@ -369,8 +369,20 @@ async def apply_session_directive_outcome(
             f"Error: {kind} targets this turn's chat slot, and this turn "
             f"holds none (this turn is {session_key!r}). Nothing was changed."
         )
-    if kind in _USER_SURFACE_DIRECTIVES and (
-        not producer_is_user_facing or not _has_user_surface(session_key)
+    # The one non-human producer a user-surface directive admits: a conductor's
+    # patrol wake dropping its own chat at a round close. Admission here only
+    # skips the human-turn refusal below; ``_refuse_unvouched_wake_reset``
+    # decides it, before anything is queued.
+    wake_reset = bool(
+        kind == "reset_conversation"
+        and producer_is_self_wake
+        and not producer_is_user_facing
+        and _has_user_surface(session_key)
+    )
+    if (
+        kind in _USER_SURFACE_DIRECTIVES
+        and not wake_reset
+        and (not producer_is_user_facing or not _has_user_surface(session_key))
     ):
         # A cron turn can run on a user's slot and a sub-agent can share its
         # parent's slot. Positive admission prevents either from silently
@@ -396,8 +408,10 @@ async def apply_session_directive_outcome(
     # deactivated, by raising that bound (``_monitor_update``).
     # Everything else -- a cron injection, an app-driven turn, a
     # sub-agent sharing the slot -- carries neither mark and is refused. This is
-    # NOT the user-surface gate below: ``set_project`` / ``reset_conversation``
-    # stay human-only, a wake must never retarget the slot's project.
+    # NOT the user-surface gate above: ``set_project`` / ``chat_tag`` stay
+    # human-only, a wake must never retarget the slot's project, and
+    # ``reset_conversation`` admits a wake only through
+    # ``_refuse_unvouched_wake_reset``.
     self_arm_ok = bool(producer_is_user_facing or producer_is_self_wake)
     try:
         if producer_is_self_wake and kind in _ARMING_DIRECTIVES:
@@ -455,7 +469,16 @@ async def apply_session_directive_outcome(
         elif kind == "set_project":
             result = await _set_project(state, slot, args)
         elif kind == "reset_conversation":
-            result = await _reset_conversation(slot, session_key, args)
+            if wake_reset:
+                await _refuse_unvouched_wake_reset(state, slot, session_key, producer_wake_loop_id)
+            result = await _reset_conversation(slot, session_key, args, from_wake=wake_reset)
+            if wake_reset:
+                logger.warning(
+                    "session-directive: patrol wake reset the conversation for "
+                    "session_key=%r loop_id=%r",
+                    session_key,
+                    producer_wake_loop_id,
+                )
         elif kind == "chat_tag":
             result = await _apply_chat_tag(state, slot, session_key, args)
         elif kind == "suggest_followup":
@@ -1570,7 +1593,79 @@ async def _set_project(state: Any, slot: Any, args: dict[str, Any]) -> str:
     )
 
 
-async def _reset_conversation(slot: Any, session_key: str, args: dict[str, Any]) -> str:
+def _slot_has_pending_interaction(state: Any, slot: Any) -> bool:
+    """Whether *slot* waits on a person: a question card or a tool approval.
+
+    Reads the same registries the dashboard's waiting lanes do: the slot's
+    question records (blocking and non-blocking), its own approval futures, and
+    the gateway coordinator's approvals owned by the slot.
+    """
+    if getattr(slot, "_question_pending", None):
+        return True
+    futures = getattr(slot, "_approval_futures", None) or {}
+    if any(not fut.done() for fut in futures.values()):
+        return True
+    pending_for = getattr(state, "pending_coordinator_approvals", None)
+    return bool(callable(pending_for) and pending_for(getattr(slot, "key", "")))
+
+
+async def _refuse_unvouched_wake_reset(
+    state: Any, slot: Any, session_key: str, wake_loop_id: str
+) -> None:
+    """Refuse a patrol wake's ``reset_conversation`` unless the gateway can vouch for it.
+
+    Admitted only when the slot runs a conductor agent, the wake comes from this
+    slot's CURRENT, active loop, the
+    keystone-gated self-arm record says that loop was armed by this slot's own
+    turn (so never a cron, a sub-agent, a person's dashboard arm or the
+    bind-time default patrol), and nothing in the slot waits on a person -- a
+    reset would drop the context the answer is meant for.
+    """
+    from kiro_crew.autonudge import get_instance
+    from kiro_crew.autonudge_selfarm import WAKE_RESET_AGENTS, is_recorded_self_arm
+
+    refused = "Conversation NOT reset: "
+    if str(getattr(slot, "agent", "") or "") not in WAKE_RESET_AGENTS:
+        raise _DirectiveDenied(
+            refused + "only a conductor's patrol wake may drop its own conversation."
+        )
+
+    def _live_loop() -> Any:
+        svc = get_instance()
+        binding = _binding(session_key)
+        current = svc.get_by_slot(binding) if svc is not None and binding else None
+        if (
+            not wake_loop_id
+            or current is None
+            or getattr(current, "id", "") != wake_loop_id
+            or not getattr(current, "active", False)
+        ):
+            raise _DirectiveDenied(
+                refused + "the loop that delivered this wake is not this session's live monitor."
+            )
+        return current
+
+    current = _live_loop()
+    vouched = await asyncio.to_thread(
+        is_recorded_self_arm, wake_loop_id, str(getattr(current, "slot_key", ""))
+    )
+    if not vouched:
+        raise _DirectiveDenied(
+            refused + "the loop that delivered this wake was not armed by this session's "
+            "own turn, so its wake may not drop the conversation."
+        )
+    # Re-read after the await: a Pause, Stop or replacement can land while the
+    # trust read is off-loop. From here to the queued flag nothing yields.
+    _live_loop()
+    if _slot_has_pending_interaction(state, slot):
+        raise _DirectiveDenied(
+            refused + "a question card or a tool approval is still pending in this session."
+        )
+
+
+async def _reset_conversation(
+    slot: Any, session_key: str, args: dict[str, Any], *, from_wake: bool = False
+) -> str:
     """Queue a conversation discard for this slot's next turn boundary.
 
     Deferred rather than applied here because the caller is mid-turn: a discard
@@ -1592,6 +1687,9 @@ async def _reset_conversation(slot: Any, session_key: str, args: dict[str, Any])
     in the tab: the record is the user's, the context was the conversation's.
     """
     slot._pending_discard_conversation_key = session_key
+    # A wake's discard re-checks, where it lands, that nobody is waiting on an
+    # answer (``chat_runner``); a person's own reset does not.
+    slot._pending_discard_from_wake = from_wake
     return (
         "Conversation reset queued. It lands at a turn boundary — normally the "
         "end of this turn, later if a turn is still in flight on the session or "

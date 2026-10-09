@@ -3064,11 +3064,6 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
   // it, so exiting focus mode restores what the user had. null = focus mode is
   // not the reason the list is hidden (the user owns the state).
   const sidebarAutoHidden = useRef<boolean | null>(null)
-  // One LLM title generation at a time from the phone bar's menu item: the
-  // menu closes on select, so nothing else stops a second tap from starting a
-  // concurrent call whose last response would win (SessionTitleControl's
-  // button has the same guard in its `generating` state).
-  const menuAutoTitleInFlight = useRef(false)
   const [sidePanelDock] = useSidePanelDock()
   // Recomputed on every dock flip: the wrapper keeps one React key across the
   // flip, so both axes have to stay named or the flipped-away one gets driven
@@ -5586,7 +5581,6 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
         currentSlot={currentSlot}
         sidebarAutoHidden={sidebarAutoHidden}
         openSidebar={openSidebar}
-        menuAutoTitleInFlight={menuAutoTitleInFlight}
         effectiveMode={effectiveMode}
         sidebarOnScreen={sidebarOnScreen}
         activePoppedOut={activePoppedOut}

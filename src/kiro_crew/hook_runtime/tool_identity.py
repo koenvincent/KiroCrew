@@ -19,6 +19,7 @@ if TYPE_CHECKING:
         _BUILTIN_APP_MCP_SERVERS,
         _BUILTIN_APP_NAMES,
         _GLOBAL_INLINE_FLAGS_RE,
+        _HOST_READ_ONLY_BUILTIN_ALIASES,
         _HOST_READ_ONLY_BUILTIN_TOOLS,
         _TITLE_ONLY_GRANT_NOTED,
         _TITLE_ONLY_GRANT_NOTED_CAP,
@@ -276,12 +277,21 @@ def _is_host_read_only_builtin(
     stamping contract; that contract belongs to kiro-cli
     (``kiro_tool_identity_meta`` in the engine) and is the one every
     ``mcp_server_name`` consumer in ``kiro_crew.hooks`` already rests on.
+
+    The stamped name is read through ``_HOST_READ_ONLY_BUILTIN_ALIASES`` first.
+    kiro-cli names its file-read built-in ``read`` (``fs_read`` is the alias it
+    still accepts in a spec), while the allowlist and ``BUILTIN_TOOL_SCOPES``
+    carry ``fs_read``; without the step a ``read`` call is unproven and a
+    ``READ_ONLY`` surface refuses every file read. The table holds only the
+    read-only aliases, so a ``write`` or ``shell`` stamp has no entry, is
+    tested under its own name, and is refused as before.
     """
     if not mcp_identity_trusted:
         return False
     if mcp_server_name or not mcp_tool_name:
         return False
-    return mcp_tool_name in _HOST_READ_ONLY_BUILTIN_TOOLS
+    name = _HOST_READ_ONLY_BUILTIN_ALIASES.get(mcp_tool_name, mcp_tool_name)
+    return name in _HOST_READ_ONLY_BUILTIN_TOOLS
 
 
 def _app_owns_mcp_server(mcp_server_name: str, app: str) -> bool:

@@ -34,6 +34,7 @@ from chat_test_helpers import _make_app, _make_state
 from kiro_crew import autonudge
 from kiro_crew.apps.builtins.issue_radar.backend import crew_runtime
 from kiro_crew.autonudge import AutoNudgeService, NudgeAdmissionRefused
+from kiro_crew.crew_log import emit as _emit_module
 from kiro_crew.dashboard import chat_handlers as handlers
 from kiro_crew.monitoring.models import MonitorBudgets, MonitorOutcome
 
@@ -764,3 +765,131 @@ async def test_a_banner_loop_whose_cycles_are_spent_is_still_not_restored(
     assert resp.status == 500
     assert svc.get_by_slot(NAME) is None, "a spent loop was revived to preserve its banner"
     svc.stop()
+
+
+@pytest.mark.asyncio
+async def test_a_deliberate_close_emits_a_removed_crew_log_edge(tmp_path, monkeypatch) -> None:
+    """The deliberate close (tab ✕ / ``session_close``) writes a ``session/closed``
+    crew-log edge with ``END_REASON_REMOVED`` for the slot's mapped sid, so a later
+    ``session_status`` gone row for this worker reads ``closed`` ("finished") and not
+    ``lost``. The sid is read from the session MAP (``mapped_sid``), which still
+    names it even when a prior idle-expiry ``reset`` already popped the live session
+    before the tab was closed -- the finished-then-reset-then-close case that read
+    ``lost`` before. This lives in ``close_slot``, the one deliberate caller; the
+    generic ``SessionManager.remove`` stays silent (pinned in
+    ``test_session_service_boundaries``).
+    """
+    from unittest.mock import patch
+
+    state = _state_with_slot(tmp_path)
+    state.sessions.mapped_sid = lambda _key: "sid-finished-worker"
+
+    # The emit is awaited through ``awaiting_commit``; the stub settles it True so
+    # the close proceeds. (The commit-before-wake ORDER is pinned separately below.)
+    def _emit(session_id, reason, *, on_settled=None):
+        if on_settled is not None:
+            on_settled(True)
+
+    with patch("kiro_crew.crew_log.emit.on_session_closed", side_effect=_emit) as on_closed:
+        resp = await handlers.api_chat_slot_delete(_Req(state, NAME))
+
+    assert resp.status == 200
+    from kiro_crew.metrics.sessions import END_REASON_REMOVED
+
+    on_closed.assert_called_once()
+    args, kwargs = on_closed.call_args
+    assert args == ("sid-finished-worker", END_REASON_REMOVED)
+    assert "on_settled" in kwargs  # awaited, not fire-and-forget
+
+
+@pytest.mark.asyncio
+async def test_a_deliberate_close_with_no_mapped_sid_emits_nothing(tmp_path, monkeypatch) -> None:
+    """A slot the session map has no sid for (never ran a turn, or its mapping was
+    already cleared) writes no close edge rather than a ``removed`` edge for an empty
+    sid -- the emit is a no-op on a blank sid, so the close still succeeds and the
+    gone-row split simply has no close to read (it defaults to ``lost``)."""
+    from unittest.mock import patch
+
+    state = _state_with_slot(tmp_path)
+    state.sessions.mapped_sid = lambda _key: ""
+
+    with patch("kiro_crew.crew_log.emit.on_session_closed") as on_closed:
+        resp = await handlers.api_chat_slot_delete(_Req(state, NAME))
+
+    assert resp.status == 200
+    on_closed.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_a_deliberate_close_commits_the_removed_edge_before_waking_the_conductor(
+    tmp_path, monkeypatch
+) -> None:
+    """Persist-before-you-publish: the ``removed`` edge is handed to
+    ``awaiting_commit`` and the close BLOCKS on its commit, so by the time the close
+    returns (and the conductor is woken on the strength of it) the edge is durable.
+    The conductor's wake can trigger a ``session_status`` that folds this worker's
+    lifecycle; if the edge had not yet landed, that fold would read the earlier
+    ``reset`` and report ``lost`` -- a redundant re-dispatch of a finished worker.
+
+    We assert the emit flows through ``awaiting_commit`` (not a bare fire-and-forget
+    ``on_session_closed``) and that the ``on_settled`` callback is both passed and
+    settled -- i.e. the writer's answer is awaited, not ignored.
+    """
+    from unittest.mock import patch
+
+    state = _state_with_slot(tmp_path)
+    state.sessions.mapped_sid = lambda _key: "sid-finished-worker"
+
+    settled: list[bool] = []
+
+    def _emit(session_id, reason, *, on_settled=None):
+        # A real committed write settles on a later tick; emulate that so a caller
+        # that did not AWAIT the commit would return before the settle lands.
+        assert on_settled is not None, "the removed edge must be awaited, not fire-and-forget"
+        asyncio.get_running_loop().call_soon(on_settled, True)
+
+    def _record_settle(wrote):
+        settled.append(wrote)
+
+    orig_awaiting = _emit_module.awaiting_commit
+
+    async def _traced_awaiting(emit_one, *, what, timeout=5.0):
+        result = await orig_awaiting(emit_one, what=what, timeout=timeout)
+        _record_settle(result)
+        return result
+
+    with patch("kiro_crew.crew_log.emit.on_session_closed", side_effect=_emit):
+        with patch("kiro_crew.crew_log.emit.awaiting_commit", side_effect=_traced_awaiting):
+            resp = await handlers.api_chat_slot_delete(_Req(state, NAME))
+
+    assert resp.status == 200
+    # The close awaited the commit and saw it settle True BEFORE returning -- so a
+    # conductor woken after this point reads the edge, never the stale ``reset``.
+    assert settled == [True], settled
+
+
+@pytest.mark.asyncio
+async def test_a_deliberate_close_still_succeeds_when_the_removed_edge_write_is_dropped(
+    tmp_path, monkeypatch
+) -> None:
+    """Fail-safe direction: if ``awaiting_commit`` reports the edge was dropped (or
+    timed out), the close still completes (slot removed, 200). The gone row then reads
+    ``lost`` -- a transient redundant re-dispatch, never a lost worker -- which is the
+    safe way to be wrong, so a drop must not block the close.
+    """
+    from unittest.mock import patch
+
+    state = _state_with_slot(tmp_path)
+    state.sessions.mapped_sid = lambda _key: "sid-finished-worker"
+
+    def _emit(session_id, reason, *, on_settled=None):
+        if on_settled is not None:
+            on_settled(False)  # writer dropped it
+
+    with patch("kiro_crew.crew_log.emit.on_session_closed", side_effect=_emit):
+        resp = await handlers.api_chat_slot_delete(_Req(state, NAME))
+
+    assert resp.status == 200
+    assert (
+        state.get_slot(NAME) is None
+    ), "the close must still remove the slot when the edge is dropped"

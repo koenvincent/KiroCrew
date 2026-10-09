@@ -2,7 +2,7 @@ import { Suspense, lazy, type ComponentProps, type Dispatch, type MutableRefObje
 import { createPortal } from 'react-dom'
 import { Columns2, ExternalLink, EyeOff, MoreHorizontal, VenetianMask } from 'lucide-react'
 
-import { api } from '../../../api/client'
+import { generateSlotTitle } from '../../../hooks/slotTitleGeneration'
 import ErrorBoundary from '../../../components/ErrorBoundary'
 import ErrorNotice, { ErrorNoticeMenuItem } from '../../../components/ErrorNotice'
 import { PanelRightSolid } from '../../../components/icons/panels'
@@ -11,7 +11,6 @@ import type { useChatPopouts } from '../../../hooks/useChatPopouts'
 import { i18nT } from '../../../i18n/t'
 import type { AppDispatch } from '../../../store'
 import { requestSlotReveal } from '../../../store/chatSlice'
-import { sseSlotTitle } from '../../../store/dashboardSlice'
 import type { ChatSlot } from '../../../types'
 import { errMessage } from '../../../utils/thunkError'
 import { ChatHeaderMenu } from '../ChatPageMessageContent'
@@ -39,8 +38,6 @@ interface MobileTopBarProps {
   /** Pre-expand sidebar state; a user reveal clears it (see ChatPage). */
   sidebarAutoHidden: MutableRefObject<boolean | null>
   openSidebar: () => void
-  /** One LLM title generation at a time from the menu item. */
-  menuAutoTitleInFlight: MutableRefObject<boolean>
   effectiveMode: string | undefined
   sidebarOnScreen: boolean
   activePoppedOut: boolean
@@ -78,7 +75,6 @@ export default function MobileTopBar({
   currentSlot,
   sidebarAutoHidden,
   openSidebar,
-  menuAutoTitleInFlight,
   effectiveMode,
   sidebarOnScreen,
   activePoppedOut,
@@ -137,20 +133,15 @@ export default function MobileTopBar({
                 onRename={() => setEditingTitleSlot(activeSlot)}
                 // The phone bar does not render the title row's hover-revealed
                 // Auto-title button (an opacity-0 control has no touch home), so
-                // the LLM rename is a menu item here. Same endpoint and same
-                // store write as SessionTitleControl's button; the Undo window
+                // the LLM rename is a menu item here, through the same shared
+                // per-slot generation the sidebar row menu uses; the Undo window
                 // that button offers is a hover-hold affordance and is not
                 // offered from a menu -- Rename in the same menu is the way back.
                 onAutoTitle={() => {
-                  if (menuAutoTitleInFlight.current) return
-                  menuAutoTitleInFlight.current = true
+                  const run = generateSlotTitle(activeSlot, dispatch)
+                  if (!run) return
                   setActionError(null)
-                  const slot = activeSlot
-                  api.generateTitle(slot).then(r => {
-                    /* title is redacted server-side via redact_exfiltration_urls + redact_credentials */
-                    if (r.title) dispatch(sseSlotTitle({ key: slot, title: r.title }))
-                  }).catch(e => showActionError(errMessage(e) || i18nT('pages.chatPage.unknown_error'), i18nT('pages.chatPage.could_not_generate_title')))
-                    .finally(() => { menuAutoTitleInFlight.current = false })
+                  run.catch(e => showActionError(errMessage(e) || i18nT('pages.chatPage.unknown_error'), i18nT('pages.chatPage.could_not_generate_title')))
                 }}
                 mode={effectiveMode}
                 sidebarOnScreen={sidebarOnScreen}

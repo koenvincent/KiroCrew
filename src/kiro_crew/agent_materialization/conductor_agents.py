@@ -179,7 +179,7 @@ _SHIPPED_GRANT_HISTORY: dict[str, frozenset[str]] = {
     "kirocrew-conductor": (
         frozenset({"session", "report", "tool_search", "@kirocrew-core"})
         | _HISTORY_CORE_VERBS
-        | {"@kirocrew-core/select_crew"}
+        | {"@kirocrew-core/select_crew", "@kirocrew-core/reset_conversation"}
         | _HISTORY_DASHBOARD_VERBS
         | {"@kirocrew-dashboard/chat_folder_file_self"}
         | _HISTORY_WORK_VERBS
@@ -188,7 +188,7 @@ _SHIPPED_GRANT_HISTORY: dict[str, frozenset[str]] = {
     "kirocrew-ledger-conductor": (
         frozenset({"session", "report", "tool_search"})
         | _HISTORY_CORE_VERBS
-        | {"@kirocrew-core/select_crew"}
+        | {"@kirocrew-core/select_crew", "@kirocrew-core/reset_conversation"}
         | _HISTORY_DASHBOARD_VERBS
         | {"@kirocrew-dashboard/chat_folder_file_self"}
         | _HISTORY_WORK_VERBS

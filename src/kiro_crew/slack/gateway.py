@@ -7949,6 +7949,9 @@ class GatewayOrchestrator:
                     # An ACTIVE loop holding for an unanswered approval; the
                     # popover words it as paused.
                     "approval_stalled": bool(loop.approval_stalled),
+                    # An ACTIVE work-ledger watch holding because every open item
+                    # waits on a person; the popover says it is waiting on you.
+                    "waiting_on_person": bool(loop.waiting_on_person),
                 }
                 if is_structured_monitor_loop(loop):
                     assert loop.monitor is not None

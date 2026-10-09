@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { listLineBreakEdit, type ListLineBreakEdit } from '../components/composerListContinuation'
+import { listLineBreakEdit, listMarkerBackspaceEdit, type ListLineBreakEdit } from '../components/composerListContinuation'
 
 function apply(value: string, caret: number, edit: ListLineBreakEdit | null): string {
   if (!edit) return `${value.slice(0, caret)}\n${value.slice(caret)}`
@@ -157,5 +157,72 @@ describe('ordinal increment', () => {
     ['99999999999999999999', '99999999999999999999'],
   ])('%s. -> %s.', (input, expected) => {
     expect(breakAt(`${input}. x|`)).toBe(`${input}. x\n${expected}. `)
+  })
+})
+
+// Backspace at the `|` in `marked`, the way the composer would; returns the
+// value and the caret after it.
+function backspaceAt(marked: string): [string, number] {
+  const caret = marked.indexOf('|')
+  const value = marked.replace('|', '')
+  const edit = listMarkerBackspaceEdit(value, caret)
+  if (!edit) return [value.slice(0, caret - 1) + value.slice(caret), caret - 1]
+  return [value.slice(0, edit.start) + edit.insert + value.slice(edit.end), edit.start + edit.insert.length]
+}
+
+describe('listMarkerBackspaceEdit', () => {
+  // Every marker the Enter key continues is cleared by ONE Backspace.
+  it.each([
+    ['1. a\n2. |', '1. a\n'],
+    ['9) a\n10) |', '9) a\n'],
+    ['09. a\n10. |', '09. a\n'],
+    ['- a\n- |', '- a\n'],
+    ['* a\n* |', '* a\n'],
+    ['+ a\n+ |', '+ a\n'],
+    ['- [x] a\n- [ ] |', '- [x] a\n'],
+    ['1. [ ] a\n2. [ ] |', '1. [ ] a\n'],
+    ['  - a\n  - |', '  - a\n'],
+    ['\t1. a\n\t2. |', '\t1. a\n'],
+    ['-   a\n-   |', '-   a\n'],
+    ['- [ ]|', ''],
+  ])('clears the empty item %j in one press', (input, expected) => {
+    const [value, caret] = backspaceAt(input)
+    expect(value).toBe(expected)
+    expect(caret).toBe(expected.length)
+  })
+
+  it('keeps the text after the caret on an empty item line', () => {
+    expect(backspaceAt('1. a\n2. |\nnext')).toEqual(['1. a\n\nnext', 5])
+  })
+
+  it.each([
+    ['2. |text', 'text', 0],
+    ['- [ ] |todo', 'todo', 0],
+    ['  10) |deep', '  deep', 2],
+    ['intro\n- |item\nend', 'intro\nitem\nend', 6],
+  ])('removes only the marker of %j and keeps indent and text', (input, expected, caret) => {
+    expect(backspaceAt(input)).toEqual([expected, caret])
+  })
+
+  it.each([
+    ['2.| '],
+    ['2|. '],
+    ['- t|ext'],
+    ['plain|'],
+    ['2024.|'],
+    ['|- a'],
+    [' |- a'],
+  ])('deletes one character for %j', input => {
+    const caret = input.indexOf('|')
+    expect(listMarkerBackspaceEdit(input.replace('|', ''), caret)).toBeNull()
+  })
+
+  it('does not act with the caret inside a protected chip range', () => {
+    expect(listMarkerBackspaceEdit('- abc', 2, [{ start: 1, end: 4 }])).toBeNull()
+  })
+
+  it('rejects an out-of-range caret', () => {
+    expect(listMarkerBackspaceEdit('- ', 0)).toBeNull()
+    expect(listMarkerBackspaceEdit('- ', 3)).toBeNull()
   })
 })

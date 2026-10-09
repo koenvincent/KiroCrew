@@ -28,7 +28,7 @@ import { readBusySendDefault, setBusySendDefault, type BusySendMode } from '../.
 import { platformShortcut } from '../../utils/platform'
 import { capRoleOther, clampRoleOther } from '../../lib/userProfile'
 import { ROLE_SLUGS, TECH_SLUGS } from '../../lib/profileOptions'
-import { fmtNumber } from '../../i18n/format'
+import { fmtNumber, fmtUnit } from '../../i18n/format'
 import { normalizeHiddenModels } from '../../hooks/useInteractiveModels'
 
 import { i18nT } from '../../i18n/t'
@@ -89,6 +89,21 @@ const SOFT_STOP_MIN = 0.5
 const SOFT_STOP_MAX = 60
 const SOFT_STOP_DEFAULT = 10.0
 
+/** `dashboard.title_refresh_every_turns`: 0 is the built-in schedule, any other
+ *  value is MIN..MAX (config/sections.py TITLE_REFRESH_EVERY_TURNS_MIN / _MAX). */
+const TITLE_REFRESH_PATH = 'dashboard.title_refresh_every_turns'
+const TITLE_REFRESH_MIN = 4
+const TITLE_REFRESH_MAX = 1000
+
+/** The loader's own reading of a cadence: zero or below is the built-in schedule,
+ *  1-3 rises to the minimum, anything above the ceiling is capped. A save sends
+ *  this value, so what the row shows after a save is what the loader runs: the
+ *  PATCH gate stores any 0-1000 and leaves 1-3 to the loader. */
+function normalizeTitleRefresh(n: number): number {
+  if (!(n > 0)) return 0
+  return Math.min(TITLE_REFRESH_MAX, Math.max(TITLE_REFRESH_MIN, Math.round(n)))
+}
+
 type CompletionKeepMode = 'head' | 'tail' | 'both'
 const COMPLETION_KEEP_OPTIONS: CompletionKeepMode[] = ['head', 'tail', 'both']
 
@@ -144,9 +159,12 @@ const COMPLETION_KEEP_CHARS_MIN = 0
 const COMPLETION_KEEP_CHARS_MAX = 512000
 const COMPLETION_KEEP_CHARS_DEFAULT = 3000
 
+/** What PATCH returns beside the config when it clamped the value it was sent. */
+type ClampNotice = { requested: number; stored: number; min: number; max: number }
+
 /** Shape of the kirocrewConfig query payload this panel reads and patches. */
 type KirocrewConfigShape = {
-  session?: { autocompact_pct?: number }
+  session?: { autocompact_pct?: number; compact_wait_secs?: number }
   session_summary?: { enabled?: boolean }
   agent?: {
     model?: string
@@ -159,7 +177,7 @@ type KirocrewConfigShape = {
     fallback_model?: string
     refusal_fallback_model?: string
   }
-  dashboard?: { user_role?: string; user_role_other?: string; user_technical_level?: string; prevent_sleep?: boolean }
+  dashboard?: { user_role?: string; user_role_other?: string; user_technical_level?: string; prevent_sleep?: boolean; title_refresh_every_turns?: number }
 }
 
 function invalidRegex(pattern: string): boolean {
@@ -717,6 +735,39 @@ export function ChatPanel({ basePath }: { basePath?: string } = {}) {
     onError: () => setSaveError(i18nT('pages.settings.chatPanel.failed_to_save_session_summaries')),
   })
 
+  // ── Auto-title refresh cadence (server-side; one background call per refresh) ──
+  // The GET serializes the LOADED config, so a hand-edited 2 shows as the 4 that
+  // runs. Per-path overlay like the Model selectors, so the stepper moves at click
+  // time and a slow save cannot roll back a sibling path. A failure also bumps the
+  // banner tick: this row sits low in the Sessions card, below the fold on a short
+  // window, and a stepper that only snaps back reads as a broken control.
+  const titleRefresh = normalizeTitleRefresh(mcCfg?.dashboard?.title_refresh_every_turns ?? 0)
+  const shownTitleRefresh = overlay.shown(TITLE_REFRESH_PATH, titleRefresh)
+  const titleRefreshMut = useMutation({
+    ...overlay.mutationOpts<number>({
+      queryKey: ['kirocrewConfig'],
+      mutationFn: (v: number) => api.patchConfig(TITLE_REFRESH_PATH, v),
+      path: () => TITLE_REFRESH_PATH,
+      displayValue: v => v,
+      applyToCache: (cached, v) => setConfigPathValue(cached as KirocrewConfigShape, TITLE_REFRESH_PATH, v),
+      onFailure: () => {
+        setPathSaveError(TITLE_REFRESH_PATH, i18nT('pages.settings.chatPanel.failed_to_save_title_refresh'))
+        setChatSaveFailTick(t => t + 1)
+      },
+      onSupersede: clearOwnPathError,
+    }),
+    // Rapid clicks fire one PATCH each; a shared scope runs them in click
+    // order, so the last click is the value stored. onMutate still runs at
+    // click time, so the readout moves immediately.
+    scope: { id: TITLE_REFRESH_PATH },
+  })
+  const setTitleRefresh = (n: number) => {
+    const next = normalizeTitleRefresh(n)
+    if (next !== shownTitleRefresh) titleRefreshMut.mutate(next)
+  }
+  /** What the title-refresh readout shows for 0, the built-in schedule. */
+  const titleRefreshDefault = i18nT('pages.settings.chatPanel.title_refresh_default')
+
   // "Other" reveals a free-text role. Typed locally and committed on blur /
   // Enter so a PATCH does not fire per keystroke; seeded from the server once
   // the config query resolves, and re-seeded whenever the server value changes
@@ -840,6 +891,48 @@ export function ChatPanel({ basePath }: { basePath?: string } = {}) {
       setLocalKeepChars(
         String(mcCfg?.agent?.completion_keep_chars ?? COMPLETION_KEEP_CHARS_DEFAULT)
       )
+    },
+  })
+
+  // ── Compaction wait budget ──
+  // The server clamps an out-of-range value instead of refusing it (0 keeps
+  // the built-in budget; anything else lands in 60-3600 s), so the field shows
+  // what was saved and says why it differs from what was typed.
+  const [localWaitSecs, setLocalWaitSecs] = useState('')
+  const [waitClampNotice, setWaitClampNotice] = useState('')
+  // True only while the user holds a typed, unsaved value. An untouched field
+  // follows the server on every refetch, and a blur without an edit saves
+  // nothing, so a value saved elsewhere is never written back over.
+  const waitSecsEditedRef = useRef(false)
+  const serverWaitSecs = mcQ.data?.session?.compact_wait_secs
+  useEffect(() => {
+    if (mcQ.isSuccess && !waitSecsEditedRef.current) {
+      setLocalWaitSecs(String(serverWaitSecs ?? 0))
+    }
+  }, [mcQ.isSuccess, serverWaitSecs])
+
+  const waitSecsMut = useMutation({
+    mutationFn: (n: number) => api.patchConfig('session.compact_wait_secs', n),
+    onSuccess: (data: { clamp_notice?: ClampNotice } | undefined) => {
+      const notice = data?.clamp_notice
+      if (notice) {
+        setLocalWaitSecs(String(notice.stored))
+        setWaitClampNotice(
+          i18nT('pages.settings.chatPanel.compaction_wait_budget_clamped', {
+            requested: fmtUnit(notice.requested, 'second'),
+            stored: fmtUnit(notice.stored, 'second'),
+            min: fmtUnit(notice.min, 'second'),
+            max: fmtUnit(notice.max, 'second'),
+          }),
+        )
+      } else {
+        setWaitClampNotice('')
+      }
+      return qc.invalidateQueries({ queryKey: ['kirocrewConfig'] })
+    },
+    onError: () => {
+      setSaveError(i18nT('pages.settings.chatPanel.failed_to_save_compaction_wait_budget'))
+      setLocalWaitSecs(String(mcCfg?.session?.compact_wait_secs ?? 0))
     },
   })
 
@@ -1507,6 +1600,38 @@ export function ChatPanel({ basePath }: { basePath?: string } = {}) {
             disabled={!mcQ.isSuccess}
             configKey="session.autocompact_pct"
           />
+          <SettingsInput
+            label={i18nT('pages.settings.chatPanel.compaction_wait_budget')}
+            description={i18nT('pages.settings.chatPanel.compaction_wait_budget_description')}
+            hint={i18nT('pages.settings.chatPanel.compaction_wait_budget_hint')}
+            type="number"
+            value={localWaitSecs}
+            min={0}
+            max={3600}
+            step={30}
+            onChange={v => {
+              waitSecsEditedRef.current = true
+              setLocalWaitSecs(v)
+              setWaitClampNotice('')
+            }}
+            onBlur={() => {
+              if (!waitSecsEditedRef.current) return
+              waitSecsEditedRef.current = false
+              const saved = mcCfg?.session?.compact_wait_secs ?? 0
+              const n = Number(localWaitSecs)
+              if (localWaitSecs.trim() === '' || !Number.isFinite(n)) {
+                setLocalWaitSecs(String(saved))
+                return
+              }
+              if (n === saved) return
+              waitSecsMut.mutate(n)
+            }}
+            // Locked while a save is in flight: its result rewrites the field
+            // (the clamped value), which must never land on a newer draft.
+            disabled={!mcQ.isSuccess || waitSecsMut.isPending}
+            configKey="session.compact_wait_secs"
+          />
+          <FieldHint message={waitClampNotice} />
         </SettingsCard>
       </div>
 
@@ -1764,6 +1889,22 @@ export function ChatPanel({ basePath }: { basePath?: string } = {}) {
             <SettingsSelect label={i18nT('pages.settings.chatPanel.restore_window')} hint={i18nT('pages.settings.chatPanel.time_window_for_session_restoration')} value={String(dashCfg.restore_window_minutes)} options={RESTORE_OPTIONS} optionLabels={restoreLabels()} onChange={v => setDash({ restore_window_minutes: Number(v) })} disabled={dashDisabled} />
           )}
           <SettingsToggle label={i18nT('pages.settings.chatPanel.session_summaries')} description={i18nT('pages.settings.chatPanel.summarize_each_session_by_intent_in_the_right_pa')} hint={i18nT('pages.settings.chatPanel.summarize_each_session_by_intent_hint')} checked={summaryEnabled} onChange={v => summaryMut.mutate(v)} disabled={!mcQ.isSuccess || summaryMut.isPending} />
+          {/* 0 is the built-in schedule and reads as "Default", so + leaves it
+              for the minimum cadence, − at the minimum returns to it, and − at
+              Default is disabled: there is nothing below it. A plain +/− stepper
+              like Message Font Size, no typed input. */}
+          <SettingsStepper
+            label={i18nT('pages.settings.chatPanel.title_refresh_every_turns')}
+            description={i18nT('pages.settings.chatPanel.title_refresh_every_turns_desc')}
+            hint={i18nT('pages.settings.chatPanel.title_refresh_every_turns_hint')}
+            value={shownTitleRefresh === 0 ? titleRefreshDefault : shownTitleRefresh}
+            onIncrement={() => setTitleRefresh(shownTitleRefresh < TITLE_REFRESH_MIN ? TITLE_REFRESH_MIN : shownTitleRefresh + 1)}
+            onDecrement={() => setTitleRefresh(shownTitleRefresh <= TITLE_REFRESH_MIN ? 0 : shownTitleRefresh - 1)}
+            disabled={!mcQ.isSuccess}
+            decrementDisabled={shownTitleRefresh === 0}
+            reserveWidthFor={[titleRefreshDefault, TITLE_REFRESH_MAX]}
+            configKey="dashboard.title_refresh_every_turns"
+          />
           <SettingsToggle label={i18nT('pages.settings.chatPanel.session_card_source_links')} description={i18nT('pages.settings.chatPanel.session_card_source_links_desc')} checked={dashCfg.session_card_source_links} onChange={v => setDash({ session_card_source_links: v })} disabled={dashDisabled} />
           <SettingsToggle label={i18nT('pages.settings.chatPanel.folder_suggestions')} description={i18nT('pages.settings.chatPanel.offer_to_file_a_new_session_into_a_matching_fold')} checked={dashCfg.folder_suggestions_enabled} onChange={v => setDash({ folder_suggestions_enabled: v })} disabled={dashDisabled} />
         </SettingsCard>

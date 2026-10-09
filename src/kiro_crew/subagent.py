@@ -616,20 +616,10 @@ def _vet_remote_placement_governance(parent_session_key: str, app: str = "") -> 
             app=app,
             fail_closed=True,
         )
+        # Under an installed policy the row must be named to grant it: the
+        # catalog declares ``explicit_grant`` and ``resolve`` applies it.
         if not getattr(gate, "permitted", False):
             return getattr(gate, "reason", "remote sub-agent placement disabled by policy")
-        # Opt-in under a governed fleet: a remote child runs under the PEER's
-        # approval policy, so an installed policy written before this row existed
-        # must not be loosened from below. Omission permits every other scope;
-        # here the ceiling has to name the row (layer policy/both) to grant it.
-        from kiro_crew.platform.context import current_context
-
-        ceiling = getattr(current_context(), "governance", None)
-        if ceiling is not None and getattr(gate, "layer", "") not in ("policy", "both"):
-            return (
-                "remote sub-agent placement is not granted by the installed policy "
-                "(add capabilities.remote_spawn with enabled: true)"
-            )
         return None
     except PlatformCompositionError:
         raise

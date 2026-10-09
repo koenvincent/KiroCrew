@@ -227,6 +227,11 @@ describe('SessionAutomationPopover', () => {
     expect(screen.getByRole('button', { name: 'Resume loop and nudge now' })).toBeEnabled()
   })
 
+  it('carries a person-wait hold through the compatibility bridge', () => {
+    renderPopover({ ...activeLegacyLoop, waitingOnPerson: true })
+    expect(screen.getByTestId('auto-nudge-status')).toHaveTextContent(/^Waiting on you · /)
+  })
+
   it('clears a paused legacy loop through the bridge: the record is handed up as null and the popover closes', async () => {
     const fetchMock = vi.fn().mockResolvedValue(new Response(null, { status: 204 }))
     vi.stubGlobal('fetch', fetchMock)

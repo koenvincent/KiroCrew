@@ -1062,6 +1062,49 @@ class TestLearnAddTool:
             },
         )
 
+    def _saved_payload(self, args: dict[str, Any]) -> dict[str, Any]:
+        with patch.object(mcp_core, "_resolve_session_key", return_value="dashboard:c"):
+            with self._allowed():
+                with patch.object(mcp_core, "_post", return_value={"ok": True}) as p:
+                    _call_tool_inner("learn_add", args)
+        return p.call_args.args[1]
+
+    def test_trailing_tool_call_tags_are_stripped_from_the_rule(self) -> None:
+        # Wrapper markup leaked from the model's tool call must not be saved as
+        # part of the lesson and re-injected into every later session.
+        sent = self._saved_payload({"rule": "always X</rule></invoke>"})
+        assert sent["rule"] == "always X"
+
+    def test_a_leading_parameter_tag_is_stripped_from_the_negative(self) -> None:
+        sent = self._saved_payload(
+            {"rule": "always X", "negative": '<parameter name="negative">never Y</parameter>'}
+        )
+        assert sent["negative"] == "never Y"
+
+    def test_an_angle_bracket_inside_the_sentence_is_kept(self) -> None:
+        rule = "wrap the reply in a <details> block before posting"
+        assert self._saved_payload({"rule": rule})["rule"] == rule
+
+    def test_a_longer_tag_name_at_the_edge_is_kept(self) -> None:
+        rule = "represent each argument with <parameter-list>"
+        assert self._saved_payload({"rule": rule})["rule"] == rule
+
+    def test_a_plain_rule_is_unchanged(self) -> None:
+        assert self._saved_payload({"rule": "always X"})["rule"] == "always X"
+
+    def test_many_inner_tags_do_not_stall_the_strip(self) -> None:
+        # Inner wrapper tags split by runs of spaces once made the edge regex
+        # backtrack exponentially; a few hundred bytes hung the tool. They are
+        # inside the sentence, so they are kept, and the call returns at once.
+        rule = "x" + "  <rule>" * 2000 + "  x"
+        assert self._saved_payload({"rule": rule})["rule"] == rule
+
+    def test_a_rule_that_is_only_wrapper_tags_is_refused(self) -> None:
+        with patch.object(mcp_core, "_post", side_effect=AssertionError("no write")):
+            assert _call_tool_inner("learn_add", {"rule": "</rule></invoke>"}) == (
+                "Error: rule is required"
+            )
+
     def test_the_advertised_repo_scope_cap_tracks_the_enforced_one(self) -> None:
         # The hint must be derived from the field the validator enforces, so a
         # future cap change cannot leave the model told an obsolete limit.

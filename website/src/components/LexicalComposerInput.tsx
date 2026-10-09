@@ -24,6 +24,7 @@ import {
   COMMAND_PRIORITY_HIGH,
   COPY_COMMAND,
   CUT_COMMAND,
+  DELETE_CHARACTER_COMMAND,
   type EditorState,
   type ElementNode,
   type LexicalEditor,
@@ -54,7 +55,7 @@ import {
   hasPlainClipboardText,
   stripTrailingBlankLines,
 } from './composerPastePolicy'
-import { listLineBreakEdit } from './composerListContinuation'
+import { listLineBreakEdit, listMarkerBackspaceEdit } from './composerListContinuation'
 import {
   $createPasteTokenNode,
   $isPasteTokenNode,
@@ -111,6 +112,9 @@ interface LexicalComposerInputProps {
    *  snapshot history answers here and returns true when it handled the step.
    *  Without it Lexical's HistoryPlugin handles undo as usual. */
   onHistoryStep?: (direction: 'undo' | 'redo') => boolean
+  /** Close the host's coalescing typing burst, so a structural edit the
+   *  composer makes (a list-marker Backspace) gets its own undo step. */
+  onEndUndoBurst?: () => void
   onUploadFiles?: (files: File[]) => void
   sentMessages?: PromptHistoryItem[]
   /** Owner of `sentMessages` (the slot); a change ends prompt-history browsing. */
@@ -247,6 +251,28 @@ function $applyListLineBreak(): boolean {
   return true
 }
 
+// Remove the list marker in front of a collapsed caret in one Backspace
+// (listMarkerBackspaceEdit); false leaves the one-character delete to
+// PlainTextPlugin. One editor update, one undo step: `endUndoBurst` runs
+// before the edit so the host's typing snapshot is kept, not overwritten.
+function $applyListMarkerBackspace(endUndoBurst?: () => void): boolean {
+  const selection = $getSelection()
+  if (!$isRangeSelection(selection) || !selection.isCollapsed()) return false
+  const chips = $nodesOfType(PasteTokenNode).map(node => {
+    const start = $nodeStartOffset(node)
+    return { start, end: start + node.getTextContentSize() }
+  })
+  const edit = listMarkerBackspaceEdit($getRoot().getTextContent(), $pointOffset(selection.anchor), chips)
+  if (!edit) return false
+  endUndoBurst?.()
+  const range = $createRangeSelection()
+  $setPointAtOffset(range.anchor, edit.start)
+  $setPointAtOffset(range.focus, edit.end)
+  $setSelection(range)
+  range.removeText()
+  return true
+}
+
 function ComposerControlPlugin({
   controlRef,
   onReady,
@@ -374,8 +400,11 @@ function InteractionPlugin({
   readOnly,
   sendOnEnter,
   showFullPastes,
-}: Pick<LexicalComposerInputProps, 'blocks' | 'onBlocksChange' | 'onChange' | 'onSend' | 'onOptimizeChord' | 'onUploadFiles' | 'sentMessages' | 'historyScope' | 'onEditLastRequest' | 'disabled' | 'readOnly' | 'sendOnEnter' | 'showFullPastes'>) {
+  onEndUndoBurst,
+}: Pick<LexicalComposerInputProps, 'blocks' | 'onBlocksChange' | 'onChange' | 'onSend' | 'onOptimizeChord' | 'onUploadFiles' | 'sentMessages' | 'historyScope' | 'onEditLastRequest' | 'disabled' | 'readOnly' | 'sendOnEnter' | 'showFullPastes' | 'onEndUndoBurst'>) {
   const [editor] = useLexicalComposerContext()
+  const endUndoBurstRef = useRef(onEndUndoBurst)
+  endUndoBurstRef.current = onEndUndoBurst
   const blocksRef = useRef(blocks)
   const rawPasteRef = useRef(false)
   const historyCursorRef = useRef<PromptHistoryCursor | null>(null)
@@ -554,6 +583,18 @@ function InteractionPlugin({
       () => continueList(false),
       COMMAND_PRIORITY_HIGH,
     )
+    // Backspace (its keydown and the `deleteContentBackward` beforeinput)
+    // arrives as a backward DELETE_CHARACTER_COMMAND. Android Chrome is the
+    // exception: Lexical leaves a collapsed delete to the browser there,
+    // because Chromium Android ignores preventDefault on that event, so this
+    // handler never runs and the marker deletes one character at a time.
+    // Claiming the beforeinput instead would delete the marker and then one
+    // more character natively.
+    const unregisterMarkerBackspace = editor.registerCommand(
+      DELETE_CHARACTER_COMMAND,
+      isBackward => isBackward && !editor.isComposing() && $applyListMarkerBackspace(() => endUndoBurstRef.current?.()),
+      COMMAND_PRIORITY_HIGH,
+    )
 
     const moveAfterRecall = (value: string, position: 'start' | 'end') => {
       requestAnimationFrame(() => {
@@ -617,6 +658,7 @@ function InteractionPlugin({
       unregisterEnter()
       unregisterLineBreak()
       unregisterParagraph()
+      unregisterMarkerBackspace()
       unregisterArrowUp()
       unregisterArrowDown()
       rootListeners()
@@ -650,6 +692,7 @@ export default function LexicalComposerInput({
   onReady,
   onSelectionChange,
   onHistoryStep,
+  onEndUndoBurst,
   onUploadFiles,
   sentMessages,
   historyScope,
@@ -729,6 +772,7 @@ export default function LexicalComposerInput({
           disabled={disabled}
           readOnly={readOnly}
           sendOnEnter={sendOnEnter}
+          onEndUndoBurst={onEndUndoBurst}
         />
       </div>
     </LexicalComposer>

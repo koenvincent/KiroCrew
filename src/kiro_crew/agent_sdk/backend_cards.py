@@ -475,6 +475,13 @@ OFF_CARD_SETS: Mapping[str, str] = {
         "whether a refusal card gains a category line. Visible, and nothing a "
         "reader can act on or would pick a harness for"
     ),
+    "ACP_BACKENDS_UNATTRIBUTED_TERMINAL_ERROR": (
+        "how a harness that writes a turn's provider failure as message text is "
+        "made to report it as a failure. Every harness ends such a turn on an error "
+        "row once this is right, so a reader choosing a harness loses nothing; a "
+        "wrong membership either shows a failure as an answer or an answer as a "
+        "failure, which is a defect"
+    ),
     "ACP_BACKENDS_MODEL_EFFORT_PAIR_IDS": (
         "whether an advertised <model>[<effort>] id is applied as two writes. The "
         "model switch either lands or is refused, which its own line already says"

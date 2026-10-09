@@ -1269,6 +1269,32 @@ class TestPrivateStoreCallerIsolation:
         )
         assert state.get_slot(result["target"]) is not None
 
+    def test_an_owner_tab_pinned_to_a_member_dispatches_its_own_store_worker(
+        self, tmp_path, monkeypatch, _fresh_create_budget
+    ):
+        # The production binder, not a hand-written vouch. An ordinary `chat-` tab
+        # the owner pointed at a member is case (b) of `_member_caller`, so it is
+        # fenced and reaches only the own-store admission. That admission needs
+        # this process's vouch, and the only thing that ever binds such a tab is
+        # `_pin_private_agent_assignment`; if it publishes without vouching, every
+        # conductor tab the owner opens on a member is refused for its whole life.
+        from kiro_crew.dashboard.chat_persistence import _pin_private_agent_assignment
+        from kiro_crew.execution_context import read_vouched_session_execution
+
+        state, cfg = self._prepare(tmp_path, monkeypatch)
+        caller = state.get_or_create_slot("chat-34-1789000000")
+        key = slot_history_key(caller)
+        store = _pin_private_agent_assignment(
+            key, "radar", cfg, conversation_log=state.conversation_log
+        )
+        caller.agent = "radar"
+        caller.memory_store = store
+        vouched = read_vouched_session_execution(key)
+        assert vouched is not None and vouched.store.store_id == store
+
+        result = asyncio.run(sc.create_session(state, caller_session_key=key, agent="radar"))
+        assert state.get_slot(result["target"]) is not None
+
     def test_a_restart_self_heals_own_store_dispatch_at_the_next_gate_admission(
         self, tmp_path, monkeypatch, _fresh_create_budget
     ):

@@ -18,8 +18,8 @@ than one update function with a field allowlist:
 
   * :func:`apply_conductor_action` writes ``title``, ``acceptance``, ``state``,
     ``verdict``, ``decision``, ``worker_session_key``, ``round`` and ``fails``.
-  * :func:`apply_worker_report` writes ``status``, ``summary``, ``artifacts``,
-    ``pr`` and ``last_report_at``.
+  * :func:`apply_worker_report` writes ``status``, ``reason``, ``summary``,
+    ``artifacts``, ``pr`` and ``last_report_at``.
 
 The two field sets are disjoint. Phase 2 mounts one tool on each, so a worker cannot
 reach a conductor field because the function it can call takes no parameter that
@@ -79,8 +79,10 @@ from kiro_crew.session_ledger import (
     unlink_lock_in_hold,
 )
 from kiro_crew.work_vocab import (
+    WORK_BLOCKED_REASONS,
     WORK_FOLD_NAME,
     WORK_ITEM_STATES,
+    WORK_REASON_STATUSES,
     WORK_STORED_ITEM_LIMIT,
     WORK_VERDICTS,
     WORK_WORKER_STATUSES,
@@ -111,6 +113,9 @@ VERDICTS: frozenset[str] = frozenset(WORK_VERDICTS)
 #: What a worker may say about itself. ``blocked`` and ``question`` are separate
 #: because they differ in WHO must act: an external dependency versus the conductor.
 WORKER_STATUSES: frozenset[str] = frozenset(WORK_WORKER_STATUSES)
+
+#: Why a ``blocked`` / ``question`` report is stuck; see :data:`WORK_BLOCKED_REASONS`.
+BLOCKED_REASONS: frozenset[str] = frozenset(WORK_BLOCKED_REASONS)
 
 #: The statuses from which a report gap still means "the WORKER went quiet", which is
 #: the only thing :func:`is_stale` exists to surface. ``done`` is deliberately absent:
@@ -342,7 +347,8 @@ class WorkItem:
 
     Conductor-owned: ``title``, ``acceptance``, ``state``, ``verdict``, ``decision``,
     ``worker_session_key``, ``round``, ``fails``.
-    Worker-owned: ``status``, ``summary``, ``artifacts``, ``pr``, ``last_report_at``.
+    Worker-owned: ``status``, ``reason``, ``summary``, ``artifacts``, ``pr``,
+    ``last_report_at``.
     Server-owned: ``item_id``, ``created_at``, ``closed_at``.
 
     ``orphaned`` and ``stale`` are NOT fields. They are derived at read time by
@@ -361,6 +367,9 @@ class WorkItem:
     round: int = 0
     fails: int = 0
     status: str | None = None
+    #: Why a ``blocked`` / ``question`` report is stuck (:data:`BLOCKED_REASONS`), or
+    #: ``None``. Every report replaces it, so one without a reason clears it.
+    reason: str | None = None
     summary: str = ""
     artifacts: dict[str, str] = field(default_factory=dict)
     pr: int | None = None
@@ -390,6 +399,7 @@ class WorkItem:
             "round": self.round,
             "fails": self.fails,
             "status": self.status,
+            "reason": self.reason,
             "summary": self.summary,
             "artifacts": self.artifacts,
             "pr": self.pr,
@@ -408,6 +418,7 @@ class WorkItem:
             return cls()
         state = _as_str(raw.get("state"))
         status = _as_opt_str(raw.get("status"))
+        reason = _as_opt_str(raw.get("reason"))
         verdict = _as_opt_str(raw.get("verdict"))
         artifacts_raw = raw.get("artifacts")
         artifacts: dict[str, str] = {}
@@ -424,6 +435,7 @@ class WorkItem:
             round=_as_int(raw.get("round"), 0),
             fails=_as_int(raw.get("fails"), 0),
             status=status if status in WORKER_STATUSES else None,
+            reason=reason if reason in BLOCKED_REASONS else None,
             summary=_as_str(raw.get("summary")),
             artifacts=artifacts,
             pr=_finite_int(raw.get("pr")),
@@ -2111,9 +2123,13 @@ def apply_worker_report(
     summary: Any,
     artifacts: Any = None,
     pr: Any = None,
+    reason: Any = None,
 ) -> dict[str, Any]:
-    """Write the fields the WORKER owns: ``status``, ``summary``, ``artifacts``,
-    ``pr`` and ``last_report_at``. Nothing else is reachable from here.
+    """Write the fields the WORKER owns: ``status``, ``reason``, ``summary``,
+    ``artifacts``, ``pr`` and ``last_report_at``. Nothing else is reachable from here.
+
+    ``reason`` rides only on ``blocked`` / ``question`` and is replaced by every
+    report, so a later report without one clears it.
 
     There is no ``verdict``, ``state``, ``acceptance``, ``decision`` or ``round``
     parameter, so a worker cannot mark itself accepted or widen its own bar — the
@@ -2134,6 +2150,15 @@ def apply_worker_report(
     checked_summary = _require_text(summary, MAX_SUMMARY_CHARS, "summary")
     checked_artifacts = _require_artifacts(artifacts)
     checked_pr = _require_pr(pr)
+    checked_reason: str | None = None
+    if reason is not None:
+        checked_reason = _require_choice(reason, BLOCKED_REASONS, "reason", CODE_INVALID_VALUE)
+        if checked_status not in WORK_REASON_STATUSES:
+            raise WorkLedgerError(
+                "reason is allowed only with status blocked or question",
+                code=CODE_INVALID_VALUE,
+                field="reason",
+            )
     checked_id = _require_item_id(item_id)
 
     with item_lock(slot_key, checked_id, create=False):
@@ -2145,6 +2170,7 @@ def apply_worker_report(
         if item.is_terminal:
             raise WorkLedgerError(f"item {checked_id!r} is {item.state}", code=CODE_ITEM_CLOSED)
         item.status = checked_status
+        item.reason = checked_reason
         item.summary = checked_summary
         item.artifacts = checked_artifacts
         if checked_pr is not None:

@@ -38,6 +38,7 @@ import logging
 from typing import Callable
 
 from kiro_crew import irq, ledger_wake, work_ledger
+from kiro_crew.work_vocab import WORK_BLOCKED_REASONS, WORK_REASON_STATUSES
 
 logger = logging.getLogger(__name__)
 
@@ -203,22 +204,14 @@ class WorkLedgerProbe(irq.Probe):
             stored = len(items)
         all_readable = stored <= len(items)
         newest: dict[str, str] = {}
-        newest_report: dict[str, str] = {}
         tails: dict[str, list[work_ledger.WorkEvent]] = {}
         for item in items:
             events = work_ledger.read_events(key, item.item_id, limit=_EVENT_TAIL)
             tails[item.item_id] = events
             if events:
                 newest[item.item_id] = events[-1].id
-            if item.last_report_at:
-                # The item's WORKER-OWNED fields, not the event tail: eight conductor
-                # writes would push the newest report out of a tail and move this
-                # without any worker saying anything.
-                newest_report[item.item_id] = json.dumps(
-                    [item.last_report_at, item.status, item.summary], default=str
-                )
         epoch = ledger_wake.revision(newest)
-        self.revision = ledger_wake.revision(newest_report) or _NO_REPORTS
+        self.revision = worker_report_revision(items)
 
         if items and all_readable and all(item.is_terminal for item in items):
             # Every item closed means the goal this ledger serves is finished, so
@@ -385,6 +378,76 @@ def has_open_items(conductor_key: str) -> bool:
     except Exception:  # noqa: BLE001 - a read fault must leave the bound in force
         logger.debug("work-ledger probe: open-items read failed for %s", conductor_key)
         return False
+
+
+def worker_report_revision(items: list[work_ledger.WorkItem]) -> str:
+    """A digest of each item's newest WORKER report: the one rule both readers share.
+
+    The quiet floor (:attr:`WorkLedgerProbe.revision`) and the person-wait hold
+    (:func:`person_wait_fingerprint`) both ask "has a worker said anything since the
+    conductor last looked?", so both read this. Worker-owned fields only, not the
+    event tail: the conductor's own writes are things it already knows, and eight of
+    them would push the newest report out of a tail. Every report moves
+    ``last_report_at``, so a report that repeats the last one still counts. A ledger
+    with no report yet answers :data:`_NO_REPORTS`, never empty.
+    """
+    newest_report: dict[str, str] = {}
+    for item in items:
+        if item.last_report_at:
+            newest_report[item.item_id] = json.dumps(
+                [item.last_report_at, item.status, item.summary], default=str
+            )
+    return ledger_wake.revision(newest_report) or _NO_REPORTS
+
+
+def person_wait_fingerprint(
+    conductor_key: str, *, worker_closed: Callable[[str], bool] | None = None
+) -> str | None:
+    """The ledger's fingerprint when every open item waits on a person, else ``None``.
+
+    What the AutoNudge timer asks before a work-ledger watch spends a turn: an open
+    item that is ``blocked`` or ``question`` with a ``reason`` of ``approval`` or
+    ``needs_human`` cannot move until someone acts, and when every open item is one,
+    the patrol has nothing to read that its last turn did not. The fingerprint IS
+    :func:`worker_report_revision`, the digest the quiet floor uses, so a worker's
+    report -- even one that stays blocked, because ``last_report_at`` moves -- changes
+    it and the conductor's own writes do not. The timer holds only while it equals the
+    copy taken at the loop's last delivered turn (``ledger_seen_fp``), which the timer
+    keeps apart from the floor's ``ledger_delivered_revision`` because the two are
+    forgotten at different times: the hold's copy is read at the top of the tick and
+    cleared when a cycle never starts, fails, or a person presses Nudge.
+
+    An item whose worker session is gone (*worker_closed*) is not a wait on a person:
+    nobody is left to answer its approval, so the patrol must run and the probe's
+    stall wake must reach the conductor.
+
+    Positive evidence only, like :func:`has_open_items`: no open item, a torn item
+    file, an unreadable header or a read that raises all answer ``None``, so doubt
+    leaves the loop firing as it always has. Blocking file reads; call it off-loop.
+    """
+    try:
+        record = work_ledger.read_conductor(conductor_key)
+        if record is None:
+            return None
+        items = work_ledger.list_work_items(conductor_key)
+        stored = sum(1 for _ in work_ledger.items_dir(conductor_key).glob("it_*.json"))
+        if stored > len(items):
+            return None
+        open_items = [item for item in items if not item.is_terminal]
+        if not open_items:
+            return None
+        if not all(
+            item.status in WORK_REASON_STATUSES and item.reason in WORK_BLOCKED_REASONS
+            for item in open_items
+        ):
+            return None
+        closed = worker_closed or _always_open
+        if any(closed(item.worker_session_key or "") for item in open_items):
+            return None
+        return worker_report_revision(items)
+    except Exception:  # noqa: BLE001 - a read fault must never hold a patrol
+        logger.debug("work-ledger probe: person-wait read failed for %s", conductor_key)
+        return None
 
 
 def _conductor_key(raw: object) -> str:

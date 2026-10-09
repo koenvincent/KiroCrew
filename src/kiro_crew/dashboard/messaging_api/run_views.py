@@ -242,6 +242,15 @@ async def api_spawn_status(request: web.Request) -> web.Response:
         # separate `spawn list` or a log grep.
         if _awaiting_spawn_approval(info):
             data["awaiting_approval"] = True
+        if getattr(info, "approval_floor", "") == "interactive":
+            # A floored run's tool requests wait for the remote hub's person;
+            # the hub reads them here and answers on .../approvals/{id}.
+            from kiro_crew.subagent_manager.hub_approvals import pending_for
+
+            data["approvals"] = [
+                {key: value if key == "id" else _redact(value) for key, value in item.items()}
+                for item in pending_for(info.id)
+            ]
     return web.json_response(data)
 
 

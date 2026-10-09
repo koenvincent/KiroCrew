@@ -109,7 +109,7 @@ describe('the facade composition', () => {
   // The owner hooks in the order the facade calls them. Each sits where its block sat
   // before the owners were extracted, which is what keeps React's effect order.
   const CALL_ORDER = [
-    'useSessionSources', 'useDebouncedSessionSearch', 'useSessionRename', 'useSidebarLane',
+    'useSessionSources', 'useDebouncedSessionSearch', 'useSessionRename', 'useSessionAutoTitle', 'useSidebarLane',
     'useSessionFilterState', 'useSessionStatusFilters', 'useHistoryPane', 'usePinnedSessionOrder',
     'useStaleCollapse', 'useFolderSort', 'useFolderRename', 'useSidebarTags',
     'useBoardColumns', 'useSidebarResize', 'usePinnedOrderAuthority', 'useColumnPopover', 'useBoardColumnMutations',

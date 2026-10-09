@@ -485,7 +485,7 @@ re-enable unexpired sessions previously revoked by `kirocrew logout`.
 
 An **app token** (payload carries a non-empty `app` claim, minted by the `X-App-Secret` exchange at `POST /api/apps/<name>/token`) must not have the same reach as a dashboard-user token. `_enforce_app_scope(request, app_name, path)` applies least privilege, **deny-by-default**:
 
-- An app token may access **only** (1) its **own namespace** — `/apps/<name>/...` and `/api/apps/<name>/...`, matched on a path boundary so app `foo` cannot reach app `foo-bar` — and (2) the API path prefixes the app declared in its manifest `permissions.api` allowlist (`_app_api_allowlist`, cached ~30s; any load failure returns an empty tuple → confined to its own namespace only). Everything else is a 403 with an `app_scope_check` SEL audit event.
+- An app token may access **only** (1) its **own namespace** — `/apps/<name>/...` and `/api/apps/<name>/...`, matched on a path boundary so app `foo` cannot reach app `foo-bar` — and (2) the API path prefixes the app declared in its manifest `permissions.api` allowlist (`_app_api_allowlist`, cached ~30s; any load failure returns an empty tuple → confined to its own namespace only; entries an update added stay out until the owner approves them, see `approved-grants.json` in app-kit-platform §13). Everything else is a 403 with an `app_scope_check` SEL audit event.
 - It is enforced in **every** middleware branch that admits a token (the normal cookie/query-param flow and the cross-app `/apps/<other>/api` reverse-proxy re-check) — otherwise an app token could reach a mixed internal path (e.g. `/api/chat`, `/api/spawn`) with no app identity set and be mistaken for the dashboard user (privilege escalation).
 - It is a **no-op for dashboard-user tokens** (empty `app` claim), which bypass the gate entirely.
 
@@ -877,7 +877,11 @@ tries the same refresh and, when it fails, hands recovery to its hub instead of
 raising the banner. A 401 or 403 without the header whose
 body is an HTML document came from a proxy in front of the gateway; the client
 words it through `website/src/api/edgeAuthChallenge.ts` and never offers the
-token flow, which could not clear it.
+token flow, which could not clear it. In a top-level document that refusal also
+raises the same fixed banner the gateway denial uses, with the reload instruction
+and a reload button in place of the token field; it shares that banner's latch,
+so the first 2xx clears it. An embedded pane raises nothing, because its message
+already names where to sign in.
 
 > **Note:** the *No token* / *Expired token* / *Invalid HMAC signature* rows above apply to `/api/*`, `/apps/*`, and non-`GET`/`HEAD` requests. A non-API `GET`/`HEAD` navigation in those same states is instead served the public SPA shell (200) so the app can cold-start its refresh flow — see *SPA Shell Bypass (cold-start recovery)*. `IP mismatch` is **not** relaxed: it remains a hard 403 (theft signal).
 

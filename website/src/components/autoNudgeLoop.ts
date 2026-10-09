@@ -46,6 +46,11 @@ export interface AutoNudgeLoop {
    *  fires it, then resumes by itself. Carried by the REST list (`asdict(loop)`)
    *  and the `autonudge_state` frame; `undefined` reads as not held. */
   approval_stalled?: boolean
+  /** True while an ACTIVE work-ledger watch holds because every open item waits
+   *  on a person and nothing moved since its last turn. It fires nothing until
+   *  the ledger changes. Carried by the REST list and the `autonudge_state`
+   *  frame; `undefined` reads as not held. */
+  waiting_on_person?: boolean
   /** Short stand-in for `message` in the visible transcript row; '' = none. */
   banner?: string
   /** The kill-switch file the server substitutes for `{{STOP_FILE}}` at fire

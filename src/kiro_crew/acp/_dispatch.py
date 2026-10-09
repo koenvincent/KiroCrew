@@ -876,6 +876,93 @@ def parse_claude_compaction_notice(chunk: str) -> tuple[str, str] | None:
     return None
 
 
+# codex-acp writes a few notices of its own as unattributed message text for a
+# client without AIR or ``session.notices``: ``createWarningEvent``,
+# ``createConfigWarningEvent`` and ``createContextCompactedEvent``. They are
+# never a turn's failure, so they are delivered as they arrive rather than held.
+# A prompt the adapter parses as a slash command (``parseCommand``: the first
+# text block, trimmed, starts with ``/``) is excluded wholesale by the caller,
+# because command output and the ``/review`` result are unattributed text too.
+_CODEX_ADAPTER_NOTICE_PREFIXES = ("Warning: ", "Config warning: ", "*Context compacted")
+
+
+def is_unattributed_error_candidate(event: AcpEvent) -> bool:
+    """Whether *event* may be a provider failure that codex-acp wrote as text.
+
+    True for a text chunk that named no ``messageId`` and is not one of the
+    adapter's fixed notices. Read only for a harness in
+    ``ACP_BACKENDS_UNATTRIBUTED_TERMINAL_ERROR``, and only on a prompt the
+    adapter did not take as a slash command; see ``AcpSessionHandle._run_turn``.
+    """
+    return (
+        event.kind == EVENT_TEXT_CHUNK
+        and event.unattributed
+        and not event.text.startswith(_CODEX_ADAPTER_NOTICE_PREFIXES)
+    )
+
+
+def prompt_is_adapter_command(params: dict[str, Any]) -> bool:
+    """Whether codex-acp will parse this ``session/prompt`` as a slash command.
+
+    The adapter's own test (``parseCommand``): the FIRST content block is text
+    and, trimmed, starts with ``/``.
+    """
+    blocks = params.get("prompt") if isinstance(params, dict) else None
+    if not isinstance(blocks, list) or not blocks:
+        return False
+    first = blocks[0]
+    if not isinstance(first, dict) or first.get("type") != "text":
+        return False
+    return str(first.get("text") or "").strip().startswith("/")
+
+
+def _service_error_detail(text: str) -> str:
+    """The provider message inside codex's service-error envelope, or *text*.
+
+    codex-acp before 2.1 forwards the provider body verbatim, for example
+    ``{"type":"error","error":{"message":"...","type":"invalid_request_error"},
+    "status":400}``; 2.1 unwraps the same envelope to its message itself. The
+    HTTP status is kept beside the message so the shared classifier reads the
+    same evidence it reads for every other harness: a 5xx is transient there and
+    a 4xx is not.
+    """
+    try:
+        value = json.loads(text)
+    except ValueError:
+        return text
+    if not isinstance(value, dict) or value.get("type") != "error":
+        return text
+    error = value.get("error")
+    status = value.get("status")
+    if not isinstance(error, dict) or isinstance(status, bool) or not isinstance(status, int):
+        return text
+    message = error.get("message")
+    if not isinstance(message, str) or not message.strip():
+        return text
+    return f"{message.strip()} (HTTP {status})"
+
+
+def unattributed_terminal_error(texts: list[str]) -> dict[str, Any] | None:
+    """The JSON-RPC-shaped error for a turn that ended on adapter-written text.
+
+    *texts* are the held candidate chunks of one turn, in order. codex-acp's
+    ``createErrorEvent`` writes each terminal error as ONE chunk, the message
+    followed by a blank line, so a run that is not made only of such chunks is
+    streamed prose from somewhere else and returns ``None``: the caller then
+    delivers it as text, which is what every turn did before this check. A
+    repeated error (the native notification and a duplicate of it) is reported
+    once.
+
+    The result has the shape a backend's own error response has, so it goes
+    through ``_raise_acp_error`` and gets the same wording and the same retry
+    verdict as any other harness's provider failure.
+    """
+    if not texts or any(not t.endswith("\n\n") or not t.strip() for t in texts):
+        return None
+    distinct = list(dict.fromkeys(_service_error_detail(t.strip()) for t in texts))
+    return {"code": -32603, "message": "Internal error", "data": "; ".join(distinct)}
+
+
 #: How many launch labels one session's record keeps for the recycle notice. A
 #: session can launch any number of background tasks; the notice names the
 #: newest few, and the record stays bounded however many it saw.

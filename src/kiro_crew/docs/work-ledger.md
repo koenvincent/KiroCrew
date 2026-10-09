@@ -47,6 +47,7 @@ An item is the unit of dispatch. It holds:
 | `fails` | conductor | how many acceptance attempts came back `fail` |
 | `state` | conductor | `open`, or terminal: `accepted` / `rejected` / `abandoned` |
 | `status` | worker | `progress` / `done` / `blocked` / `question` |
+| `reason` | worker | on `blocked` / `question`, when only a person can move it: `approval` / `needs_human` |
 | `summary` | worker | the worker's own account, up to 500 chars |
 | `artifacts` | worker | pointers to what it produced |
 | `pr` | worker | a pull-request number it produced |
@@ -162,6 +163,16 @@ One call, four statuses:
 **`blocked` and `question` differ by who must act.** That is why they are
 separate values and not one "stuck". A build the worker does not control is
 `blocked`; a choice only the conductor can make is `question`.
+
+**`reason` says when a `blocked` or `question` report waits on a person.**
+`approval` means a tool approval timed out or is waiting, and `needs_human`
+means only a person can unblock it. A wait on a build, service or other item
+carries no reason. It is refused on `progress` and `done`, and every report
+replaces it. When every open item waits on a person (`approval` or
+`needs_human`) and nothing on the ledger changed since the conductor's last
+turn, the conductor's `work-ledger` watch holds: no turns, no extension, and
+the goal popover says it is waiting on you. A worker's new report releases it;
+the conductor's own writes do not.
 
 Reports belong at real milestones, not on a timer.
 `summary` is capped at 500 characters.

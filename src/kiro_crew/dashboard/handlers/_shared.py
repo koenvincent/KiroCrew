@@ -1542,20 +1542,73 @@ def _get_memory(state: DashboardState):
     return state._standalone_memory  # type: ignore[attr-defined]
 
 
-def _get_active_workspace(state: DashboardState) -> str:
-    """Return the workspace of the most recently active chat slot, or 'default'."""
-    slots = getattr(state, "_slots", {})
-    if slots:
-        # Pick the slot with the most messages (most active)
-        best = max(slots.values(), key=lambda s: s.total_messages, default=None)
-        if best and best.workspace and best.workspace != "default":
-            return best.workspace
+def _lesson_caller_slot_key(state: DashboardState, session_key: str) -> str:
+    """Map a lesson caller's session key to its slot key, or ``""``.
+
+    Delegates to :func:`session_control.caller_slot_key` for the shared
+    resolution (history key, slot key, transcript stem) and adds ONLY a
+    fallback that matches each slot's :func:`effective_session_key`, so a
+    channel-born slot surfaced without a session-map binding -- whose turns run
+    on ``dashboard:<slot>`` -- still resolves to its own workspace.
+
+    That extra match belongs ONLY to the lesson read/write path, which is why
+    it lives here rather than in ``caller_slot_key``: widening the latter would
+    also change the ``authorize_target`` self-target guard that every
+    session-control verb consults, which this bug does not touch.
+    """
+    if not session_key:
+        return ""
+    from kiro_crew.dashboard import session_control
+
+    resolved = session_control.caller_slot_key(state, session_key)
+    if resolved:
+        return resolved
+    # Lazy, like the other session_control imports in this module.
+    from kiro_crew.dashboard.chat_utils import effective_session_key
+
+    for slot in list(getattr(state, "_slots", {}).values()):
+        try:
+            if session_key == effective_session_key(slot):
+                return slot.key
+        except Exception:
+            continue
+    return ""
+
+
+def _get_active_workspace(state: DashboardState, session_key: str = "") -> str:
+    """Return the REQUESTING session's workspace, or 'default'.
+
+    Resolution is per-session: *session_key* names the chat slot making the
+    call, and that slot's own ``workspace`` is returned. Falling back to
+    ``'default'`` is the ONLY fallback -- never to another session's workspace.
+
+    A global "which slot is busiest" value is not a safe source for this: it
+    would route every session's workspace-scoped lesson reads and writes into
+    whichever workspace happens to be most active, crossing workspace
+    boundaries.
+
+    A caller with no session key (``session_key`` empty) or whose slot cannot
+    be found (headless/standalone, or a slot that does not exist) resolves to
+    ``'default'``. The slot is resolved through the lessons-local
+    :func:`_lesson_caller_slot_key`, not ``session_control.caller_slot_key``, so
+    the session-control self-target guard is unaffected by this path.
+    """
+    slot = state.get_slot(_lesson_caller_slot_key(state, session_key)) if session_key else None
+    ws = getattr(slot, "workspace", None) if slot is not None else None
+    if ws and ws != "default":
+        return ws
     return "default"
 
 
-def _get_lessons(state: DashboardState, workspace: str | None = None):
-    """Get LessonStore for a workspace. Falls back to global."""
-    ws = workspace or _get_active_workspace(state)
+def _get_lessons(state: DashboardState, workspace: str | None = None, *, session_key: str = ""):
+    """Get LessonStore for a workspace. Falls back to the requesting session.
+
+    *workspace* wins when the caller names one explicitly; otherwise the
+    workspace is resolved from *session_key* (the requesting slot), never from a
+    global heuristic. Both resolve to the global store ('default') when nothing
+    names a non-default workspace.
+    """
+    ws = workspace or _get_active_workspace(state, session_key)
     if ws != "default" and state.context_builder:
         return state.context_builder.get_lessons_for(ws)
     return state.lessons

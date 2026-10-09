@@ -969,6 +969,22 @@ jobs:
           # a site that does not.
           READ_FAILURE_TOKEN="[read-failed]"
           read_failure=false
+          # ONE stable token marks a pending that an advisory lane owes this
+          # head a verdict it computed and could not publish -- the
+          # `(verdict not published, re-run this lane)` state scored below. It
+          # is the opposite of a read-failure pending in what RESOLVES it: a
+          # recompute of PR Readiness re-derives the same verdict (the lane's
+          # own check-run is already `success`, so there is no new evidence),
+          # and only RE-RUNNING THE LANE republishes the withheld verdict. So
+          # the token tells the self-heal sweep to re-fire that lane rather than
+          # this aggregator. It rides the description FIRST for the same reason
+          # the read-failure token does -- the API caps a description at 140
+          # characters and cuts the tail -- and a token not a sentence so
+          # pr-readiness-sweep.yml matches a literal, never a phrasing. Every
+          # arm that scores `(verdict not published, ...)` sets this flag, and
+          # test_pr_readiness_sweep.py fails a site that does not.
+          VERDICT_UNPUBLISHED_TOKEN="[verdict-unpublished]"
+          verdict_unpublished=false
           passed=()
           pending=()
           failed=()
@@ -1255,6 +1271,7 @@ jobs:
                   failed+=("$label (BLOCK)")
                 elif [ "$pass" -gt 0 ]; then
                   if [ "$(advisory_slot_unpublished "$label")" = "1" ]; then
+                    verdict_unpublished=true
                     pending+=("$label (verdict not published, re-run this lane)")
                   else
                     passed+=("$label")
@@ -1421,6 +1438,7 @@ jobs:
                   skipped) passed+=("$label") ;;
                   success|neutral)
                     if [ "$(advisory_slot_unpublished "$label")" = "1" ]; then
+                      verdict_unpublished=true
                       pending+=("$label (verdict not published, re-run this lane)")
                     else
                       passed+=("$label")
@@ -1673,9 +1691,18 @@ jobs:
             # A read-failure pending reaches the sweep through this generic
             # description too, so the token leads this one as well, and the
             # names budget below pays for it so the total still fits the cap.
+            # An unpublished-verdict pending rides the same way, by its
+            # own token: it tells the sweep to re-run the owing LANE rather than
+            # re-fire this aggregator, which is the only thing that republishes
+            # the withheld verdict. Both can hold at once (a transient read
+            # failed on a PR that also owes a verdict), so both tokens lead when
+            # they do; the names budget below shrinks to keep the 140-char cap.
             prefix=""
             if [ "$read_failure" = "true" ]; then
               prefix="$READ_FAILURE_TOKEN "
+            fi
+            if [ "$verdict_unpublished" = "true" ]; then
+              prefix="$prefix$VERDICT_UNPUBLISHED_TOKEN "
             fi
             names_budget=$(( 70 - ${#prefix} ))
             names=""

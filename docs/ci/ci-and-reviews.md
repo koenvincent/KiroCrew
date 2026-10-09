@@ -1770,7 +1770,9 @@ An issue that is closed as not planned, or loses its tier or `triaged` label, af
 last `opened` / `synchronize` / `reopened` / `edited` / `labeled` / `unlabeled` event
 and before merge is not re-read: no issue-side event re-runs a `pull_request`
 lane, and `pr-readiness-sweep.yml` re-fires the readiness recompute, not the
-lanes. Both reversals are deliberate maintainer writes that no workflow in
+Issue Gate lane (its advisory-review re-run path, #13100, covers only the three
+whole-design lanes). Both reversals are deliberate maintainer writes that no
+workflow in
 `.github/` performs, the window closes on any PR activity, and the remedy is a
 revert; an issue-side revalidation lane (a reverse index from issue to the open
 PRs declaring it, plus a write path to re-dispatch their gate runs) would exist for
@@ -2362,6 +2364,41 @@ revision is reachable from the revision alone, and a second run on the same head
 adds a record beside the first. The two Security Scope lanes upload it only when
 their scrub step reported `scrub_ok=true`. A warning or error caused by a failed
 comment read appends `Cause of the failed comment read: <cause>`.
+
+#### A withheld advisory verdict is re-run and republished (#13100)
+
+Retaining the verdict (above) keeps it from being lost, but on its own it never
+reaches the pull request: nothing re-ran the lane, so a whole-design advisory
+lane -- Design, UX, First Principles -- that withheld its verdict left the PR
+reading as unreviewed for its own head until a human noticed. The self-heal
+sweep now closes that. When an advisory lane completes `success` but its comment
+slot still carries an older head's verdict, `pr-readiness.yml` scores the lane as
+a named pending (`<Lane> (verdict not published, re-run this lane)`) and stamps
+`[verdict-unpublished]` first on the readiness status description -- the same
+place and the same reason the `[read-failed]` token rides there. `pr_status.py`'s
+`evaluate_reviewer_markers` (the one predicate both gates answer from) is what
+decides a lane owes the head a verdict, so the required status and the local gate
+cannot disagree about it.
+
+`pr-readiness-sweep.yml` reads that token on a stale pending and, instead of
+re-firing the aggregator (which would only re-derive the same named pending,
+because the lane's own check-run is already `success`), runs
+`.github/scripts/republish_withheld_verdict.py`. That script asks the disposition
+gate which advisory lanes are owed, locates each owing lane's run -- the
+same-repo `pull_request` run by head, or the fork Stage-2 run via its
+`<!-- ai-review-fork-lane run=<id> -->` check-run marker, exactly as the
+human-override handler does -- and `gh run rerun`s it. The re-run recomputes a
+fresh verdict and republishes it through the lanes' own guarded comment upsert,
+whose authority rule is unchanged (it replaces only an older head's occupant and
+stands down on a current-head one), so the recovery adds no new trust surface. It
+is scoped to the three advisory lanes: the required reviewer lanes (Opus, GPT,
+Security Scope) fail CLOSED on a withheld verdict and are recovered by their own
+check-run finalize, never read as a stale `success`.
+
+Self-terminating: once a re-run republishes, the lane leaves the gate's
+`unpublished` set, the token clears, and the next sweep does nothing; a re-run
+still in flight carries an `in_progress` check-run that readiness scores
+`(not started)`, so the window between dispatch and republish re-fires nothing.
 
 ### Security posture of the reviewer jobs
 

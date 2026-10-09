@@ -23,6 +23,7 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     from kiro_crew.hooks import (
         _GATE_TIER_KINDS,
+        _HOST_READ_ONLY_BUILTIN_ALIASES,
         _READ_ONLY_TOOL_KINDS,
         GateRule,
         GateTier,
@@ -276,6 +277,15 @@ class GateFacts:
                 targets.append(self.canonical_mcp_name)
             if call.mcp_tool and call.mcp_tool not in targets:
                 targets.append(call.mcp_tool)
+            # kiro-cli stamps ``read`` where a rule is written ``fs_read``; the
+            # read-only proof resolves that alias, so a rule must reach it too.
+            # Built-ins only: a server's own tool called ``read`` is not the
+            # host's file reader, and the proof excludes it the same way.
+            alias = (
+                "" if call.mcp_server else _HOST_READ_ONLY_BUILTIN_ALIASES.get(call.mcp_tool, "")
+            )
+            if alias and alias not in targets:
+                targets.append(alias)
             if call.command:
                 targets.append(call.command)
             for raw_command in self.raw_shell_commands:
@@ -650,6 +660,13 @@ def _tier_governance(facts: GateFacts, tier: GateTier) -> ToolHookResult | None:
     deny on any identity denies the call.
     """
     call = facts.call
+    # The trusted name and, where kiro-cli stamped an alias (``read``) on a
+    # built-in, the spelling a rule is written in (``fs_read``) -- the same
+    # spelling the read-only proof resolves it to. A server's own ``read`` is
+    # not the host's file reader and gets no alias. Both in the one query;
+    # neither repeats the title.
+    alias = "" if call.mcp_server else _HOST_READ_ONLY_BUILTIN_ALIASES.get(call.mcp_tool, "")
+    extra_titles = tuple(name for name in (call.mcp_tool, alias) if name and name != call.title)
     gov_reason = _governance_denial(
         facts.ctx,
         call.title,
@@ -660,7 +677,7 @@ def _tier_governance(facts: GateFacts, tier: GateTier) -> ToolHookResult | None:
         call.raw_params,
         diff_path=call.diff_path,
         mcp_ref=facts.governance_mcp_ref,
-        extra_titles=(call.mcp_tool,) if call.mcp_tool and call.mcp_tool != call.title else (),
+        extra_titles=extra_titles,
         spawn_target=call.spawn_target,
     )
     if gov_reason:

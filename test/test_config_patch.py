@@ -636,6 +636,79 @@ class TestFolderSortRoundTrip:
         assert field.default == FOLDER_SORT_DEFAULT == "custom"
 
 
+# ── Auto-title refresh cadence (dashboard.title_refresh_every_turns) ─────
+
+
+class TestTitleRefreshEveryTurns:
+    """Settings → Chat → Sessions → "Auto-title refresh interval (turns)".
+
+    The row reads its value back from GET /api/config/kirocrew, which serializes
+    the LOADED config, so a stored value must load as the cadence chat_title runs.
+    """
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("value", [0, 4, 5, 1000])
+    async def test_a_value_round_trips_through_the_config_file(self, tmp_config, value) -> None:
+        from kiro_crew.config.loader import KiroCrewConfig
+
+        async with TestClient(TestServer(_make_app())) as c:
+            resp = await _patch(c, "dashboard.title_refresh_every_turns", value)
+            assert resp.status == 200, await resp.text()
+        stored = json.loads(tmp_config.read_text(encoding="utf-8"))
+        assert stored["dashboard"]["title_refresh_every_turns"] == value
+        assert KiroCrewConfig.load().dashboard.title_refresh_every_turns == value
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("low", [1, 2, 3])
+    async def test_one_to_three_is_stored_and_the_loader_raises_it(self, tmp_config, low) -> None:
+        # The gate admits the loader's whole domain, so a PATCH of 2 stores 2 the
+        # way `kirocrew config set` would, and the loader raises it to the minimum.
+        # The row reads back the loaded 4, the cadence that runs.
+        from kiro_crew.config.loader import KiroCrewConfig
+        from kiro_crew.config.sections import TITLE_REFRESH_EVERY_TURNS_MIN
+
+        async with TestClient(TestServer(_make_app())) as c:
+            resp = await _patch(c, "dashboard.title_refresh_every_turns", low)
+            assert resp.status == 200, await resp.text()
+        stored = json.loads(tmp_config.read_text(encoding="utf-8"))
+        assert stored["dashboard"]["title_refresh_every_turns"] == low
+        assert (
+            KiroCrewConfig.load().dashboard.title_refresh_every_turns
+            == TITLE_REFRESH_EVERY_TURNS_MIN
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_bad_value_is_refused_and_the_file_untouched(self, tmp_config) -> None:
+        from kiro_crew.config.loader import KiroCrewConfig
+        from kiro_crew.config.sections import TITLE_REFRESH_EVERY_TURNS_MAX
+
+        async with TestClient(TestServer(_make_app())) as c:
+            assert (await _patch(c, "dashboard.title_refresh_every_turns", 8)).status == 200
+            for bad in (-1, TITLE_REFRESH_EVERY_TURNS_MAX + 1):
+                resp = await _patch(c, "dashboard.title_refresh_every_turns", bad)
+                assert resp.status == 400, bad
+                # The refusal names the gate's whole domain, 0 included.
+                expected = f"must be between 0 and {TITLE_REFRESH_EVERY_TURNS_MAX}"
+                assert expected in (await resp.json())["error"]
+            for bad in ("abc", None, [5]):
+                resp = await _patch(c, "dashboard.title_refresh_every_turns", bad)
+                assert resp.status == 400, bad
+        assert KiroCrewConfig.load().dashboard.title_refresh_every_turns == 8
+
+    @pytest.mark.asyncio
+    async def test_a_non_finite_number_is_refused_not_a_500(self, tmp_config) -> None:
+        # aiohttp's json.loads accepts Infinity/NaN, and int() raises
+        # OverflowError on Infinity: the validator must answer 400, not a 500.
+        async with TestClient(TestServer(_make_app())) as c:
+            for literal in ("Infinity", "-Infinity", "NaN"):
+                resp = await c.patch(
+                    "/api/config/kirocrew",
+                    data=f'{{"path": "dashboard.title_refresh_every_turns", "value": {literal}}}',
+                    headers={"Content-Type": "application/json"},
+                )
+                assert resp.status == 400, literal
+
+
 # ── Int validator ────────────────────────────────────────────────────────
 
 
@@ -697,6 +770,59 @@ class TestFloatValidator:
     async def test_float_non_numeric_returns_400(self, tmp_config) -> None:
         async with TestClient(TestServer(_make_app())) as c:
             resp = await _patch(c, "session.autocompact_pct", "abc")
+            assert resp.status == 400
+
+
+# ── Clamped float: session.compact_wait_secs ─────────────────────────────
+
+
+class TestCompactWaitSecsClamp:
+    """The wait budget is editable and clamps (not rejects) an out-of-range value.
+
+    The stored value is the one the load path would produce from it, and the
+    response carries a ``clamp_notice`` so the Settings row can say so.
+    """
+
+    @staticmethod
+    def _stored(cfg_path) -> object:
+        return json.loads(cfg_path.read_text(encoding="utf-8"))["session"]["compact_wait_secs"]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("value", [0, 60, 450, 3600])
+    async def test_in_range_value_is_stored_without_notice(self, tmp_config, value) -> None:
+        async with TestClient(TestServer(_make_app())) as c:
+            resp = await _patch(c, "session.compact_wait_secs", value)
+            assert resp.status == 200
+            body = await resp.json()
+        assert "clamp_notice" not in body
+        assert self._stored(tmp_config) == float(value)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("value", "stored"),
+        [(1, 60.0), (59.5, 60.0), (3601, 3600.0), (99999, 3600.0), (-5, 0.0)],
+    )
+    async def test_out_of_range_value_is_clamped_with_notice(
+        self, tmp_config, value, stored
+    ) -> None:
+        async with TestClient(TestServer(_make_app())) as c:
+            resp = await _patch(c, "session.compact_wait_secs", value)
+            assert resp.status == 200
+            body = await resp.json()
+        assert body["clamp_notice"] == {
+            "path": "session.compact_wait_secs",
+            "requested": float(value),
+            "stored": stored,
+            "min": 60.0,
+            "max": 3600.0,
+        }
+        assert self._stored(tmp_config) == stored
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("value", ["abc", float("nan"), True, None])
+    async def test_non_number_is_still_rejected(self, tmp_config, value) -> None:
+        async with TestClient(TestServer(_make_app())) as c:
+            resp = await _patch(c, "session.compact_wait_secs", value)
             assert resp.status == 400
 
 

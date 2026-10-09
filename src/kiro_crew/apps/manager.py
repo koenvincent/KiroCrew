@@ -22,7 +22,7 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Callable, Iterator, Sequence
 from urllib.parse import urlparse
 
 from kiro_crew import platform_compat
@@ -59,6 +59,9 @@ logger = logging.getLogger(__name__)
 
 APP_MANIFEST_FILENAME = "app.json"
 INSTALLED_META_FILENAME = "installed.json"
+# The approved ``permissions.api`` / ``permissions.events`` set, beside the
+# record but in its own file so only the grant-owning paths ever write it.
+APPROVED_GRANTS_FILENAME = "approved-grants.json"
 
 
 # ---------------------------------------------------------------------------
@@ -289,6 +292,182 @@ def _write_installed(name: str, meta: InstalledApp) -> None:
     atomic_write(meta_path, json.dumps(credential_free_meta.to_dict(), indent=2) + "\n")
 
 
+# Grant families held back on a widening update. ``sessionApproval`` is a flag
+# with its own disable-until-consent path below; these two are entry lists.
+STAGED_GRANT_FAMILIES = ("api", "events")
+
+
+def _parse_approved_grants(raw: Any) -> dict[str, list[str]]:
+    """Read the parsed contents of an approved-grants file, failing closed.
+
+    Anything but a mapping approves nothing, so a damaged file holds the app to
+    none of its declared api/events entries rather than to all of them.
+    """
+    record = raw if isinstance(raw, dict) else {}
+    parsed: dict[str, list[str]] = {}
+    for family in STAGED_GRANT_FAMILIES:
+        entries = record.get(family)
+        parsed[family] = (
+            [e for e in entries if isinstance(e, str)] if isinstance(entries, list) else []
+        )
+    return parsed
+
+
+def _approved_grants_path(name: str) -> Path:
+    return app_dir(name) / APPROVED_GRANTS_FILENAME
+
+
+def _read_approved_grants(name: str) -> dict[str, list[str]] | None:
+    """Read *name*'s approved api/events set, fresh from disk, failing closed.
+
+    ``None`` means no file: an install from before the set was stored (or a
+    gateway-shipped builtin), which approves what its manifest declares. A file
+    that cannot be read or parsed approves nothing.
+    """
+    path = _approved_grants_path(name)
+    try:
+        text = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        logger.warning("Failed to read %s: %s", path, exc)
+        return {family: [] for family in STAGED_GRANT_FAMILIES}
+    try:
+        return _parse_approved_grants(json.loads(text))
+    except json.JSONDecodeError:
+        return {family: [] for family in STAGED_GRANT_FAMILIES}
+
+
+def _write_approved_grants(name: str, grants: dict[str, list[str]] | None) -> None:
+    """Atomically store *name*'s approved set; ``None`` removes the file.
+
+    Only the grant-owning paths call this: install, update, registration and
+    an owner approval. Every other record write leaves the set alone because it
+    never touches this file.
+    """
+    path = _approved_grants_path(name)
+    if grants is None:
+        path.unlink(missing_ok=True)
+        return
+    body = {family: list(grants.get(family, ())) for family in STAGED_GRANT_FAMILIES}
+    path.parent.mkdir(parents=True, exist_ok=True)
+    atomic_write(path, json.dumps(body, indent=2) + "\n")
+
+
+def _declared_grant_entries(permissions: Any) -> dict[str, list[str]]:
+    """``api``/``events`` entries from a manifest's permissions (object or raw dict)."""
+    declared: dict[str, list[str]] = {}
+    for family in STAGED_GRANT_FAMILIES:
+        if isinstance(permissions, dict):
+            entries = permissions.get(family)
+        else:
+            entries = getattr(permissions, family, None)
+        declared[family] = (
+            [e for e in entries if isinstance(e, str) and e] if isinstance(entries, list) else []
+        )
+    return declared
+
+
+def _approved_grants_after_manifest_change(
+    *,
+    existing_approved: dict[str, list[str]] | None,
+    old_permissions: Any,
+    new_permissions: Any,
+) -> dict[str, list[str]]:
+    """Return the approved set to store after an update or re-registration.
+
+    The baseline is what the owner approved. A record from before the field
+    approves what the replaced manifest declared; with no readable replaced
+    manifest there is no known approval, so the baseline is empty. The result
+    keeps only baseline entries the new manifest still declares: an entry the
+    new manifest adds is not approved, and one it drops must be approved again
+    if a later version brings it back.
+    """
+    if existing_approved is not None:
+        baseline = existing_approved
+    elif old_permissions is not None:
+        baseline = _declared_grant_entries(old_permissions)
+    else:
+        baseline = {}
+    declared = _declared_grant_entries(new_permissions)
+    return {
+        family: [e for e in declared[family] if e in set(baseline.get(family, ()))]
+        for family in STAGED_GRANT_FAMILIES
+    }
+
+
+def _held_back_entries(
+    approved: dict[str, list[str]] | None, permissions: Any
+) -> dict[str, list[str]]:
+    """Declared api/events entries the approved set does not cover."""
+    declared = _declared_grant_entries(permissions)
+    if approved is None:
+        return {family: [] for family in STAGED_GRANT_FAMILIES}
+    return {
+        family: [e for e in declared[family] if e not in set(approved.get(family, ()))]
+        for family in STAGED_GRANT_FAMILIES
+    }
+
+
+def staged_app_grants(
+    name: str, family: str, read_declared: Callable[[], Sequence[str] | None]
+) -> list[str]:
+    """Return *name*'s declared ``permissions.<family>`` entries that are approved.
+
+    The enforcement points (``token_auth._app_api_allowlist``,
+    ``ws_event_scope._read_declared_events``, the hook context) grant exactly
+    this: declared by the live manifest (*read_declared*, ``None`` when there is
+    none) and in the app's approved-grants file, both read fresh. An install
+    without the file approves what is declared. An app with nothing on disk passes the declared
+    entries unchanged (callers gate on installation themselves); an app
+    directory without a readable record is not evidence of approval and grants
+    nothing.
+    """
+    declared = read_declared()
+    if declared is None:
+        return []
+    meta = _read_installed(name)
+    if meta is None:
+        root = app_dir(name)
+        if (root / INSTALLED_META_FILENAME).exists() or (root / APP_MANIFEST_FILENAME).exists():
+            return []
+        return list(declared)
+    grants = _read_approved_grants(name)
+    if grants is None:
+        return list(declared)
+    approved = set(grants.get(family, ()))
+    return [entry for entry in declared if entry in approved]
+
+
+def _approved_grants_row(name: str) -> dict[str, Any]:
+    """The ``approvedGrants`` key for an app row, absent when no set is stored."""
+    grants = _read_approved_grants(name)
+    return {} if grants is None else {"approvedGrants": grants}
+
+
+def approved_manifest_permissions(app_info: dict[str, Any]) -> dict[str, Any]:
+    """``app_info``'s manifest permissions limited to approved api/events entries.
+
+    For the hook-context builders, which start from a ``get_app``/``list_apps``
+    row; the live manifest and record are re-read through ``staged_app_grants``.
+    """
+    name = str(app_info.get("name", ""))
+    manifest = app_info.get("manifest") or {}
+    permissions = dict(manifest.get("permissions") or {})
+    for family in STAGED_GRANT_FAMILIES:
+        if family not in permissions:
+            continue
+
+        def _read(family: str = family) -> list[str] | None:
+            live = get_app_manifest(name)
+            if live is None:
+                return None
+            return [e for e in getattr(live.permissions, family) if e]
+
+        permissions[family] = staged_app_grants(name, family, _read)
+    return permissions
+
+
 def _pending_session_approval_after_manifest_change(
     *,
     existing_pending: bool,
@@ -434,6 +613,7 @@ _COPY_IGNORE = (
     "__pycache__",
     ".venv",
     INSTALLED_META_FILENAME,
+    APPROVED_GRANTS_FILENAME,
     ".kirocrew-deps",
     ".kirocrew-deps-staging",
     ".kirocrew-deps-prior",
@@ -1065,6 +1245,9 @@ def install_app(
         # runtime admission must still remain bound to what was installed.
         sourceUrl=source_repository.strip(),
     )
+    # Installing is the consent moment for everything the manifest declares.
+    # Written before the record, so no record ever sits beside a missing set.
+    _write_approved_grants(name, _declared_grant_entries(manifest.permissions))
     _write_installed(name, meta)
 
     # Create data directory
@@ -1185,6 +1368,17 @@ def update_app(
         requested_session_approval
         and not (old_manifest and old_manifest.permissions.sessionApproval)
     )
+    # ``permissions.api`` / ``permissions.events`` are read live too. An added
+    # entry is held back instead of disabling the app: it keeps running on the
+    # set the owner approved until they approve the new one.
+    # Read before the tree swap: the file lives in the tree the swap retires.
+    existing_approved = _read_approved_grants(name)
+    approved_grants = _approved_grants_after_manifest_change(
+        existing_approved=existing_approved,
+        old_permissions=old_manifest.permissions if old_manifest else None,
+        new_permissions=manifest.permissions,
+    )
+    widened_grants = any(_held_back_entries(approved_grants, manifest.permissions).values())
 
     # Carry every persisted field forward from ``existing``, overriding only
     # what the update changes. Keeping this metadata inside the file transaction
@@ -1291,6 +1485,9 @@ def update_app(
         refusal = gateway_data_dir_obstruction(dest)
         if refusal:
             raise InstalledTreeRefused(refusal)
+        # The new tree carries no set (the copy skips the file); a rollback
+        # restores the old tree's file with it.
+        _write_approved_grants(name, approved_grants)
         _write_installed(name, meta)
     except (OSError, shutil.Error, ValueError, InstalledTreeRefused) as exc:
         rollback_error = ""
@@ -1354,6 +1551,23 @@ def update_app(
                 "control -- review it on the app page and enable again"
             ),
             notice="session_approval_reconsent",
+        )
+    if widened_grants:
+        sel().log_api_access(
+            caller="app_update",
+            operation="grants_widened",
+            outcome="staged",
+            resources=f"name={name!r}",
+            error="update added permissions.api/events entries; approve to grant them",
+        )
+        return AppResult(
+            ok=True,
+            name=name,
+            message=(
+                f"updated {name} v{old_version} -> v{manifest.version}; "
+                "this version requests new permissions, which stay off until you "
+                "approve them on the app page"
+            ),
         )
     return AppResult(
         ok=True,
@@ -2190,8 +2404,20 @@ def _app_activation_denied(name: str, *, fail_closed: bool = False) -> str | Non
         return None
 
 
-def enable_app(name: str, *, session_approval_consent: bool = False) -> AppResult:
-    """Enable an installed app."""
+def enable_app(
+    name: str,
+    *,
+    session_approval_consent: bool = False,
+    grants_consent: dict[str, list[str]] | None = None,
+) -> AppResult:
+    """Enable an installed app.
+
+    ``grants_consent`` names the held-back ``permissions.api``/``events``
+    entries the owner was shown and approved (see ``approvedGrants``). Only
+    those, and only while the live manifest still declares them, join the
+    approved set; an entry added after the owner looked stays held back.
+    Without it the app is enabled on the approved set.
+    """
     if not _check_path_safety(name):
         return AppResult(ok=False, name=name, error=f"unsafe app name: {name!r}")
     meta = _read_installed(name)
@@ -2246,16 +2472,49 @@ def enable_app(name: str, *, session_approval_consent: bool = False) -> AppResul
             error_code="session_approval_consent_required",
         )
 
-    if meta.enabled:
+    current_grants = _read_approved_grants(name) if grants_consent is not None else None
+    approve_grants = grants_consent is not None and current_grants is not None
+    if meta.enabled and not approve_grants:
         return AppResult(ok=True, name=name, message=f"{name} is already enabled")
 
+    still_staged = False
+    if approve_grants and grants_consent is not None and current_grants is not None:
+        live = get_app_manifest(name)
+        if live is None:
+            # Nothing declared can be approved; say so rather than report an
+            # approval that changed nothing.
+            return AppResult(
+                ok=False,
+                name=name,
+                error="the app manifest cannot be read right now; try approving again",
+                error_code="grants_manifest_unreadable",
+            )
+        declared = _declared_grant_entries(live.permissions)
+        approved: dict[str, list[str]] = {}
+        for family in STAGED_GRANT_FAMILIES:
+            shown = {e for e in grants_consent.get(family, ()) if isinstance(e, str)}
+            kept = list(current_grants.get(family, ()))
+            kept += [e for e in declared[family] if e in shown and e not in kept]
+            approved[family] = kept
+            still_staged = still_staged or any(e not in kept for e in declared[family])
+        _write_approved_grants(name, approved)
+        sel().log_api_access(
+            caller="app_enable",
+            operation="grants_approved",
+            outcome="partial" if still_staged else "success",
+            resources=f"name={name!r}",
+        )
     meta.enabled = True
     meta.sessionApprovalConsentPending = False
     meta.updatedAt = _now_iso()
     _write_installed(name, meta)
 
     logger.info("Enabled app %s", name)
-    return AppResult(ok=True, name=name, message=f"enabled {name}")
+    return AppResult(
+        ok=True,
+        name=name,
+        message=f"enabled {name}",
+    )
 
 
 def disable_app(name: str) -> AppResult:
@@ -2309,9 +2568,9 @@ def list_apps() -> list[dict[str, Any]]:
                 # callers run it concurrently from worker threads, and a
                 # persisted read-modify-write of installed.json from a
                 # listing would race real mutators (install/enable/
-                # register) and silently overwrite their fields. The
-                # durable repair happens on the single-app paths
-                # (get_app / update_app).
+                # register) and silently overwrite their fields. get_app
+                # is read-only for the same reason; the record's version is
+                # rewritten by update_app / register_external_app.
                 if (
                     meta.lifecycle == "app"
                     and manifest.version
@@ -2322,6 +2581,7 @@ def list_apps() -> list[dict[str, Any]]:
                 pass
         app_info: dict[str, Any] = {
             **meta.to_dict(),
+            **_approved_grants_row(entry.name),
             "manifest": manifest_data,
         }
         # Include migratedTo if non-empty
@@ -2345,14 +2605,16 @@ def get_app(name: str) -> dict[str, Any] | None:
         try:
             manifest = AppManifest.from_json_file(manifest_path)
             manifest_data = manifest.to_dict()
-            # Sync version for self-managed apps (same as list_apps)
+            # Reflect a self-managed app's own manifest version in the RETURNED
+            # row only, as list_apps does. The record here was read before the
+            # manifest, so writing it back would overwrite whatever a
+            # registration landing between the two reads stored -- an approval,
+            # a disable-for-consent -- with the stale snapshot.
             if meta.lifecycle == "app" and manifest.version and manifest.version != meta.version:
                 meta.version = manifest.version
-                meta.updatedAt = _now_iso()
-                _write_installed(name, meta)
         except Exception:
             pass
-    return {**meta.to_dict(), "manifest": manifest_data}
+    return {**meta.to_dict(), **_approved_grants_row(name), "manifest": manifest_data}
 
 
 def get_app_manifest(name: str) -> AppManifest | None:
@@ -2734,6 +2996,36 @@ def register_external_app(
     widened_session_approval = requested_session_approval and not (
         prior_manifest and prior_manifest.permissions.sessionApproval
     )
+    # Same holding back as ``update_app`` for added api/events entries. A first
+    # registration approves what it declares: there is no earlier approval to
+    # widen, as with an install.
+    new_permissions = (
+        manifest_data.get("permissions") if isinstance(manifest_data, dict) else None
+    )
+    prior_grants = _read_approved_grants(name) if existing else None
+    prior_grants_present = _approved_grants_path(name).is_file() if existing else False
+    approved_grants: dict[str, list[str]] | None
+    if not manifest_data:
+        approved_grants = (
+            _read_approved_grants(name)
+            if existing
+            else (
+                _declared_grant_entries(on_disk.permissions)
+                if (on_disk := get_app_manifest(name)) is not None
+                else None
+            )
+        )
+    elif existing:
+        approved_grants = _approved_grants_after_manifest_change(
+            existing_approved=prior_grants,
+            old_permissions=prior_manifest.permissions if prior_manifest else None,
+            new_permissions=new_permissions,
+        )
+    else:
+        approved_grants = _declared_grant_entries(new_permissions)
+    widened_grants = bool(manifest_data) and any(
+        _held_back_entries(approved_grants, new_permissions).values()
+    )
 
     if existing:
         # Build replacement metadata without mutating the persisted snapshot;
@@ -2771,9 +3063,13 @@ def register_external_app(
         )
         manifest_text = json.dumps(manifest_data, indent=2) + "\n" if manifest_data else ""
         try:
-            if manifest_data and widened_session_approval:
-                # Disable first when adding the grant so the new manifest is
-                # never live beside metadata that still authorizes the app.
+            if manifest_data:
+                # Narrowing first: the new set is a subset of the old one, so
+                # it is safe beside either manifest.
+                _write_approved_grants(name, approved_grants)
+            if manifest_data and (widened_session_approval or widened_grants):
+                # Disable (or hold back) first when adding a grant so the new
+                # manifest is never live beside metadata that authorizes it.
                 _write_installed(name, meta)
                 atomic_write(manifest_path, manifest_text)
             else:
@@ -2785,6 +3081,8 @@ def register_external_app(
             rollback_errors: list[str] = []
             try:
                 _write_installed(name, existing)
+                if manifest_data:
+                    _write_approved_grants(name, prior_grants if prior_grants_present else None)
             except OSError as rollback_exc:
                 rollback_errors.append(f"metadata rollback failed: {rollback_exc}")
             try:
@@ -2818,6 +3116,8 @@ def register_external_app(
             resources=resources,
             lifecycle=lifecycle,
         )
+        if approved_grants is not None:
+            _write_approved_grants(name, approved_grants)
         _write_installed(name, meta)
         # Persist manifest if provided (so dashboard can show full info).
         if manifest_data:
@@ -2866,6 +3166,14 @@ def register_external_app(
             ),
             secret=secret if is_new_secret else "",
             notice="session_approval_reconsent",
+        )
+    if widened_grants:
+        sel().log_api_access(
+            caller="app_register",
+            operation="grants_widened",
+            outcome="staged",
+            resources=f"name={name!r}",
+            error="registration added permissions.api/events entries; approve to grant them",
         )
     result = AppResult(
         ok=True,

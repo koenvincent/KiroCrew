@@ -1301,21 +1301,24 @@ async def test_the_subagent_ladder(names, kw, low, rung, steered):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("hook", "low", "attended", "rung"),
+    ("hook", "low", "attended", "answer", "rung"),
     [
         # The gate's own grant (auto_approve_tools=["*"]) does not stand in for
-        # a person, at full fidelity or for a low-fidelity child.
-        (TOOL_AUTO_APPROVE, False, False, "headless"),
-        (TOOL_AUTO_APPROVE, True, False, "child_unattended"),
-        # It goes to the person instead, who is told about the floor.
-        (TOOL_AUTO_APPROVE, False, True, "callback"),
+        # the hub's person, at full fidelity or for a low-fidelity child.
+        (TOOL_AUTO_APPROVE, False, False, True, "hub"),
+        (TOOL_AUTO_APPROVE, True, False, True, "hub"),
+        # A person on this gateway is not the floor's person: only the hub is asked.
+        (TOOL_AUTO_APPROVE, False, True, True, "hub"),
+        (TOOL_ALLOW, False, True, False, "hub"),
         # A deny still refuses before anyone is asked.
-        (TOOL_DENY, False, True, "hook_deny"),
+        (TOOL_DENY, False, True, None, "hook_deny"),
     ],
 )
-async def test_an_interactive_floor_drops_every_auto_grant_but_keeps_denies(
-    names, hook, low, attended, rung
+async def test_an_interactive_floor_hands_every_request_to_the_hub(
+    names, hook, low, attended, answer, rung
 ):
+    from kiro_crew.subagent_manager import hub_approvals
+
     asked: list = []
 
     async def callback(event, parent_session_key=""):
@@ -1326,9 +1329,21 @@ async def test_an_interactive_floor_drops_every_auto_grant_but_keeps_denies(
         hook=hook, callback=callback if attended else None, approval_floor="interactive"
     )
     event = _low_fidelity_event(identity_verified=True) if low else _event()
-    settled = await settle(Ask(event, RecordingWire(log), "subagent:a1"), policy)
+    pending = asyncio.create_task(settle(Ask(event, RecordingWire(log), "subagent:a1"), policy))
+    if answer is not None:
+        for _ in range(200):
+            listed = hub_approvals.pending_for("a1")
+            if listed:
+                break
+            await asyncio.sleep(0.01)
+        assert len(listed) == 1 and listed[0]["title"] == event.title
+        assert hub_approvals.resolve("a1", listed[0]["id"], answer)
+    settled = await asyncio.wait_for(pending, timeout=5)
     assert settled.rung == rung
-    assert asked == (["interactive"] if rung == "callback" else [])
+    if answer is not None:
+        assert settled.outcome == ("approved" if answer else "rejected")
+    assert asked == []
+    assert hub_approvals.pending_for("a1") == []
 
 
 @pytest.mark.asyncio
@@ -1666,6 +1681,11 @@ async def test_every_rung_the_subagent_ladder_can_settle_on_has_its_row():
     refusals, approvals = await _ladder_rungs(policy, Ask(_event(), RecordingWire([]), "k"))
     # The run bails at its own limits.
     refusals |= set(get_args(tool_permission.BailReason))
+    # A floored run swaps every person on this gateway for the remote hub's.
+    floored, _info, _log = _subagent_ladder(approval_floor="interactive")
+    for responder in (*floored.responders, floored.child.responder):
+        refusals.add(responder.name)
+        approvals.add(responder.name)
     assert refusals == set(tool_permission._SUBAGENT_REFUSALS)
     assert approvals == set(tool_permission._SUBAGENT_APPROVALS)
 

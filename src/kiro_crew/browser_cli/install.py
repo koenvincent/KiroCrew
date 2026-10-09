@@ -111,9 +111,21 @@ def cli_env() -> dict[str, str]:
     This PATH is execution support only. :func:`cli_path` does not consume it:
     gateway execution resolves the sandbox-sealed managed entrypoint or a fixed,
     non-writable system candidate by absolute path.
+
+    ``NODE_USE_SYSTEM_CA=1`` makes these Node children trust the OS certificate
+    store (macOS Keychain, Windows Certificate Store, OpenSSL defaults on Linux)
+    in addition to Node's bundled roots. Behind a TLS-intercepting corporate
+    proxy the browser download otherwise fails ``UNABLE_TO_GET_ISSUER_CERT_LOCALLY``
+    even though the OS trusts the proxy's CA, and a GUI-launched gateway has no
+    shell profile through which the user could set the variable. The gateway's
+    own Python side already verifies through the OS store (``_ssl_compat``).
+    The variable is used instead of ``--use-system-ca`` in ``NODE_OPTIONS``
+    because a Node that predates the feature ignores an unknown variable but
+    refuses to start on an unknown flag. A value the user already set is kept.
     """
     env = dict(os.environ)
     env["PATH"] = node_augmented_path(augmented_path(env.get("PATH", "")))
+    env.setdefault("NODE_USE_SYSTEM_CA", "1")
     return env
 
 
@@ -461,6 +473,33 @@ def _agent_writable_roots() -> tuple[Path, ...]:
     return github_runner.agent_writable_roots()
 
 
+def agent_writable_root_over_data_home(data_home: Path | None = None) -> Path | None:
+    """The agent-writable root that contains the data home, or ``None``.
+
+    The managed launcher lives under the data home, so a workspace root or
+    project directory at the data home or above it (``$HOME`` is the usual
+    case) puts every launcher the installer writes inside the fence.
+    """
+    try:
+        data_home = (data_home or config_dir()).resolve(strict=False)
+        roots = _agent_writable_roots()
+    except (OSError, RuntimeError):
+        return None
+    for root in roots:
+        if _under(data_home, root):
+            return root
+    return None
+
+
+def _data_home_overlap_remedy(root: Path) -> str:
+    return (
+        f"the workspace root or project directory {root} contains the Kiro Crew data "
+        f"home ({config_dir()}), so a launcher installed there is inside the "
+        "agent-writable tree and would be refused. Point it at a directory outside "
+        "the data home and restart the gateway"
+    )
+
+
 def _under(path: Path, root: Path) -> bool:
     try:
         return path == root or root in path.parents
@@ -515,6 +554,20 @@ def _managed_candidate(candidate: Path) -> tuple[Path | None, str | None]:
     if not _under(resolved, resolved_root):
         return None, f"the entrypoint resolves outside the managed tools boundary {resolved_root}"
     return (None, common) if (common := _common_candidate_rejection(resolved)) else (resolved, None)
+
+
+def _managed_leaf_unresolved_reason() -> str:
+    """Why the managed leaf yields no launcher, worded for the install step.
+
+    An entrypoint that is on disk but refused is a different failure from one
+    that is absent: the refusal names the boundary, and an agent-writable root
+    that contains the data home is a configuration the user can change.
+    """
+    resolved, refusal = _resolve_managed_cli()
+    if resolved is not None or refusal is None:
+        return f"{CLI_BIN} was not found in the managed tools leaf after a successful install"
+    candidate, reason = refusal
+    return redact_install_output(f"{CLI_BIN} was installed at {candidate} but refused: {reason}")
 
 
 def _gateway_writable_component(candidate: Path, resolved: Path) -> Path | None:
@@ -580,6 +633,34 @@ def _warn_cli_refusal(candidate: Path, reason: str) -> None:
     )
 
 
+def _resolve_managed_cli() -> tuple[Path | None, tuple[Path, str] | None]:
+    """The first vetted managed entrypoint, and the first managed refusal seen."""
+    first_refusal: tuple[Path, str] | None = None
+    for candidate in _managed_cli_candidates():
+        if not os.path.lexists(candidate):
+            continue
+        resolved, reason = _managed_candidate(candidate)
+        if resolved is not None:
+            return resolved, first_refusal
+        if reason is not None and first_refusal is None:
+            first_refusal = (candidate, reason)
+    return None, first_refusal
+
+
+def _resolve_system_cli() -> tuple[Path | None, tuple[Path, str] | None]:
+    """The first vetted fixed-system entrypoint, and the first system refusal seen."""
+    first_refusal: tuple[Path, str] | None = None
+    for candidate in _system_cli_candidates():
+        if not os.path.lexists(candidate):
+            continue
+        resolved, reason = _system_candidate(candidate)
+        if resolved is not None:
+            return resolved, first_refusal
+        if reason is not None and first_refusal is None:
+            first_refusal = (candidate, reason)
+    return None, first_refusal
+
+
 def cli_path() -> str | None:
     """Canonical trusted ``playwright-cli`` path, or ``None``.
 
@@ -589,27 +670,18 @@ def cli_path() -> str | None:
     hit is inspected only after every vetted location misses, so the refusal can
     name the planted shim without ever running it.
     """
-    first_refusal: tuple[Path, str] | None = None
-    for candidate in _managed_cli_candidates():
-        if not os.path.lexists(candidate):
-            continue
-        resolved, reason = _managed_candidate(candidate)
-        if resolved is not None:
-            if first_refusal is not None:
-                _warn_cli_refusal(*first_refusal)
-            return str(resolved)
-        if reason is not None and first_refusal is None:
-            first_refusal = (candidate, reason)
-    for candidate in _system_cli_candidates():
-        if not os.path.lexists(candidate):
-            continue
-        resolved, reason = _system_candidate(candidate)
-        if resolved is not None:
-            if first_refusal is not None:
-                _warn_cli_refusal(*first_refusal)
-            return str(resolved)
-        if reason is not None and first_refusal is None:
-            first_refusal = (candidate, reason)
+    managed, first_refusal = _resolve_managed_cli()
+    if managed is not None:
+        if first_refusal is not None:
+            _warn_cli_refusal(*first_refusal)
+        return str(managed)
+    system, system_refusal = _resolve_system_cli()
+    if first_refusal is None:
+        first_refusal = system_refusal
+    if system is not None:
+        if first_refusal is not None:
+            _warn_cli_refusal(*first_refusal)
+        return str(system)
 
     if first_refusal is None:
         found = shutil.which(CLI_BIN, path=os.environ.get("PATH", ""))
@@ -1825,6 +1897,20 @@ def install(on_stage: StageCallback | None = None) -> dict[str, Any]:
     steps: list[dict[str, Any]] = []
     _emit_stage(on_stage, STAGE_INSTALLING_CLI)
 
+    overlap = agent_writable_root_over_data_home()
+    if overlap is not None and _resolve_system_cli()[0] is None:
+        steps.append(
+            {
+                "name": "check-install-boundary",
+                "ok": False,
+                "returncode": 1,
+                "stderr": redact_install_output(
+                    f"refusing to install {CLI_BIN}: {_data_home_overlap_remedy(overlap)}"
+                ),
+            }
+        )
+        return {"ok": False, "steps": steps}
+
     npm = find_node_tool("npm")
     if npm is None:
         steps.append(
@@ -1903,10 +1989,7 @@ def install(on_stage: StageCallback | None = None) -> dict[str, Any]:
                 "name": "resolve-binary",
                 "ok": False,
                 "returncode": 127,
-                "stderr": (
-                    f"{CLI_BIN} was not found in the managed tools leaf after "
-                    "a successful install"
-                ),
+                "stderr": _managed_leaf_unresolved_reason(),
             }
         )
         return {"ok": False, "steps": steps}

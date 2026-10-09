@@ -320,6 +320,16 @@ Each cycle:
 
    `blocked` and `question` differ by who must act. That is why they are separate
    values, and why you must not treat one as the other.
+
+   A `blocked` or `question` row may also carry the worker's `reason`: `approval`
+   (a tool approval timed out) or `needs_human` (only a person can unblock it).
+   No reason means the item moves on its own (a build, a service). Tell your workers to
+   report `blocked` with `reason=approval` the moment a tool approval times out.
+   When every open item waits on a person (`approval` or `needs_human`), put the
+   ask in front of the user on that turn: your patrol then holds, takes no
+   turns and does not extend, and the goal popover shows it waiting on the user.
+   A worker's new report releases it; your own writes (decide, goal, close) do
+   not, so answer the user's question or re-dispatch to move it.
 3. **Verify every `done` with the evaluator — never by reading the child's
    transcript and judging, and never by believing the claim.** Take the
    `accept_batch` from a full `work_ledger_read` (no `compact`), **keep only the entries
@@ -442,6 +452,33 @@ per-round pause. Count both from `work_ledger_read`, not from memory:
 Both are needs-human stops (see the checklist): the loop stays armed, and the
 first cycle after the answer resumes. Put `items used: N of 20` in every round
 report.
+
+**Then drop your chat.** Every patrol turn re-sends your whole conversation,
+and a conductor that runs for days pays for it on every quiet cycle. Your state
+already lives in the two ledgers, and each wake carries their snapshot. So once
+the next round is dispatched, end that same turn with two calls, in order:
+
+1. `session_ledger_record` with everything the next turn needs:
+   - `goal` — the goal, one line;
+   - `next` — the round number, and for each open item its item id, its
+     worker key and its PR number (or "no PR yet");
+   - `patrol_base` — unchanged from Patrol (`cycles=<C> runtime=<R>`).
+
+   Check the item ids, worker keys and PRs against a fresh `work_ledger_read`,
+   not against memory: the work ledger is the record, `next` is the pointer.
+2. `reset_conversation`, as the last call of the turn. It lands at the turn
+   boundary; the next wake starts from the ledger snapshot alone.
+
+Never reset when:
+
+- a question to the user is unanswered — the answer would arrive in a chat
+  that no longer holds the question;
+- the round is still running — reset only at a round close;
+- the session ledger write failed — the reset would drop the only copy.
+
+The gateway refuses a reset from a loop it cannot vouch for, or while a
+question card or tool approval is pending. A refused reset changes nothing:
+carry on in the same chat and try again at the next round close.
 
 ### Goal changes mid-flight
 
@@ -638,7 +675,8 @@ what the composer renders:
   granted by name too, and only these: `monitor_start`, `monitor_update`,
   `autonudge_stop`, `wait`, `resource_status`, `list_sessions`,
   `session_ledger_read`, `session_ledger_record`, `skill_search`, `skill_fetch`,
-  `select_crew`, `send_message`, `send_notification`, `ask_question`. That covers
+  `select_crew`, `send_message`, `send_notification`, `ask_question`,
+  `reset_conversation`. That covers
   every core call this procedure asks you to make; **any other core tool is
   mounted but prompts**, including `task_run`, `workflow_run` and the `spawn_*`
   family, which this charter forbids you to route a work item to in the first

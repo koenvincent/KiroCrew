@@ -119,3 +119,39 @@ export function listLineBreakEdit(
   }
   return { start: caret, end: caret, insert: `\n${nextPrefix(marker)}` }
 }
+
+/**
+ * The edit the composer's Backspace should make at `caret`, or `null` for an
+ * ordinary one-character delete.
+ *
+ * Backspace with the caret right where a list item's text begins removes the
+ * whole marker in one press: the bullet or number, its delimiter, the gap and
+ * any `[ ]` task box. Without this, clearing a `2. ` the Enter key just made
+ * takes three presses, and `  - [ ] ` takes eight.
+ *
+ * - An empty item (marker and whitespace only) is cleared to an empty line,
+ *   indent included: the same result as Enter on that item, so either key
+ *   ends the list in one press.
+ * - An item with text keeps its indent and its text and loses only the
+ *   marker, so the text stays where it was as a plain line.
+ * - A caret anywhere else (inside or before the marker, mid-text, off a list
+ *   line, inside an inline chip) gets `null`.
+ */
+export function listMarkerBackspaceEdit(
+  value: string,
+  caret: number,
+  protectedRanges: readonly ProtectedRange[] = [],
+): ListLineBreakEdit | null {
+  if (caret <= 0 || caret > value.length) return null
+  if (protectedRanges.some(range => range.start < caret && caret < range.end)) return null
+  const lineStart = value.lastIndexOf('\n', caret - 1) + 1
+  const newline = value.indexOf('\n', caret)
+  const lineEnd = newline === -1 ? value.length : newline
+  const line = value.slice(lineStart, lineEnd)
+  const marker = parseMarker(line)
+  if (!marker || caret - lineStart !== marker.contentStart) return null
+  if (line.slice(marker.contentStart).trim() === '') {
+    return { start: lineStart, end: lineEnd, insert: '' }
+  }
+  return { start: lineStart + marker.indent.length, end: caret, insert: '' }
+}

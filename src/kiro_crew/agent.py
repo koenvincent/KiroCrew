@@ -35,6 +35,7 @@ Every moved name is re-exported here, so reading or patching
 from __future__ import annotations
 
 import contextlib
+import contextvars
 import importlib
 import json
 import logging
@@ -361,6 +362,201 @@ def _agent_identity_enabled() -> bool:
     )
 
 
+class SharedAgentHomeRefused(OSError):
+    """A spec write was refused because this instance does not own its directory.
+
+    An ``OSError`` subclass on purpose, and that is the whole design: every
+    caller that already treats "the spec could not be written" as a failure
+    does so with ``except OSError`` — the dashboard's spec editor and MCP
+    toggles, the read-only side spec, the Connections mint — so they report a
+    refusal through the arm they already have, with no new contract to learn
+    and none to forget. A caller with no arm propagates, which is the correct
+    end for the paths that would otherwise record success for a file that was
+    never written: a worker mirror stamped as re-derived, an agent name handed
+    to kiro-cli whose spec is absent.
+
+    Raised only when :func:`_declined_foreign_spec_write` is true, which needs a
+    data home that does not own the shared agents directory. A correctly homed
+    instance never reaches it, so this adds no failure mode to one.
+    """
+
+
+def _declined_foreign_spec_write(path: Path) -> bool:
+    """Is *path* a spec in an agents directory this instance must not own?
+
+    ``rebuild_agent_config`` consults :func:`_decline_shared_agent_home` and
+    returns without writing when the answer is yes. The DERIVED specs had no
+    such check: ``kirocrew-worker.json`` (``worker_agent``), the conductor
+    agents, the service agents (guest, lite, knowledge, research) and the
+    read-only side spec are each written straight through
+    :func:`_atomic_json_write`, and most of them on DISPATCH rather than at
+    boot. A second gateway on its own ``KIROCREW_HOME`` therefore re-pinned the
+    machine-wide derived specs to its own ``.venv`` and data home every time it
+    dispatched a worker — the exact poisoning the template-spec guard exists to
+    prevent, arriving through a door the guard never covered.
+
+    Checked HERE, at the primitive those derived writers share, rather than in
+    each writer: a new materialization path that reaches this primitive is
+    covered the day it is added, and such a writer cannot forget the check. It
+    is NOT every spec write in the tree — ``apps/bridges.py`` renders app agent
+    specs into the same directory through :func:`atomic_write`, a different
+    primitive this guard never sees, and other writers reach it the same way.
+    Those remain open; what this covers is the set that goes through
+    :func:`_atomic_json_write`: ``worker_agent``, the conductor agents, the
+    service agents, the default-spec commit, the fork refresh and the read-only
+    side spec. The decision itself is not re-implemented — it is the same
+    :func:`_decline_shared_agent_home` the rebuild asks, so the two cannot
+    drift and every exemption that function grants (a private redirected
+    target, the dedicated ``isolated_agents_dir(own home)``, a default-home
+    instance, an instance whose own provenance is in the specs) is honoured
+    identically.
+
+    Scoped to the agents directory by comparing the write's PARENT against
+    :func:`kiro_agents_dir_path`, so this primitive's other callers — notably a
+    ``config.json`` write — are untouched. ``audit=False`` is passed to the
+    shared decision so it does not emit the rebuild's own boot-path event under
+    a source that did not make this call; both halves are recorded here instead,
+    under this source. The REFUSAL is recorded via the ``denied`` branch below;
+    an ADMITTED write that is not inside an already-admitted rebuild is recorded
+    via :func:`_audit_allowed_shared_write`. EVERY admitted shared-home write is
+    audited this way, including on a single-gateway (default-home) install -- the
+    permission grant for a per-dispatch write made outside the boot rebuild has
+    no other record, so leaving it unaudited would be a gap in the SEL trail. The
+    one admitted case that stays silent is a PRIVATE redirected target, which is
+    not a decision about the shared resource (the same reason
+    :func:`_decline_shared_agent_home` does not audit its private-target
+    returns). The rebuild's own grant is still audited once per rebuild and does
+    not reach the allowed branch (the ``_rebuild_spec_install_admitted`` arm
+    returns first), so there is no double-record. Neither half is throttled; the
+    dedupe below covers the operator-facing WARNING only, which repeats ~1/min
+    for the process lifetime.
+    """
+    try:
+        if path.parent.resolve() != kiro_agents_dir_path().resolve():
+            return False
+    except OSError:
+        # The parent could not be resolved, so we cannot PROVE this write lands
+        # outside the shared agents directory. Fail closed: a write we cannot
+        # clear is treated as a non-owned shared-home write and refused, rather
+        # than admitted on the unproven assumption it is private.
+        return True
+    if _rebuild_spec_install_admitted.get():
+        # Inside a rebuild the guard already admitted. Asking again per write
+        # would answer a DIFFERENT question than the rebuild's, because the
+        # rebuild's own first spec changes what the temp-checkout arm sees --
+        # see ``_rebuild_spec_install_admitted``. The rebuild has already emitted
+        # its own "allowed" agent_home_write event once, so emitting here too
+        # would double-count the same admitted transaction.
+        return False
+    if _decline_shared_agent_home(audit=False) is None:
+        # The write is admitted. Record the "allowed" half for the shared agents
+        # directory, so a derived-spec write admitted OUTSIDE a rebuild (e.g. a
+        # worker mirror re-derived on spawn after an app deregistration left it
+        # stale) is not a silent gap in the SEL trail -- the rebuild audits its
+        # own grant, but these per-dispatch writers reach this primitive on their
+        # own. A PRIVATE redirected target is exempt, not a decision about the
+        # shared resource, so it emits nothing (mirrors _decline_shared_agent_home,
+        # which does not audit its private-target returns). Best-effort: a lost
+        # audit record must never turn an allowed write into a failure.
+        _audit_allowed_shared_write(path)
+        return False
+    _warn_declined_home_once(
+        "derived-spec",
+        path.parent,
+        "Refusing to write the derived agent spec %s from a data home that does "
+        "not own %s: the spec would pin this instance's venv and data home into "
+        "a file the owning gateway's sessions load. The existing spec is left in "
+        "place. To let this instance own its specs, remove the stale kirocrew*.json "
+        "specs from that directory and restart.",
+        path.name,
+        path.parent,
+    )
+    try:
+        sel().log_api_access(
+            caller="system",
+            operation="agent_home_write",
+            outcome="denied",
+            source="derived-spec",
+            resources=str(path.parent),
+            error="data home does not own the shared agent home; derived spec write refused",
+        )
+    except Exception:  # noqa: BLE001 — a lost record must not turn a refusal into a write
+        logger.debug("SEL audit unavailable for a refused shared write", exc_info=True)
+    return True
+
+
+def _audit_allowed_shared_write(path: Path) -> None:
+    """Record the "allowed" half of an admitted derived-spec write, best-effort.
+
+    Called only from :func:`_declined_foreign_spec_write` when the write is
+    admitted (``_decline_shared_agent_home`` returned ``None``) and NOT inside an
+    already-admitted rebuild. It closes the audit gap a per-dispatch writer leaves
+    when it is admitted OUTSIDE the boot rebuild -- the worker mirror re-derived
+    on spawn after an app deregistration left it stale is the motivating case --
+    so that write carries an ``agent_home_write`` / ``allowed`` event under its
+    own source, matching the ``denied`` half this guard already records.
+
+    EVERY admitted shared-home write is recorded, including the default home.
+    This path is reached with ``audit=False`` passed to the shared decision, so
+    the decision itself emits nothing -- without this call the permission grant
+    for an admitted write made outside a rebuild would be unaudited, which is a
+    gap in the trail whether or not the home is the default one. The rebuild
+    already audits its own grant once per rebuild and does not reach here (the
+    ``_rebuild_spec_install_admitted`` arm returns earlier), so there is no
+    double-record.
+
+    A PRIVATE target is the one case that stays silent: ``_decline_shared_agent_home``
+    returns ``None`` for a redirected target the ambient environment would never
+    produce (a test ``tmp_path``, a relocated agents dir), and that is not a
+    decision about the shared resource -- the same reason that function does not
+    audit its private-target returns. The target is the shared one only when the
+    configured agents dir resolves to the ambient one; otherwise it is a private
+    redirect and we emit nothing.
+
+    Best-effort: any failure (an unresolvable path, an unavailable audit sink) is
+    swallowed, because an allowed write must never be turned into a failure by a
+    lost record -- the same contract the ``denied`` branch keeps.
+    """
+    try:
+        if kiro_agents_dir_path().resolve() != ambient_agents_dir().resolve():
+            # A private redirect, not the shared directory: no shared-resource
+            # decision was made here, so (like _decline_shared_agent_home's own
+            # private-target returns) emit nothing.
+            return
+        sel().log_api_access(
+            caller="system",
+            operation="agent_home_write",
+            outcome="allowed",
+            source="derived-spec",
+            resources=str(path.parent),
+        )
+    except Exception:  # noqa: BLE001 — a lost record must not turn an allowed write into a failure
+        logger.debug("SEL audit unavailable for an allowed shared write", exc_info=True)
+
+
+def write_owner_derived_spec(path: Path, data: dict) -> None:
+    """Write a spec whose content carries nothing of THIS instance.
+
+    A second entry point rather than a keyword on :func:`_atomic_json_write`,
+    for two reasons. The cross-split shape ratchet in
+    ``test_agent_refactor_contracts`` pins that primitive's signature, so a new
+    parameter there is a red; and the claim belongs in the NAME a caller reads
+    at its own call site, where the reviewer of that call can check it, rather
+    than in a flag threaded through a general-purpose writer.
+
+    The one caller is the Connections mint: it copies ONE server entry verbatim
+    out of the owner's own on-disk spec into a uniquely named throwaway its
+    manifest sweep reaps. Nothing of this instance is pinned into the shared
+    agents directory by it, so the ownership guard must not refuse it --
+    otherwise every OAuth Connect fails on a relocated or worktree-booted
+    instance. Authorization is the writer's claim, made here, and deliberately
+    NOT a filename the guard recognizes: a name is not evidence of who produced
+    the bytes, so a guard trusting one would let any writer reach this
+    directory by choosing the right name.
+    """
+    _atomic_json_write_unguarded(path, data)
+
+
 def _atomic_json_write(path: Path, data: dict) -> None:
     """Write JSON atomically via tmp+rename to prevent read-of-partial-file.
 
@@ -368,6 +564,25 @@ def _atomic_json_write(path: Path, data: dict) -> None:
     (truncate-then-write) can deliver empty or partial JSON, crashing the
     ACP process with exit code 1.  rename() is atomic on Linux when source
     and destination are on the same filesystem.
+
+    Raises :class:`SharedAgentHomeRefused` when
+    :func:`_declined_foreign_spec_write` says this instance does not own the
+    agents directory the spec would land in. RAISING rather than returning is
+    the point: the remedy for the directory is still the rebuild's — leave
+    whatever already worked in place, write nothing — but "wrote nothing" and
+    "wrote it" must not be indistinguishable to the caller. Were the refusal
+    silent, every caller would read it as a commit: the dashboard's spec editor
+    would answer 200 on an edit it discarded, the read-only side spec would
+    return a derived name whose file is absent, the Connections mint would hand
+    kiro-cli an agent it never wrote, and the worker mirror would record itself
+    as re-derived while still carrying grants revoked from ``kirocrew.json``.
+    ``SharedAgentHomeRefused`` is an ``OSError``, so each of those callers
+    reports it through the failure arm it already has.
+
+    The signature stays ``-> None``: the verdict travels as an exception, which
+    the callers that must act on it already catch, so the cross-split shape
+    ratchet in ``test_agent_refactor_contracts`` keeps pinning this primitive
+    unchanged.
 
     The rename goes through ``replace_with_retry`` because atomicity is not the
     only way that step fails. On Windows ``os.replace`` raises
@@ -388,6 +603,22 @@ def _atomic_json_write(path: Path, data: dict) -> None:
     ``oauth.clientSecret``, remote ``headers`` credentials -- and kiro-cli runs
     as the same user, so no reader needs more. On Windows
     ``fchmod_safe`` is a no-op and the file inherits the directory's ACL.
+    """
+    if _declined_foreign_spec_write(path):
+        raise SharedAgentHomeRefused(
+            f"refusing to write {path.name}: this data home does not own {path.parent}"
+        )
+    _atomic_json_write_unguarded(path, data)
+
+
+def _atomic_json_write_unguarded(path: Path, data: dict) -> None:
+    """The atomic tmp+rename write itself, with no ownership question asked.
+
+    Split out so the guarded primitive and :func:`write_owner_derived_spec`
+    share one write path: two copies would drift, and the mode handling and
+    the Windows rename retry below are exactly what must not be duplicated.
+    Private and NOT a general escape hatch -- a new caller of this instead of
+    the guarded primitive is how the guard gets bypassed by accident.
     """
     fd, tmp_name = tempfile.mkstemp(dir=path.parent, suffix=".tmp")
     try:
@@ -3111,6 +3342,39 @@ def _existing_specs_are_mine(target: Path, own_home: Path | None) -> bool | None
 #: mirroring session_pid_sig's _report_signing_unavailable.
 _declined_home_warned: set[tuple[str, str]] = set()
 
+#: Set only while a ``rebuild_agent_config`` call that the shared-home guard
+#: ALREADY ADMITTED is still installing its specs. Read by
+#: :func:`_declined_foreign_spec_write` so the derived writes inside that
+#: rebuild are covered by the rebuild's own decision instead of re-deriving one
+#: per write.
+#:
+#: The re-derivation is not merely wasteful, it inverts: the temp-checkout arm
+#: declines only when a spec is present to preserve, and the rebuild's own first
+#: write creates one. So a fresh install from a plain temp checkout wrote
+#: ``kirocrew.json``, and every spec after it in the SAME rebuild -- knowledge,
+#: research, heartbeat, the conductors, the worker mirror -- was then refused
+#: against the file the rebuild had just created. A dispatch afterwards fails
+#: with ``agent_unresolved``.
+#:
+#: This cannot widen the guard, because it is only ever set on the ALLOWED path:
+#: a rebuild the guard declines returns before reaching the flag and writes
+#: nothing. Reset via its token in a ``finally``, so it never outlives its own
+#: call and never leaks into a write made outside one -- a worker dispatch, a
+#: dashboard edit and the Connections mint all still ask the guard for
+#: themselves, which is the whole point of asking it at the primitive.
+#:
+#: A ``ContextVar``, not a module global, so the exemption is scoped to the
+#: rebuild's OWN call stack rather than the whole process. ``rebuild_agent_config``
+#: is synchronous and the dashboard/dispatch writers reach the guard on worker
+#: threads via ``asyncio.to_thread``; each ``to_thread`` call runs the target in
+#: a COPY of the context taken when it was submitted, so a value set inside the
+#: rebuild's execution is confined to the rebuild's context and is NOT observed
+#: by a concurrent threaded writer -- that writer sees the default and consults
+#: the guard for itself, even if a config-watcher rebuild is in flight.
+_rebuild_spec_install_admitted: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "_rebuild_spec_install_admitted", default=False
+)
+
 
 def _warn_declined_home_once(arm: str, target: Path, msg: str, *args: object) -> None:
     """WARN the first shared-home refusal per (target, arm); debug thereafter."""
@@ -3770,157 +4034,172 @@ def rebuild_agent_config(
     logger.info("Installed agent config: %s", path)
     _claim_propagated_model(config, main_name)
 
-    # Install KiroCrew AIM capabilities package (includes kirocrew-lite)
-    _install_aim_capabilities()
-
-    # Install kirocrew-knowledge agent (used by Knowledge Library LLMPool)
-    try:
-        service_agents._install_knowledge_agent()
-    except Exception:
-        logger.debug("kirocrew-knowledge agent install failed", exc_info=True)
-
-    # Install kirocrew-research agent (used by the Research Lab campaign loop)
-    try:
-        service_agents._install_research_agent()
-    except Exception:
-        logger.debug("kirocrew-research agent install failed", exc_info=True)
-
-    # Install kirocrew-dashboard-manager agent (the subagent a crewmate hands page
-    # work to). Degrades to a debug line like the two above: with the spec absent a
-    # crewmate still has `dashboard_fields` and `dashboard_write`, so the page it has
-    # keeps working and only CHANGING the page is unavailable.
-    try:
-        service_agents._install_dashboard_manager_agent()
-    except Exception:
-        logger.debug("kirocrew-dashboard-manager agent install failed", exc_info=True)
-
-    # Install kirocrew-heartbeat agent (used by HeartbeatService for unattended polling)
-    try:
-        _install_heartbeat_agent()
-    except Exception:
-        logger.debug("kirocrew-heartbeat agent install failed", exc_info=True)
-
-    # Install kirocrew-conductor agent (goal decomposition + session-control dispatch).
-    # ``clean`` is passed through: the conductor installers carry the user's own
-    # ``allowedTools`` entries forward across a rebuild, and a clean rebuild is the
-    # explicit reset that drops them, as it drops every customization above. Each
-    # reports whether it wrote: a spec left on disk because it could not be read
-    # is a list this rebuild did NOT re-derive, and so is one whose installer
-    # raised -- a failed write (a read-only file, a refused ``os.replace``) leaves
-    # the previous list on disk exactly as a refused read does -- and ``_held_out``
-    # must say so in both cases, or a moved ceiling is marked projected onto a
-    # list that still carries the old grants.
-    conductor_held = False
-    try:
-        conductor_held |= not conductor_agents._install_conductor_agent(clean=clean)
-    except Exception:
-        conductor_held = True
-        logger.debug("kirocrew-conductor agent install failed", exc_info=True)
-
-    # Install kirocrew-pipeline-conductor agent (repository pipeline fleet supervision)
-    try:
-        conductor_held |= not conductor_agents._install_pipeline_conductor_agent(clean=clean)
-    except Exception:
-        conductor_held = True
-        logger.debug("kirocrew-pipeline-conductor agent install failed", exc_info=True)
-
-    # Install the deprecated kirocrew-ledger-conductor alias (the same spec as
-    # kirocrew-conductor above, under its old name, for one release). EAGER for
-    # the same forced reason spelled out on the worker below: ``session_create``
-    # refuses an agent it cannot resolve, and resolution reads a boot-time
-    # in-memory snapshot that no spec write refreshes — so a lazily-materialized
-    # spec is invisible to the validation that runs ahead of the spawn. A session
-    # already running under the old name resolves it on every dispatch, which is
-    # what the alias exists to keep working.
-    try:
-        conductor_held |= not conductor_agents._install_ledger_conductor_agent(clean=clean)
-    except Exception:
-        conductor_held = True
-        logger.debug("kirocrew-ledger-conductor alias install failed", exc_info=True)
-
-    # Install kirocrew-security-conductor agent (one security audit's worker fleet)
-    try:
-        conductor_held |= not conductor_agents._install_security_conductor_agent(clean=clean)
-    except Exception:
-        conductor_held = True
-        logger.debug("kirocrew-security-conductor agent install failed", exc_info=True)
-    # Settled here, not at the end: ``prime_ceiling_projection`` seeds the ceiling
-    # baseline from this after the boot rebuild, and a rebuild that raises further
-    # down must still leave the installers' verdict behind, not the previous one.
+    # The guard ADMITTED this rebuild above, and that one decision now covers
+    # every derived spec it installs. Re-asking per write would answer a
+    # different question: ``write_default_spec`` has just created
+    # ``kirocrew.json``, and the temp-checkout arm declines precisely when a
+    # spec is present -- so each spec below would be refused against the file
+    # this rebuild wrote. See ``_rebuild_spec_install_admitted``.
+    #
+    # ``finally``, not a plain reset after the block: several of these calls can
+    # raise past their own arms, and a leaked flag would exempt every later
+    # write in the process -- a worker dispatch, a dashboard edit -- from the
+    # guard this change exists to add.
     global _conductor_spec_held
-    _conductor_spec_held = conductor_held
-
-    # Install kirocrew-worker agent (the default toolset plus the work-ledger set).
-    #
-    # EAGER, like its six siblings above, and that placement is forced rather than
-    # chosen. ``session_create`` refuses an agent it cannot resolve
-    # (``agent_unresolved``), resolution runs through
-    # ``config.loader._materialized_kiro_agent``, and that is a pure IN-MEMORY
-    # snapshot refreshed at boot and by app (de)registration — never by a spec
-    # write. A spec materialized on the spawn path is therefore invisible to the
-    # validation that runs ahead of the spawn, so on a clean install a conductor
-    # cannot dispatch a worker at all. Measured: the name resolves False in the boot
-    # snapshot, and still False after a lazy write until a refresh nothing triggers.
-    #
-    # Being here also means every boot re-filters this spec's grants through the
-    # governance ceiling, exactly as it does for the six siblings, so the spec
-    # cannot outlive a tightened ceiling.
+    _rebuild_admitted_token = _rebuild_spec_install_admitted.set(True)
     try:
-        worker_agent._install_worker_agent()
-    except Exception:
-        logger.debug("kirocrew-worker agent install failed", exc_info=True)
+        # Install Kiro Crew AIM capabilities package (includes kirocrew-lite)
+        _install_aim_capabilities()
 
-    # Install kirocrew-dashboard-author agent (authors one dashboard template and lands
-    # it as a PR). EAGER for the same forced reason spelled out on the worker above:
-    # ``session_create`` refuses an agent it cannot resolve, resolution reads a boot-time
-    # in-memory snapshot that no spec write refreshes, so a lazily-materialized spec is
-    # invisible to the validation that runs ahead of the spawn -- a conductor could never
-    # dispatch it on a clean install. Being here also re-filters its grants through the
-    # governance ceiling on every boot, so the spec normally cannot outlive a tightened
-    # ceiling -- with one exception: a file at the stem that is NOT this installer's own
-    # (its bytes do not reproduce the installer-recorded ownership digest) is left untouched,
-    # so a hand-authored user spec at the once-user-creatable stem -- or a copy of another
-    # owned agent renamed onto it -- is never overwritten. Ownership is the digest the
-    # installer records in the ``agent_state`` sidecar for this name.
-    dashboard_author_install_error: Exception | None = None
-    try:
-        worker_agent._install_dashboard_author_agent()
-    except Exception as exc:
-        # Capture, do NOT swallow. An installer failure must not ABORT the independent
-        # repairs below (fork governance refresh, hook repair) -- those run for every other
-        # installer's failure too -- so we let them run first. But it must not be reported as
-        # a SUCCESSFUL rebuild either: this spec's ``allowedTools`` is re-filtered through the
-        # governance ceiling on every rebuild, so a ceiling-TIGHTENING rebuild whose
-        # author-spec rewrite failed (e.g. a Windows sharing violation, a spec-lock timeout)
-        # leaves the spec's forbidden auto-approvals live. If this rebuild then reported
-        # success, ``reproject_for_ceiling_change`` would advance its generation memo and the
-        # next poll would NOT retry -- the forbidden grants would persist for the process
-        # lifetime. So the failure is re-raised at the END of the rebuild (after the
-        # independent repairs), which (a) escapes before ``_wrote_out`` is marked True, so
-        # ``rebuild_agent_config_reporting`` does not report a write, and (b) leaves the
-        # reprojection memo behind so the next poll retries -- the safe direction the
-        # success contract already documents for a post-write exception.
-        dashboard_author_install_error = exc
-        # A tightened ceiling whose author-spec rewrite failed leaves revoked auto-
-        # approvals live. Mark the hold so ``prime_ceiling_projection`` does not seed
-        # the ceiling as projected, and ``retry_held_conductor_specs`` retries the
-        # rewrite on the next maintenance poll (GPT 6.1 F1: boot-time author install
-        # failures lose the governance retry).
-        _conductor_spec_held = True
-        logger.warning(
-            "kirocrew-dashboard-author agent install failed; completing independent repairs "
-            "then failing the rebuild so a tightened ceiling is retried, not marked synced",
-            exc_info=True,
-        )
+        # Install kirocrew-knowledge agent (used by Knowledge Library LLMPool)
+        try:
+            service_agents._install_knowledge_agent()
+        except Exception:
+            logger.debug("kirocrew-knowledge agent install failed", exc_info=True)
 
-    # Bidirectional sync: ensure packages installed for one provider
-    # are also available for the other (agents↔plugins, skills).
-    sync_aim_packages()
+        # Install kirocrew-research agent (used by the Research Lab campaign loop)
+        try:
+            service_agents._install_research_agent()
+        except Exception:
+            logger.debug("kirocrew-research agent install failed", exc_info=True)
 
-    fork_refresh.refresh_after_rebuild(refresh_forks, gated_off)
+        # Install kirocrew-dashboard-manager agent (the subagent a crewmate hands page
+        # work to). Degrades to a debug line like the two above: with the spec absent a
+        # crewmate still has `dashboard_fields` and `dashboard_write`, so the page it has
+        # keeps working and only CHANGING the page is unavailable.
+        try:
+            service_agents._install_dashboard_manager_agent()
+        except Exception:
+            logger.debug("kirocrew-dashboard-manager agent install failed", exc_info=True)
 
-    # Security: sanitize invalid hook keys in agent configs
-    repair_agent_configs()
+        # Install kirocrew-heartbeat agent (used by HeartbeatService for unattended polling)
+        try:
+            _install_heartbeat_agent()
+        except Exception:
+            logger.debug("kirocrew-heartbeat agent install failed", exc_info=True)
+
+        # Install kirocrew-conductor agent (goal decomposition + session-control dispatch).
+        # ``clean`` is passed through: the conductor installers carry the user's own
+        # ``allowedTools`` entries forward across a rebuild, and a clean rebuild is the
+        # explicit reset that drops them, as it drops every customization above. Each
+        # reports whether it wrote: a spec left on disk because it could not be read
+        # is a list this rebuild did NOT re-derive, and so is one whose installer
+        # raised -- a failed write (a read-only file, a refused ``os.replace``) leaves
+        # the previous list on disk exactly as a refused read does -- and ``_held_out``
+        # must say so in both cases, or a moved ceiling is marked projected onto a
+        # list that still carries the old grants.
+        conductor_held = False
+        try:
+            conductor_held |= not conductor_agents._install_conductor_agent(clean=clean)
+        except Exception:
+            conductor_held = True
+            logger.debug("kirocrew-conductor agent install failed", exc_info=True)
+
+        # Install kirocrew-pipeline-conductor agent (repository pipeline fleet supervision)
+        try:
+            conductor_held |= not conductor_agents._install_pipeline_conductor_agent(clean=clean)
+        except Exception:
+            conductor_held = True
+            logger.debug("kirocrew-pipeline-conductor agent install failed", exc_info=True)
+
+        # Install the deprecated kirocrew-ledger-conductor alias (the same spec as
+        # kirocrew-conductor above, under its old name, for one release). EAGER for
+        # the same forced reason spelled out on the worker below: ``session_create``
+        # refuses an agent it cannot resolve, and resolution reads a boot-time
+        # in-memory snapshot that no spec write refreshes — so a lazily-materialized
+        # spec is invisible to the validation that runs ahead of the spawn. A session
+        # already running under the old name resolves it on every dispatch, which is
+        # what the alias exists to keep working.
+        try:
+            conductor_held |= not conductor_agents._install_ledger_conductor_agent(clean=clean)
+        except Exception:
+            conductor_held = True
+            logger.debug("kirocrew-ledger-conductor alias install failed", exc_info=True)
+
+        # Install kirocrew-security-conductor agent (one security audit's worker fleet)
+        try:
+            conductor_held |= not conductor_agents._install_security_conductor_agent(clean=clean)
+        except Exception:
+            conductor_held = True
+            logger.debug("kirocrew-security-conductor agent install failed", exc_info=True)
+        # Settled here, not at the end: ``prime_ceiling_projection`` seeds the ceiling
+        # baseline from this after the boot rebuild, and a rebuild that raises further
+        # down must still leave the installers' verdict behind, not the previous one.
+        _conductor_spec_held = conductor_held
+
+        # Install kirocrew-dashboard-author agent (authors one dashboard template and lands
+        # it as a PR). EAGER for the same forced reason spelled out on the worker above:
+        # ``session_create`` refuses an agent it cannot resolve, resolution reads a boot-time
+        # in-memory snapshot that no spec write refreshes, so a lazily-materialized spec is
+        # invisible to the validation that runs ahead of the spawn -- a conductor could never
+        # dispatch it on a clean install. Being here also re-filters its grants through the
+        # governance ceiling on every boot, so the spec normally cannot outlive a tightened
+        # ceiling -- with one exception: a file at the stem that is NOT this installer's own
+        # (its bytes do not reproduce the installer-recorded ownership digest) is left untouched,
+        # so a hand-authored user spec at the once-user-creatable stem -- or a copy of another
+        # owned agent renamed onto it -- is never overwritten. Ownership is the digest the
+        # installer records in the ``agent_state`` sidecar for this name.
+        dashboard_author_install_error: Exception | None = None
+        try:
+            worker_agent._install_dashboard_author_agent()
+        except Exception as exc:
+            # Capture, do NOT swallow. An installer failure must not ABORT the independent
+            # repairs below (fork governance refresh, hook repair) -- those run for every other
+            # installer's failure too -- so we let them run first. But it must not be reported as
+            # a SUCCESSFUL rebuild either: this spec's ``allowedTools`` is re-filtered through the
+            # governance ceiling on every rebuild, so a ceiling-TIGHTENING rebuild whose
+            # author-spec rewrite failed (e.g. a Windows sharing violation, a spec-lock timeout)
+            # leaves the spec's forbidden auto-approvals live. If this rebuild then reported
+            # success, ``reproject_for_ceiling_change`` would advance its generation memo and the
+            # next poll would NOT retry -- the forbidden grants would persist for the process
+            # lifetime. So the failure is re-raised at the END of the rebuild (after the
+            # independent repairs), which (a) escapes before ``_wrote_out`` is marked True, so
+            # ``rebuild_agent_config_reporting`` does not report a write, and (b) leaves the
+            # reprojection memo behind so the next poll retries -- the safe direction the
+            # success contract already documents for a post-write exception.
+            dashboard_author_install_error = exc
+            # A tightened ceiling whose author-spec rewrite failed leaves revoked auto-
+            # approvals live. Mark the hold so ``prime_ceiling_projection`` does not seed
+            # the ceiling as projected, and ``retry_held_conductor_specs`` retries the
+            # rewrite on the next maintenance poll (GPT 6.1 F1: boot-time author install
+            # failures lose the governance retry).
+            _conductor_spec_held = True
+            logger.warning(
+                "kirocrew-dashboard-author agent install failed; completing independent repairs "
+                "then failing the rebuild so a tightened ceiling is retried, not marked synced",
+                exc_info=True,
+            )
+
+        # Install kirocrew-worker agent (the default toolset plus the work-ledger set).
+        #
+        # EAGER, like its six siblings above, and that placement is forced rather than
+        # chosen. ``session_create`` refuses an agent it cannot resolve
+        # (``agent_unresolved``), resolution runs through
+        # ``config.loader._materialized_kiro_agent``, and that is a pure IN-MEMORY
+        # snapshot refreshed at boot and by app (de)registration — never by a spec
+        # write. A spec materialized on the spawn path is therefore invisible to the
+        # validation that runs ahead of the spawn, so on a clean install a conductor
+        # cannot dispatch a worker at all. Measured: the name resolves False in the boot
+        # snapshot, and still False after a lazy write until a refresh nothing triggers.
+        #
+        # Being here also means every boot re-filters this spec's grants through the
+        # governance ceiling, exactly as it does for the six siblings, so the spec
+        # cannot outlive a tightened ceiling.
+        try:
+            worker_agent._install_worker_agent()
+        except Exception:
+            logger.debug("kirocrew-worker agent install failed", exc_info=True)
+
+        # Bidirectional sync: ensure packages installed for one provider
+        # are also available for the other (agents↔plugins, skills).
+        sync_aim_packages()
+
+        fork_refresh.refresh_after_rebuild(refresh_forks, gated_off)
+
+        # Security: sanitize invalid hook keys in agent configs
+        repair_agent_configs()
+    finally:
+        _rebuild_spec_install_admitted.reset(_rebuild_admitted_token)
 
     if dashboard_author_install_error is not None:
         # The independent repairs have run; now fail the rebuild. ``_wrote_out`` is left
@@ -4395,6 +4674,14 @@ loop is running and drive that one round with `wait`.
 **Rounds run back to back.** When a round lands, report it, then plan and
 dispatch the next round in the same turn. Do not wait for the user: the one
 Round-0 go-ahead covers every round.
+
+**Drop your chat at a round close.** Every patrol turn re-sends this whole
+chat; the ledgers already hold your state. Once the next round is dispatched,
+`session_ledger_record` `goal`, `next` (the open item ids, their worker keys and
+their PRs) and `patrol_base`, then call `reset_conversation` as the last act of
+that turn. The next wake resumes from the ledger snapshot it carries. Never
+reset mid-round, and never while a question to the person is unanswered. A
+refused reset changes nothing: carry on.
 
 **Rounds are not gated, but spend is bounded.** Count from the ledger. With no
 budget from the user, a goal holds at most 20 ledger items in total, re-plans
@@ -5026,6 +5313,10 @@ _CONDUCTOR_CORE_GRANTS: tuple[str, ...] = (
     "@kirocrew-core/send_notification",
     "@kirocrew-core/ask_question",
     "@kirocrew-core/nothing_to_do",
+    # Dropping its own chat at a round close. The directive consumer admits it
+    # from a patrol wake only on the slot's own live self-armed loop, with no
+    # question or approval pending (``session_directive_apply``).
+    "@kirocrew-core/reset_conversation",
 )
 
 
@@ -5244,6 +5535,10 @@ arguments: which item you are bound to is resolved from your own session.
   control, a credential you do not have, another item's output).
 - `question` — your conductor's own decision is needed. `blocked` and `question`
   differ by WHO must act, which is why they are separate values.
+- On `blocked` or `question`, say when only a person can move it, in `reason`:
+  `approval` when a tool approval timed out or is waiting (report it the moment
+  one times out), `needs_human` when only a person can unblock you. Leave it
+  unset for a build, service or other item that moves on its own.
 - `done` — the acceptance condition is met. Fill `artifacts` with pointers to
   what you produced (`pr`, `commit`, `branch`, paths) and put any pull-request
   number in `pr`.

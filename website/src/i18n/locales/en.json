@@ -7669,15 +7669,19 @@
       "profile_memory_ownership_mismatch": "Bound to another crewmate",
       "profile_memory_unavailable": "Not available",
       "profile_notes_sub": "Its own working notes · read-only",
-      "profile_model": "Model",
-      "profile_model_auto": "Auto",
       "profile_card": "Profile",
       "profile_sessions_tab": "Sessions",
       "profile_goals_tab": "Goals",
       "profile_goals_soon": "Goals are coming soon: set what {{name}} is working toward and follow its progress here.",
       "dashboard_empty": "{{name}} has not published a dashboard yet. Ask it in this chat, and what it publishes shows here.",
       "profile_permissions": "Permissions",
-      "profile_permissions_sub": "What it may do · set in the editor",
+      "profile_effort_hint": "Higher levels think longer, answer slower, and cost more.",
+      "profile_settings_waiting": "These unlock once the chat with this crewmate is open.",
+      "profile_permission_changed": "The permission changed elsewhere. This is the current setting.",
+      "profile_mode_normal_hint": "{{name}} asks you before each tool, in every chat with it.",
+      "profile_mode_reads_hint": "{{name}} runs read-only commands on its own and asks for the rest, in every chat with it. Pick Normal to approve each step.",
+      "profile_mode_trust_hint": "{{name}} runs tools without asking you first, in every chat with it. Pick Normal to approve each step.",
+      "profile_model_inherited_hint": "Using {{model}}, the crew default",
       "schedule_up_next": "Up next",
       "schedule_in": "Runs in {{time}}",
       "schedule_none": "Nothing wakes this crewmate on its own yet.",
@@ -8661,7 +8665,8 @@
         "view_this_commit_on_github": "View this commit on GitHub",
         "what_s_new": "What's new",
         "you_are_on_the_latest_version": "You are on the latest version.",
-        "you_re_on_the_latest_version": "You're on the latest version."
+        "you_re_on_the_latest_version": "You're on the latest version.",
+        "update_refused_dirty_worktree": "Update stopped to keep your local edits safe: your {{productName}} folder has uncommitted changes ({{changed}}). Commit or stash them, then press Update now again. To stash everything, run the command below in a terminal in your {{productName}} folder."
       },
       "botChannelPanel": {
         "allowed_user_ids": "Allowed user IDs",
@@ -8857,7 +8862,12 @@
         "minimap_location_desc": "When located on the right edge, the minimap replaces the scroll bar.",
         "remove_the_agents_pin": "Clear its pin",
         "failed_to_clear_agent_model_pin": "Couldn't clear the agent's pinned model ({{error}}). Try again.",
-        "failed_to_clear_agent_model_pin_no_reason": "Couldn't clear the agent's pinned model. Try again."
+        "failed_to_clear_agent_model_pin_no_reason": "Couldn't clear the agent's pinned model. Try again.",
+        "compaction_wait_budget": "Compaction Time Limit (seconds)",
+        "compaction_wait_budget_description": "Longest a compaction may run. 0 = default (300 s). Otherwise 60 to 3,600 s.",
+        "compaction_wait_budget_hint": "Past this limit the session restarts, or a manual compaction reports that it timed out. Raise it if compaction on a large context regularly needs more than 300 seconds.",
+        "compaction_wait_budget_clamped": "Saved {{stored}}. {{requested}} is outside the allowed range ({{min}} to {{max}}).",
+        "failed_to_save_compaction_wait_budget": "Failed to save compaction wait budget"
       },
       "computerUsePanel": {
         "accessibility": "Accessibility",

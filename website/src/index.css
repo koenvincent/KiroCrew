@@ -546,6 +546,10 @@ html:lang(ko) {
   --shadow-md:0 4px 12px rgba(0,0,0,.08),0 0 0 1px rgba(0,0,0,.04);
   --shadow-lg:0 12px 28px rgba(0,0,0,.12);
 }
+/* Internal token, outside the [data-theme] blocks so packs cannot set it.
+   --shadow-lg alone reads flat over near-black chat; light mode keeps it. */
+:root{--shadow-float:0 0 0 1px rgba(0,0,0,.4),0 24px 64px -8px rgba(0,0,0,.7),0 8px 24px rgba(0,0,0,.45)}
+[data-mode="light"]{--shadow-float:var(--shadow-lg)}
 :root,[data-theme="dark"],[data-theme="amber-dark"]{
   --search-highlight:rgba(255,167,38,.45);--search-highlight-current:rgba(255,120,0,.85);--search-highlight-current-border:rgba(255,255,255,.9);
   --bg:#12141a;--bg-accent:#14161d;--bg-elevated:#1a1d25;--bg-hover:#262a35;

@@ -484,8 +484,9 @@ policy: `require_policy_signature` in the operator-controlled
 `admission_policy.json`, which demands one on *every* policy tier, the fetched one
 included.
 
-The trust key lives in that same file, under `trust_keys` keyed by the policy's
-`identity.issuer`. Both live there rather than in the policy for the same reason: a
+The trust key lives in that same file, keyed by the policy's `identity.issuer`:
+under `trust_public_keys` as a base64 Ed25519 **public** key (recommended), or under
+`trust_keys` as a shared HMAC secret. Both live there rather than in the policy for the same reason: a
 document must not be the authority on whether it has to be authentic, since an
 attacker rewriting the policy would simply clear such a flag — and
 `admission_policy.json` is on the protected floor the agent cannot write.
@@ -496,11 +497,15 @@ file does not invalidate it while changing any value does.
 
 Two limitations, stated plainly:
 
-- **The primitive is symmetric HMAC-SHA256.** Any host that can verify a
-  signature holds a secret that can also *produce* one, so this detects an
-  endpoint or transport that tampered with the document — not a host that decided
-  to forge its own. It raises the bar; it is not a public-key attestation. An
-  asymmetric verify swaps in behind the same helper if that changes.
+- **`trust_keys` is symmetric HMAC-SHA256.** Any host that can verify such a
+  signature holds a secret that can also *produce* one, so it detects an endpoint
+  or transport that tampered with the document — not a host that decided to forge
+  its own. `trust_public_keys` is the public-key answer: the host holds only the
+  public half and the private half stays with whoever signs. An issuer listed in
+  `trust_public_keys` is verified with Ed25519 alone; its `trust_keys` entry is no
+  longer consulted, even when the public-key value is a `null` or empty
+  placeholder: every policy from that issuer then reads as unverified, and is
+  refused when `require_policy_signature` is set.
 - **No signing runbook ships.** There is no `kirocrew policy sign`, no key
   distribution tooling and no rotation procedure; you compute the signature and
   place the key yourself. `require_policy_signature` on a fleet with no matching
@@ -508,6 +513,19 @@ Two limitations, stated plainly:
   `false` — as [the example policy](assets/security-policy.example.json) does — is
   a reasonable starting point when the endpoint is already an authenticated,
   TLS-fronted internal service.
+
+**Moving an issuer from HMAC to Ed25519.** The order matters, because provisioning
+the public key immediately un-verifies every still-HMAC-signed document cached for
+that issuer:
+
+1. Re-sign the policy with the Ed25519 private key (the signature is the base64 of
+   the 64-byte signature over the canonical payload) and publish it.
+2. Confirm every host has fetched the re-signed document.
+3. Add `trust_public_keys[<issuer>]` (base64 of the raw 32-byte public key) to
+   `admission_policy.json`.
+4. Delete the issuer's `trust_keys` entry. Step 3 already stops it being used for
+   policy documents; deleting it removes the secret from the host. Keep it if the
+   same name also signs plugin manifests, which still verify through `trust_keys`.
 
 ### What is not included
 

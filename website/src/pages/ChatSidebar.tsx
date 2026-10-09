@@ -111,7 +111,8 @@ import { buildSidebarRows, chipLabel, sameRowView, type ConductorRowView, type R
 import { useSessionSources } from './chat-sidebar/sessionSources'
 import { CrewGroupSection, CrewOfflineContext, LocalGroupHeader, useCollapsedCrews } from './chat-sidebar/CrewGroups'
 import { crewOf, type CrewGroup } from '../hooks/useInstanceSessions'
-import { useSessionRename, useFolderRename } from './chat-sidebar/rename'
+import { useSessionRename, useSessionAutoTitle, useFolderRename } from './chat-sidebar/rename'
+import { useSlotTitleGenerating } from '../hooks/slotTitleGeneration'
 import { useSidebarLane, useLaneCycle, renderedLane } from './chat-sidebar/lanes'
 import { useHistoryPane } from './chat-sidebar/history'
 import { usePinnedSessionOrder, usePinnedOrderAuthority, usePinnedKeyboardReorder } from './chat-sidebar/pinnedOrder'
@@ -796,6 +797,9 @@ interface SessionRowActions {
   onRenameChange: (value: string) => void
   onRenameCommit: (key: string, value: string) => void
   onRenameCancel: () => void
+  /** The row menu's "Regenerate title": re-derives the title from the
+   *  conversation without making the session active. */
+  onAutoTitle: (key: string) => void
   onDuplicate: (key: string) => void
   onCloseSession: (key: string) => void
   onMenuCloseAutoFocus: (e: Event) => void
@@ -886,7 +890,7 @@ const SessionRow = memo(function SessionRow({ view, actions }: SessionRowProps) 
   } = view.shell
   const {
     onNativeDragStart, onNativeDragEnd, onPinnedKeyboardReorder,
-    renameInputRef, onRenameStart, onRenameChange, onRenameCommit, onRenameCancel,
+    renameInputRef, onRenameStart, onRenameChange, onRenameCommit, onRenameCancel, onAutoTitle,
     onDuplicate, onCloseSession, onMenuCloseAutoFocus, onSelectSlot, onOpenSlotInNewTab, onOpenSource, onOpenPeerSession,
     openElsewhere, toggleConductor,
   } = actions
@@ -895,6 +899,7 @@ const SessionRow = memo(function SessionRow({ view, actions }: SessionRowProps) 
   // (rename, close, fork, drag, the row menu) is withheld exactly as it is for a peer
   // row, because the slot's lifecycle is owned elsewhere.
   const onOpenElsewhere = opensElsewhere != null ? () => openElsewhere(opensElsewhere) : undefined
+  const titleGenerating = useSlotTitleGenerating(s.key)
   // Peer ownership, present only on a row sourced from a connected remote
   // instance. Every local-only affordance below is gated on its ABSENCE rather
   // than disabled: a control that looks actionable and silently does nothing is
@@ -1599,6 +1604,7 @@ const SessionRow = memo(function SessionRow({ view, actions }: SessionRowProps) 
       slotKey: rowKey,
       mode,
       onRename: () => onRenameStart(rowKey, scope, rowTitle && rowTitle !== rowKey ? rowTitle : '', true),
+      onAutoTitle: () => onAutoTitle(rowKey),
       onOpenInNewTab: onOpenSlotInNewTab ? () => onOpenSlotInNewTab(rowKey) : undefined,
       // A row menu opens from inside this panel, where the folder-order banner
       // (when there is one) sits over the tree -- the menu need not repeat it.
@@ -1606,7 +1612,7 @@ const SessionRow = memo(function SessionRow({ view, actions }: SessionRowProps) 
       // On a card with sessions under it, the menu's Close says it reaches this
       // one session only, as visible text: a phone has no hover tooltip.
       closeHint: closeReachHint,
-    }), [rowKey, mode, onRenameStart, scope, rowTitle, onOpenSlotInNewTab, closeReachHint])
+    }), [rowKey, mode, onRenameStart, onAutoTitle, scope, rowTitle, onOpenSlotInNewTab, closeReachHint])
     const rowActions = useMemo(() => (void langGen, !renamingHere && !foreignRow ? (isMobile ? (
       <div className="absolute top-1/2 -translate-y-1/2 right-1.5 flex items-center gap-0.5">
         <DropdownMenu>
@@ -2116,7 +2122,16 @@ const SessionRow = memo(function SessionRow({ view, actions }: SessionRowProps) 
                   A separate ↳ glyph also double-stacked into "↳↳ Fork of …". */}
               {renamingHere ? (
                 <textarea ref={renameInputRef} rows={1} className={`w-full bg-bg-elevated border border-accent rounded px-1 py-0 ${ROW_TITLE_CLS} text-text-strong outline-hidden select-text resize-none block overflow-hidden focus-ring`} value={renameValue} onChange={e => onRenameChange(e.target.value)} {...ime.bindEnter<HTMLTextAreaElement>({ onEnter: () => { (document.activeElement as HTMLTextAreaElement)?.blur() }, onEscape: onRenameCancel, onBlur: () => onRenameCommit(s.key, renameValue) })} onMouseDown={e => e.stopPropagation()} />
-              ) : (s.title && s.title !== s.key ? s.title : s.key)}
+              ) : (
+                <>
+                  {/* A menu-started Regenerate title closes its menu at once, so
+                      the row itself says the model call is running. */}
+                  {titleGenerating && (
+                    <Loader size={ROW_ICON_PX} className="lucide-inline mr-1 shrink-0 text-accent animate-spin" role="img" aria-label={i18nT('pages.chatPage.regenerating_title')} data-testid="row-title-generating" />
+                  )}
+                  {s.title && s.title !== s.key ? s.title : s.key}
+                </>
+              )}
             </div>
             {/* Secondary line: one ordered resolver decides both the words and the
                 marker leading them (#3830), so the two can no longer disagree.
@@ -2458,6 +2473,7 @@ function ChatSidebar({
     suppressMenuRestoreRef, onRenameStart, onRenameChange, onRenameCancel, onRenameCommit,
     onMenuCloseAutoFocus,
   } = useSessionRename({ dispatch, store, queryClient })
+  const { autoTitleError, setAutoTitleError, onAutoTitle } = useSessionAutoTitle({ dispatch, store })
   // Folder create / settings modal target. One modal instance is rendered at the
   // sidebar root, so — unlike the inline inputs it replaced — it needs no column
   // scope: a folder rendered in several board columns can only have one modal.
@@ -3330,7 +3346,7 @@ function ChatSidebar({
   // What every session row can do, built once: the row's memo compares this one
   // reference, so none of these may take a new identity per render.
   const rowActions = useMemo(() => ({
-    renameInputRef, onRenameStart, onRenameChange, onRenameCommit, onRenameCancel,
+    renameInputRef, onRenameStart, onRenameChange, onRenameCommit, onRenameCancel, onAutoTitle,
     onDuplicate: sessionActions.duplicate, onCloseSession: sessionActions.close,
     onMenuCloseAutoFocus, onSelectSlot, onOpenSlotInNewTab, onOpenSource,
     onOpenPeerSession: openPeerSession,
@@ -3338,7 +3354,7 @@ function ChatSidebar({
     onPinnedKeyboardReorder: reorderPinnedByKeyboard,
     openElsewhere, toggleConductor: toggleConductorExpanded,
   }), [
-    renameInputRef, onRenameStart, onRenameChange, onRenameCommit, onRenameCancel,
+    renameInputRef, onRenameStart, onRenameChange, onRenameCommit, onRenameCancel, onAutoTitle,
     sessionActions.duplicate, sessionActions.close, onMenuCloseAutoFocus, onSelectSlot, onOpenSlotInNewTab,
     onOpenSource, openPeerSession, startBoardCardDrag, endNativeSessionDrag, reorderPinnedByKeyboard,
     openElsewhere, toggleConductorExpanded,
@@ -5542,6 +5558,17 @@ function ChatSidebar({
         onDismiss={() => setRenameError('')}
         className="mx-2 mt-2 shrink-0"
         testId="rename-error"
+      />
+      <ErrorNotice
+        title={i18nT('pages.chatPage.could_not_generate_title')}
+        message={autoTitleError}
+        askAgent
+        // Below, not beside: at sidebar width a side link squeezes the
+        // message into a one-word column.
+        actionPlacement="below"
+        onDismiss={() => setAutoTitleError('')}
+        className="mx-2 mt-2 shrink-0"
+        testId="auto-title-error"
       />
         {/* An instance that is CONNECTED but did not answer contributes no rows.
           *  Saying so is the difference between "that instance has nothing open" and

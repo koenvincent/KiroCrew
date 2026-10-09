@@ -756,6 +756,18 @@ skills/crons/MCP registration overwrite in place.
 
 Writer: `apps/bridges.py::reconcile_enabled_app_resources`.
 
+Enablement also decides which of an app's **`kirocrew-core` tools are advertised**.
+The four built-in apps reached through that server — Issue Radar, Dev Fleet, Ops
+Mission Control, Design Tweak — gate every agent route on `is_app_enabled` (a 403
+whose body differs per app: Dev Fleet's routes and the app reverse proxy Design
+Tweak sits behind name it `app_not_enabled`, Ops Mission Control `app_disabled`,
+Issue Radar carries no code), and since #16099 `tools/list` emits a tool's
+descriptor only
+while the same `installed.json` read says the app is enabled; a read fault lists
+rather than hides. The contract, the tool-to-app map and why the listing reads the
+tri-state `app_enabled_state` are in
+[mcp](../../architecture/mcp.md#an-apps-tools-follow-the-apps-enablement).
+
 ### 7.1 A hung startup lifecycle hook is bounded at the dispatch boundary
 
 `LifecycleDispatcher` invokes startup hooks **serially** in lexicographic app-name
@@ -1579,9 +1591,65 @@ is written disabled, SEL caller `app_register`). App updates retain the prior
 tree until the replacement and its metadata are durable, so a failed update
 restores the old manifest and enabled state together. A replacement manifest
 that removes the flag clears any lingering `sessionApprovalConsentPending` bit.
-This re-gate covers
-`sessionApproval` only; `permissions.api` and `permissions.events` are likewise
-read live and still widen on update without a consent moment (issue #11212).
+
+`permissions.api` and `permissions.events` are read live as well, and an update
+that adds any entry to either is held back rather than disabled. Each app stores
+the entries the owner has approved in `approved-grants.json`
+(`{"api": [...], "events": [...]}`) beside `installed.json`, and every
+enforcement point -- `token_auth._app_api_allowlist`,
+`ws_event_scope._read_declared_events`, and the hook context's event bus via
+`approved_manifest_permissions` -- grants only entries the live manifest
+declares AND that file holds (`staged_app_grants`, which reads the manifest,
+the record and the file fresh on each call). The set has its own file so that
+the many `installed.json` writers (dev mode, enable/disable, provenance, the
+builtin sync) structurally cannot write a stale copy of it: only the
+grant-owning paths below touch it, each with one atomic write, and no lock is
+needed.
+
+- **Writing the set.** `install_app` and a first `register_external_app` store
+  what the manifest declares (installing is the consent moment), before the
+  record. `update_app` and a re-registration store the previous set limited to
+  what the new manifest still declares, so an added entry is not approved and a
+  dropped one must be approved again if a later version brings it back; when
+  anything is held back `update_app` logs SEL `grants_widened` / `staged`
+  (caller `app_update`, or `app_register` for a re-registration) and says so in
+  its message, and the app stays enabled. The set only ever narrows on these
+  paths, so it is written before the manifest it goes with. `update_app` writes
+  it into the new tree before the record (the file is in `_COPY_IGNORE`, so a
+  source tree cannot ship one), and a failed update's rollback restores the old
+  tree's file with the old tree; a failed re-registration puts back the prior
+  file, or removes it if there was none. Gateway-shipped builtins carry no set:
+  they change with the gateway, not through an update.
+- **Backfill.** An install with no `approved-grants.json` (from before the file,
+  or a builtin) approves what its manifest declares, so no app loses access on
+  upgrade; its first update or re-registration takes that as the previous set.
+- **Approval.** The detail page lists the held-back entries under "API access"
+  and "WebSocket events" (the Permissions card's labels) with a plain-words line
+  for each group, and tags them "not approved" on the Permissions card. Its
+  "Approve new permissions" button posts `/enable` with `grantsConsent:
+  {"api": [...], "events": [...]}` naming the entries the owner was shown
+  (owner-gated; any other value approves nothing). `enable_app` adds only those
+  entries, and only while the live manifest still declares them, to the file;
+  an entry declared after the owner looked stays held back (SEL
+  `grants_approved` / `partial`). It refuses with `grants_manifest_unreadable`,
+  changing nothing, while the manifest cannot be read. The button is offered
+  only while the app is enabled, because the enable route would also switch a
+  disabled app on; a disabled app is told to turn it on, then approve the new
+  entries there. `get_app` and `list_apps` rows carry the set as
+  `approvedGrants`. The approved event set is part of `hook_signature`, so
+  approving events reloads the app's hooks and rebuilds its event bus; the API
+  and WebSocket caches pick an approval up within their refresh interval.
+  `get_app` is read-only, like `list_apps`.
+- **Failure direction is closed.** An install without the file whose old
+  manifest is unreadable gives an empty previous set on update; an
+  `approved-grants.json` that cannot be read, or holds anything but a mapping
+  (including `[]`, `false`, `null`), approves nothing; and an app directory with
+  no readable record (corrupt, or mid-update between the tree swap and the new
+  record) grants no entry.
+
+`sessionApprovalConsentPending` keeps its own disable-until-consent shape: that
+grant is enforced through the enabled flag on several session routes rather
+than at one gate, so it is not folded into the approved set.
 
 **Prefix grants are narrowed to owned resources on the cross-session routes.**
 `permissions.api` is a prefix match, so the routes below are judged per resource
@@ -2013,7 +2081,12 @@ mismatch returns `app_trust_repository_mismatch` and requires revoke plus fresh
 consent without returning either repository coordinate. A legacy name grant with
 no binding is inactive for every repository-backed source — including the same
 repository it historically used — and returns `app_execution_denied` so the
-normal consent dialog can create the missing binding. A still-installed app with
+normal consent dialog can create the missing binding. The exception is an app
+still installed with positively local provenance: the grant endpoint binds to
+that installed source, so the dialog could only record a local grant again.
+That refusal returns `app_trust_local_only` instead, so no consent dialog opens,
+and its prose names the route that does record the repository: uninstall
+keeping data, then install from the App Store. A still-installed app with
 positively local provenance retains migration compatibility; an unknown/fresh
 same-name local source does not inherit that old grant. The commit is deliberately
 not bound: a new pin in the same repository is the ordinary catalog update path

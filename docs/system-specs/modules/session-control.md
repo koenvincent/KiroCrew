@@ -25,7 +25,7 @@ unreachable in production because the caller's `X-Internal-Secret` is ignored.
 | `session_retry` | `POST /api/session-control/retry` | Re-run a failed last turn through `continue_slot_turn`, the Resume button's path, with `require_interrupted=True` (`turn_not_failed` otherwise) and `authorize_target` re-run synchronously under the slot lock before the continuation is queued |
 | `session_set_model` | `POST /api/session-control/set-model` | Record a pending model and/or reasoning-effort pick on an idle session; `apply_pending_model_pick` commits it at the start of the target's next turn after re-running `authorize_target` in the same synchronous step. Each half yields separately to a newer user pick from its own control. A busy target is refused with `target_busy` and keeps its settings |
 | `session_reload` | `POST /api/session-control/reload` | Relaunch the agent process of an idle session the caller created, through `chat_handlers.reload_slot_session` (shared with the tab menu's Reload session). The transcript is kept and gets one notice naming the caller. Self, remote-crew and busy targets (turn running or starting, queued messages, sub-agents) are refused |
-| `session_close` | `POST /api/session-control/close` | Close (archive) another session, as the tab ✕ does — heavier than stop, and recoverable rather than a delete |
+| `session_close` | `POST /api/session-control/close` | Close (archive) another session, or the caller itself, as the tab ✕ does — heavier than stop, and recoverable rather than a delete |
 | `session_revive` | `POST /api/session-control/revive` | Bring an archived session back into the live sidebar, as clicking it in the History tab does — the mirror of close, optionally filing it into a folder |
 | `session_send` | `POST /api/session-control/send` | Deliver a message that another session runs as its next turn, or cut it into the turn already running (`steer`) |
 | `session_broadcast` | `POST /api/session-control/broadcast` | Deliver ONE message to several sessions — by default every session the caller created — in a required `queue` or `steer` mode, reporting the outcome per target |
@@ -148,12 +148,20 @@ that edge can exist, but is a weaker, agent-editable source. The union is the
 answer, and every row names the sources that placed it (`crew_log`, `history`,
 `live`, joined with `+`).
 
-The row's `status` separates `working` / `queued` / `idle` / `gone` /
-`unknown`. A tree-backed row absent from the dashboard is `gone`, preserving the
-existing meaning. A history-only row is `unknown`: its metadata proves the
-session was created, but does not claim whether it finished or was lost. This
-does not add another completed-versus-lost conflation to `gone` (tracked in issue
-#14213). The persisted field is already read by the member ownership boundary in
+The row's `status` separates `working` / `queued` / `idle` / `closed` / `lost` /
+`unknown`. A tree-backed row absent from the dashboard is `closed` or `lost`: the
+roster records that a session the dashboard no longer holds still existed, and
+its folded lifecycle says which fate it met. `closed` (carrying `closed_at`) is
+the DELIBERATE tab close -- the worker finished and its tab was closed
+(`remove` -> `END_REASON_REMOVED`); nothing is there to re-dispatch. `lost` is
+the fail-safe default: a session gone with a turn still open, or whose only close
+edge came from a process recycle (`reset`) or a `destroy`, or whose fold could
+not be read -- the state a patrol re-dispatches. A history-only row is `unknown`:
+its metadata proves the session was created, but does not claim whether it
+finished or was lost. Splitting `closed` from `lost` is what resolves the
+completed-versus-lost conflation #14213 named; the split reads the lifecycle the
+status fold already projects, adding no new crew-log vocabulary. The persisted
+field is already read by the member ownership boundary in
 session-control authorization, so using it for an informational roster row asks
 no more trust of it than the existing fence. It does not become crew-log lineage,
 and its distinct `source` keeps that visible.
@@ -552,7 +560,7 @@ and skip the target guard while keeping the creator gates.
 **What the child gets on top of the human fork**, applied by a `stamp` callback
 `fork_slot` runs on the child before its birth save, so it lands in the same
 metadata line as the transcript and is on disk before the slot is broadcast (no
-second persistence window; a failed save withdraws the whole child): `title` (else the fork's `↳ Fork of <parent>`),
+second persistence window; a failed save withdraws the whole child): `title` (a final, user-origin name; else the fork's `↳ Fork of <parent>`, which the background `refresh_forked_title` pass renames from the latest person-typed question when the parent's title was auto),
 `folder_id` (else the parent's folder, which the human fork inherits; an
 unknown folder refuses the whole fork before any copy, confirmed read-only under
 the folder-store lock like `create_session`, and the Model-B un-hide runs only
@@ -826,7 +834,11 @@ A private member store is reachable on two authorities and no others:
   chose would make the two sources one. Claiming it is OPT-IN: the default is not to
   vouch, so a binder that says nothing about provenance publishes the record and
   claims no authority, and a caller that should have claimed it fails loudly at a
-  refused dispatch rather than quietly widening access. A member-LESS identity is never
+  refused dispatch rather than quietly widening access. An owner's pick of a member
+  for a dashboard tab or member DM thread (`_pin_private_agent_assignment`) vouches:
+  every caller authorizes the owner's request first, and the store it publishes is
+  the one config resolves for that member, never one carried from the record. A
+  member-LESS identity is never
   vouched even when its caller asks: no member means the Global store, and the admission
   identifies its caller by member, so the entry could never be admitted.
   A record published elsewhere can also leave a vouched entry behind.
@@ -1752,7 +1764,11 @@ the conversation is saved to history (`closed=True`) and can be reopened later, 
 closing dismisses the LIVE tab, it does not delete the transcript. It is a
 strictly heavier act than `session_stop` — an in-flight turn is cancelled first
 and its work discarded — so the tool description tells the caller to read the
-session before closing it. It reuses the dashboard's own close path
+session before closing it. Close waives the self-target refusal
+(`allow_self=True`, as release does) on both its admission gate and its pre-pop
+re-check, so a session that has finished its one job can archive its own tab; the
+self-close cancels the caller's own running turn, which is the turn that asked
+for it, and every other caller and target rule still applies. It reuses the dashboard's own close path
 (`close_slot`), the same sequence the ✕ button runs: a synchronous tombstone,
 auto-nudge-loop retirement BEFORE the awaits so no nudge resurrects the tab, the
 owning app's close hook with rollback, persist-as-closed, and per-tab session

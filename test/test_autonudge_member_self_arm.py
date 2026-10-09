@@ -1426,9 +1426,13 @@ class TestLegacyLoopUpdateOnAMemberSlotKeepsTheSelfArmRule:
 
 @pytest.mark.asyncio
 async def test_a_self_wake_does_not_unlock_the_user_surface_directives() -> None:
-    """The wake mark is self-arm provenance ONLY. ``set_project`` and
-    ``reset_conversation`` stay behind the authenticated-human gate: a loop's
-    wake must never retarget the slot's project or discard its conversation."""
+    """The wake mark is self-arm provenance ONLY. ``set_project`` stays behind
+    the authenticated-human gate: a loop's wake must never retarget the slot's
+    project.
+
+    ``reset_conversation`` is left out of this sentence on purpose: a
+    conductor's own vouched patrol wake may drop its chat at a round close. That
+    one exception and its refusals are pinned in test_conductor_wake_reset.py."""
     with patch.object(sda, "_audit") as audit:
         result = await sda.apply_session_directive(
             SimpleNamespace(),
