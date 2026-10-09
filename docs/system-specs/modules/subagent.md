@@ -3982,6 +3982,10 @@ selects the connected, version-equal instance with the fewest live external
 records; ties rotate. The accepted response carries `executor` and the concrete
 `instance_id`, and the MCP receipt renders `[remote:<instance>]`. A local run is
 never described as remote merely because its parent is attached to an instance.
+The task text leaves the hub through `peer_redaction.redact_peer_text` (the
+exfiltration-URL then credential redactors), the same scrub every string coming
+back from the peer gets, so a credential the model quoted into the task never
+reaches another host; the shadow record keeps that scrubbed text.
 
 Remote placement does not keep this gateway's approval ceiling: the child runs
 under the PEER's own tool-approval policy and profile, which the originating

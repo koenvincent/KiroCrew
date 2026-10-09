@@ -279,6 +279,48 @@ async def test_remote_spawn_picks_least_loaded_peer_and_relays_completion(
 
 
 @pytest.mark.asyncio
+async def test_a_credential_quoted_in_the_task_never_reaches_the_peer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("kiro_crew.dashboard.remote_subagents._POLL_SECONDS", 0.0)
+    instances = _Instances(
+        [
+            (200, {"id": "peer01"}),
+            (200, {"done": True, "result": "ok", "error": "", "outcome": "completed"}),
+        ]
+    )
+    manager = _Manager()
+    service = RemoteSubagentService(  # type: ignore[arg-type]
+        SimpleNamespace(instances_manager=instances), manager
+    )
+    secret = "AKIAIOSFODNN7EXAMPLE"
+
+    info = await service.spawn(
+        task=f"deploy with key {secret} please",
+        parent_session="",
+        agent="",
+        max_turns=0,
+        cwd="/home/kirocrew/workplace/repo",
+        model="",
+        reasoning_effort="",
+        include_memory=False,
+        include_lessons=False,
+        include_project=False,
+        memory_mode="persistent",
+        batch_id="",
+        batch_total=0,
+    )
+    await _settle_monitor(service, info.id)
+
+    sent = instances.calls[0]
+    assert sent[1:3] == ("POST", "api/spawn")
+    assert secret not in json.dumps(sent[3])
+    assert "deploy with key" in str(sent[3]["task"])
+    assert secret not in info.task
+    await service.close()
+
+
+@pytest.mark.asyncio
 async def test_remote_spawn_refuses_disconnected_explicit_peer() -> None:
     manager = _Manager()
     service = RemoteSubagentService(

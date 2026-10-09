@@ -1190,8 +1190,11 @@ class RemoteSubagentService:
         if include_project and not remote_cwd:
             remote_cwd = await self._sync_parent_project(selected, parent_session, app=app)
 
+        # The peer is another host: a credential the model quoted into the task
+        # must not leave this gateway, so the outbound task is scrubbed the same
+        # way as the shadow copy and everything that comes back.
         peer_body: dict[str, object] = {
-            "task": task,
+            "task": redact_peer_text(task),
             "parent_session": "",
             "silent": True,
             "include_memory": include_memory,

@@ -569,12 +569,9 @@ _REDACTION_SINKS: tuple[tuple[str, str, str], ...] = (
         "scrubbed with `peer_redaction.redact_peer_text` (the exfiltration-URL then "
         "credential redactors) before it is "
         "written: a secret the peer's agent echoed does not land locally or reach "
-        "the parent model. The local shadow copy of the task is scrubbed the same "
-        "way. The task itself is forwarded to the peer VERBATIM, exactly as a local "
-        "subagent receives it, because rewriting it would change the work the "
-        "operator asked for; what bounds that exposure is the destination, the "
-        "OPERATOR'S OWN peer instance over a tunnel they authenticated, the same "
-        "basis as the session transfer bundle above.",
+        "the parent model. The task is scrubbed the same way before it leaves for "
+        "the peer, and the local shadow copy carries that scrubbed text: a "
+        "credential the model quoted into the task never reaches another host.",
     ),
     (
         "Federated session search",

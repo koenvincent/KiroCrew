@@ -676,7 +676,7 @@ def _refilter_archive(archive: Any, *, digest: Optional["hashlib._Hash"] = None)
     return Path(filtered.name)
 
 
-def _custom_home_rel_parts(root: Path) -> Optional[tuple]:
+def custom_home_rel_parts(root: Path) -> Optional[tuple]:
     """``KIROCREW_HOME``'s path parts relative to the repo root, if it's under it.
 
     Dev mode (AGENTS.md) allows a custom-named data dir (e.g. ``.kirocrew-dev`` or
@@ -720,11 +720,6 @@ def excluded_tracked_path(rel: str, home_parts: Optional[tuple] = None) -> bool:
     if base in _EXCLUDE_NAMES:
         return True
     return False
-
-
-def custom_home_rel_parts(root: Path) -> Optional[tuple]:
-    """Public spelling of :func:`_custom_home_rel_parts` for other packagers."""
-    return _custom_home_rel_parts(root)
 
 
 def _git_tracked_files(root: Path) -> Optional[list]:
@@ -795,7 +790,7 @@ def _tar_fallback(root: Path, *, digest: Optional["hashlib._Hash"] = None) -> Pa
             action="source:PackageLocalCheckout",
         )
 
-    home_parts = _custom_home_rel_parts(root)  # e.g. ("data", "kc-home") or None
+    home_parts = custom_home_rel_parts(root)  # e.g. ("data", "kc-home") or None
 
     def _excluded(rel: str) -> bool:
         return excluded_tracked_path(rel, home_parts)
