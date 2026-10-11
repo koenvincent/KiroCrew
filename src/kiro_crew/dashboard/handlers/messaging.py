@@ -184,8 +184,10 @@ from kiro_crew.dashboard.messaging_api.slack_settings import (  # noqa: F401
     api_slack_config_save,
 )
 from kiro_crew.dashboard.messaging_api.spawn import (  # noqa: F401
+    _client_run_id_refusal,
     _continue_on_loop,
     _floored_caller_refusal,
+    _requested_backend,
     _slot_for_parent,
     _spawn_on_loop,
     _spawn_request_memory_mode,

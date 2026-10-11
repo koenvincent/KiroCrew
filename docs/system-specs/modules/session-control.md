@@ -25,6 +25,7 @@ unreachable in production because the caller's `X-Internal-Secret` is ignored.
 | `session_retry` | `POST /api/session-control/retry` | Re-run a failed last turn through `continue_slot_turn`, the Resume button's path, with `require_interrupted=True` (`turn_not_failed` otherwise) and `authorize_target` re-run synchronously under the slot lock before the continuation is queued |
 | `session_set_model` | `POST /api/session-control/set-model` | Record a pending model and/or reasoning-effort pick on an idle session; `apply_pending_model_pick` commits it at the start of the target's next turn after re-running `authorize_target` in the same synchronous step. Each half yields separately to a newer user pick from its own control. A busy target is refused with `target_busy` and keeps its settings |
 | `session_reload` | `POST /api/session-control/reload` | Relaunch the agent process of an idle session the caller created, through `chat_handlers.reload_slot_session` (shared with the tab menu's Reload session). The transcript is kept and gets one notice naming the caller. Self, remote-crew and busy targets (turn running or starting, queued messages, sub-agents) are refused |
+| `session_rename` | `POST /api/session-control/rename` | Set the caller's own title or a target's through `chat_title.apply_manual_title`, the sidebar rename's code, after `authorize_target` with `allow_self`; a scheduled run's own session is still refused as `unattended_target`. The title is final (`_TITLE_ORIGIN_USER`). An empty title, one over 200 characters (before or after `_scrub_text` redaction, which lengthens credential-shaped text into markers), one with no character that renders (only whitespace, characters `terminal_safe._is_invisible` reports such as zero-width, variation-selector and Hangul-filler characters, or the blank Braille pattern U+2800), one containing U+2800 anywhere (scanning normalization keeps it, so it could split a secret past the redactors), or one with a control character or any text-direction control (embeddings, overrides, isolates and the U+200E/U+200F/U+061C marks), or any other `Cf` format character except U+200C/U+200D and the tag characters U+E0020..U+E007F that spell flag subdivisions (`_is_allowed_format_char`; the tag block's other `Cf` character, U+E0001 LANGUAGE TAG, is refused; its unassigned code points are not `Cf`), is refused with `invalid_title`; if the history write fails the live slot keeps and broadcasts the new title (best-effort, like the sidebar and channel renames; the next full save writes it) and the verb answers `title_persist_failed` (500) instead of `ok` |
 | `session_close` | `POST /api/session-control/close` | Close (archive) another session, or the caller itself, as the tab ✕ does — heavier than stop, and recoverable rather than a delete |
 | `session_revive` | `POST /api/session-control/revive` | Bring an archived session back into the live sidebar, as clicking it in the History tab does — the mirror of close, optionally filing it into a folder |
 | `session_send` | `POST /api/session-control/send` | Deliver a message that another session runs as its next turn, or cut it into the turn already running (`steer`) |
@@ -227,6 +228,23 @@ the slot's `_tab_id`) is treated as the sender being gone; and a structurally
 exempt entry is never dropped at all. The report is
 best-effort and does not gate the drop — withholding the message is the
 authorization decision, and it must not depend on the notice landing.
+
+**A deliberate discard reports to the sender too.** The drain is not the only
+place a stamped entry leaves the queue unrun: a person cancelling its queue card
+(`api_chat_slot_queue_cancel`) and a hard stop clearing the queue
+(`stop_slot_turn`'s escalated branch) discard it as well, and the sender's last
+word is still the `started: false` receipt. Both sites read the entry's stamp and
+call `notify_send_origin_discarded` with their cause (`SEND_DISCARD_QUEUE_CANCEL`,
+`SEND_DISCARD_HARD_STOP`), which appends a notice to the sender naming the target,
+what discarded the message and an excerpt, and saying it will not run. The wording
+names the discard rather than a constraint, because neither discard changes an
+authorization. The recipient is resolved by the same check as the drop notice
+(`_send_origin_recipient`), so the same four cases write nothing: no stamp, a
+self-send, a closed sender, and a reused key held by a different tab. The hard
+stop reports exactly the entries it takes off the queue, before the settle can
+suspend; a send that lands during the settle stays queued and is not reported,
+because it will still run. Best-effort here too: the discard
+was already decided by the person or the stop.
 
 **The stamp names a session, not a key, and does not survive a restart.** It
 carries the sender's `_tab_id` beside its slot key and is omitted unless both are
@@ -1068,7 +1086,7 @@ itself opened. Member sessions also bypass the provider warm pool
 default backend, so a warm hit would skip both the member backend route and
 the mount. The member backend is `agent.member_acp_backend` (default `kas`),
 and requires a wire-capable backend (`ACP_BACKENDS_MEMBER_DISPATCH`: the
-claude seam, KAS, codex, opencode and goose); kiro-cli v2 reads its template from disk and
+claude seam, KAS, codex, opencode, goose and deepseek); kiro-cli v2 reads its template from disk and
 exposes no per-session channel, so a member session on it runs as plain chat —
 the tools are simply not mounted, never mounted-and-refused. Codex qualifies
 because `providers/mirrors/codex.py` already gives it a per-session array and
@@ -1080,7 +1098,7 @@ mechanism. `tool_gate.is_enforced` is true for opencode as well, on
 BACK from the harness's own config resolution before the first prompt, so a session
 that cannot establish the asking posture is refused there too, and
 `providers/mirrors/opencode.py` documents `permission_surface_owned` as
-accepted-and-ignored for exactly that reason.
+accepted-and-ignored for exactly that reason. deepseek's routing, `VERIFIED_GATE_EXTENSION`, is enforced too: Crew's gate plugin answers every tool call with `ask`, and its load marker is read back before the first prompt. deepseek has no mirror, so its member array comes from `AcpClient._mirrorless_member_mounts`: only the member mounts, with `disabled` honoured and a narrowed tool withholding its whole server, since no mirror carries a per-tool deny there. An element that cannot start fails the whole deepseek session, so an entry that does not resolve is never placed.
 
 ### The crew panel rides the same vehicle
 

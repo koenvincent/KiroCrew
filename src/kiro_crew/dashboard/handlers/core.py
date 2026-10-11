@@ -33,6 +33,8 @@ from kiro_crew.config.loader import (
     _VALID_STT_PROVIDERS,
     AUTOCOMPACT_PCT_MAX,
     AUTOCOMPACT_PCT_MIN,
+    CHAT_TURN_TIMEOUT_MAX,
+    CHAT_TURN_TIMEOUT_MIN,
     COMPLETION_KEEP_CHARS_MIN,
     DEDUP_EVERY_N_SWEEPS_MAX,
     EMBED_RATE_LIMIT_MAX,
@@ -74,6 +76,7 @@ from kiro_crew.config.sections import (
     TITLE_REFRESH_EVERY_TURNS_MAX,
     transcribe_vocabulary_name,
 )
+from kiro_crew.config.superseded_defaults import ack_explicit_write
 from kiro_crew.context_management import RESULT_FILE_MAX_BYTES
 from kiro_crew.dashboard.chat_utils import drained_to_thread, run_config_write
 from kiro_crew.dashboard.handlers._shared import (
@@ -2673,6 +2676,18 @@ def _selectable_acp_backends() -> list[str]:
     return selectable_backend_values()
 
 
+# The grammar of every model PIN a Settings picker writes and `_validate_role_model`
+# then checks against the account's entitlement. The pickers list the advertised
+# model names, which OpenCode spells `provider/model`, so a pin accepts a bare id
+# OR slash-joined segments; the empty value (INHERIT / disabled, per key) still
+# matches. Malformed segments (`a//b`, `/a`, `a/`) and shell metacharacters are
+# refused. One constant so a picker cannot offer an id a sibling pin refuses.
+_MODEL_PIN_PATTERN = (
+    r"(?:[A-Za-z0-9][A-Za-z0-9._\-\[\]]*|[A-Za-z0-9][A-Za-z0-9._\-]*"
+    r"(?:/[A-Za-z0-9][A-Za-z0-9._\-]*)+)?\Z"
+)
+
+
 _EDITABLE_CONFIG: dict[str, dict] = {
     "agent.provider": {"type": "enum", "values": ["acp"]},
     # Which ACP agent drives a session: "" = kiro-cli, "kas" = kiro-agent.
@@ -2687,25 +2702,27 @@ _EDITABLE_CONFIG: dict[str, dict] = {
     # fixed list: the real vocabulary is whatever the live kiro-cli advertises
     # (/api/models spawns it to find out), and it spans both canonical registry
     # keys ("opus-4.8-1m") and kiro's own ids ("claude-opus-4.8"). So this is a
-    # grammar check instead — model-id charset only, no separators or shell
-    # metacharacters — and an unknown-but-well-formed id is rejected downstream
-    # by kiro itself rather than silently accepted here. "auto"/"" = defer to
-    # the agent config / kiro's own default.
-    "agent.model": {"type": "str", "max_len": 64, "pattern": r"^[A-Za-z0-9._\-\[\]]*$"},
-    # Per-task-class model overrides. Same grammar as agent.model (the real
-    # vocabulary is whatever the backend advertises). "" / "auto" defers to the
-    # chat default. `validate_fn` additionally rejects a well-formed id the
-    # active provider or the account's entitlement cannot honor.
+    # grammar check instead — `_MODEL_PIN_PATTERN`, the grammar every model pin
+    # shares, since the Settings → Chat picker lists the same advertised names
+    # (provider-qualified on OpenCode) — and an unknown-but-well-formed id is
+    # rejected downstream by kiro itself rather than silently accepted here.
+    # "auto"/"" = defer to the agent config / kiro's own default.
+    "agent.model": {"type": "str", "max_len": 64, "pattern": _MODEL_PIN_PATTERN},
+    # Per-task-class model overrides. The model-pin grammar (the real
+    # vocabulary is whatever the backend advertises, provider-qualified on
+    # OpenCode). "" / "auto" defers to the chat default. `validate_fn`
+    # additionally rejects a well-formed id the active provider or the
+    # account's entitlement cannot honor.
     "agent.role_models.background": {
         "type": "str",
         "max_len": 64,
-        "pattern": r"^[A-Za-z0-9._\-\[\]]*$",
+        "pattern": _MODEL_PIN_PATTERN,
         "validate_fn": _validate_role_model,
     },
     "agent.role_models.subagent": {
         "type": "str",
         "max_len": 64,
-        "pattern": r"^[A-Za-z0-9._\-\[\]]*$",
+        "pattern": _MODEL_PIN_PATTERN,
         "validate_fn": _validate_role_model,
     },
     # Throttle-exhaustion fallback model. Single value: "auto" (default) defers
@@ -2716,7 +2733,7 @@ _EDITABLE_CONFIG: dict[str, dict] = {
     "agent.fallback_model": {
         "type": "str",
         "max_len": 64,
-        "pattern": r"^[A-Za-z0-9._\-\[\]]*$",
+        "pattern": _MODEL_PIN_PATTERN,
         "validate_fn": _validate_role_model,
     },
     # Content-filter (refusal) fallback model. Single value: "" (default)
@@ -2727,7 +2744,7 @@ _EDITABLE_CONFIG: dict[str, dict] = {
     "agent.refusal_fallback_model": {
         "type": "str",
         "max_len": 64,
-        "pattern": r"^[A-Za-z0-9._\-\[\]]*$",
+        "pattern": _MODEL_PIN_PATTERN,
         "validate_fn": _validate_role_model,
     },
     "agent.reasoning_effort": {"type": "enum", "values": ["", *EFFORT_LEVELS]},
@@ -2761,6 +2778,13 @@ _EDITABLE_CONFIG: dict[str, dict] = {
         "type": "float",
         "min": SOFT_STOP_BUDGET_MIN,
         "max": SOFT_STOP_BUDGET_MAX,
+    },
+    # Same bounds as the load-time clamp, so Settings cannot save a ceiling the
+    # loader would then rewrite. Read on every turn, so the next turn follows it.
+    "agent.chat_turn_timeout_secs": {
+        "type": "int",
+        "min": CHAT_TURN_TIMEOUT_MIN,
+        "max": CHAT_TURN_TIMEOUT_MAX,
     },
     "session.timeout_secs": {"type": "int", "min": SESSION_TIMEOUT_MIN, "max": SESSION_TIMEOUT_MAX},
     # Range shared with the load-time clamp in config/loader.py — one constant
@@ -3016,15 +3040,15 @@ _EDITABLE_CONFIG: dict[str, dict] = {
 # so the masked GET returns a sentinel for it. The same entitlement validation as
 # the `agent.role_models.*` pins next to it, because the vocabulary is identically
 # unknowable up front: `""` INHERITS (the turn keeps its session's model) and no
-# concrete id is named here. The grammar is wider: a tier also accepts
-# `provider/model` ids, while a role_models pin stays one segment.
+# concrete id is named here. The grammar is `_MODEL_PIN_PATTERN`, shared with the
+# role-model and fallback pins.
 for _tier in DECISION_MODEL_ROUTE_TIERS:
     _EDITABLE_CONFIG[f"decisions.model_route.{_tier}"] = {
         "type": "str",
         "max_len": 64,
         # OpenCode's picker advertises provider/model ids. Allow those while
         # retaining the empty INHERIT value and rejecting malformed segments.
-        "pattern": r"(?:[A-Za-z0-9][A-Za-z0-9._\-\[\]]*|[A-Za-z0-9][A-Za-z0-9._\-]*(?:/[A-Za-z0-9][A-Za-z0-9._\-]*)+)?\Z",
+        "pattern": _MODEL_PIN_PATTERN,
         "validate_fn": _validate_role_model,
     }
 
@@ -3038,11 +3062,14 @@ for _tier in DECISION_MODEL_ROUTE_TIERS:
 # its own consent scope, not by either of these keys.
 #
 # ``provider`` is a closed enum, so a typo is a refusal rather than a silently
-# different judge. ``llm_model`` takes the same grammar and the same entitlement
-# validation as the ``agent.role_models.*`` pins and the ``decisions.model_route``
-# tiers, because the vocabulary is identically unknowable up front: the id must be
-# one the provider advertises to this account, and ``JUDGE_MODEL_DEFAULT`` INHERITS
-# (the judge keeps the model its agent already resolves).
+# different judge. ``llm_model`` takes the same entitlement validation as the
+# ``agent.role_models.*`` pins and the ``decisions.model_route`` tiers, because the
+# vocabulary is identically unknowable up front: the id must be one the provider
+# advertises to this account, and ``JUDGE_MODEL_DEFAULT`` INHERITS (the judge keeps
+# the model its agent already resolves). Its grammar stays the bare id, NOT
+# ``_MODEL_PIN_PATTERN``: the decision gate scrubs any model that fails
+# ``decisions.types.is_model_id`` (no ``/``), so a saved ``provider/model`` pin
+# would never reach the judge.
 _EDITABLE_CONFIG["decisions.nudge_wake.provider"] = {
     "type": "enum",
     "values": list(JUDGE_PROVIDERS),
@@ -3430,6 +3457,12 @@ async def api_kirocrew_config_patch(request: web.Request) -> web.Response:
                     raise ValueError(f"config section '{part}' is not an object")
                 section = nxt
             section[parts[-1]] = value
+            # Saving the old default of an auto-adopting superseded-default row
+            # (a 7200 turn limit) is an explicit choice. Ack it here, under the
+            # config lock and before the write, so the reload this write triggers
+            # does not adopt it away. A failed ack raises OSError and aborts the
+            # write, rather than saving a value the next load would delete.
+            ack_explicit_write(path_key, value)
             return data
 
         try:

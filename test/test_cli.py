@@ -4920,6 +4920,52 @@ class TestDoctorMcpTools:
         assert agent_path.read_bytes() == before
         assert "agent config (auto-fix skipped: shared home)" in issues
 
+    def test_auto_fix_refused_at_the_locked_recheck_is_audited_and_writes_nothing(
+        self, tmp_path, capsys
+    ):
+        """Ownership that changes between the probe and the write is caught under
+        the agent-spec lock, and the audit records that final refusal."""
+        from kiro_crew.cli_doctor import _doctor_mcp_tools
+
+        agent_path = tmp_path / "kirocrew.json"
+        _write_agent_config(
+            agent_path,
+            tools=[],
+            allowed=[],
+            servers={
+                "kirocrew-core": {"command": "/bin/kirocrew", "args": ["mcp-core"]},
+                "kirocrew-cron": {"command": "/bin/kirocrew", "args": ["mcp-cron"]},
+            },
+        )
+        before = agent_path.read_bytes()
+        issues: list[str] = []
+        sel_mock = MagicMock()
+        with (
+            patch(
+                "kiro_crew.agent._decline_shared_agent_home",
+                side_effect=[None, agent_path],
+            ),
+            patch("kiro_crew.cli_doctor.sel", sel_mock),
+            self._mock_probe(
+                {
+                    "kirocrew-core": ("ok", [], ""),
+                    "kirocrew-cron": ("ok", [], ""),
+                }
+            ),
+        ):
+            _doctor_mcp_tools(agent_path, issues)
+        out = capsys.readouterr().out
+        assert "Auto-fix skipped: shared home" in out
+        assert agent_path.read_bytes() == before
+        assert "agent config (auto-fix skipped: shared home)" in issues
+        sel_mock.return_value.log_api_access.assert_called_once_with(
+            caller="system",
+            operation="agent_home_write",
+            outcome="denied",
+            source="cli_doctor",
+            resources=str(agent_path),
+        )
+
     def test_declined_home_reports_a_forbidden_grant_without_writing(self, tmp_path, capsys):
         """A declined home leaves a ceiling-forbidden grant on disk, logs no
         SEL revoke, and reports the grant for the owning install to repair."""
@@ -4959,7 +5005,7 @@ class TestDoctorMcpTools:
         assert issues == [
             f"{ref} auto-approve forbidden by ceiling (repair from the owning install)"
             for ref in ("@kirocrew-cron", "@kirocrew-core")
-        ] + ["agent config (auto-fix skipped: shared home)"]
+        ] + ["@kirocrew-guide config", "agent config (auto-fix skipped: shared home)"]
 
     def test_ceiling_revoke_drops_per_tool_grants_too(self, tmp_path, capsys):
         """Withholding auto-approve drops the bare ref and every ``@server/tool``
@@ -5036,6 +5082,25 @@ class TestDoctorMcpTools:
         # The other managed servers are unaffected — the carve-out is scoped.
         assert "@kirocrew-core" in updated["allowedTools"]
         assert "@kirocrew-cron" in updated["allowedTools"]
+
+    def test_auto_fix_never_blanket_allows_the_guide_set(self, tmp_path, capsys):
+        """The guide set is always on but granted per tool, so doctor mounts its
+        ref and never mints the whole-server grant: that would pre-approve a tool
+        added to the server later, before anyone reviewed it."""
+        from kiro_crew.cli_doctor import _doctor_mcp_tools
+
+        agent_path = tmp_path / "kirocrew.json"
+        _healthy_agent_file(agent_path)
+        data = json.loads(agent_path.read_text(encoding="utf-8"))
+        data["tools"] = []
+        data["allowedTools"] = []
+        agent_path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+        with self._mock_probe({}):
+            _doctor_mcp_tools(agent_path, [])
+        updated = json.loads(agent_path.read_text(encoding="utf-8"))
+        assert "@kirocrew-guide" in updated["tools"]
+        assert "@kirocrew-guide" not in updated["allowedTools"]
+        assert "@kirocrew-core" in updated["allowedTools"]
 
     def test_auto_fix_preserves_a_user_made_computer_use_grant(self, tmp_path, capsys):
         """Doctor never MINTS the grant, but never REMOVES a user's own either.
@@ -5530,13 +5595,73 @@ class TestDoctorStt:
             patch("kiro_crew.cli_doctor.config_dir", return_value=tmp_path),
             patch("kiro_crew.cli_doctor.probe_server", side_effect=_noop_probe_server),
             patch("kiro_crew.slack.enterprise.validate_enterprise", return_value=True),
-            patch.dict("sys.modules", modules or {}),
+            pytest.MonkeyPatch.context() as _mp,
         ):
+            # Fake ONLY the named sys.modules keys, each restored to its exact prior
+            # state (present, absent or None) on exit. A whole-dict
+            # patch.dict("sys.modules", ...) would instead evict a submodule this
+            # run imports for the first time inside the block
+            # (kiro_crew.acp.skill_projection, reached lazily via the ACP driver),
+            # leaving the kiro_crew.acp package attribute pointing at a now-orphan
+            # module object -- cross-test pollution a co-runner then trips over.
+            # setitem is the scoped restore testing-conventions D11 mandates.
+            for _name, _mod in (modules or {}).items():
+                _mp.setitem(sys.modules, _name, _mod)
             try:
                 _doctor()
             except SystemExit as exc:
                 code = int(exc.code or 0)
         return capsys.readouterr().out, code
+
+    def test_report_module_faking_does_not_evict_lazily_imported_modules(
+        self, tmp_path, capsys, monkeypatch
+    ):
+        """``_report``'s ``modules=`` faking must not corrupt a co-runner's module identity.
+
+        The doctor run inside ``_report`` reaches ``kiro_crew.acp.skill_projection``
+        lazily (through the ACP driver), so on a cold xdist worker that submodule is
+        imported for the FIRST time inside the module-faking block. The faking must
+        leave it in place: after ``_report`` returns, ``sys.modules``, the
+        ``kiro_crew.acp`` package attribute and a re-import all have to name one
+        module object.
+
+        A whole-dict ``patch.dict("sys.modules", ...)`` restores its entry snapshot
+        on exit and so evicts that submodule while the package attribute still
+        names it. A later test on the same worker then re-imports it as a second
+        object, monkeypatches that one, and the runtime's function-local
+        ``from kiro_crew.acp.skill_projection import ...`` resolves the unpatched
+        real preparer. This drives the real helper, so it fails on that restore.
+        """
+        import importlib
+
+        name = "kiro_crew.acp.skill_projection"
+        # Drop every trace so the doctor's import is a genuine first import, the
+        # window a cold xdist worker hits. monkeypatch puts both back at teardown.
+        acp_pkg = importlib.import_module("kiro_crew.acp")
+        monkeypatch.delitem(sys.modules, name, raising=False)
+        monkeypatch.delattr(acp_pkg, "skill_projection", raising=False)
+
+        faked = {
+            "amazon_transcribe": MagicMock(),
+            "amazon_transcribe.client": MagicMock(),
+            "boto3": MagicMock(),
+        }
+        # Each faked key's prior state: real modules on a host with the voice extra,
+        # absent on one without. The pin asserts restoration of THIS state, so it is
+        # host-independent.
+        missing = object()
+        before = {k: sys.modules.get(k, missing) for k in faked}
+
+        self._report(tmp_path, capsys, modules=faked)
+
+        for k in faked:
+            assert sys.modules.get(k, missing) is before[k]
+        # The doctor really did import the submodule inside the block; without this
+        # the identity assertions below would pass vacuously.
+        survivor = getattr(acp_pkg, "skill_projection", None)
+        assert survivor is not None, "the doctor run no longer imports skill_projection"
+        assert sys.modules.get(name) is survivor
+        assert importlib.import_module(name) is survivor
 
     def test_doctor_stt_local_engine_and_model_ready(self, tmp_path, capsys, monkeypatch):
         """The ready state names the resolved catalog model AND where it sits, so
@@ -6863,12 +6988,9 @@ class TestDoctorEmbeddings:
     def _hermetic_config(self, monkeypatch):
         """Pin config to a pristine default (see ``_pin_default_config``)."""
         _pin_default_config(monkeypatch)
-        # LLAMA_CPP_LIB_PATH selects between two mutually exclusive diagnoses: name the
-        # missing bundled libs, or blame the operator's override directory. Which branch a
-        # test exercises is therefore part of its scenario, not an ambient property of the
-        # host — and the variable is easy to inherit, because the real loader sets it to its
-        # own bundled libs dir the first time embeddings load. Cleared per test; the tests
-        # that exercise the override branch set it themselves.
+        # LLAMA_CPP_LIB_PATH selects between two mutually exclusive diagnoses:
+        # the bundled tree or an operator override. Each test owns whether the
+        # live environment or the startup-removal record supplies that value.
         monkeypatch.delenv("LLAMA_CPP_LIB_PATH", raising=False)
 
     @staticmethod
@@ -6880,51 +7002,28 @@ class TestDoctorEmbeddings:
         model_present: bool,
         platform_supported: bool = True,
         missing_libs: dict | None = None,
-        loader_setdefaults: str = "",
         lib_path_override: str | None = None,
+        dropped_lib_path: str | None = None,
     ):
-        """Run _doctor with the embeddings runtime/model state stubbed.
+        """Run _doctor with the embedding and library-path state stubbed.
 
-        ``loader_setdefaults`` reproduces the real loader's side effect of
-        ``setdefault``-ing LLAMA_CPP_LIB_PATH to its own bundled libs dir, which
-        is what makes reading that var after the load call ambiguous.
-
-        ``lib_path_override`` controls the LLAMA_CPP_LIB_PATH the doctor sees:
-        ``None`` (default) CLEARS it — the var LEAKS between tests otherwise,
-        because both the ``loader_setdefaults`` path and the real embeddings
-        loader plant it via ``os.environ.setdefault`` (invisible to
-        monkeypatch teardown), so whichever test ran first in the pytest
-        worker poisoned override-sensitive assertions (shard-layout-dependent
-        CI failures). A string sets the override deliberately, via monkeypatch
-        so it is restored on teardown.
+        ``lib_path_override`` controls the live environment. ``dropped_lib_path``
+        controls the startup record used when the variable is absent.
         """
         agent_file = tmp_path / "kirocrew.json"
         _healthy_agent_file(agent_file)
         import kiro_crew.cli_doctor as doc
 
         if lib_path_override is None:
-            # setenv FIRST so monkeypatch records a teardown action even when
-            # the var is ABSENT: delenv(raising=False) on a missing var
-            # registers nothing, so the loader_setdefaults path's direct
-            # os.environ.setdefault would still leak into later tests in
-            # workers where the var was never set (GPT review). The
-            # setenv+delenv pair restores the original state either way.
+            # The setenv+delenv pair records absence for teardown even when the
+            # inherited process environment did not contain the variable.
             monkeypatch.setenv("LLAMA_CPP_LIB_PATH", "")
             monkeypatch.delenv("LLAMA_CPP_LIB_PATH", raising=False)
         else:
             monkeypatch.setenv("LLAMA_CPP_LIB_PATH", lib_path_override)
 
-        def _load():
-            if loader_setdefaults:
-                # Through monkeypatch, not a bare os.environ write: the real loader's
-                # setdefault is a process-wide mutation, and reproducing it literally leaked
-                # the variable into every later test in the same worker, flipping them onto
-                # the override branch depending on distribution order.
-                if "LLAMA_CPP_LIB_PATH" not in os.environ:
-                    monkeypatch.setenv("LLAMA_CPP_LIB_PATH", loader_setdefaults)
-            return object if runtime_ok else None
-
-        monkeypatch.setattr(doc, "_load_llama_class", _load)
+        monkeypatch.setattr(doc, "dropped_inherited_lib_path", lambda: dropped_lib_path)
+        monkeypatch.setattr(doc, "_load_llama_class", lambda: object if runtime_ok else None)
         monkeypatch.setattr(
             doc, "_platform_libs_dirname", lambda: "macos_arm64" if platform_supported else None
         )
@@ -7014,33 +7113,64 @@ class TestDoctorEmbeddings:
         assert "Missing native libs" not in out
         assert "reinstall Kiro Crew" not in out
 
-    def test_doctor_does_not_mistake_the_loaders_own_setdefault_for_an_override(
-        self, tmp_path, capsys, monkeypatch
+    @pytest.mark.parametrize("value_source", ["environment", "startup-record"])
+    def test_doctor_does_not_mistake_an_inherited_bundled_path_for_an_override(
+        self, tmp_path, capsys, monkeypatch, value_source: str
     ):
-        """A complete payload that fails to import is not reported as overridden.
-
-        `_load_llama_class()` `setdefault`s LLAMA_CPP_LIB_PATH to its OWN bundled
-        libs dir, so reading the var AFTER that call cannot distinguish "operator
-        set it" from "the loader just set it to the bundle" — which produced the
-        self-contradiction "the libs load from <bundled path>, not the bundled
-        tree". Doctor must sample the environment before the load.
-        """
-        monkeypatch.delenv("LLAMA_CPP_LIB_PATH", raising=False)
-        # Libs ARE missing, so reading the var too late suppresses the real
-        # packaging diagnosis and prints the override note in its place. With no
-        # missing libs both branches stay silent and the bug is invisible.
+        """The live and recorded forms both diagnose this install's bundled tree."""
+        inherited = (
+            "/opt/kirocrew/0.7.9/lib/python3.12/site-packages/kiro_crew/_vendor/"
+            "llama_cpp_libs/macos_arm64"
+        )
         self._run_doctor(
             tmp_path,
             monkeypatch,
             runtime_ok=False,
             model_present=False,
             missing_libs={"macos_arm64": ["libllama.dylib"]},
-            loader_setdefaults="/bundled/_vendor/llama_cpp_libs/x",
+            lib_path_override=inherited if value_source == "environment" else None,
+            dropped_lib_path=inherited if value_source == "startup-record" else None,
         )
         out = capsys.readouterr().out
 
         assert "not the bundled tree" not in out
         assert "Missing native libs for macos_arm64: libllama.dylib" in out
+        assert f"LLAMA_CPP_LIB_PATH={inherited}" in out
+        if value_source == "startup-record":
+            assert "inherited from another Kiro Crew process and removed at startup" in out
+        else:
+            assert "is ignored; this install uses its own bundled tree" in out
+        assert "point it at a directory of your own" in out
+
+    @pytest.mark.parametrize("value_source", ["environment", "startup-record"])
+    def test_doctor_reports_an_empty_lib_path_as_unset_not_inherited(
+        self, tmp_path, capsys, monkeypatch, value_source: str
+    ):
+        """An empty value is reported as unset on either path, never as inherited.
+
+        The startup record only establishes that the variable was empty and
+        removed; a live empty value is simply treated as unset. Neither may
+        claim it came from another Kiro Crew process.
+        """
+        self._run_doctor(
+            tmp_path,
+            monkeypatch,
+            runtime_ok=True,
+            model_present=True,
+            lib_path_override="" if value_source == "environment" else None,
+            dropped_lib_path="" if value_source == "startup-record" else None,
+        )
+        out = capsys.readouterr().out
+
+        assert "lib path:    ⏹ LLAMA_CPP_LIB_PATH=(empty)" in out
+        assert "inherited from another Kiro Crew process" not in out
+        if value_source == "startup-record":
+            assert "was empty and removed at startup; treated as unset." in out
+            assert "is empty, so it is treated as unset." not in out
+        else:
+            assert "is empty, so it is treated as unset." in out
+            assert "was empty and removed at startup; treated as unset." not in out
+        assert "point it at a directory of your own" in out
 
     def test_doctor_unsupported_platform_is_not_an_issue(self, tmp_path, capsys, monkeypatch):
         """No vendored libs for this platform = designed degradation, not a doctor failure."""
@@ -9539,11 +9669,33 @@ class TestChatPermissionRequest:
         from kiro_crew.acp.types import ACP_BACKEND_CLAUDE
 
         client = AcpClient(work_dir=tmp_path, acp_backend=ACP_BACKEND_CLAUDE)
-        self._direct_tool_call(client)
+        self._direct_tool_call(client, path=str(tmp_path / "notes.md"))
         event = client._build_permission_event(self._direct_permission_message())
 
         assert event.is_shell is False
         assert event.shell_classified is True
+        assert event.raw_params_trusted is True
+        provider, sels, reads = await self._drive(monkeypatch, event=event, answer="a")
+        assert provider.calls == [("approve", "req-direct", False)]
+        assert reads["n"] == 1
+        assert [s["outcome"] for s in sels] == ["allowed"]
+
+    @pytest.mark.asyncio
+    async def test_direct_client_relative_edit_target_reaches_the_prompt(
+        self, monkeypatch, tmp_path
+    ):
+        """An ordinary relative edit target is the routine shape on every
+        backend. Its params spelling is judged verbatim as it always was and
+        the request goes to the human, exactly like the absolute sibling above;
+        only a DELETE's relative target (the call's sole evidence) is refused
+        as unverifiable (``tool_paths.PARAMS_ONLY_TARGET_KINDS``)."""
+        from kiro_crew.acp.client import AcpClient
+        from kiro_crew.acp.types import ACP_BACKEND_CLAUDE
+
+        client = AcpClient(work_dir=tmp_path, acp_backend=ACP_BACKEND_CLAUDE)
+        self._direct_tool_call(client, path="notes.md")
+        event = client._build_permission_event(self._direct_permission_message())
+
         assert event.raw_params_trusted is True
         provider, sels, reads = await self._drive(monkeypatch, event=event, answer="a")
         assert provider.calls == [("approve", "req-direct", False)]
@@ -9581,8 +9733,13 @@ class TestChatPermissionRequest:
         from kiro_crew.acp.types import ACP_BACKEND_CLAUDE
 
         client = AcpClient(work_dir=tmp_path, acp_backend=ACP_BACKEND_CLAUDE)
+        # Absolute so the hook gate has nothing to refuse on the target itself;
+        # what this pins is that inline data earns no provenance, and the
+        # refusal is the unverified-shell one, not a target denial.
         event = client._build_permission_event(
-            self._direct_permission_message(tool_call_id="uncached", inline_path="notes.md")
+            self._direct_permission_message(
+                tool_call_id="uncached", inline_path=str(tmp_path / "notes.md")
+            )
         )
 
         assert event.raw_params_trusted is False

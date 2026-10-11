@@ -83,6 +83,8 @@ export interface SearchableSelectProps {
   className?: string
   style?: React.CSSProperties
   'aria-label'?: string
+  /** Set on the trigger, so a note about the current value is read with the field. */
+  'aria-describedby'?: string
 }
 
 /** Row text style, from the option's font stack — the only styling a row exposes. */
@@ -112,6 +114,7 @@ export default function SearchableSelect({
   className,
   style,
   'aria-label': ariaLabel,
+  'aria-describedby': ariaDescribedBy,
 }: SearchableSelectProps) {
   const [open, setOpen] = useState(false)
   const [filter, setFilter] = useState('')
@@ -157,7 +160,7 @@ export default function SearchableSelect({
     // combobox convention commits the top match whenever the user has NARROWED
     // the list: typing "los ang" and pressing Enter should not sit silent just
     // because two rows still match. Reporting 1 whenever anything matches routes
-    // Enter here, and `choose(filtered[0])` picks the row the user is looking at.
+    // Enter here, and `onEnterSingleMatch` picks the row the user is looking at.
     //
     // Gated on a non-empty filter, because on an UNFILTERED list `filtered[0]` is
     // merely the first row, not a match for anything the user expressed. Opening
@@ -165,7 +168,17 @@ export default function SearchableSelect({
     // saved value — with a "default" row at the top, that silently discards the
     // user's choice.
     filteredCount: filter.trim() && filtered.length > 0 ? 1 : 0,
-    onEnterSingleMatch: () => { const o = filtered[0]; if (o) choose(o) },
+    // An exact value or label match wins over the top row: a row whose label
+    // merely CONTAINS the typed text (e.g. "Inherit (kirocrew)") must not shadow
+    // the option the user typed in full. Only real options qualify: the
+    // free-text row's value IS the typed text and stays an offer, not a default.
+    onEnterSingleMatch: () => {
+      const typed = filter.trim().toLowerCase()
+      const exact = filtered.find(r => options.includes(r)
+        && (r.value.toLowerCase() === typed || r.label.toLowerCase() === typed))
+      const o = exact ?? filtered[0]
+      if (o) choose(o)
+    },
     closeToTrigger,
   })
 
@@ -179,6 +192,7 @@ export default function SearchableSelect({
         id={id}
         disabled={disabled}
         aria-label={ariaLabel}
+        aria-describedby={ariaDescribedBy}
         aria-haspopup="listbox"
         className={cn(
           'flex items-center justify-between w-full px-3 py-2 rounded-md text-sm border border-border bg-bg-elevated text-text',

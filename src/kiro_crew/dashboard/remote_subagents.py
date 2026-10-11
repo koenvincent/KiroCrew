@@ -67,6 +67,10 @@ _RESULT_NOT_RETAINED = (
     "The run finished, but its incognito/temporary result was held only in memory "
     "and did not survive a gateway restart."
 )
+_NEVER_STARTED = (
+    "This gateway restarted before the remote crew confirmed the run, and the crew "
+    "has no run under the name it was sent with, so it did not start there."
+)
 
 
 # Mapping writes run on worker threads (``asyncio.to_thread``), so a per-run
@@ -199,14 +203,45 @@ def _project_read_check(parent_session: str, app: str = "") -> Callable[[str], b
     def may_read(absolute: str) -> bool:
         try:
             decision = resolve(ceiling, profile, "filesystem.read", absolute)
-            return bool(getattr(decision, "permitted", False))
+            permitted = bool(getattr(decision, "permitted", False))
         except PlatformCompositionError:
             raise
         except Exception:
             logger.warning("filesystem.read evaluation failed for a remote snapshot", exc_info=True)
             raise unavailable from None
+        if not permitted:
+            _audit_snapshot_denial(parent_session, absolute, decision)
+        return permitted
 
     return may_read
+
+
+def _audit_snapshot_denial(parent_session: str, absolute: str, decision: object) -> None:
+    """Record in the SEL that the snapshot left *absolute* out under ``filesystem.read``.
+
+    The PreToolUse gate audits the denials it makes, and this check stands in
+    for that gate on a read the gateway does itself, so each denied file gets
+    its own event with the parent's attribution, the path, and the deciding rule
+    and layer. Permits are not written one per file, as the gate does not write
+    them either; the spawn audit records the upload. Best effort, like the
+    gate's: the file is already left out, so a failed write cannot widen what
+    reaches the peer.
+    """
+    try:
+        from kiro_crew.sel import sel
+
+        sel().log_governance_decision(
+            session_key=parent_session,
+            tool_name="remote_project_snapshot",
+            scope="filesystem.read",
+            item=absolute,
+            outcome="denied",
+            rule=str(getattr(decision, "rule", "") or ""),
+            layer=str(getattr(decision, "layer", "") or ""),
+            reason=str(getattr(decision, "reason", "") or ""),
+        )
+    except Exception:
+        logger.debug("remote snapshot read-denial audit failed", exc_info=True)
 
 
 def _snapshot_project(
@@ -610,10 +645,12 @@ class RemoteSubagentService:
         delivered: bool,
         done: bool | None = None,
         dismissed: bool = False,
+        accepted: bool = True,
     ) -> None:
         """Write *info*'s mapping; *done* overrides ``info.done`` for a commit
         that must land before the in-memory flag may flip. A *dismissed* mapping
         is never restored and is pruned like any delivered terminal one.
+        ``accepted=False`` marks the record written before the peer was asked.
 
         Writes for one run are serialized, and a committed dismissal is sticky:
         a delivery acknowledgement that was already in flight when the operator
@@ -622,7 +659,25 @@ class RemoteSubagentService:
         with _mapping_lock(info.id):
             if not dismissed:
                 dismissed = cls._stored_dismissed(run_dir)
-            cls._write_mapping(run_dir, info, delivered=delivered, done=done, dismissed=dismissed)
+            cls._write_mapping(
+                run_dir, info, delivered=delivered, done=done, dismissed=dismissed, accepted=accepted
+            )
+
+    @classmethod
+    def _discard_mapping(cls, run_id: str) -> bool:
+        """Remove the mapping of a run the peer never started; False if it stays."""
+        run_dir = cls._run_dir(run_id)
+        with _mapping_lock(run_id):
+            return not run_dir.exists() or rmtree_force(run_dir)
+
+    @staticmethod
+    def _stored_accepted(run_dir: Path) -> bool:
+        """Whether the peer confirmed the run; an unreadable or older record says yes."""
+        try:
+            raw = json.loads((run_dir / "state.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return True
+        return not (isinstance(raw, dict) and raw.get("accepted") is False)
 
     @staticmethod
     def _stored_dismissed(run_dir: Path) -> bool:
@@ -640,6 +695,7 @@ class RemoteSubagentService:
         delivered: bool,
         done: bool | None,
         dismissed: bool,
+        accepted: bool = True,
     ) -> None:
         run_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
         state = {
@@ -649,6 +705,9 @@ class RemoteSubagentService:
             "executor": "remote",
             "instance_id": info.instance_id,
             "remote_id": info.remote_id,
+            # False only for the record written BEFORE the peer is asked: the run
+            # is named first, so a restart in between finds it under that name.
+            "accepted": accepted,
             "parent_session": info.parent_session_key,
             # Incognito/temporary runs keep their task and result in memory
             # only, as the local path does; the mapping itself is still needed
@@ -1215,20 +1274,13 @@ class RemoteSubagentService:
         if approval_floor:
             peer_body["approval_floor"] = approval_floor
 
-        status, payload = await self._request_json(selected, "POST", "api/spawn", body=peer_body)
-        if not 200 <= status < 300:
-            raise RemoteSubagentError(
-                redact_peer_text(str(payload.get("error") or ""))
-                or f"The remote crew refused the run (HTTP {status}).",
-                code=str(payload.get("code") or "remote_spawn_refused"),
-                status=status,
-            )
-        remote_id = str(payload.get("id") or "")
-        if not _REMOTE_ID_RE.fullmatch(remote_id):
-            raise RemoteSubagentError(
-                "The remote crew accepted the run but returned an invalid identifier.",
-                code="remote_run_id_invalid",
-            )
+        # Named here and recorded BEFORE the peer is asked, so a gateway that
+        # dies between the peer's answer and our own record still finds the
+        # run on restart (``GET /api/spawn/{id}`` under the same name) instead
+        # of leaving it running on the peer with no parent able to see it. The
+        # id has the peer's own minted shape, so its readers all accept it.
+        minted_remote_id = os.urandom(8).hex()
+        peer_body["run_id"] = minted_remote_id
         local_id = uuid.uuid4().hex[:8]
         info = SubagentInfo(
             id=local_id,
@@ -1247,24 +1299,56 @@ class RemoteSubagentService:
             batch_total=batch_total,
             executor="remote",
             instance_id=selected,
-            remote_id=remote_id,
+            remote_id=minted_remote_id,
             approval_floor=approval_floor,
         )
         info._exec_started = info.started
         info._slot_released = True
-        # Persist before publish: without the mapping on disk a restart can
-        # neither recover nor cancel the peer run, so a failed write must not
-        # produce a successful receipt. Stop the orphan on the peer instead.
+        try:
+            await asyncio.to_thread(self._persist_info, info, delivered=False, accepted=False)
+        except Exception:
+            logger.warning("Could not persist remote subagent mapping %s", info.id, exc_info=True)
+            raise RemoteSubagentError(
+                "The remote run could not be recorded locally, so it was not sent.",
+                code="remote_mapping_unpersisted",
+                status=507,
+            ) from None
+
+        try:
+            status, payload = await self._request_json(
+                selected, "POST", "api/spawn", body=peer_body
+            )
+        except RemoteSubagentError:
+            # The peer may or may not have accepted it. It is named, so ask it to
+            # stop that name; the record goes only once the peer confirms none
+            # runs, otherwise a restart reconciles it from the record.
+            await self._withdraw_unconfirmed(info)
+            raise
+        if not 200 <= status < 300:
+            await asyncio.to_thread(self._discard_mapping, info.id)
+            raise RemoteSubagentError(
+                redact_peer_text(str(payload.get("error") or ""))
+                or f"The remote crew refused the run (HTTP {status}).",
+                code=str(payload.get("code") or "remote_spawn_refused"),
+                status=status,
+            )
+        remote_id = str(payload.get("id") or "")
+        if not _REMOTE_ID_RE.fullmatch(remote_id):
+            await self._withdraw_unconfirmed(info)
+            raise RemoteSubagentError(
+                "The remote crew accepted the run but returned an invalid identifier.",
+                code="remote_run_id_invalid",
+            )
+        # A crew that predates ``run_id`` ignores it and names the run itself.
+        info.remote_id = remote_id
+        # Persist before publish: without the confirmed mapping a restart would
+        # report a started run as never started, so a failed write must not
+        # produce a successful receipt. Stop the run on the peer instead.
         try:
             await asyncio.to_thread(self._persist_info, info, delivered=False)
         except Exception:
             logger.warning("Could not persist remote subagent mapping %s", info.id, exc_info=True)
-            try:
-                await self.cancel(info)
-            except Exception:
-                logger.warning(
-                    "Could not cancel unrecorded remote run %s on %s", remote_id, selected
-                )
+            await self._withdraw_unconfirmed(info)
             raise RemoteSubagentError(
                 "The remote run could not be recorded locally and was cancelled on its crew.",
                 code="remote_mapping_unpersisted",
@@ -1366,10 +1450,17 @@ class RemoteSubagentService:
                 if missing < _MAX_NOT_FOUND_POLLS:
                     await asyncio.sleep(_POLL_SECONDS)
                     continue
+                never_started = not await asyncio.to_thread(
+                    self._stored_accepted, self._run_dir(info.id)
+                )
                 if await self._finish(
                     info,
                     {
-                        "error": "The remote run is no longer available on its crew.",
+                        "error": (
+                            _NEVER_STARTED
+                            if never_started
+                            else "The remote run is no longer available on its crew."
+                        ),
                         "done": True,
                     },
                 ):
@@ -1525,6 +1616,34 @@ class RemoteSubagentService:
             except Exception:
                 logger.warning("Could not mark remote run %s delivered", info.id, exc_info=True)
         return True
+
+    async def _withdraw_unconfirmed(self, info: SubagentInfo) -> None:
+        """Stop *info* on its peer, and drop its record once the peer confirms
+        nothing runs under its name.
+
+        For a spawn whose answer was lost or unusable. ``404`` means the peer
+        never started it, a 2xx that it stopped it. Anything else, an
+        unreachable peer included, keeps the record, so the next restart
+        reconciles the run from it instead of leaving it running unseen.
+        """
+        try:
+            status, _payload = await self._request_json(
+                info.instance_id, "DELETE", f"api/spawn/{info.remote_id}"
+            )
+        except RemoteSubagentError:
+            status = 0
+        if 200 <= status < 300 or status == 404:
+            try:
+                if await asyncio.to_thread(self._discard_mapping, info.id):
+                    return
+            except Exception:
+                logger.warning("Could not discard remote mapping %s", info.id, exc_info=True)
+        logger.warning(
+            "Remote run %s on %s was not confirmed stopped; its record is kept for the "
+            "next restart to reconcile",
+            info.remote_id,
+            info.instance_id,
+        )
 
     async def cancel(self, info: SubagentInfo) -> bool:
         if info.executor != "remote" or not info.instance_id or not info.remote_id:

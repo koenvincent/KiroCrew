@@ -1,6 +1,6 @@
 import { Suspense, lazy, type ComponentProps, type Dispatch, type MutableRefObject, type ReactNode, type SetStateAction } from 'react'
 import { createPortal } from 'react-dom'
-import { Columns2, ExternalLink, EyeOff, MoreHorizontal, VenetianMask } from 'lucide-react'
+import { Columns2, ExternalLink, EyeOff, MoreHorizontal, Pin, VenetianMask } from 'lucide-react'
 
 import { generateSlotTitle } from '../../../hooks/slotTitleGeneration'
 import ErrorBoundary from '../../../components/ErrorBoundary'
@@ -152,6 +152,9 @@ export default function MobileTopBar({
                 newSessionHere={embedMode !== 'chat' ? mobileNewSessionItem : undefined}
                 triggerLabel={
                   <>
+                    {/* Same pin marker as SessionTitleControl's desktop row, so a
+                        Pin or Unpin from this menu visibly takes effect on a phone. */}
+                    {currentSlot?.pinned && <Pin size={12} className="lucide-inline mr-1 shrink-0 text-accent" aria-label={i18nT('pages.chatSidebar.pinned')} data-testid="session-pinned-glyph" />}
                     {currentSlot?.memory_mode === 'incognito' && <EyeOff size={13} className="lucide-inline shrink-0 text-warn" aria-label={i18nT('pages.chatPage.incognito_memory_writes_disabled')} />}
                     {currentSlot?.memory_mode === 'temporary' && <VenetianMask size={13} className="lucide-inline shrink-0 text-aim" aria-label={i18nT('pages.chatPage.temporary_no_memory_reads_or_writes')} />}
                     {title}

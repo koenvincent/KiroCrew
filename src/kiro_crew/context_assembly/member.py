@@ -310,13 +310,15 @@ _MEMBER_BRIEFING_ITEM_UNAVAILABLE = """
 # extra capacity for a long page job, and the crewmate's own hands are the path.
 _MEMBER_DASHBOARD_ITEM = """
 7. You have a Dashboard tab of your own, and it is yours to change. `dashboard_fields`
-   lists its fields and `dashboard_write` fills the ones that are yours, so anything a
-   person must ACT on goes there and not only into your reply — the tab is what they
-   read when they are not reading this thread. To change the PAGE itself, load the
+   lists its fields and `dashboard_write` fills the ones that are yours. Anything a
+   person must ACT on goes into `panel_publish` and those fields, not only into your
+   reply — the tab is what they read when they are not reading this thread. To change the PAGE itself, load the
    `dashboard` skill and follow it: `dashboard_templates` to search, `dashboard_preview`
    to stage one, `dashboard_apply` once they say yes, `dashboard_rollback` to go back.
    ALWAYS show the preview link and ask first — the page is the reader's to approve, and
-   one swapped without asking is one they have to undo. You cannot write a page
+   one swapped without asking is one they have to undo. With the 'Dynamic Dashboard'
+   Feature Preview off (the default) the tab shows your `panel_publish` record; this page
+   shows only for readers who turned the preview on. You cannot write a page
    yourself; previewing takes a template id, and the tool says so if you try. A long
    page job may go to the `kirocrew-dashboard-manager` subagent, which holds the same
    tools, but you do not need it to answer "show me another one"."""
@@ -563,7 +565,7 @@ def build_v2_essentials(
     trigger_text: str,
     steering_dirs: tuple[str, ...],
     desk_withheld: bool,
-    provider_type: str,
+    provider_type: str | None,
 ) -> str:
     """Refresh complete member essentials without opening learned memory.
 
@@ -575,7 +577,10 @@ def build_v2_essentials(
     ``provider_type`` names the harness serving the session. Only kiro-cli
     (:data:`PROVIDER_ACP`) honours ``chat.disableInheritingDefaultResources``,
     so its verdict is read once here, where the harness is known, and handed
-    to every consumer; no consumer reads the setting itself.
+    to every consumer; no consumer reads the setting itself. ``None`` means
+    the harness is not known to be kiro-cli, so the opt-out is not read and
+    the snapshot keeps inheriting: a caller that omits it can never drop the
+    global steering on a harness that has nothing delivering it instead.
     """
     from kiro_crew import context as ctx  # circular import: the facade imports this owner
     from kiro_crew.member_essential_context import (
@@ -674,12 +679,12 @@ def build_v2_essentials(
     # The project and global ``.kiro/steering`` trees are skipped as already
     # delivered only while the snapshot above actually delivered them: a
     # kiro-cli workspace that opts out of the default resources gets them
-    # from neither the snapshot nor the harness, so a folder that declares
-    # one of those roots must carry its documents itself. The template's
-    # declared resources can still carry some of those files, so under the
-    # opt-out a folder document whose canonical path the template already
-    # delivered is not collected again. Same verdict as the snapshot, read
-    # once above.
+    # only as far as the template declares them, so a folder that declares
+    # one of those roots must carry the rest of its documents itself. A
+    # folder document whose canonical path the template already delivered
+    # is not collected again under the opt-out. Same verdict as the
+    # snapshot, read once above; the non-member path takes the same
+    # decision in _render_folder_steering_section.
     guide_sources = frozenset(source for source, _ in documents) - core_sources
     folder_docs: SteeringCollection = ctx.SteeringCollection()
     folder_insert_at = len(documents)

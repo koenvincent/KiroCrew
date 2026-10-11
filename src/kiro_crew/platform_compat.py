@@ -286,10 +286,14 @@ async def exit_after_failed_restart_exec(target: str | None) -> None:
     wedged disk must delay this exit, never hold it" true of the wait and not only of
     the work.
 
-    The ``gateway.log`` tail is not spelled out again here.
-    :func:`kiro_crew.cli.drain_log_queue_before_hard_exit` is the shared async
-    hard-exit drain for that queue -- same pool, its own outer deadline, and it never
-    raises -- so every hard-exit path keeps one spelling and one ceiling for it.
+    The queued SEL audit tail is drained first, then the ``gateway.log`` tail --
+    the order :mod:`kiro_crew.slack.events` uses, so a SEL write failure's own log
+    line still reaches a live listener. Neither is spelled out again here:
+    :func:`kiro_crew.sel.flush_audit_queue_before_hard_exit` and
+    :func:`kiro_crew.cli.drain_log_queue_before_hard_exit` are the shared async
+    hard-exit drains for those two queues -- same pool, each its own outer
+    deadline, and neither raises -- so every hard-exit path keeps one spelling and
+    one ceiling for each.
     """
     logger.critical(
         "Gateway restart could not replace this process (target %r); exiting instead of "
@@ -299,6 +303,7 @@ async def exit_after_failed_restart_exec(target: str | None) -> None:
         exc_info=True,
     )
     from kiro_crew.cli import drain_log_queue_before_hard_exit
+    from kiro_crew.sel import flush_audit_queue_before_hard_exit
 
     try:
         await asyncio.wait_for(
@@ -311,6 +316,15 @@ async def exit_after_failed_restart_exec(target: str | None) -> None:
         # Also the deadline: TimeoutError is an Exception, and a fatal exit must never
         # be blocked by bookkeeping or logging.
         pass
+    # The queued SEL audit tail -- the restart's own security-of-record event among
+    # it -- dies with the os._exit below unless it is drained first. This is a gateway
+    # hard exit like the normal shutdown, so it drains SEL
+    # the same bounded way. Flush SEL BEFORE the gateway.log tail (the order
+    # ``slack/events.py`` already uses): a SEL write failure logs its "dropped N events"
+    # line, and draining gateway.log first would stop the listener that line needs, so
+    # the audit loss would leave no trace. The shared helper offloads to this pool under
+    # its own deadline and never raises.
+    await flush_audit_queue_before_hard_exit()
     # The gateway.log tail has its own async hard-exit drain, which already offloads to
     # this pool under its own deadline and already never raises. Calling it keeps one
     # spelling and one ceiling for that queue across every hard-exit path.
@@ -6189,6 +6203,18 @@ def process_owner_uid(pid: int) -> int | None:
     return None
 
 
+def effective_uid() -> int | None:
+    """Return this process's effective uid, or ``None`` where there is no uid concept.
+
+    Windows has no ``os.geteuid``; a caller that formats a per-user path from the
+    uid (``/run/user/<uid>``) must treat ``None`` as "no such path on this
+    platform" rather than guess a number.
+    """
+    if not IS_POSIX:
+        return None
+    return os.geteuid()
+
+
 # Tri-state liveness results for pid_liveness().
 PID_DEAD = "dead"  # confirmed not running -> safe to prune
 PID_ALIVE = "alive"  # confirmed running
@@ -7316,7 +7342,9 @@ def terminate_and_reap_sync(
     stdio use the async helper, which drains them; this one is for a child
     writing to the caller's own terminal. Otherwise (Windows, a child already
     reaped, or one that does not lead its own group) it is killed outright the
-    way :func:`kill_and_reap` kills: its tree, unless it shares our group.
+    way :func:`kill_and_reap` kills: its tree, unless it shares our group or
+    has already been reaped -- a reaped child's pid may belong to another
+    process by now.
 
     A Ctrl-C landing mid-stop does not abandon it: KeyboardInterrupt is held
     until the stop has finished, then re-raised once.
@@ -7351,7 +7379,14 @@ def terminate_and_reap_sync(
             with contextlib.suppress(Exception):
                 kill_process_group(pgid, SIGKILL)
     else:
-        if type(proc.pid) is int and not _shares_own_process_group(proc.pid):
+        # ``poll()`` reaps an exited child, which frees its pid for reuse, so a
+        # pid-addressed tree kill is only safe while it still answers ``None``:
+        # a child exiting after that stays an unreaped zombie holding its pid.
+        if (
+            type(proc.pid) is int
+            and proc.poll() is None
+            and not _shares_own_process_group(proc.pid)
+        ):
             with contextlib.suppress(Exception):
                 kill_process_tree(proc.pid, SIGKILL)
     if proc.poll() is None:
@@ -9141,6 +9176,7 @@ class ProcStat(NamedTuple):
     session: int | None = None
     start_ticks: int | None = None
     rss_pages: int | None = None
+    cpu_ticks: int | None = None
 
 
 def _linux_proc_root(proc_root: "Path | None") -> "Path | None":
@@ -9162,7 +9198,9 @@ def read_proc_stat(pid: int, *, proc_root: "Path | None" = None) -> "ProcStat | 
     same read, so a caller needing several never mixes two processes behind a
     recycled pid. ``start_ticks`` is in clock ticks since boot;
     :func:`process_age_secs` turns it into an age. ``rss_pages`` is in pages of
-    ``SC_PAGE_SIZE``.
+    ``SC_PAGE_SIZE``. ``cpu_ticks`` is utime plus stime in clock ticks, so a
+    caller differencing two reads gets a CPU rate whose identity check
+    (``start_ticks``) came from the same read; it is None unless both are present.
 
     None when the file cannot be read (gone, permission, no ``/proc``) or the
     line has no ``)``; otherwise a :class:`ProcStat` whose fields may each be
@@ -9178,6 +9216,7 @@ def read_proc_stat(pid: int, *, proc_root: "Path | None" = None) -> "ProcStat | 
     tokens = _stat_tokens(raw)
     if tokens is None:
         return None
+    utime, stime = _stat_token_int(tokens, 11), _stat_token_int(tokens, 12)
     return ProcStat(
         state=tokens[0].decode("ascii", "replace") if tokens else None,
         ppid=_stat_token_int(tokens, 1),
@@ -9185,6 +9224,7 @@ def read_proc_stat(pid: int, *, proc_root: "Path | None" = None) -> "ProcStat | 
         session=_stat_token_int(tokens, 3),
         start_ticks=_stat_token_int(tokens, 19),
         rss_pages=_stat_token_int(tokens, 21),
+        cpu_ticks=None if utime is None or stime is None else utime + stime,
     )
 
 

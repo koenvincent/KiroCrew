@@ -102,6 +102,13 @@ grant audits retain their audit-or-deny contract.
   `verify_integrity`, `prune`) and on exit. It waits on a pending-event counter
   (a `threading.Condition`, race-free vs a bare queue-empty check), bounded by
   `_FLUSH_TIMEOUT_SECS` so a wedged writer can't hang a read.
+- **Hard exits**: the gateway's normal-shutdown exit and the restart-exec
+  failure exit (`platform_compat.exit_after_failed_restart_exec`) drain an
+  existing SEL singleton with `flush_audit_queue_before_hard_exit`, which uses
+  the teardown executor and an outer deadline, before the gateway.log tail.
+  Restart retains its inline off-loop drain. These best-effort drains avoid
+  initializing a trust root during exit. The second-signal force exit does not
+  drain SEL yet (#19042).
 - **Fallback**: if the writer can't be started, `log()` writes synchronously so
   an event is never silently dropped.
 - **Write failures**: when an append or the chain lock raises `OSError`, the

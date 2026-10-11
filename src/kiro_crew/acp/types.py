@@ -47,6 +47,7 @@ from kiro_crew.acp_backends import (  # noqa: F401 - re-exported for existing im
     ACP_BACKENDS_MODEL_EFFORT_PAIR_IDS,
     ACP_BACKENDS_MODEL_VIA_CONFIG_OPTION,
     ACP_BACKENDS_OPEN_EXTERNAL_URL,
+    ACP_BACKENDS_PERMISSION_KIND_FROM_TOOL_CALL,
     ACP_BACKENDS_POD_HOME_REMAP,
     ACP_BACKENDS_RESUME_WITHOUT_LOAD,
     ACP_BACKENDS_SEED_LOCAL_SETTINGS,
@@ -150,6 +151,13 @@ METHOD_SESSION_TERMINATE = "_kiro.dev/session/terminate"
 #: ``terminate`` exists for, and the record is what would otherwise accumulate.
 #: Takes the same ``{"sessionId": ...}`` params and is idempotent.
 METHOD_KAS_SESSION_DELETE = "_kiro/session/delete"
+#: KAS's manual compaction verb. A REQUEST with ``{"sessionId": ...}`` params,
+#: answered ``{"success": bool}`` once the summary is committed; a successful run
+#: emits ``summarization_completed`` before the answer. It is how a user's
+#: ``/compact`` reaches KAS: sent as ``session/prompt`` text the model just writes a
+#: summary and the context does not shrink. Advertised in ``initialize``'s
+#: ``_meta.kiro.extensionMethods`` and forwarded by kiro-cli's relay.
+METHOD_KAS_SESSION_COMPACT = "_kiro/session/compact"
 #: The STANDARD ACP evict verb, for a host that implements it. codex-acp does: it
 #: drops the session from its local map and unsubscribes the Codex thread, so the
 #: sessionId stops answering while the thread's own record survives on the Codex
@@ -941,6 +949,20 @@ class AcpEvent:
     #: fails CLOSED (identity not counted as verified) instead of silently
     #: passing on non-emptiness alone.
     mcp_identity_trusted: bool = False
+    #: mcp_identity_unreadable: the frame PRESENTED an MCP identity half the
+    #: name bound refused (``tool_surface.mcp_identity_unreadable``) -- on the
+    #: preceding tool_call frame (carried per scoped toolCallId) or on this
+    #: permission frame's own ``mcpTool.identity``. Not the same as naming no
+    #: identity: the call names a tool Crew cannot retain, so the exact per-tool
+    #: deny that name is under cannot be checked, and every site that answers a
+    #: permission request refuses it outright instead of judging it by title.
+    mcp_identity_unreadable: bool = False
+    #: kas_builtin_ids: this permission event was built for a member of
+    #: ``ACP_BACKENDS_PERMISSION_KIND_FROM_TOOL_CALL`` (KAS), so a bare built-in
+    #: ``tool_name`` is a KAS id (``read_file``) that ``platform.tool_names``
+    #: maps to its kiro-cli policy name. False on every other harness, whose
+    #: bare ids the gate reads under their own name only.
+    kas_builtin_ids: bool = False
     # Canonical, NON-model-authored tool identity from adapter-authored
     # ``_meta.kiro`` or ``_meta.goose`` (see ``_dispatch._kiro_tool_name``).
     # ``title`` is LLM-authored prose — for shell tools ``select_tool_title``

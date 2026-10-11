@@ -2753,6 +2753,52 @@ class TestAcpClientReadMessage:
         assert msg is None
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "line",
+        [
+            pytest.param(b"42\n", id="int"),
+            pytest.param(b'"progress"\n', id="string"),
+            pytest.param(b"null\n", id="null"),
+            pytest.param(b"true\n", id="bool"),
+            pytest.param(b"[]\n", id="empty-array"),
+            pytest.param(b'[{"jsonrpc":"2.0","id":7,"result":{}}]\n', id="batch-array"),
+            pytest.param(b"[" * 30_000 + b"]" * 30_000 + b"\n", id="nested-past-decoder-ceiling"),
+            pytest.param(b"1" * 5_000 + b"\n", id="integer-past-digit-limit"),
+        ],
+    )
+    async def test_read_line_that_is_not_a_json_object_skipped(self, tmp_path, line):
+        """Valid JSON that is not an object, and JSON ``json.loads`` rejects with
+        ``RecursionError`` or a plain ``ValueError``, is skipped like non-JSON."""
+        client = AcpClient(work_dir=tmp_path)
+
+        mock_process = MagicMock()
+        mock_stdout = AsyncMock()
+        mock_stdout.readline = AsyncMock(return_value=line)
+        mock_process.stdout = mock_stdout
+        mock_process.returncode = None
+        client._process = mock_process
+
+        msg = await client._read_message(timeout=1.0)
+        assert msg is None
+
+    @pytest.mark.asyncio
+    async def test_wait_for_response_reads_past_a_stray_scalar_line(self, tmp_path):
+        """A stray non-object line before the awaited reply costs that line only;
+        the initialize wait still returns the reply."""
+        client = AcpClient(work_dir=tmp_path)
+        reply = json.dumps({"jsonrpc": "2.0", "id": 1, "result": {"protocolVersion": 1}})
+
+        mock_process = MagicMock()
+        mock_stdout = AsyncMock()
+        mock_stdout.readline = AsyncMock(side_effect=[b"123\n", (reply + "\n").encode()])
+        mock_process.stdout = mock_stdout
+        mock_process.returncode = None
+        client._process = mock_process
+
+        result = await client._wait_for_response(1, timeout=2.0, method="initialize")
+        assert result == {"protocolVersion": 1}
+
+    @pytest.mark.asyncio
     async def test_read_empty_line(self, tmp_path):
         client = AcpClient(work_dir=tmp_path)
 
@@ -10312,9 +10358,11 @@ class TestResolveKiroBinEnvOverride:
         # path is runtime-owned, so only its presence and shape are pinned here.
         extra_private = wrap_kwargs.pop("extra_private_dirs")
         assert isinstance(extra_private, (list, tuple))
+        # The default tier leaves ~/.ssh readable, so the ssh-agent socket is kept.
         assert wrap_kwargs == {
             "strip_python_env": True,
             "is_kiro_cli": True,
+            **({} if sys.platform == "win32" else {"forward_ssh_auth_sock": True}),
         }
         voice_guard.assert_called_once_with(client._work_dir)
         spawn_call = mock_exec.await_args
@@ -12108,11 +12156,17 @@ class TestSpawnEnvScrub:
             "SLACK_BOT_TOKEN",
             "KIROCREW_OWNER_ID",
             "AWS_SECRET_ACCESS_KEY",
-            "SSH_AUTH_SOCK",
             "PYTHONPATH",
             "PYTHONHOME",
         ):
             assert key not in env, f"{key} leaked into ACP child env"
+        # The default tier leaves ~/.ssh readable, so the agent socket is kept:
+        # git-over-SSH works while every other credential above stays scrubbed.
+        if sys.platform == "win32":
+            # Windows has no SSH_AUTH_SOCK (a named-pipe agent): never forwarded.
+            assert "SSH_AUTH_SOCK" not in env, "SSH_AUTH_SOCK leaked into ACP child env"
+        else:
+            assert env.get("SSH_AUTH_SOCK") == "/tmp/fake-agent.sock"
         assert env.get("KIROCREW_UNRELATED_KEEPME") == "keep-this-value"
         assert env.get("AWS_ACCESS_KEY_ID") == "FAKE-akid"
         assert env.get("KIROCREW_RUNTIME_PYTHON") == sys.executable

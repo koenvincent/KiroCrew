@@ -1562,7 +1562,7 @@
       "sensitive": false,
       "tags": [],
       "label": "Idle-Exempt Sessions",
-      "help": "Session keys the idle timeout never ends, for a chat that automation wakes hours apart. A dashboard chat's key is dashboard: followed by the sid in its URL, e.g. dashboard:chat-12-1790000000, unless the tab is linked to a cron job or a channel thread, which uses that link's key instead, e.g. cron:<job id>. Closing a dashboard or cron tab still ends its process; a channel thread's session belongs to the channel, so closing its viewer does not. The Watchdog RSS Limit, when set, still applies. A listed session with no tab, such as a cron job that runs without one, is reaped only by that limit or a gateway restart, even after its job is deleted, so take a deleted job's key off the list. At most 10 keys are kept.",
+      "help": "Session keys the idle timeout never ends, for a chat that automation wakes hours apart. A dashboard chat's key is dashboard: followed by the sid in its URL, e.g. dashboard:chat-12-1790000000, unless the tab is linked to a cron job or a channel thread, which uses that link's key instead, e.g. cron:<job id>. Closing a dashboard or cron tab still ends its process; a channel thread's session belongs to the channel, so closing its viewer does not. The Watchdog RSS Limit, when set, still applies. A listed session with no tab, such as a cron job that runs without one, keeps running even after its job is deleted, so take a deleted job's key off the list. The RSS limit or a gateway restart still ends it. On the kiro-cli or KAS backend, a Kiro sign-out from the dashboard ends it at once, whatever account it signed in with. After any other switch or sign-out of the Kiro account it signed in with, the next dashboard chat turn ends it, and so does the next agent cron run unless Kiro Crew then cannot tell which account is signed in, as with a social login. A session that is mid-turn then ends later instead, when its next turn starts or at a later dashboard chat turn or agent cron run. At most 10 keys are kept.",
       "hasChildren": true,
       "enumValues": null,
       "defaultValue": []
@@ -4663,7 +4663,7 @@
       "sensitive": false,
       "tags": [],
       "label": "Remote-call stall window (s)",
-      "help": "Idle seconds before an MCP tool that looks blocked on its own remote call is cancelled and the turn routed to tool-stall recovery. The shape is a tool whose process tree shows no CPU or IO movement while a process below kiro-cli holds an established TCP connection: a remote call waiting on a peer that may never answer. The window is measured from the last stream frame or the last probe that saw the tree move, whichever is later, so a slow stream that moves bytes now and then keeps the full tool_stall_suspect_secs window. Linux and macOS only; Windows has no socket view and keeps the full window. Off (0) by default: the connection cannot yet be tied to the MCP server serving the in-flight tool, so another server's persistent connection could cut a quiet tool short. 900 is the suggested value when opting in. Clamped against the transport's per-prompt timeout like the other windows.",
+      "help": "Idle seconds before an MCP tool that looks blocked on its own remote call is cancelled and the turn routed to tool-stall recovery. The shape is a tool whose process tree shows no CPU or IO movement while the tool's own MCP server, or a process it started, holds an established TCP connection: a remote call waiting on a peer that may never answer. The server is recognized by the command the session launched it with, so another server's persistent connection never counts; a server that cannot be recognized exactly once (a launcher that re-executes under a different command line, or a second copy of it on the same runtime) keeps the full window. The window is measured from the last stream frame or the last probe that saw the tree move, whichever is later, so a slow stream that moves bytes now and then keeps the full tool_stall_suspect_secs window. Linux and macOS only; Windows has no socket view and keeps the full window. Off (0) by default; 900 is the suggested value when opting in. Clamped against the transport's per-prompt timeout like the other windows.",
       "hasChildren": false,
       "enumValues": null,
       "defaultValue": 0.0
@@ -4884,7 +4884,7 @@
       "sensitive": false,
       "tags": [],
       "label": "Allowed Users",
-      "help": "List of Slack users allowed to interact. Each entry: {slack_id, name}.",
+      "help": "Ignored for access: Slack is owner-only, so only the owner can interact. A name here is only a display-name fallback. Each entry: {slack_id, name}.",
       "hasChildren": true,
       "enumValues": null,
       "defaultValue": []
@@ -4940,7 +4940,7 @@
       "sensitive": false,
       "tags": [],
       "label": "Open Channels",
-      "help": "Channel IDs where all users are authorized without allowlist.",
+      "help": "Ignored for access: open channels are disabled (Slack is owner-only).",
       "hasChildren": true,
       "enumValues": null,
       "defaultValue": []
@@ -7182,6 +7182,7 @@
         "qr_session_until_restart": true,
         "qr_session_persist_across_restart": false,
         "restore_window_minutes": 30,
+        "idle_slot_sweep_days": 7,
         "surface_channel_sessions": true,
         "bot_name": "",
         "avatar": "",
@@ -7196,6 +7197,7 @@
         "default_memory_mode": "persistent",
         "widget_density": "more",
         "use_builtin_browser": true,
+        "browser_local_origins": [],
         "browser_view_port": 0,
         "verbosity": "answer_only",
         "link_previews": false,
@@ -7231,6 +7233,7 @@
         "feature_videos_enabled": false,
         "feature_videos_cache_max_mb": 500.0,
         "folder_suggestions_enabled": true,
+        "topic_tags_enabled": false,
         "tips_cadence_hours": 6.0,
         "tips_snooze_hours": 48.0,
         "tips_recency_decay": 0.6,
@@ -7482,6 +7485,21 @@
       "requiresRestart": true
     },
     {
+      "path": "dashboard.idle_slot_sweep_days",
+      "kind": "core",
+      "type": "integer",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [],
+      "label": "Archive Idle Sessions After Days",
+      "help": "When 450 or more sessions are open, archive sessions idle for this many days to history, hourly, and post a notification. Pinned sessions, app sessions, the open session, sessions with a running turn, a pending approval or sub-agents, crew worker sessions and sessions an auto-nudge loop drives are kept. 0 = never.",
+      "hasChildren": false,
+      "enumValues": null,
+      "defaultValue": 7,
+      "requiresRestart": true
+    },
+    {
       "path": "dashboard.surface_channel_sessions",
       "kind": "core",
       "type": "boolean",
@@ -7687,6 +7705,34 @@
       "hasChildren": false,
       "enumValues": null,
       "defaultValue": true
+    },
+    {
+      "path": "dashboard.browser_local_origins",
+      "kind": "core",
+      "type": "array",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [],
+      "label": "Built-in Browser Local Origins",
+      "help": "Loopback origins the browser tool may open in the built-in panel, each written host:port with host localhost, 127.0.0.1 or [::1] (e.g. localhost:5173 for a Vite dev server). Empty (the default) keeps every loopback, private and link-local address refused. The port is required and matched exactly, so one entry opens one dev server and never the rest of the machine; the gateway's own port is refused even when listed. Entries in any other shape are dropped. The agent cannot set this while its sandbox is on: config.json is read-only inside the sandbox.",
+      "hasChildren": true,
+      "enumValues": null,
+      "defaultValue": []
+    },
+    {
+      "path": "dashboard.browser_local_origins.*",
+      "kind": "core",
+      "type": "string",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [],
+      "label": "*",
+      "help": "",
+      "hasChildren": false,
+      "enumValues": null,
+      "defaultValue": null
     },
     {
       "path": "dashboard.browser_view_port",
@@ -8277,6 +8323,20 @@
       "hasChildren": false,
       "enumValues": null,
       "defaultValue": true
+    },
+    {
+      "path": "dashboard.topic_tags_enabled",
+      "kind": "core",
+      "type": "boolean",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [],
+      "label": "Topic Tags Enabled",
+      "help": "Ask the background model for up to two topic tags from a new chat session's first message. A session never gets more than three tags this way. Off by default because each new session costs one model call.",
+      "hasChildren": false,
+      "enumValues": null,
+      "defaultValue": false
     },
     {
       "path": "dashboard.tips_cadence_hours",
@@ -8934,6 +8994,20 @@
       "tags": [],
       "label": "Tool stall hard cap override (s)",
       "help": "Per-agent override for watchdog.tool_stall_hard_cap_secs on sessions running this agent. 0 inherits watchdog.tool_stall_hard_cap_secs. Applies to UNKNOWN verdicts and to an opaque MCP tool whose only WORKING evidence is movement in the runtime's process tree; every other WORKING session is never acted on.",
+      "hasChildren": false,
+      "enumValues": null,
+      "defaultValue": 0.0
+    },
+    {
+      "path": "agents.*.autocompact_pct",
+      "kind": "core",
+      "type": "number",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [],
+      "label": "Auto-compact threshold override (%)",
+      "help": "Default context-usage percentage at which sessions running this agent compact. 0 inherits session.autocompact_pct, and so does a negative value. A positive value is held to the same 5-90 range as the global. Set low (e.g. 45) for an orchestrator that should stay sharp, high (e.g. 85) for a worker that should keep its long context. A session's own threshold override (the context popover slider) still takes precedence.",
       "hasChildren": false,
       "enumValues": null,
       "defaultValue": 0.0

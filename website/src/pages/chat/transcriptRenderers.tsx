@@ -35,10 +35,11 @@ import type React from 'react'
 import ThinkingBlock from './ThinkingBlock'
 import ToolCallLine from './ToolCallLine'
 import NudgeCard, { nudgeMatchesLoop } from './NudgeCard'
+import ConversationCard, { CARD_ROLE } from '../../cards/ConversationCard'
 import RecoveryCard, { opensTurn, resolveInjectCard } from './RecoveryCard'
 import { SystemNoticeRow, isSystemNoticeRow } from './CompactionCard'
 import SkillLoadCard, { isSkillLoadRow } from './SkillLoadCard'
-import { ErrorCard, SESSION_START_REPEAT_REFUSAL_AT, isAuthRequired, isCapabilitiesChanged, isModelUnentitled, isSessionStartFailed, isUsageLimit, sessionStartFailureStreak } from './ErrorCard'
+import { ErrorCard, SESSION_START_REPEAT_REFUSAL_AT, isAuthRequired, isCapabilitiesChanged, isModelUnentitled, isSessionStartFailed, isTurnTimeout, isUsageLimit, sessionStartFailureStreak } from './ErrorCard'
 import { FEATURE_REQUEST_FORM_URL, isFeatureRequestRow } from '../../prompts/featureRequest'
 import NoticeCard from './NoticeCard'
 import { resolveTransientNotice } from './transientNotice'
@@ -51,7 +52,9 @@ import { REASONING_ROLES, hasReasoningContent } from './groupDisplayItems'
 import { FileCard } from '../../components/FileCard'
 import UserMessage from './UserMessage'
 import CrewmateMessage, { type CrewmateIdentity } from './CrewmateMessage'
-import { crewmateBubbleClass, crewmateRunPosition } from '../../components/chat/crewmateBubbles'
+import { crewmateBubbleClass, crewmateCornerClass, crewmateRunPosition } from '../../components/chat/crewmateBubbles'
+import { CardCornersContext } from '../../cards/cardCorners'
+import { CardAuthorContext } from '../../cards/cardAuthor'
 import { formatTs, quoteMessageFor, renderAssistantBubble, replyInThreadFor, threadFooterFor, type MessageRenderer, type MessageRenderContext } from '../../app-sdk/messageRenderers'
 import { renderUserContent } from './ChatPageMessageContent'
 import { fmtMessageTimeFull } from './messageTime'
@@ -155,6 +158,9 @@ export interface TranscriptRendererOptions {
   /** Fix affordance for a `materialization_changed` row: open the named crew
    *  member's Capabilities pane. Omitted on a surface with no crew editor. */
   onOpenCapabilities?: (member: string) => void
+  /** Fix affordance for a `turn_timeout` row: deep-link to the Turn Time Limit
+   *  setting. Omitted on a surface with no settings route. */
+  onOpenTurnLimit?: () => void
   /** Draw the assistant rows as a CREWMATE speaking: avatar + name + time on
    *  the first message of a run, one bordered bubble per message, grouped
    *  corners (components/chat/crewmateBubbles). Set by the Members page for a
@@ -381,6 +387,33 @@ export function createTranscriptRenderers(
       },
     },
     {
+      // Mate's change card or guide offer, at the point it was proposed. The
+      // row holds a reference; the live card is the card / guide store's, so it
+      // updates in place (cards/ConversationCard). The SDK default draws nothing
+      // for this role, which is right for a store-free surface.
+      id: 'conversation_card',
+      roles: [CARD_ROLE],
+      // In a crewmate's chat the card is the crewmate's own message: it joins
+      // the run of the reply that explains it, in the same column and exactly
+      // as wide as a reply.
+      render: (m, ctx) => {
+        if (!crewmate) return ctx.row(<ConversationCard message={m} slot={o.slot} />)
+        const pos = crewmateRunPosition(ctx.messages, ctx.index, crewmateTranscript)
+        return ctx.row(
+          <CrewmateMessage pos={pos}>
+            {/* Same cap as a crewmate bubble (72ch at the message font size). */}
+            <div className="max-w-[72ch]" style={{ fontSize: 'var(--mc-message-font-size, 14px)' }}>
+              <CardCornersContext.Provider value={crewmateCornerClass(pos)}>
+                <CardAuthorContext.Provider value={crewmate.label || crewmate.name}>
+                  <ConversationCard message={m} slot={o.slot} />
+                </CardAuthorContext.Provider>
+              </CardCornersContext.Provider>
+            </div>
+          </CrewmateMessage>,
+        )
+      },
+    },
+    {
       // No default entry: an auto-nudge turn would draw nothing at all.
       id: 'nudge',
       roles: ['nudge'],
@@ -553,6 +586,7 @@ export function createTranscriptRenderers(
             unentitledElsewhere={unentitled}
             featureRequestFormUrl={featureRequestFormUrl}
             onOpenCapabilities={openCapabilities}
+            onOpenTurnLimit={isTurnTimeout(m) ? o.onOpenTurnLimit : undefined}
           />,
         )
       },

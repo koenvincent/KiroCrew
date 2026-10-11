@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import base64
 import bisect
+import contextvars
 import functools
 import hashlib
 import hmac
@@ -30,6 +31,7 @@ import os
 import posixpath
 import re
 import secrets
+import zlib
 from collections import Counter
 from collections.abc import Callable, Iterator
 from typing import NamedTuple
@@ -294,6 +296,28 @@ _CREDENTIAL_PATTERNS_SANS_JWT = re.compile(
     _CREDENTIAL_PATTERNS.pattern.replace(f"|{JWT_MULTI_SEGMENT}", "", 1)
 )
 
+# Telegram bot token, as `_CREDENTIAL_PATTERNS` spells it.
+_TELEGRAM_BRANCH = r"[0-9]{6,}:[A-Za-z0-9_-]{30,}"
+_TELEGRAM_AT_RE = re.compile(_TELEGRAM_BRANCH)
+
+# Leftmost start of a non-JWT branch, found in linear time. Unguarded, the Telegram
+# branch re-walks a digit run from every digit in it. A later digit has fewer digits
+# before the same ``:``, so only the run's first digit can win; `_sans_jwt_start`
+# checks the one exception, a run that begins before the scan position.
+_CREDENTIAL_STARTS_SANS_JWT = re.compile(
+    _CREDENTIAL_PATTERNS_SANS_JWT.pattern.replace(
+        f"|{_TELEGRAM_BRANCH}", f"|(?<![0-9]){_TELEGRAM_BRANCH}", 1
+    )
+)
+
+
+def _sans_jwt_start(text: str, pos: int) -> int:
+    """Leftmost index >= *pos* where a non-JWT branch matches, else ``len(text) + 1``."""
+    if "0" <= text[pos - 1 : pos] <= "9" and _TELEGRAM_AT_RE.match(text, pos):
+        return pos
+    found = _CREDENTIAL_STARTS_SANS_JWT.search(text, pos)
+    return len(text) + 1 if found is None else found.start()
+
 
 def _is_json_object_segment(segment: str) -> bool:
     """Whether *segment* base64url-decodes to a JSON object: JOSE, itsdangerous, Flask session."""
@@ -304,6 +328,69 @@ def _is_json_object_segment(segment: str) -> bool:
     return isinstance(header, dict)
 
 
+_JWT_SEGMENT_RUN_RE = re.compile(r"[A-Za-z0-9_-]*")
+
+
+def _segment_run_end(text: str, pos: int) -> int:
+    """End of the run of JWT segment characters starting at *pos*."""
+    run = _JWT_SEGMENT_RUN_RE.match(text, pos)
+    return run.end() if run is not None else pos
+
+
+def _jwt_branch_matches_at(text: str, i: int, run_end: int) -> bool:
+    """Whether ``JWT_MULTI_SEGMENT`` matches at the ``eyJ`` at *i*, its run ending at *run_end*.
+
+    The branch needs one segment character after ``eyJ``, then two ``.`` separators with
+    a possibly empty run between them. Segment characters exclude ``.``, so the first
+    separator can only sit at *run_end*.
+    """
+    return (
+        run_end > i + 3
+        and text.startswith(".", run_end)
+        and text.startswith(".", _segment_run_end(text, run_end + 1))
+    )
+
+
+def _next_jwt_branch_start(text: str, pos: int, matched_run_end: int) -> tuple[int, int]:
+    """Leftmost index >= *pos* where the JWT branch matches, and that start's run end.
+
+    Every ``eyJ`` in one segment run shares the run's end, and a later one leaves fewer
+    characters before it, so one failure settles the whole run and the scan jumps past
+    it. ``search`` instead re-walks the run from each ``eyJ``, which is quadratic on a
+    long ``eyJ`` repeat. For the same reason one success settles every later ``eyJ`` with
+    a character after it in that run, so *matched_run_end*, the end of the run the last
+    start matched in, is reused rather than walked again when an overlapping match of
+    another branch moved *pos* past that start. No start: ``(len(text) + 1, -1)``.
+    """
+    if pos < matched_run_end:
+        i = text.find("eyJ", pos, matched_run_end - 1)
+        if i != -1:
+            return i, matched_run_end
+        pos = matched_run_end
+    while (i := text.find("eyJ", pos)) != -1:
+        run_end = _segment_run_end(text, i)
+        if _jwt_branch_matches_at(text, i, run_end):
+            return i, run_end
+        pos = run_end
+    return len(text) + 1, -1
+
+
+def _credential_search(text: str, pos: int, starts: list[int]) -> re.Match[str] | None:
+    """``_CREDENTIAL_PATTERNS.search(text, pos)``, in time linear over a whole scan.
+
+    The leftmost match starts at the earlier of the leftmost JWT-branch start and the
+    leftmost start of every other branch, and ``match`` there applies the alternation's
+    own branch order. *starts* caches both starts, and the JWT start's run end, across
+    calls with a rising *pos*.
+    """
+    if starts[0] < pos:
+        starts[0] = _sans_jwt_start(text, pos)
+    if starts[1] < pos:
+        starts[1], starts[2] = _next_jwt_branch_start(text, pos, starts[2])
+    first = min(starts[0], starts[1])
+    return _CREDENTIAL_PATTERNS.match(text, first) if first <= len(text) else None
+
+
 def _credential_matches(text: str) -> Iterator[re.Match[str]]:
     """``_CREDENTIAL_PATTERNS.finditer(text)``, minus JWT-branch hits whose header is not JSON.
 
@@ -312,7 +399,8 @@ def _credential_matches(text: str) -> Iterator[re.Match[str]]:
     second ``eyJ`` stays a credential: rejecting it would rescan that header once per ``eyJ``.
     """
     pos = 0
-    while (m := _CREDENTIAL_PATTERNS.search(text, pos)) is not None:
+    starts = [-1, -1, -1]
+    while (m := _credential_search(text, pos, starts)) is not None:
         header = m.group().split(".", 1)[0]
         if (
             m.group().startswith("eyJ")
@@ -531,6 +619,33 @@ _SECRET_MAX_VOWEL_RATIO = 0.30
 # 0.36% on its own, against 9.29% for the lowercase-run gate and 6.60% for the
 # vowel-ratio gate. Three is the knee: four leaves the reported paths redacted.
 _SECRET_MAX_SLASHES = 3
+
+# The second ceiling a window CUT OUT OF A LONGER RUN is held to: it may not cross
+# the opening `/` of a routed commit and take twelve of its digits. A commit
+# permalink is one run (`com/Owner/RepoName/blob/<commit>/src/file`), and its window
+# straddling `RepoName/blob/` and the start of the commit clears every gate on two
+# separators: capitals from the repository name, lowercase and digits from the hex.
+# A routed commit is a path segment of exactly 40 or 64 lowercase hex digits, as git
+# prints one, right after one of the code-host routes below and ending at a `/` or
+# the run's edge. The route is what keeps a key out: a key's own window crosses the
+# opening `/` of a routed commit only when the key itself holds that `/` and twelve
+# hex digits after it, which makes the text a permalink whose route runs into the
+# key. A window starting inside a commit is judged as before, and so is hex a key
+# carries anywhere else. Measured on ten commits of each of the 1,000 most-starred
+# GitHub repositories: 3.58% of their blob permalinks fire without this and 0.02%
+# with it, and none of 20,000 key-shaped random keys is lost glued before, after or
+# inside a commit, after a letter, after a route, or in a URL path. The residuals
+# are a repository name whose own capitals fill most of a window, a window that
+# starts inside the commit and runs into a path with capitals (1.08% of links to a
+# path like `src/File.py`, against 4.64% before), a key that carries a route word
+# and a `/` followed by twelve or more hex digits running to its end,
+# raw.githubusercontent.com links, which have no route word, and commits typed in
+# upper or mixed case, which git never prints.
+_ROUTED_COMMIT_RE = re.compile(
+    r"(?:(?<=/)|\A)(?:blob|tree|blame|raw|commits?|src)/"
+    r"(?P<commit>[0-9a-f]{64}|[0-9a-f]{40})(?=/|\Z)"
+)
+_ROUTED_COMMIT_PIECE_MIN = 12
 
 # A token that base64-decodes to >=85% printable ASCII is encoded *text*, not a
 # random key (random 40-char keys decode to mostly non-printable bytes). Such a
@@ -862,14 +977,16 @@ def _contains_bare_secret(run: str) -> bool:
     glued secret (``X`` + key, key + ``ABC``, key + ``X`` + key) does NOT decode
     cleanly as a whole run, so it still reaches the sliding window below.
 
-    SEPARATOR CEILING FOR A FRAGMENT. ``/`` is in the run alphabet, so a deep
-    absolute path is one run whose straddling sub-windows clear every per-window
-    gate. A key-shaped window carrying a path's separator density
-    (``_SECRET_MAX_SLASHES``) is declined, on two conditions that keep this a gate
-    rather than a hole: only when the run is LONGER than one whole key (a
-    40-char run IS the token somebody wrote, so a standalone key is never subject
-    to it), and only AFTER :func:`_looks_like_secret_key` has answered, so every
-    offset is still classified and a glued key is still found at its own offset.
+    SEPARATOR AND COMMIT CEILINGS FOR A FRAGMENT. ``/`` is in the run alphabet, so
+    a deep absolute path, or a permalink carrying a commit hash, is one run whose
+    straddling sub-windows clear every per-window gate. A key-shaped window
+    carrying a path's separator density (``_SECRET_MAX_SLASHES``) or crossing into a
+    routed commit (``_ROUTED_COMMIT_RE``, ``_ROUTED_COMMIT_PIECE_MIN``) is declined,
+    on two conditions that keep this a gate rather than a hole: only when the run is
+    LONGER than one whole key (a 40-char run IS the token somebody wrote, so a
+    standalone key is never subject to it), and only AFTER
+    :func:`_looks_like_secret_key` has answered, so every offset is still classified
+    and a glued key is still found at its own offset.
     """
     return next(_bare_secret_window_starts(run), None) is not None
 
@@ -900,6 +1017,9 @@ def _bare_secret_window_starts(
             return
     if _decodes_to_printable_text(run):
         return
+    commit_starts = (
+        [match.start("commit") for match in _ROUTED_COMMIT_RE.finditer(run)] if is_fragment else []
+    )
     for start in range(len(run) - _SECRET_KEY_LEN + 1):
         if skip_spans and any(
             min(start + _SECRET_KEY_LEN, end) - max(start, begin) >= _HOST_ID_EXEMPT_OVERLAP
@@ -909,10 +1029,27 @@ def _bare_secret_window_starts(
         window = run[start : start + _SECRET_KEY_LEN]
         if not _looks_like_secret_key(window):
             continue
-        if is_fragment and window.count("/") > _SECRET_MAX_SLASHES:
-            # Key-shaped, but a fragment carrying a path's separator density.
+        if is_fragment and (
+            window.count("/") > _SECRET_MAX_SLASHES
+            or _crosses_into_a_routed_commit(start, commit_starts)
+        ):
+            # Key-shaped, but a fragment carrying a path's separators or a commit.
             continue
         yield start
+
+
+def _crosses_into_a_routed_commit(start: int, commit_starts: list[int]) -> bool:
+    """Whether the window at *start* crosses a routed commit's opening ``/`` and
+    takes ``_ROUTED_COMMIT_PIECE_MIN`` of its digits.
+
+    Commits are a whole window long and a route apart, so only the first one
+    starting after *start* can be crossed: one bisect, however many the run holds.
+    """
+    index = bisect.bisect_right(commit_starts, start)
+    return (
+        index < len(commit_starts)
+        and commit_starts[index] + _ROUTED_COMMIT_PIECE_MIN <= start + _SECRET_KEY_LEN
+    )
 
 
 def _decode_b64_chunk(chunk: str) -> str:
@@ -1002,15 +1139,24 @@ def _text_contains_bare_secret(text: str) -> bool:
 # run only when the run lies wholly inside a match of `_DOCUMENT_LINK_RE`, which
 # admits nothing but a fixed route on a fixed host:
 #   * HTTPS, a lowercase literal host right after the scheme (no userinfo, no
-#     port), `docs.google.com`, `drive.google.com` or `<tenant>.atlassian.net`;
+#     port), `docs.google.com`, `drive.google.com`, `<tenant>.atlassian.net`, or
+#     a PlantUML server: a host whose first label is `plantuml` (after an
+#     optional `www.`), such as `www.plantuml.com`;
 #   * every path segment fixed or drawn from a closed class: a Google id is
 #     25-72 chars of `[A-Za-z0-9_-]`, a Confluence space key is alphanumeric, a
-#     page id is digits;
+#     page id is digits, a PlantUML diagram is `[/plantuml]/<png|svg|txt|uml>/`
+#     then its deflate text in PlantUML's `[0-9A-Za-z_-]` alphabet;
 #   * no piece of the link is a whole key: a piece exactly 40 characters long
 #     voids the match when `_looks_like_secret_key` accepts it. Pieces are cut
 #     twice, once at every non-run character (`/`, `-`, `_`, `%`, `.`, `~`)
 #     and once also at `+`, the space of a Confluence title slug, so a key
-#     pasted in as the id or as a title word is still redacted;
+#     pasted in as the id or as a title word is still redacted. A PlantUML
+#     diagram is random-looking by construction, so it is judged by decoding
+#     instead: it must inflate, whole, to printable text with nothing after the
+#     stream but the encoder's zero padding, and every credential pass must
+#     leave that text unchanged. The text inflated per call is capped (see
+#     `_PLANTUML_SOURCE_CAP`). A key as the diagram, glued to one, or written
+#     in its source voids the match;
 #   * the link ends where the route ends, with one optional trailing `/`: a
 #     further base64-alphabet character (a glued key, another `/segment`)
 #     fails the match.
@@ -1025,6 +1171,7 @@ def _text_contains_bare_secret(text: str) -> bool:
 # and pass 3 is no control against a deliberate one: a single `-` already
 # splits any run.
 _DOCUMENT_ID = r"[A-Za-z0-9_-]{25,72}"
+_PLANTUML_DIAGRAM = r"[A-Za-z0-9_-]{1,16384}"
 _GOOGLE_USER = r"(?:u/[0-9]{1,2}/)?"
 _RUN_PIECE_RES = (re.compile(r"[A-Za-z0-9+]+"), re.compile(r"[A-Za-z0-9]+"))
 _DOCUMENT_LINK_RE = re.compile(
@@ -1043,21 +1190,84 @@ _DOCUMENT_LINK_RE = re.compile(
     r"|[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.atlassian\.net/wiki/spaces/~?[A-Za-z0-9]{1,64}/"
     r"(?:overview|pages/(?:edit-v2/)?[0-9]{1,20}"
     r"(?:/[A-Za-z0-9+%._~-]{1,255})?)"
+    r"|(?:www\.)?plantuml(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+(?:/plantuml)?/(?:png|svg|txt|uml)/"
+    r"(?P<diagram>" + _PLANTUML_DIAGRAM + r")"
     r")/?(?![A-Za-z0-9+/_-])"
 )
+_PLANTUML_ALPHABET = {
+    c: i for i, c in enumerate("0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz-_")
+}
+#: Decoded diagram text one call may inflate, in total, and per encoded
+#: character. Real diagrams stay under 10x; anything larger keeps its link
+#: masked, which is how it was judged before this route. The total bounds the
+#: extra scan a call can be made to do to that of a plain text this long.
+_PLANTUML_SOURCE_CAP = 16384
+_PLANTUML_RATIO_CAP = 16
+#: Set while a decoded diagram is being scanned, so a diagram link inside it is
+#: judged as any other link and decoding never nests.
+_IN_DIAGRAM_SCAN: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "_IN_DIAGRAM_SCAN", default=False
+)
+
+
+def _plantuml_source(encoded: str, limit: int) -> str | None:
+    """Return the diagram text *encoded* inflates to, whole, or None."""
+    if limit <= 0 or len(encoded) % 4:
+        return None
+    bits = [_PLANTUML_ALPHABET[c] for c in encoded]
+    raw = bytearray()
+    for i in range(0, len(bits), 4):
+        word = bits[i] << 18 | bits[i + 1] << 12 | bits[i + 2] << 6 | bits[i + 3]
+        raw += word.to_bytes(3, "big")
+    inflater = zlib.decompressobj(-zlib.MAX_WBITS)
+    try:
+        source = inflater.decompress(bytes(raw), limit).decode("utf-8")
+    except (zlib.error, UnicodeDecodeError):
+        return None
+    # The encoder emits whole 4-character groups and pads only the last one,
+    # with at most two zero bytes. A further group, a stream cut short, or one
+    # over the limit is not a whole diagram, so text glued after a diagram, or a
+    # diagram cut mid-group, is never kept.
+    padding = inflater.unused_data
+    if not inflater.eof or len(padding) > 2 or padding.strip(b"\0") or not source.strip():
+        return None
+    if not all(c.isprintable() or c in "\t\n\r" for c in source):
+        return None
+    return source
+
+
+def _plantuml_verdict(encoded: str, limit: int) -> tuple[bool, int]:
+    """Judge one diagram; also return how much text was inflated for it."""
+    source = _plantuml_source(encoded, min(limit, _PLANTUML_RATIO_CAP * len(encoded)))
+    if source is None:
+        return False, min(limit, _PLANTUML_RATIO_CAP * len(encoded))
+    # The link carries its source, so the source is judged by every credential
+    # pass; anything they would mask leaves the link masked.
+    previous = _IN_DIAGRAM_SCAN.get()
+    _IN_DIAGRAM_SCAN.set(True)
+    try:
+        return redact_credentials(source)[0] == source, len(source)
+    finally:
+        _IN_DIAGRAM_SCAN.set(previous)
 
 
 def _document_link_spans(text: str) -> list[tuple[int, int]]:
     """Return the spans of the :data:`_DOCUMENT_LINK_RE` matches that hold no key."""
-    return [
-        m.span()
-        for m in _DOCUMENT_LINK_RE.finditer(text)
-        if not any(
-            len(piece) == _SECRET_KEY_LEN and _looks_like_secret_key(piece)
-            for piece_re in _RUN_PIECE_RES
-            for piece in piece_re.findall(m.group())
-        )
-    ]
+    spans = []
+    budget = 0 if _IN_DIAGRAM_SCAN.get() else _PLANTUML_SOURCE_CAP
+    for m in _DOCUMENT_LINK_RE.finditer(text):
+        if m["diagram"]:
+            kept, spent = _plantuml_verdict(m["diagram"], budget)
+            budget -= spent
+        else:
+            kept = not any(
+                len(piece) == _SECRET_KEY_LEN and _looks_like_secret_key(piece)
+                for piece_re in _RUN_PIECE_RES
+                for piece in piece_re.findall(m.group())
+            )
+        if kept:
+            spans.append(m.span())
+    return spans
 
 
 #: Code-point ranges of the printable-ASCII tail of the standard baseline JPEG AC

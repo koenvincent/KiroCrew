@@ -23,7 +23,7 @@ import sys
 import unicodedata
 from dataclasses import dataclass, field
 from pathlib import PureWindowsPath
-from typing import Any
+from typing import Any, Iterable
 
 # The artifact tag rule lives with the store's other field grammar and is read
 # here so the tool gate and the store cannot disagree about a tag. Import-safe:
@@ -77,6 +77,7 @@ from kiro_crew.monitoring.registry import (
     publicly_armable_objectives,
 )
 from kiro_crew.project_scope import SCOPE_FRAGMENT_RE
+from kiro_crew.session_directive import MAX_TOOL_RESULT_CHARS
 from kiro_crew.work_vocab import (
     WORK_BLOCKED_REASONS,
     WORK_ITEM_STATES,
@@ -1446,12 +1447,18 @@ def validate_jsonrpc_request(req: dict[str, Any]) -> tuple[str, Any, dict[str, A
 #: fields a caller varies across one wave in practice (model, effort); a
 #: per-task template is ``agents``. The rest stay batch-wide and can join this
 #: object later without changing the shape again.
+#: A backend's policy-facing name ("kiro", "claude", "codex"): lowercase id
+#: characters only, so a request can never smuggle anything past the endpoint's
+#: membership check into a log line or an error message.
+_BACKEND_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
+
 SPAWN_RUN_TASK_ITEM_SCHEMA = ToolSchema(
     tool_name="spawn_run.tasks[]",
     fields=[
         FieldSpec("task", str, required=True, max_len=MAX_MEDIUM_STRING),
         FieldSpec("model", str, max_len=MAX_SHORT_STRING, pattern=_MODEL_NAME_RE),
         FieldSpec("reasoning_effort", str, allowed=EFFORT_VALUES),
+        FieldSpec("backend", str, max_len=MAX_SHORT_STRING, pattern=_BACKEND_NAME_RE),
     ],
 )
 
@@ -1490,6 +1497,11 @@ SPAWN_RUN_SCHEMA = ToolSchema(
         # Batch-wide, like ``model``. ``""`` (in EFFORT_VALUES) means "unset —
         # defer to the role_efforts['subagent'] pin, else the provider default".
         FieldSpec("reasoning_effort", str, allowed=EFFORT_VALUES),
+        # Optional backend (harness) for the subagent(s), spelled the way a
+        # governance rule spells it ("kiro", "claude", "codex", ...). Shape only
+        # here: whether it is selectable on this gateway is the spawn endpoint's
+        # answer, which refuses with the selectable list.
+        FieldSpec("backend", str, max_len=MAX_SHORT_STRING, pattern=_BACKEND_NAME_RE),
         # keep=True makes the run a continuable conversation: its session
         # persists (hibernated on disk) after completion, and spawn_continue
         # can dispatch follow-up turns into it with full prior context.
@@ -1951,21 +1963,62 @@ _ASK_MAX_HEADER_LEN = 50
 _ASK_MAX_LABEL_LEN = 200
 _ASK_MAX_DESC_LEN = 500
 # The answer side is bounded too: answers are echoed verbatim into the agent's
-# transcript, so an oversized custom answer would consume model context.
-_ASK_MAX_ANSWER_LEN = 2000
+# transcript, so an oversized custom answer would consume model context. The
+# bound is derived so that the worst-case tool result (the header line, then
+# one '"<question>" -> "<answer>"' line per question at the max question length)
+# fits MAX_TOOL_RESULT_CHARS; the aggregate guard in the answer handler stays
+# as the backstop for JSON escaping or redaction growing the text past this.
+_ASK_ANSWERS_HEADER = "User has answered your questions:"
+#: Between the two JSON strings of a pair. Neither `=` nor `:`: the transport
+#: scrub's key=value patterns accept a quote and either of those after a key
+#: name, so they would join a question ending in a key name to its answer.
+_ASK_PAIR_SEPARATOR = " -> "
+# Newline, the quotes around key and answer, and the separator between them.
+_ASK_ANSWER_LINE_OVERHEAD = len(f'\n""{_ASK_PAIR_SEPARATOR}""') + _ASK_MAX_QUESTION_LEN
+_ASK_MAX_ANSWER_LEN = (
+    MAX_TOOL_RESULT_CHARS
+    - len(_ASK_ANSWERS_HEADER)
+    - _ASK_MAX_QUESTIONS * _ASK_ANSWER_LINE_OVERHEAD
+) // _ASK_MAX_QUESTIONS
 
-# ask_question requests a NON-BLOCKING dashboard question card: the MCP tool
-# returns a session directive and the agent ends its turn, so no tool call is
-# held open (see mcp_tools.control.ask_question). `questions` is only
-# shape-checked here (a bounded list); the per-question/per-option limits are
-# enforced server-side by validate_ask_user_question, which is the single
-# source of truth for the card payload.
+#: One wait slice of a blocking ask, shared by the gateway and the MCP tool.
+#: Short enough that a cancelled tool call withdraws its card promptly and the
+#: keepalive between slices resets the ACP tool-stall watchdog long before its
+#: 600s; long enough that an idle card costs a request every ~20s.
+ASK_WAIT_SLICE_SECS = 20
+
+
+def format_ask_answers(pairs: Iterable[tuple[str, str]]) -> str:
+    """The answered tool result: the header, then one ``"<question>" -> "<answer>"`` line per pair."""
+    # Imported here: kiro_crew.agent_sdk pulls in the ACP stack this module otherwise avoids.
+    # The transport scrubs the serialized result again, and a scrub that cuts through
+    # a JSON escape leaves a line that does not decode. Scrubbing the decoded values
+    # first leaves it nothing to match, and the size guard sizes this same text.
+    from kiro_crew.agent_sdk import tool_row_text as _scrub
+
+    lines = [_ASK_ANSWERS_HEADER]
+    for q, a in pairs:
+        # JSON-escaped so a quote or newline in either side cannot forge another pair.
+        lines.append(
+            json.dumps(_scrub(q), ensure_ascii=False)
+            + _ASK_PAIR_SEPARATOR
+            + json.dumps(_scrub(a), ensure_ascii=False)
+        )
+    return "\n".join(lines)
+
+
+# ask_question opens a BLOCKING dashboard question card: the MCP tool holds the
+# call open and returns the answers as its result (see
+# mcp_tools.control.ask_question). `questions` is only shape-checked here (a
+# bounded list); the per-question/per-option limits are enforced server-side by
+# validate_ask_user_question, which is the single source of truth for the card
+# payload.
 ASK_QUESTION_SCHEMA = ToolSchema(
     tool_name="ask_question",
     fields=[
         FieldSpec("questions", list, required=True, max_items=_ASK_MAX_QUESTIONS),
-        # Accepted but IGNORED: the directive the tool returns carries only
-        # `questions`, so nothing downstream reads a timeout. The bound still
+        # Accepted but IGNORED: the tool opens the card with only `questions`,
+        # so nothing downstream reads a timeout. The bound still
         # mirrors DashboardState._QUESTION_TIMEOUT_MAX, which governs the legacy
         # blocking POST /api/ask-question path. Kept lenient rather than removed
         # so a caller still passing it gets its card instead of a validation
@@ -2547,7 +2600,7 @@ ARTIFACT_SAVE_SCHEMA = ToolSchema(
     custom_validator=_validate_artifact_save,
     tool_name="artifact_save",
     fields=[
-        FieldSpec("name", str, required=True, max_len=200),
+        FieldSpec("name", str, required=True, max_len=MAX_SHORT_STRING),
         FieldSpec("content", str, required=True, max_len=ARTIFACT_CONTENT_MAX),
         FieldSpec("slug", str, max_len=80, pattern=_ARTIFACT_SLUG_RE),
         FieldSpec("kind", str, max_len=20, pattern=_ARTIFACT_KIND_RE),
@@ -3988,6 +4041,18 @@ SESSION_RELOAD_SCHEMA = ToolSchema(
     ],
 )
 
+SESSION_RENAME_SCHEMA = ToolSchema(
+    tool_name="session_rename",
+    fields=[
+        FieldSpec("target", str, required=True, max_len=MAX_SHORT_STRING),
+        # A transport bound only. The 200-character title rule is applied by the
+        # route AFTER surrounding whitespace is stripped
+        # (``session_control._clean_rename_title``), so a padded title that is
+        # short once stripped is not refused here.
+        FieldSpec("title", str, required=True, max_len=MAX_SHORT_STRING),
+    ],
+)
+
 SESSION_CLOSE_SCHEMA = ToolSchema(
     tool_name="session_close",
     fields=[
@@ -4331,6 +4396,7 @@ MCP_DASHBOARD_SCHEMAS: dict[str, ToolSchema] = {
     "session_retry": SESSION_RETRY_SCHEMA,
     "session_set_model": SESSION_SET_MODEL_SCHEMA,
     "session_reload": SESSION_RELOAD_SCHEMA,
+    "session_rename": SESSION_RENAME_SCHEMA,
     "session_close": SESSION_CLOSE_SCHEMA,
     "session_revive": SESSION_REVIVE_SCHEMA,
     "session_send": SESSION_SEND_SCHEMA,
@@ -4758,6 +4824,101 @@ MCP_PANEL_SCHEMAS: dict[str, ToolSchema] = {
     "dashboard_preview": DASHBOARD_PREVIEW_SCHEMA,
     "dashboard_apply": DASHBOARD_APPLY_SCHEMA,
     "dashboard_rollback": DASHBOARD_ROLLBACK_SCHEMA,
+}
+
+
+# ── Tool Schemas (MCP Guide — server ``kirocrew-guide``) ──
+#
+# Its own registry because the guide tools ship in an opt-in server. The shape
+# checked here is the envelope only: which action ids exist and what their params
+# mean is the gateway's catalog (``guide_catalog.validate_actions``), which is the
+# one place that can resolve a setting id against the packaged registry.
+_GUIDE_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+
+GUIDE_LIST_ACTIONS_SCHEMA = ToolSchema(tool_name="guide_list_actions")
+GUIDE_START_SCHEMA = ToolSchema(
+    tool_name="guide_start",
+    fields=[
+        FieldSpec("actions", list, required=True, item_type=dict, max_items=8),
+        # Content rules (no links, markup, control characters) are the gateway's
+        # (``guide_catalog.validate_intro``); this is only the envelope.
+        FieldSpec("intro", str, max_len=200),
+    ],
+)
+GUIDE_STATUS_SCHEMA = ToolSchema(
+    tool_name="guide_status",
+    fields=[FieldSpec("guide_id", str, max_len=64, pattern=_GUIDE_ID_PATTERN)],
+)
+GUIDE_CANCEL_SCHEMA = ToolSchema(
+    tool_name="guide_cancel",
+    fields=[FieldSpec("guide_id", str, required=True, max_len=64, pattern=_GUIDE_ID_PATTERN)],
+)
+
+MCP_GUIDE_SCHEMAS: dict[str, ToolSchema] = {
+    "guide_list_actions": GUIDE_LIST_ACTIONS_SCHEMA,
+    "guide_start": GUIDE_START_SCHEMA,
+    "guide_status": GUIDE_STATUS_SCHEMA,
+    "guide_cancel": GUIDE_CANCEL_SCHEMA,
+    "list_change_kinds": ToolSchema(tool_name="list_change_kinds"),
+    "find_setting": ToolSchema(
+        tool_name="find_setting",
+        fields=[FieldSpec("query", str, required=True, max_len=200)],
+    ),
+    "get_member_capabilities": ToolSchema(
+        tool_name="get_member_capabilities",
+        fields=[FieldSpec("member", str, required=True, max_len=128)],
+    ),
+    "diagnose_settings": ToolSchema(
+        tool_name="diagnose_settings",
+        fields=[FieldSpec("topic", str, max_len=200)],
+    ),
+    "propose_change": ToolSchema(
+        tool_name="propose_change",
+        fields=[
+            FieldSpec("kind", str, required=True, max_len=64),
+            FieldSpec("params", dict, required=True),
+            FieldSpec("reason", str, max_len=500),
+        ],
+    ),
+    "get_change_status": ToolSchema(
+        tool_name="get_change_status",
+        fields=[
+            FieldSpec("change_id", str, max_len=48, pattern=re.compile(r"^cc_[A-Za-z0-9_-]{8,40}$"))
+        ],
+    ),
+    "rename_self": ToolSchema(
+        tool_name="rename_self",
+        fields=[FieldSpec("name", str, required=True, max_len=MAX_SHORT_STRING)],
+    ),
+    "search_docs": ToolSchema(
+        tool_name="search_docs",
+        fields=[
+            FieldSpec("query", str, max_len=200),
+            FieldSpec("page", str, max_len=80),
+            FieldSpec("offset", int, min_val=0, max_val=10_000_000),
+        ],
+    ),
+    "find_ui": ToolSchema(
+        tool_name="find_ui",
+        fields=[
+            # Optional: a call passes `query` to search or `area` to browse.
+            FieldSpec("query", str, max_len=200),
+            FieldSpec(
+                "lang",
+                str,
+                max_len=16,
+                pattern=re.compile(r"^[A-Za-z]{2,3}(?:[-_][A-Za-z0-9]{2,8})?$"),
+            ),
+            FieldSpec("surface", str, max_len=64, pattern=re.compile(r"^[a-z][a-z0-9-]{0,63}$")),
+            FieldSpec(
+                "area",
+                str,
+                max_len=82,
+                pattern=re.compile(r"^[a-z][a-z0-9-]{0,40}(?:\.[a-z0-9-]{1,40})?$"),
+            ),
+            FieldSpec("offset", int, min_val=0, max_val=100_000),
+        ],
+    ),
 }
 
 MCP_COMPUTER_SCHEMAS: dict[str, ToolSchema] = {

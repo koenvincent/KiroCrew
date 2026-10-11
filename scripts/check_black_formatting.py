@@ -57,7 +57,9 @@ Three conditions still force the whole tree, because each can change the verdict
 for files the diff never names: an undeterminable scope, ``RATCHET_SCOPE_WHOLE_TREE``
 (the main-branch audit), and an edit to anything in ``FULL_TREE_TRIGGERS`` (the
 black pin and config in ``pyproject.toml``, or the exemption list in
-``.github/black-baseline.txt``). The gate scripts themselves are NOT triggers: an
+``.github/black-baseline.txt``). A baseline edit that only deletes entries is the
+exception: it adds the deleted paths to the scope instead, since removing an
+exemption can only matter for those files. The gate scripts themselves are NOT triggers: an
 edit to them changes how the verdict is computed, not which files are dirty, and
 making them triggers meant a PR that edits the gate could never finish
 ``backend-lint`` on a hosted runner (three heads of the scoping change itself timed
@@ -84,6 +86,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_BASELINE = ROOT / ".github" / "black-baseline.txt"
+BASELINE_REL = ".github/black-baseline.txt"
 DEFAULT_TARGETS = ("src", "test")
 # Pinned so the gate cannot start disagreeing with the documented command when a
 # contributor's black defaults differ. Matches ci.yml and AGENTS.md.
@@ -96,7 +99,7 @@ WOULD_REFORMAT = re.compile(r"^would reformat (.+)$")
 FULL_TREE_TRIGGERS = frozenset(
     {
         "pyproject.toml",
-        ".github/black-baseline.txt",
+        BASELINE_REL,
     }
 )
 BLACK_PIN = re.compile(r"""^\s*["']black==([^"'\s]+)["']""", re.MULTILINE)
@@ -227,6 +230,37 @@ def _scoped_targets(changed: set[str] | None) -> tuple[str, ...] | None:
     )
 
 
+def _base_baseline(scope_label: str) -> set[str] | None:
+    """The baseline's entries at the base this change is diffed against, or None."""
+    scope = _load_scope()
+    base = scope.base_ref(scope_label, cwd=ROOT)
+    shown = scope.show_at(base, BASELINE_REL, cwd=ROOT) if base else None
+    if shown is None:
+        return None
+    lines = (line.strip() for line in shown.splitlines())
+    return {line for line in lines if line and not line.startswith("#")}
+
+
+def _rescope_baseline_deletion(
+    changed: set[str], scope_label: str, current: set[str]
+) -> tuple[set[str], str | None]:
+    """Replace a deletion-only baseline edit with the paths it removed.
+
+    Removing an entry only revokes an exemption, so checking exactly the removed
+    paths reaches the same verdict as the whole tree. An added or changed entry
+    could exempt any file, so it (or an unreadable base) still forces the tree.
+    Returns the scope and, when a baseline edit still forces the tree, why.
+    """
+    if changed & FULL_TREE_TRIGGERS != {BASELINE_REL}:
+        return changed, None
+    old = _base_baseline(scope_label)
+    if old is None:
+        return changed, "the baseline at the base could not be read"
+    if not current <= old:
+        return changed, "the baseline edit adds an entry"
+    return (changed - {BASELINE_REL}) | (old - current), None
+
+
 def _read_baseline(path: Path) -> list[str]:
     if not path.is_file():
         raise SystemExit(
@@ -271,14 +305,16 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     changed, scope_label = _load_scope().changed_paths()
+    why_full: str | None = None
+    if changed is not None:
+        changed, why_full = _rescope_baseline_deletion(changed, scope_label, baseline)
     targets = _scoped_targets(changed)
     print(f"black gate scope: {scope_label}", end="")
     if changed is None:
         print("")
     elif targets is None:
-        print(
-            f" ({len(changed)} changed file(s); whole tree, a black-config or baseline file changed)"
-        )
+        reason = why_full or "a black-config or baseline file changed"
+        print(f" ({len(changed)} changed file(s); whole tree, {reason})")
     else:
         print(f" ({len(changed)} changed file(s); {len(targets)} checked)")
 

@@ -64,6 +64,7 @@ from kiro_crew.dashboard import (  # noqa: F401
 )
 from kiro_crew.dashboard import server_runtime as _server_runtime
 from kiro_crew.dashboard import (  # noqa: F401
+    slot_retention,
     tailnet,
     tailnet_serve,
 )
@@ -207,6 +208,7 @@ from kiro_crew.dashboard.server_runtime.crewmate_prune import (  # noqa: F401
     _crewmate_prune_gate_holds_path,
     _kick_crewmate_prune,
     _kick_deferred_transcript_removal,
+    _register_change_card_hook,
     _register_crewmate_prune_gate,
     await_crewmate_prune_settled,
 )
@@ -551,6 +553,13 @@ _STRICT_INTERNAL_API_PATHS = frozenset(
         # ``local_only=False`` deployment reclassifies strict paths as mixed.
         "/api/computer-use/frame",
         "/api/session-keepalive",
+        # Blocking MCP ask_question: open / wait / withdraw. STRICT for the same
+        # reason as the keepalive above -- the only caller is the tool in an MCP
+        # subprocess, and the card is addressed by the attested X-Session-Key,
+        # which a browser bearer must not be able to assert. Its own prefix so
+        # the browser half of /api/ask-question is not swept in by the
+        # prefix-matched strict check.
+        "/api/agent-ask",
         # Session directives: the provider-neutral leg of the directive
         # protocol. STRICT for the same reasons as its sibling above — the
         # only legitimate caller is a Kiro Crew directive tool in an MCP
@@ -667,6 +676,21 @@ _STRICT_INTERNAL_API_PATHS = frozenset(
         # internal-secret call falls through to cookie auth and every publish
         # fails with 403.
         "/api/agent-panel",
+        # MCP-only (the four kirocrew-guide tools); no browser caller. Prefix
+        # matching covers "/actions", "/start", "/status" and "/cancel". STRICT:
+        # the caller's slot is derived from the X-Session-Key this secret backs,
+        # so a cookie fall-through would let a browser name any session as the one
+        # offering the guide. The browser half ("/api/guide/pending", "/claim",
+        # ...) is deliberately NOT under this prefix and stays on cookie auth.
+        "/api/guide/agent",
+        # MCP-only (the list_change_kinds / propose_change / get_change_status tools); no browser
+        # caller. Prefix matching covers "/kinds", "/propose" and "/status".
+        # STRICT for the same reason as the guide: the card's slot is derived from
+        # the X-Session-Key this secret backs. The browser half ("/api/cards/pending",
+        # "/api/cards/{id}/preview|cancel|dismiss") is deliberately NOT under this
+        # prefix and stays on owner-only cookie auth; applying a card happens only
+        # on the existing settings routes, through the card hook.
+        "/api/cards/agent",
         # MCP-only (knowledge_add_document tool); no browser caller — the
         # dashboard ingests via its own cookie-authed knowledge routes. Same
         # wiring class as "/api/notifications/agent" above.
@@ -691,6 +715,7 @@ _STRICT_INTERNAL_API_PATHS = frozenset(
         "/api/session-control/retry",
         "/api/session-control/set-model",
         "/api/session-control/reload",
+        "/api/session-control/rename",
         "/api/session-control/close",
         "/api/session-control/revive",
         "/api/session-control/send",
@@ -1194,7 +1219,9 @@ async def _revive_intended_instances(
     policy — which instances are picked and the per-instance failure isolation —
     is unit-testable without standing up the whole app.
     """
-    intended = [inst for inst in registry.list() if inst.was_connected]
+    # A disabled crew keeps its intent so enabling it brings it back, but it is
+    # not revived while it stays disabled.
+    intended = [inst for inst in registry.list() if inst.was_connected and not inst.disabled]
     if not intended:
         return
     logger.info("Auto-reconnecting %d instance(s) on startup", len(intended))
@@ -2011,6 +2038,7 @@ async def start_dashboard(
         _register_connections_warm_lifecycle(app, state)
         _register_workflow_lifecycle(app, state)
         _register_crewmate_prune_gate(app, state)
+        _register_change_card_hook(app)
 
         # Unix-socket cleanup hook — registered before runner.setup freezes the
         # signal lists; the path itself only becomes known after the site starts

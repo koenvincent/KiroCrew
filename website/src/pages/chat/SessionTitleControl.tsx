@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
-import { EyeOff, Loader, Pen, Sparkles, Undo2, VenetianMask } from 'lucide-react'
+import { EyeOff, Loader, Pen, Pin, Sparkles, Undo2, VenetianMask } from 'lucide-react'
 import { useImeGuard } from '../../hooks/useImeGuard'
 import useHeldWindow from '../../hooks/useHeldWindow'
 import { Btn, Input } from '../../components/ui'
@@ -12,6 +12,7 @@ import { sseSlotTitle } from '../../store/dashboardSlice'
 import { api } from '../../api/client'
 import { errMessage } from '../../utils/thunkError'
 import { i18nT } from '../../i18n/t'
+import { uiLocation } from '../../uiLocations/uiLocation'
 
 /**
  * SessionTitleControl — the session title as ONE editable control: the
@@ -100,6 +101,10 @@ export default function SessionTitleControl({
   const store = useAppStore()
   const queryClient = useQueryClient()
   const memoryMode = useAppSelector((s) => s.dashboard.slots.find((x) => x.key === slotKey)?.memory_mode)
+  // Pinning from the header menu moves the row to the sidebar's pinned group,
+  // often out of view, so the header itself has to show the state: without
+  // it a pin or unpin from the chevron gave no visible sign it took.
+  const pinned = useAppSelector((s) => !!s.dashboard.slots.find((x) => x.key === slotKey)?.pinned)
   const [localEditing, setLocalEditing] = useState(false)
   const editing = editingProp ?? localEditing
   const setEditing = (next: boolean) => { setLocalEditing(next); onEditingChange?.(next) }
@@ -326,11 +331,20 @@ export default function SessionTitleControl({
     : memoryMode === 'temporary'
       ? <VenetianMask size={13} className="shrink-0 text-aim" />
       : null
-  const glyphs = glyphIcon && (
-    <span role="img" aria-label={modeText} title={modeText}>{glyphIcon}</span>
+  // The pin marker: the sidebar row's glyph and tooltip, so the two surfaces
+  // name the state the same way. It leads the row, right after the header
+  // menu chevron that toggles it, and like the memory glyph it is folded into
+  // the trigger's accessible name in the display render.
+  const pinnedText = pinned ? i18nT('pages.chatSidebar.pinned') : ''
+  const pinIcon = pinned ? <Pin size={compact ? 11 : 12} className={glyphIcon ? 'mr-1 shrink-0 text-accent' : 'shrink-0 text-accent'} /> : null
+  const glyphs = (pinIcon || glyphIcon) && (
+    <>
+      {pinIcon && <span role="img" aria-label={pinnedText} title={pinnedText} data-testid="session-pinned-glyph">{pinIcon}</span>}
+      {glyphIcon && <span role="img" aria-label={modeText} title={modeText}>{glyphIcon}</span>}
+    </>
   )
   const renameLabel = i18nT('pages.chatPage.rename_session_title', { title })
-  const triggerLabel = modeText ? `${renameLabel}, ${modeText}` : renameLabel
+  const triggerLabel = [renameLabel, pinnedText, modeText].filter(Boolean).join(', ')
   // The SAME element in both renders (last child of a fragment in each), so
   // React keeps it mounted across the editor opening and closing: a live
   // region announces text CHANGES, and a region that remounts with its text
@@ -395,13 +409,14 @@ export default function SessionTitleControl({
           list of split-view panes reads as titles, not as N identical verbs.
           The memory-mode text follows, so the glyph's meaning survives the
           label and a click on the glyph still opens the editor. */}
-      <Clickable className="group/title flex min-w-0 items-center gap-1" ref={titleTriggerRef} aria-label={triggerLabel} onClick={(e) => {
+      <Clickable className="group/title flex min-w-0 items-center gap-1" aria-label={triggerLabel} {...uiLocation('chat.session-title', titleTriggerRef)} onClick={(e) => {
         // An auto-repeat keydown from the Enter still held since the commit is
         // not a request to rename again (Clickable passes the keyboard event
         // through; a pointer click has no `repeat`).
         if (generating || (e && 'repeat' in e && (e as { repeat?: boolean }).repeat)) return
         setUndoable(null); setEditing(true)
       }}>
+        {pinIcon && <span aria-hidden="true" title={pinnedText} data-testid="session-pinned-glyph">{pinIcon}</span>}
         {glyphIcon && <span aria-hidden="true" title={modeText} data-testid="memory-mode-glyph">{glyphIcon}</span>}
         <TypewriterText
           text={title}

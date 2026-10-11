@@ -28,7 +28,10 @@ that did not hold at admission. A dropped CROSS-SESSION delivery is reported bac
 to its sender too, since the target's own notice is on a transcript the sender
 does not read: the entry also carries the sending session, as a slot key plus
 that slot's tab identity (:func:`send_origin_meta`), and the drop appends a
-notice there (:func:`notify_send_origin_dropped`). A human-typed queued message
+notice there (:func:`notify_send_origin_dropped`). The two deliberate discards
+of a queued entry, a person cancelling its queue card and a hard stop clearing
+the queue, report back the same way with their own wording
+(:func:`notify_send_origin_discarded`). A human-typed queued message
 shares the same window and the same re-check, and carries no sender to report to.
 
 Authorization is deny-by-default and checked in one place
@@ -43,6 +46,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import unicodedata
 import uuid
 from collections.abc import Awaitable, Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
@@ -80,9 +84,9 @@ from kiro_crew.dashboard.chat_fork import (
 from kiro_crew.dashboard.chat_persistence import _TRANSIENT_ROLES as _PERSISTENCE_TRANSIENT_ROLES
 from kiro_crew.dashboard.chat_persistence import (
     _recent_session_slot_name,
-    _remember_reasoning_effort_for_restore,
     save_slot_off_loop,
 )
+from kiro_crew.dashboard.chat_title import apply_manual_title
 from kiro_crew.dashboard.chat_utils import (
     _history_key_for,
     _normalize_model,
@@ -95,6 +99,7 @@ from kiro_crew.dashboard.create_rate_limit import (
     allow_create,
     has_create_budget,
 )
+from kiro_crew.dashboard.handlers._shared import _scrub_text
 from kiro_crew.dashboard.relay_archive import (
     RELAY_ARCHIVE_CODE,
     RELAY_ARCHIVE_ERROR,
@@ -130,6 +135,7 @@ from kiro_crew.metrics.turns import turn_outcome
 from kiro_crew.security import redact, redact_and_truncate
 from kiro_crew.sel import sel
 from kiro_crew.session_summary import derive_state
+from kiro_crew.terminal_safe import _is_invisible  # one shared list of invisible code points
 from kiro_crew.validation import (
     _MODEL_NAME_RE,
     BROADCAST_TARGET_ALLOWANCE_SECS,
@@ -1445,6 +1451,20 @@ CHANNEL_RECIPIENT_META_KEY = "channel_recipient"
 # a caller holding several deliveries in flight can tell which one went.
 SEND_DROP_EXCERPT_CHARS = 120
 
+# The two deliberate discards of a queued entry that are not the drain's
+# authorization re-check: a person cancelling the entry's queue card, and a hard
+# stop clearing the whole queue. Each is passed as the ``cause`` of
+# :func:`notify_send_origin_discarded`, which words the sender's notice from it.
+SEND_DISCARD_QUEUE_CANCEL = "queue_cancel"
+SEND_DISCARD_HARD_STOP = "hard_stop"
+
+# Sender-notice phrasing per discard cause. Neither discard changes a
+# constraint, so the drain's containment wording would describe nothing here.
+_SEND_DISCARD_REASONS = {
+    SEND_DISCARD_QUEUE_CANCEL: "it was cancelled from that session's queue",
+    SEND_DISCARD_HARD_STOP: "a hard stop of that session discarded its queue",
+}
+
 # Transcript-notice phrasing per snapshot field, for the drop notice a reader
 # of the session must be able to understand without knowing this module.
 _CONTAINMENT_CHANGE_LABELS = {
@@ -1874,15 +1894,9 @@ def notify_send_origin_dropped(
     drop still proceeds. Withholding the message is the authorization decision,
     and it must not depend on the report landing.
     """
-    if not origin:
-        return False
     target_key = str(getattr(target_slot, "key", ""))
-    if origin == target_key:
-        return False
-    sender = state._slots.get(origin)
+    sender = _send_origin_recipient(state, origin, origin_tab, target_key)
     if sender is None:
-        return False
-    if str(getattr(sender, "_tab_id", "") or "") != str(origin_tab or ""):
         return False
     try:
         excerpt = send_drop_excerpt(text)
@@ -1903,6 +1917,83 @@ def notify_send_origin_dropped(
         )
         return False
     return True
+
+
+def notify_send_origin_discarded(
+    state: "DashboardState",
+    *,
+    entry_meta: Any,
+    target_slot: "_ChatSlot",
+    text: Any,
+    cause: str,
+) -> bool:
+    """Tell the SENDING session that a deliberate discard removed its queued delivery.
+
+    The drain is not the only place a stamped entry leaves the queue unrun. A
+    person cancelling its queue card (``api_chat_slot_queue_cancel``) and a hard
+    stop clearing the queue (``stop_slot_turn``) discard it too, and the sender's
+    last word on the message is still the ``started: False`` receipt that said it
+    would run later. Every other sign of the discard lands on the target, which
+    the sender does not read.
+
+    *cause* is :data:`SEND_DISCARD_QUEUE_CANCEL` or :data:`SEND_DISCARD_HARD_STOP`
+    and selects the wording: a deliberate discard changes no authorization, so the
+    notice names what discarded the entry rather than a constraint.
+
+    *entry_meta* is the discarded entry's own ``meta``, read here rather than by
+    the caller so both discard sites read the stamp the way the drain does. The
+    recipient is resolved exactly as :func:`notify_send_origin_dropped` resolves
+    it, so the same four cases answer False without writing: no stamp, a
+    self-send, a closed sender, and a key now held by a different tab.
+
+    Best-effort: a failure is logged and the discard stands, because the person
+    or the stop already decided it.
+    """
+    target_key = str(getattr(target_slot, "key", ""))
+    origin = send_origin_slot(entry_meta)
+    sender = _send_origin_recipient(state, origin, send_origin_tab(entry_meta), target_key)
+    if sender is None:
+        return False
+    try:
+        reason = _SEND_DISCARD_REASONS[cause]
+        excerpt = send_drop_excerpt(text)
+        sender.append(
+            "notice",
+            f"⚠️ Message you sent to {target_key} was discarded before it ran: "
+            + reason
+            + ". It was not delivered and will not run."
+            + (f' Text: "{excerpt}"' if excerpt else ""),
+            "msg msg-info",
+        )
+    except Exception:
+        logger.exception(
+            "Failed to report a discarded delivery to its sender (origin=%s, target=%s)",
+            origin,
+            target_key,
+        )
+        return False
+    return True
+
+
+def _send_origin_recipient(
+    state: "DashboardState", origin: str, origin_tab: str, target_key: str
+) -> "_ChatSlot | None":
+    """The live sending slot a sender notice may be written to, or None.
+
+    One resolver for both sender notices, so the four non-notice cases
+    :func:`notify_send_origin_dropped` documents cannot hold on one discard path
+    and not another: no stamp, a self-send, a closed sender, and a reused key
+    whose current occupant is a different tab. An absent *origin_tab* never
+    matches a live slot, so the identity check cannot be skipped by omitting it.
+    """
+    if not origin or origin == target_key:
+        return None
+    sender = state._slots.get(origin)
+    if sender is None:
+        return None
+    if str(getattr(sender, "_tab_id", "") or "") != str(origin_tab or ""):
+        return None
+    return sender
 
 
 def notify_channel_recipient_dropped(
@@ -3886,7 +3977,9 @@ def _not_creator_reason(
 AUDIENCE_ADMISSION_KEY_PREFIX = "admission:"
 
 
-def record_audience_admission(slot: Any, admission: dict[str, Any]) -> None:
+def record_audience_admission(
+    slot: Any, admission: dict[str, Any], *, for_pending_turn: bool = False
+) -> None:
     """Record *admission* on *slot* as the audience its current turn was admitted under.
 
     *admission* is the ``admission`` of the :class:`OwnerDmVerdict` the gate just
@@ -3938,9 +4031,20 @@ def record_audience_admission(slot: Any, admission: dict[str, Any]) -> None:
 
     A caller with no slot record of its own leaves nothing, which is the behaviour
     such a caller has today.
+
+    ``for_pending_turn`` lifts the in-a-turn requirement for ONE kind of caller: a
+    producer that is about to START the turn this admission is about, and that has
+    no suspension point between this call and the turn's admission. The guard above
+    exists because an entry nothing clears would make the publisher withhold the
+    mirror leg of an UNRELATED later reply, judged by an admission that was never
+    about it; a caller whose next statement starts the turn leaves an entry that
+    turn's own teardown empties, so the hazard is not present. It stays opt-in
+    because no other caller can promise that, and the safe default is the guard.
     """
     fences = getattr(slot, "_steer_audience_fences", None)
-    if slot is None or not isinstance(fences, dict) or not _in_runner_turn(slot):
+    if slot is None or not isinstance(fences, dict):
+        return
+    if not (for_pending_turn or _in_runner_turn(slot)):
         return
     key = AUDIENCE_ADMISSION_KEY_PREFIX + json.dumps(
         admission.get(QUEUED_CONTAINMENT_META_KEY, {}), sort_keys=True, default=str
@@ -4047,12 +4151,13 @@ def authorize_target(
     member) the fence is evaluated inline as before.
 
     ``allow_self`` waives the self-target refusal, and with it the ownership fence for
-    that one case. Two verbs pass it. A release, where the target itself is a
+    that one case. Three verbs pass it. A release, where the target itself is a
     legitimate caller because a session taken over must not depend on its holder still
     running to get out. A close, so a session that has finished its one job can archive
     its own tab instead of leaving it for the person or its creator to dismiss; the close
     is the same recoverable archival a peer close is, and it cancels the caller's own
-    running turn, which is the turn asking for it. It waives nothing else -- an ephemeral, app-scoped or
+    running turn, which is the turn asking for it. And a rename, because a session naming
+    itself acts on nothing but its own sidebar label. It waives nothing else -- an ephemeral, app-scoped or
     channel-linked caller is still refused, and a target that is not the caller is
     still judged by every rule above.
     """
@@ -5337,7 +5442,8 @@ async def set_model_target(
     A reasoning effort must be one of the five canonical levels (``low``,
     ``medium``, ``high``, ``xhigh``, ``max``), which every backend accepts;
     any other level, including ``""``, is refused here and is set from the
-    effort dropdown instead. It is committed with the model in the same step. It is NOT pushed live the way that route pushes it: the
+    effort dropdown instead. It is committed with the model in the same step.
+    It is NOT pushed live the way that route pushes it: the
     turn-start reset makes the cold start apply it through the same
     ``reasoning_effort_override`` the route's reset fallback relies on, with no
     provider await after the gate.
@@ -5467,20 +5573,9 @@ async def set_model_target(
     ):
         if is_relay_archive(slot):
             raise SessionControlError(RELAY_ARCHIVE_ERROR, code=RELAY_ARCHIVE_CODE, status=409)
-        if reasoning_effort is not None:
-            # The restore allowlist marker the effort route writes before it
-            # commits a level: without it a reloaded transcript cannot bring the
-            # level back. Written here, off the loop and before the synchronous
-            # re-check below, because the turn-start commit must not do file IO.
-            try:
-                await asyncio.to_thread(_remember_reasoning_effort_for_restore, reasoning_effort)
-            except (OSError, ValueError) as exc:
-                logger.warning("session-control set_model: cannot retain effort: %s", exc)
-                raise SessionControlError(
-                    "reasoning effort persistence unavailable; nothing changed",
-                    code="effort_marker_unavailable",
-                    status=503,
-                ) from exc
+        # No restore-allowlist marker is written for the level: the five
+        # canonical levels are always restorable (`_REASONING_EFFORT_FALLBACK`),
+        # so the marker the effort dropdown writes for other levels is a no-op.
         session_key = effective_session_key(slot)
         if _switch_target_busy(state, slot, session_key, state.sessions.get_provider(session_key)):
             raise _target_busy_error()
@@ -5570,6 +5665,209 @@ def _pick_audit_fields(model: str | None, reasoning_effort: str | None) -> dict[
     return fields
 
 
+#: Stored cap on a renamed title, the same ``[:200]`` the sidebar rename route and
+#: :func:`create_session` keep. The MCP schema's own bound on the argument is the
+#: generic ``MAX_SHORT_STRING`` (500), so :func:`_clean_rename_title` is what
+#: refuses a title between 201 and 500 characters, for MCP and direct callers alike.
+_MAX_RENAME_TITLE_CHARS = 200
+
+#: Every Unicode text-direction control, refused in a renamed title: the
+#: embeddings, overrides and isolates (U+202A..U+202E, U+2066..U+2069) and the
+#: directional marks (U+200E, U+200F, U+061C).
+_BIDI_CONTROLS = frozenset(
+    "\u202a\u202b\u202c\u202d\u202e\u2066\u2067\u2068\u2069\u200e\u200f\u061c"
+)
+
+#: Characters that render as a blank glyph yet are neither whitespace nor
+#: invisible to :func:`kiro_crew.terminal_safe._is_invisible`, which already
+#: covers format characters, variation selectors, the Hangul and Khmer fillers
+#: and the tag block. The blank Braille pattern is the one such character: a
+#: printable symbol that draws nothing.
+_BLANK_GLYPHS = frozenset("\u2800")
+
+#: Format characters (category ``Cf``) a renamed title may contain: the zero-width
+#: non-joiner and joiner, which emoji sequences and joined scripts such as Persian
+#: and Devanagari need. The tag characters U+E0020..U+E007F are allowed
+#: separately, by range; the tag block's other format character, U+E0001
+#: LANGUAGE TAG, is refused. Its unassigned code points are not ``Cf`` and are
+#: not refused by this rule.
+_ALLOWED_FORMAT_CHARS = frozenset("\u200c\u200d")
+
+
+def _is_allowed_format_char(ch: str) -> bool:
+    """True for a format character a renamed title keeps: a joiner, or a tag
+    character (U+E0020..U+E007F), which spells the subdivision of a flag emoji
+    such as England's. Every other ``Cf`` character is refused."""
+    return ch in _ALLOWED_FORMAT_CHARS or "\U000e0020" <= ch <= "\U000e007f"
+
+
+def _clean_rename_title(title: str) -> str:
+    """Validate *title* for :func:`rename_target` and return the stored form.
+
+    The rules are the sidebar's: surrounding whitespace is stripped, an empty
+    result is refused, and nothing over 200 characters is stored. Two refusals
+    go further than the sidebar, because the sidebar's text box can produce
+    neither case and a model can: a title over the cap is refused instead of cut
+    down, and a control character (a newline, a tab, an escape) is refused
+    because a sidebar title is one line.
+
+    The stored form is the scrubbed title, which can differ from what the caller
+    sent: ``handlers._shared._scrub_text`` replaces credential-shaped text with a
+    longer marker, also catching a secret split by an invisible character. A
+    title that grows past the cap that way is refused, never cut, so no stored
+    title holds a torn marker. The verb's reply carries this stored form, so the
+    caller reads back what the sidebar shows.
+    """
+    stripped = title.strip()
+    if not stripped:
+        raise SessionControlError("title is required", code="invalid_title", status=400)
+    if len(stripped) > _MAX_RENAME_TITLE_CHARS:
+        raise SessionControlError(
+            f"title is longer than {_MAX_RENAME_TITLE_CHARS} characters; session not renamed",
+            code="invalid_title",
+            status=400,
+        )
+    if any(unicodedata.category(ch) == "Cc" or ch in "\u2028\u2029" for ch in stripped):
+        raise SessionControlError(
+            "title contains a control character; session not renamed",
+            code="invalid_title",
+            status=400,
+        )
+    # A direction control makes the sidebar render the label in an order other
+    # than the one it was written in.
+    if any(ch in _BIDI_CONTROLS for ch in stripped):
+        raise SessionControlError(
+            "title contains a text-direction control; session not renamed",
+            code="invalid_title",
+            status=400,
+        )
+    # Any other format character (a zero-width space, a word joiner, a byte-order
+    # mark, a soft hyphen) is invisible inside a visible title, so it can make a
+    # near-duplicate of another session's label. Only the format characters that
+    # emoji and joined scripts need are kept: see :func:`_is_allowed_format_char`.
+    if any(unicodedata.category(ch) == "Cf" and not _is_allowed_format_char(ch) for ch in stripped):
+        raise SessionControlError(
+            "title contains an invisible format character; session not renamed",
+            code="invalid_title",
+            status=400,
+        )
+    # A title needs at least one character that shows something. Invisible
+    # characters (a zero-width space or joiner, a variation selector, a Hangul
+    # filler) survive `str.strip()`, so a title made only of them, or of blank
+    # glyphs, would store an invisible, final name the automatic titler can
+    # never replace. Such characters are kept inside a visible title: a joiner
+    # is how an emoji sequence is written.
+    if all(ch.isspace() or _is_invisible(ch) or ch in _BLANK_GLYPHS for ch in stripped):
+        raise SessionControlError("title is required", code="invalid_title", status=400)
+    # A blank glyph is refused anywhere in the title, not only in an all-blank
+    # one. `terminal_safe.normalize_for_scanning` does not remove it (it is a
+    # printable symbol, not an invisible character), so one placed inside a
+    # secret ("AKIA\u2800...") would split it past the redactors that
+    # `_scrub_text` runs below.
+    if any(ch in _BLANK_GLYPHS for ch in stripped):
+        raise SessionControlError(
+            "title contains a blank glyph (U+2800); session not renamed",
+            code="invalid_title",
+            status=400,
+        )
+    # Sanitized with the stored-field scrub the dashboard handlers use: the title
+    # is broadcast to every dashboard and persisted with the transcript. The
+    # redactors match literal patterns, so an invisible character placed inside
+    # a secret ("AKIA\u200d...", "AKIA\ufe0f...") would split it past the match;
+    # `_scrub_text` also scans a normalized copy and keeps it when that copy
+    # reveals a secret, and otherwise leaves invisible characters in place, so
+    # an emoji sequence is unchanged. Its control-character step is inert here,
+    # because a control character was refused above.
+    scrubbed = _scrub_text(stripped)
+    # Redaction markers are longer than the text they replace. A title they push
+    # past the cap is refused like any other over-long title rather than cut,
+    # so a stored title never holds a torn marker. The message names no part of
+    # the title, so the redacted text is not echoed back.
+    if len(scrubbed) > _MAX_RENAME_TITLE_CHARS:
+        raise SessionControlError(
+            f"title is longer than {_MAX_RENAME_TITLE_CHARS} characters once "
+            "credential-shaped text in it is redacted; session not renamed",
+            code="invalid_title",
+            status=400,
+        )
+    return scrubbed
+
+
+async def rename_target(
+    state: "DashboardState",
+    *,
+    caller_session_key: str,
+    target: str,
+    title: str,
+    caller_fenced: bool | None = None,
+) -> dict[str, Any]:
+    """Rename *target*'s sidebar title, the way the sidebar's own rename does.
+
+    The reach is :func:`stop_target`'s plus the caller itself. For a target that
+    is not the caller, every rule in :func:`authorize_target` applies, including
+    the ownership fence that keeps a crew member, a cron run, an owner-DM channel
+    session and any agent-created session to the sessions it created. For the
+    caller itself, ``allow_self`` waives the self-target refusal and, with it,
+    that ownership fence, since a session naming itself acts on nothing but its
+    own sidebar label. It waives nothing else: an ephemeral, app-scoped or
+    channel-linked caller is still refused, and so is a cron run's own session,
+    because the unattended-target refusal is checked before ``allow_self``.
+
+    The rename is final (``_TITLE_ORIGIN_USER``), so the automatic titler stops
+    refreshing the target, exactly as after a manual rename. It changes nothing
+    else about the target and does not wait for a running turn.
+
+    ``caller_fenced`` has the meaning :func:`stop_target` documents.
+    """
+    # Validated before any gate, as `set_model_target` does: a malformed title
+    # needs no target lookup, and refusing it first keeps a bad argument from
+    # reading as an access decision.
+    clean_title = _clean_rename_title(title)
+    # Same prewarm ordering as `stop_target`: nothing may suspend between the
+    # gate and the write it authorizes.
+    try:
+        await asyncio.to_thread(sel)
+    except Exception:  # noqa: BLE001 - a prewarm failure must not fail the rename
+        logger.warning("session-control SEL prewarm failed", exc_info=True)
+    await prewarm_enabled_check()
+
+    slot = authorize_target(
+        state,
+        caller_session_key=caller_session_key,
+        target=target,
+        operation="rename",
+        precomputed_ownership_fenced=caller_fenced,
+        allow_self=True,
+    )
+    # `apply_manual_title` assigns every field before its first await, so the
+    # title is on the slot before this coroutine can suspend.
+    if not await apply_manual_title(state, slot, clean_title):
+        _audit(
+            caller_session_key=caller_session_key,
+            operation="rename",
+            slot_key=slot.key,
+            outcome="error",
+            detail={"chars": len(clean_title), "reason": "title_persist_failed"},
+        )
+        raise SessionControlError(
+            f"{slot.key!r} now shows the new title, but it could not be saved yet; "
+            "the session's next save writes it, and until then a restart brings back "
+            "the previous title. Renaming again with the same title is safe",
+            status=500,
+            code="title_persist_failed",
+        )
+    _audit(
+        caller_session_key=caller_session_key,
+        operation="rename",
+        slot_key=slot.key,
+        outcome="allowed",
+        detail={"chars": len(clean_title)},
+    )
+    # The slot's title, not this call's: a rename that overtook this one while it
+    # saved has already replaced it, and the caller acts on what the reply names.
+    return {"ok": True, "target": slot.key, "title": slot.title}
+
+
 @dataclass(frozen=True)
 class PendingModelPick:
     """A ``session_set_model`` pick waiting for the target's next turn.
@@ -5644,6 +5942,45 @@ def _another_alias_is_mid_turn(state: "DashboardState", slot: "_ChatSlot") -> bo
         other is not slot and other.running and canonical_key(_cancel_target(other)) == target
         for other in list(state._slots.values())
     )
+
+
+def legacy_effort_base(model: str | None, *, pair_id_backend: bool) -> str:
+    """The base id a pin folds to when an effort level is committed, or ``""``.
+
+    On a backend that spells effort into the model id (codex:
+    ``gpt-6-astra[max]``), a pin still carrying a ``[level]`` suffix would keep
+    claiming the old level after a new one is committed, so the commit folds the
+    pin to its base id. Any other backend, or a pin with no suffix, folds nothing.
+
+    The effort dropdown route and :func:`apply_pending_model_pick` both commit a
+    level, and both ask this, so a change to the fold reaches both paths.
+    """
+    if not pair_id_backend:
+        return ""
+    base, level = model_registry.split_effort_suffix(model or "")
+    return base if level else ""
+
+
+def effort_commit_needs_reset(provider: object) -> bool:
+    """Whether committing a new effort level must reset the live session.
+
+    A live ACP session whose model takes no effort level keeps the level as a
+    stored value only: it applies once the user picks a capable model, and a
+    reset would restart the session for nothing. Any other live session, or no
+    live session, needs the reset (or the live push the dropdown tries first)
+    for the level to take.
+
+    Shared by the effort dropdown route and :func:`apply_pending_model_pick`
+    for the same reason as :func:`legacy_effort_base`.
+    """
+    # Duck-typed so this module stays above the agent-SDK boundary. Every
+    # LLMProvider has ``supports_effort``, and the base one returns a placeholder
+    # False, so only a provider that sets ``reports_effort_support`` (the ACP
+    # provider) can skip the reset. Read off the class, as isinstance would, so
+    # any other provider, an unspecced test double or no session keeps it.
+    if getattr(provider.__class__, "reports_effort_support", False) is not True:
+        return True
+    return provider.supports_effort() is not False  # type: ignore[attr-defined]
 
 
 def apply_pending_model_pick(state: "DashboardState", slot: "_ChatSlot") -> bool:
@@ -5777,16 +6114,16 @@ def apply_pending_model_pick(state: "DashboardState", slot: "_ChatSlot") -> bool
         # Recorded as an explicit pick so the model-fallback restore never undoes it.
         slot._model_pick_gen += 1
     if effort is not None:
-        if pick.pair_id_backend:
-            # The dropdown route's legacy fold: a pin still spelled
-            # ``<model>[<level>]`` would keep claiming the old level.
-            base, legacy_level = model_registry.split_effort_suffix(slot.model or "")
-            if legacy_level:
-                slot.model = base
-                changed = True
-        if (slot.reasoning_effort or "") != effort:
+        base = legacy_effort_base(slot.model, pair_id_backend=pick.pair_id_backend)
+        if base:
+            slot.model = base
+            changed = True
+        if (slot.reasoning_effort or "") != effort and effort_commit_needs_reset(
+            state.sessions.get_provider(effective_session_key(slot))
+        ):
             # A live session keeps the level it started with; the reset the
-            # caller arms on True makes the cold start read this one.
+            # caller arms on True makes the cold start read this one. A model
+            # that takes no level keeps it stored only, as the dropdown does.
             changed = True
         slot.reasoning_effort = effort
     _audit(

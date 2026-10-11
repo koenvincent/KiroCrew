@@ -565,6 +565,9 @@ class AcpSessionProvider(LLMProvider):
 
     @property
     def native_context_documents(self) -> dict[str, str]:
+        fit = getattr(self._handle, "native_context_documents_fit", None)
+        if fit is not None and not fit():
+            return {}
         return dict(self._handle.native_context_documents)
 
     @property
@@ -1028,6 +1031,16 @@ class AcpSessionProvider(LLMProvider):
         if not isinstance(backend, str):
             return True
         return backend in ACP_BACKENDS_COMPACT or backend in ACP_BACKENDS_HARNESS_MANAGED
+
+    @property
+    def harness_managed_compaction_backend(self) -> str | None:
+        """Same membership answer as
+        ``AcpProvider.harness_managed_compaction_backend``, for the bare
+        shared-subagent shape handed out without the wrapper."""
+        backend = self.backend
+        if not isinstance(backend, str) or backend not in ACP_BACKENDS_HARNESS_MANAGED:
+            return None
+        return backend
 
     @property
     def compaction_unmanaged_backend(self) -> str | None:

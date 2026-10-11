@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef } from 'react'
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef } from 'react'
 import { LexicalComposer } from '@lexical/react/LexicalComposer'
 import { ContentEditable } from '@lexical/react/LexicalContentEditable'
 import { HistoryPlugin } from '@lexical/react/LexicalHistoryPlugin'
@@ -55,7 +55,7 @@ import {
   hasPlainClipboardText,
   stripTrailingBlankLines,
 } from './composerPastePolicy'
-import { listLineBreakEdit, listMarkerBackspaceEdit } from './composerListContinuation'
+import { listLineBreakEdit, listMarkerBackspaceEdit, type ListLineBreakEdit } from './composerListContinuation'
 import {
   $createPasteTokenNode,
   $isPasteTokenNode,
@@ -242,6 +242,7 @@ function $applyListLineBreak(): boolean {
   })
   const edit = listLineBreakEdit($getRoot().getTextContent(), $pointOffset(selection.anchor), chips)
   if (!edit) return false
+  $applyRenumber(edit)
   const range = $createRangeSelection()
   $setPointAtOffset(range.anchor, edit.start)
   $setPointAtOffset(range.focus, edit.end)
@@ -249,6 +250,18 @@ function $applyListLineBreak(): boolean {
   if (edit.insert) range.insertRawText(edit.insert)
   else range.removeText()
   return true
+}
+
+// The number rewrites below the edited item, last to first: each sits after
+// the edit, so writing them never moves an offset still to be used.
+function $applyRenumber(edit: ListLineBreakEdit): void {
+  for (const write of [...(edit.renumber ?? [])].reverse()) {
+    const digits = $createRangeSelection()
+    $setPointAtOffset(digits.anchor, write.start)
+    $setPointAtOffset(digits.focus, write.end)
+    $setSelection(digits)
+    digits.insertRawText(write.insert)
+  }
 }
 
 // Remove the list marker in front of a collapsed caret in one Backspace
@@ -265,6 +278,7 @@ function $applyListMarkerBackspace(endUndoBurst?: () => void): boolean {
   const edit = listMarkerBackspaceEdit($getRoot().getTextContent(), $pointOffset(selection.anchor), chips)
   if (!edit) return false
   endUndoBurst?.()
+  $applyRenumber(edit)
   const range = $createRangeSelection()
   $setPointAtOffset(range.anchor, edit.start)
   $setPointAtOffset(range.focus, edit.end)
@@ -364,7 +378,8 @@ function HostHistoryPlugin({ onHistoryStep }: { onHistoryStep: (direction: 'undo
   const [editor] = useLexicalComposerContext()
   const stepRef = useRef(onHistoryStep)
   stepRef.current = onHistoryStep
-  useEffect(() => {
+  // Layout effect, like Lexical's own plugins: see InteractionPlugin.
+  useLayoutEffect(() => {
     const offUndo = editor.registerCommand(UNDO_COMMAND, () => { stepRef.current('undo'); return true }, COMMAND_PRIORITY_CRITICAL)
     const offRedo = editor.registerCommand(REDO_COMMAND, () => { stepRef.current('redo'); return true }, COMMAND_PRIORITY_CRITICAL)
     return () => { offUndo(); offRedo() }
@@ -420,7 +435,14 @@ function InteractionPlugin({
   if (!imeLatchRef.current) imeLatchRef.current = createImeLatch()
   blocksRef.current = blocks
 
-  useEffect(() => {
+  // A layout effect, not a passive one, for the same reason Lexical registers
+  // its own plain-text handlers in one (usePlainTextSetup): the editor root
+  // takes keydown from the moment ContentEditable's ref sets it, during this
+  // same commit, while a passive effect waits for the scheduler's next task.
+  // On the lazy first mount that task is a separate macrotask, so between the
+  // two an Enter chord reaches only Lexical's default handler and inserts a
+  // line break instead of sending or optimizing (#18193).
+  useLayoutEffect(() => {
     const latch = imeLatchRef.current!
     // Track composition on the editor root itself, with the same stranded-latch
     // recovery the textarea binding carries: a composition abandoned without

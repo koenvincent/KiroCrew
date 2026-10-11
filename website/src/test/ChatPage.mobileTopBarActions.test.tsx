@@ -118,6 +118,13 @@ describe('leading cell', () => {
     expect(screen.getByLabelText(i18nT('pages.chatPage.temporary_no_memory_reads_or_writes'))).toBeInTheDocument()
   })
 
+  it('marks a pinned session at rest and drops the mark once unpinned', () => {
+    const { rerender } = render(<MobileTopBar {...props({ currentSlot: { key: 'slot-a', pinned: true } as ChatSlot })} />)
+    expect(screen.getByLabelText(i18nT('pages.chatSidebar.pinned'))).toBeInTheDocument()
+    rerender(<MobileTopBar {...props({ currentSlot: { key: 'slot-a', pinned: false } as ChatSlot })} />)
+    expect(screen.queryByLabelText(i18nT('pages.chatSidebar.pinned'))).toBeNull()
+  })
+
   it('stands the title down in split view and the toggle down in a chat embed', () => {
     const { unmount } = render(<MobileTopBar {...props({ splitMode: true })} />)
     expect(screen.getByTestId('toggle')).toBeInTheDocument()

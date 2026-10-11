@@ -66,6 +66,7 @@ from kiro_crew.executors import run_in_tool_gate_pool
 from kiro_crew.hooks import TOOL_AUTO_APPROVE, TOOL_DENY, identity_grant_covers_child
 from kiro_crew.llm_helpers import _steer_host_deny
 from kiro_crew.permission_floor import OUTCOME_REJECTED_TRANSPORT_FLOOR
+from kiro_crew.tool_gate_busy import TOOL_GATE_BUSY_REASON
 
 #: An empty, read-only mapping: the default for every ``meta``.
 EMPTY: Mapping[str, object] = MappingProxyType({})
@@ -381,6 +382,11 @@ class Policy:
 # ── The ladder ───────────────────────────────────────────────────────────────
 
 
+def _gate_unjudged(waited: float) -> Refusal:
+    """The gate's answer for a call no tool-gate worker ran: a hook-deny refusal."""
+    return Refusal.host("hook_deny", TOOL_GATE_BUSY_REASON, DENY_CAUSE_POLICY)
+
+
 async def settle(ask: Ask, policy: Policy) -> Settled:
     """Decide, audit and answer *ask* under *policy*; see the module docstring."""
     for floor in policy.floors:
@@ -389,8 +395,8 @@ async def settle(ask: Ask, policy: Policy) -> Settled:
             return await _refuse(ask, policy, refusal)
     # The gate's path tier waits on the mc-pathres resolver on the calling
     # thread; run it on the tool-gate pool so a slow resolution parks a gate
-    # worker, not the event loop.
-    verdict = await run_in_tool_gate_pool(policy.gate.judge, ask)
+    # worker, not the event loop. A call no worker ran is refused unjudged.
+    verdict = await run_in_tool_gate_pool(policy.gate.judge, ask, on_queue_timeout=_gate_unjudged)
     if isinstance(verdict, Refusal):
         return await _refuse(ask, policy, verdict)
     low = _low_fidelity(ask, policy)

@@ -513,7 +513,15 @@
           "this_review_failed": "This review failed"
         },
         "findingCard": {
+          "cancel_dismiss": "Cancel",
+          "confirm_dismiss": "Dismiss finding",
           "consequence": "Consequence",
+          "dismiss": "Dismiss",
+          "dismiss_failed": "Could not save the dismissal. Try again.",
+          "undo_dismiss_failed": "Could not undo. The finding is still dismissed.",
+          "dismiss_reason_label": "Why dismiss this finding?",
+          "dismiss_reason_placeholder": "For example: false positive, out of scope",
+          "dismissed_reason": "Dismissed: {{reason}}",
           "evidence": "Evidence",
           "observation": "Observation",
           "post_finding": "Draft this finding as a review comment",
@@ -526,7 +534,8 @@
           "severity_must_fix": "must-fix",
           "severity_should_fix": "should-fix",
           "suggestion": "Suggestion",
-          "this_finding": "this finding"
+          "this_finding": "this finding",
+          "undo_dismiss": "Undo"
         },
         "learningRail": {
           "add_namespace": "Add namespace",
@@ -3780,6 +3789,7 @@
         "backup_kind_sessions": "Sessions archive",
         "backup_last_run": "Last backed up {{when}} · {{size}}",
         "backup_never": "Not backed up yet",
+        "backup_never_recorded": "No run recorded here — earlier archives may still be on the drive",
         "backup_remembered": "Archives this install has recorded: {{count}} · show the list",
         "backup_sessions_scope": "Includes the CLI replay logs for every session under this Kiro home, not only chats started in {{productName}}.",
         "backup_run_now": "Back up now",
@@ -4090,7 +4100,6 @@
       "your_existing_kirocrew_setup_will_not_be_affecte": "Your existing {{productName}} setup will not be affected."
     },
     "agentSelector": {
-      "agent_id_tooltip": "{{name}} — the agent ID. Crons, spawn params, and the CLI address this ID, never the label.",
       "agent_list": "Agent list",
       "default": "default",
       "filter_agents": "Filter agents",
@@ -4602,7 +4611,7 @@
     "instancesViewport": {
       "loading_pane": "Loading pane…",
       "retry": "Retry",
-      "the_tunnel_looks_connected_but_the_remote_dashbo": "The tunnel looks connected but the remote dashboard never loaded. It may be\n                  restarting — retry, or switch tabs above.",
+      "the_tunnel_looks_connected_but_the_remote_dashbo": "The tunnel looks connected but the crew's dashboard never loaded. It may be restarting — retry, or switch tabs above.",
       "this_tab_stays_until_you_disconnect_the_instance": "This tab stays until you disconnect the crew in <0>Settings → Remote Crew</0>."
     },
     "jobForm": {
@@ -4764,7 +4773,9 @@
       "remote_media_loaded_from": "Loaded from <host/>",
       "remote_media_site": "Site: <host/>",
       "remote_media_sites": "Sites: <host/>",
-      "remote_media_gateway_refused": "Media not loaded: its address goes through this dashboard's own server, so the site it would reach can't be shown."
+      "remote_media_gateway_refused": "Media not loaded: its address goes through this dashboard's own server, so the site it would reach can't be shown.",
+      "closed_session_open_failed": "Couldn't open {{name}}.",
+      "closed_session_try_again": "Try again"
     },
     "markdownToc": {
       "contents": "Contents",
@@ -4809,7 +4820,6 @@
       "saving_keeps_the_server_s_enabled_disabled_state": "Saving keeps the server's enabled/disabled state.",
       "server_name": "server-name",
       "server_name_2": "Server name",
-      "stored_header_values_are_hidden_and_read_only": "Stored header values are hidden and read-only here. To change them, remove and re-add the server — it starts disabled and your tool restrictions won't carry over, so re-apply them after re-adding.",
       "stdio_or": "(stdio) or",
       "that_looks_like_a_single_server_spec_give_it_a_n": "That looks like a single server spec — give it a name:",
       "url": "url",
@@ -4894,7 +4904,7 @@
     "onboardingFlow": {
       "answers_set_how_kiro_explains_things_plain_langu": "Answers set how Kiro explains things — plain language or full technical detail. Saved on this device; change anytime in Settings → Chat.",
       "back": "Back",
-      "choose_a_color_theme_and_mode_you_can_change_it": "Choose a color theme and mode — you can change it anytime.",
+      "choose_a_color_theme_and_mode_you_can_change_it": "Choose a mode, a color theme and translucent panels — you can change it anytime.",
       "color_theme": "Color theme",
       "continue": "Continue",
       "couldn_t_save_your_answers_press_next_to_retry_o": "Couldn't save your answers — press Next to retry, or Skip again to\n            continue without saving.",
@@ -5141,7 +5151,7 @@
       "send_a_copy_to": "Send a copy to",
       "sent": "Sent",
       "sent_transcript_only": "Sent (transcript only)",
-      "transcript_only_hint": "That instance could not restore the full conversation context, so this copy resumes from the transcript alone.",
+      "transcript_only_hint": "That crew could not restore the full conversation context, so this copy resumes from the transcript alone.",
       "unknown_error": "Unknown error"
     },
     "sessionActionsMenu": {
@@ -6404,6 +6414,8 @@
         "retry_backend_hiccup": "The agent hit a brief problem — resume to pick up where it stopped.",
         "default_model": "Change default model",
         "default_model_hint": "Open Settings → Chat → Default Model. New sessions start on this value.",
+        "turn_limit": "Change turn time limit",
+        "turn_limit_hint": "Open Settings → Chat → Advanced → Turn Time Limit. Later turns may run up to this long.",
         "pick_model": "Choose a model for this session",
         "pick_model_hint": "Open the model picker and choose one of the models your account can use, then send your message again.",
         "both_hint": "Do both: “{{pick}}” fixes this session, “{{default}}” stops new sessions from starting on the same model if the default is set to it. Then send your message again.",
@@ -6607,7 +6619,8 @@
         "send_enter": "Send (Enter)",
         "steered_into_the_running_turn": "Steered into the running turn",
         "pin_message": "Pin message",
-        "unpin_message": "Unpin message"
+        "unpin_message": "Unpin message",
+        "edit_replaces_below": "Sending replaces the replies below"
       },
       "workflowCompletionCard": {
         "open_in_the_workflows_panel": "Open in the Workflows panel",
@@ -6646,6 +6659,14 @@
       },
       "earlierMessagesBar": {
         "load_earlier_messages": "Load earlier messages"
+      },
+      "dashboardPreviewPanel": {
+        "tab_title": "{{name}} (preview)",
+        "badge": "Preview, not applied",
+        "hint": "Not live yet. Reply in chat to keep this page or ask for changes.",
+        "no_member": "The crewmate this preview belongs to could not be found.",
+        "roster_failed": "The crewmate list could not be loaded, so the preview cannot be shown.",
+        "gone": "This preview has closed. It was applied or it expired."
       }
     },
     "chatPage": {
@@ -6783,14 +6804,14 @@
       "no_sessions_match": "No sessions match",
       "older_sessions": "Older sessions",
       "older_sessions_2": "Older Sessions",
-      "pick_a_model_for_every_session_switching_a_sessi": "Pick a model for every session. Switching a session",
+      "bulk_switch_keeps_conversation": "Pick a model for every session. The conversation is kept and continues on the new model.",
+      "bulk_switch_stops_running_reply": "Running sessions switch too, and their current reply is stopped.",
       "pinned": "Pinned",
       "pinned_sessions_are_kept": "Pinned sessions are kept.",
       "popped_out_to_a_separate_window": "Popped out to a separate window",
       "private_session_cannot_be_referenced": "Private sessions can't be referenced",
       "rename": "Rename",
       "rename_flag_as_status_or_delete_tags_changes_app": "Rename, flag as status, or delete tags. Changes apply everywhere tags are shown.",
-      "resets_its_conversation": "resets its conversation",
       "resize_history_pane": "Resize history pane",
       "resize_sidebar": "Resize sidebar",
       "retry": "Retry",
@@ -6852,7 +6873,13 @@
       "include_top_level_folders": "Include top-level folders",
       "no_empty_folders": "No empty folders to delete.",
       "some_folders_kept": "Some folders were kept: they are no longer empty.",
-      "deleting_folders": "Deleting…"
+      "deleting_folders": "Deleting…",
+      "crew_status_disabled": "Off",
+      "crew_group_disabled": "Off. No connection until you enable it.",
+      "crew_enable": "Enable",
+      "crew_enable_named": "Enable {{name}}",
+      "crew_spaces_unavailable": "Folders from {{name}} could not be loaded. Its chats are listed without them.",
+      "crew_enable_failed": "Could not enable {{name}}"
     },
     "contextBreakdown": {
       "axis_turn_n": "Turn {{n}}",
@@ -7081,8 +7108,6 @@
         "inbound_webhook_tokens_registered_contexts_and_r": "Inbound webhook tokens, registered contexts, and run history. The API works; the page is not finished.",
         "open_webhooks": "Open Webhooks",
         "webhooks": "Webhooks",
-        "remote_instance_sessions": "Remote crew sessions",
-        "merge_a_connected_remote_instances_live_sessions": "Merge a connected remote crew's live sessions into the Sessions list, each marked with a server badge. A remote crew is another machine you have connected, not your agents. Functional, but not finished.",
         "artifact_deploy": "Artifact Deploy",
         "artifact_deploy_desc": "Publish an artifact to a public HTTPS URL in your own AWS account. Off by default: every deploy spends money in your account and serves the content on the open internet.",
         "open_artifact_deploy": "Open Artifact Deploy"
@@ -7424,7 +7449,7 @@
       "pill_idle_since": "Idle · {{when}}",
       "notes_tab": "Notes",
       "dashboard_tab": "Dashboard",
-      "notes_error": "Couldn't load this crewmate's notes.",
+      "notes_error": "Couldn't load the notes.",
       "notes_refresh_error": "Couldn't refresh these notes. Showing the last version that loaded.",
       "notes_unsupported": "Notes can't be read on this computer.",
       "notes_collision": "Two crewmates share this short name, so their notes can't be told apart. Rename one of them to see its notes here.",
@@ -7443,15 +7468,18 @@
       "webview_published_ago_newer": "New version published {{ago}}",
       "webview_empty": "This crewmate has not published a view yet.",
       "webview_setup": "Use Edit crewmate in the header to set it up",
-      "webview_error": "This crewmate’s published view could not be rendered.",
+      "webview_error": "The published view could not be rendered.",
       "webview_refresh_error": "Couldn’t refresh the published view. Showing the last version that loaded.",
       "webview_refresh_error_aged": "Couldn’t refresh the published view. Showing the version from {{ago}}.",
       "webview_frame_title": "Published view by {{crew}}",
       "webview_rendering": "Rendering the published view…",
       "webview_docked_rendering": "Rendering the status card…",
-      "webview_docked_error": "This crewmate's status card could not be rendered. The full dashboard may still open below.",
+      "webview_docked_error": "The status card could not be rendered. The full dashboard may still open below.",
       "webview_docked_refresh_error": "Couldn't refresh the status card. Showing the last version that loaded.",
       "webview_retry": "Try again",
+      "webview_newer_dashboard_hint": "This tab shows the published view. This crewmate also has a dynamic dashboard: turn on Dynamic Dashboard in Feature Previews to see it.",
+      "webview_newer_dashboard_hint_empty": "This tab shows published views, and none exists yet. This crewmate's dynamic dashboard appears once you turn on Dynamic Dashboard in Feature Previews.",
+      "webview_newer_dashboard_open": "Open Feature Previews",
       "activity_chat_count_one": "{{count}} run",
       "activity_chat_count_other": "{{count}} runs",
       "activity_routed_count_one": "{{count}} auto-picked",
@@ -7526,8 +7554,6 @@
       "deploy_state_unknown": "A deploy finished {{age}} ago in {{region}}. This page cannot tell whether it is still running.",
       "deploy_check_console": "Check the AWS console in {{region}} to see whether it is still running.",
       "deploy_action_manage": "Open Remote Crew in Settings",
-      "meet_crewmates": "Meet CrewMates",
-      "meet_crewmates_hint": "A guided intro that creates your first crewmate.",
       "agent_template": "Built from",
       "roster_load_failed_ask": "Ask {{productName}} about this (opens a chat)",
       "roster_load_retry": "Try again",
@@ -7673,7 +7699,13 @@
       "profile_sessions_tab": "Sessions",
       "profile_goals_tab": "Goals",
       "profile_goals_soon": "Goals are coming soon: set what {{name}} is working toward and follow its progress here.",
-      "dashboard_empty": "{{name}} has not published a dashboard yet. Ask it in this chat, and what it publishes shows here.",
+      "dashboard_empty_region": "{{name}}'s dashboard: nothing published yet",
+      "dashboard_empty_bubble_title": "I haven't published a dashboard yet.",
+      "dashboard_empty_bubble_body": "Once I publish one, it shows here: key numbers, where things stand, what needs your decision. Tell me in the chat what you want on it.",
+      "dashboard_empty_prompts_lead": "Or start from one of these. It goes into your chat box for you to edit and send.",
+      "dashboard_empty_prompt_publish": "Publish a dashboard showing what you're working on, how it's going, and what's next.",
+      "dashboard_empty_prompt_update": "Each time you finish a piece of work, update the dashboard: what you did, the key numbers, and anything you need me to decide.",
+      "dashboard_empty_prompt_pick": "Choose the three numbers I should keep an eye on. Publish just those, with a one-line reason for each.",
       "profile_permissions": "Permissions",
       "profile_effort_hint": "Higher levels think longer, answer slower, and cost more.",
       "profile_settings_waiting": "These unlock once the chat with this crewmate is open.",
@@ -7923,21 +7955,43 @@
       },
       "portabilityTab": {
         "archive_contents": "Archive contents:",
+        "archive_item_skipped": "(not imported)",
+        "archive_memory_files": "Memory files: {{count}}",
+        "archive_workspace_memory_only": "Workspace files: {{count}} (only memory and knowledge load)",
+        "archive_memory_only": "This archive holds memory only, so it imports with Merge.",
         "choose_file": "Choose file",
         "choose_import_file": "Choose import file",
         "config": "Config:",
         "created": "Created:",
         "crons": "Crons:",
         "download_all_settings_memory_skills_crons_and_le": "Download all settings, memory, skills, crons, and lessons as a portable zip file.\n          Stored credentials and session secrets are excluded.",
+        "download_memory_export_zip": "Download memory export (.zip)",
+        "download_memory_only_description": "Download only memory as a zip file. Settings, crons, skills, other workspace files and chats are left out.",
         "export_configuration": "Export Configuration",
+        "export_memory_only": "Export memory only",
+        "export_memory_only_hint": "Use it to share what the agent has learned with someone else.",
+        "export_memory_title": "Export memory",
         "from": "| From:",
         "import_configuration": "Import Configuration",
+        "import_memory_description": "Adds the memory in the file to this instance. Nothing else changes, and nothing you already have is removed.",
+        "import_memory_only": "Import memory only",
+        "import_memory_only_hint": "Brings in memory only; the rest of this instance stays as it is. Not available with Replace.",
+        "import_memory_title": "Import memory",
         "kb": "KB",
         "memory_db": "Memory DB:",
         "merge": "Merge",
         "plan_memory_files": "Plan memory files:",
         "replace": "Replace",
         "replace_mode_will_overwrite_existing_data_contin": "Replace mode will overwrite existing data. Continue?",
+        "share_memory_confirm": "Export memory",
+        "share_memory_intro": "The file holds the items below.",
+        "share_memory_item_episodic": "Summaries the agent kept from past conversations (not the chats)",
+        "share_memory_item_knowledge": "The knowledge graph and knowledge files",
+        "share_memory_item_notes": "Memory notes: preferences, projects and history",
+        "share_memory_item_semantic": "Saved facts and lessons",
+        "share_memory_item_stores": "Each crew member's own memory",
+        "share_memory_title": "Export this memory?",
+        "share_memory_warning": "Memory can hold anything the agent was told, such as names, file paths or a pasted password. Nothing is redacted. Anyone who gets the file can read all of it.",
         "skills": "Skills:",
         "upload_a_kirocrew_export_zip_to_restore_settings": "Upload a {{productName}} export zip to restore settings on this instance. Chats in the archive are added; existing chats are never replaced.\n          Existing data will be merged by default (duplicates are skipped).",
         "workspace_files": "Workspace files:"
@@ -8748,6 +8802,8 @@
         "discovery": "Discovery",
         "rail_label": "Chat settings",
         "side_panel": "Side panel",
+        "topic_tags": "Topic tags",
+        "topic_tags_desc": "Tags each new session in the sidebar with up to two topics, like \"debugging\". Uses one background-model call per new session.",
         "transcript": "Transcript",
         "answer_only_details_on_request": "Answer only — plainest words, details on request",
         "auto_add_documents": "Auto-Add Documents",
@@ -8768,6 +8824,7 @@
         "a_folder_with_no_chats_takes_one_row_instead_of": "A folder with no chats takes one row instead of two, and its New chat button moves onto the folder's own row",
         "content_width": "Content Width",
         "context": "Context",
+        "turns": "Turns",
         "context_usage_at_which_auto_compaction_triggers": "Context usage % at which auto-compaction triggers. Lower = more frequent compaction, longer sessions",
         "default_defers_to_your_agent_config_and_then_to": "Agents with their own configured model ignore this setting. 'Default' uses the model from the agent configuration, or the system default when none is configured. Changing this does not affect sessions that are already open.",
         "default_model": "Default Model",
@@ -8846,6 +8903,8 @@
         "show_timestamps": "Show Timestamps",
         "show_token_usage": "Show Context Tokens",
         "simplified_tool_call_names": "Simplified Tool Call Names",
+        "tool_calls_start_expanded": "Tool calls start expanded",
+        "tool_calls_start_expanded_desc": "Open tool call rows with their input and output showing, instead of collapsed. Rows you open or close by hand keep your choice.",
         "soft_stop_budget_seconds": "Soft-stop budget (seconds)",
         "split_view_session_grid": "Split View (Session Grid)",
         "subagents": "Subagents",
@@ -8854,7 +8913,7 @@
         "text_streaming_style": "Text Streaming Style",
         "time_window_for_session_restoration": "Time window for session restoration",
         "when_enabled_inline_tool_pills_show_simplified_t": "When enabled, inline tool pills show simplified tool use purpose instead of the exact command being run",
-        "which_model_new_sessions_start_with_pick_a_model": "Which model new sessions start with when their agent pins none. Set a model per agent under Capabilities → Agents, or pick one inside a session to override it there.",
+        "which_model_new_sessions_start_with_pick_a_model": "Which model new sessions start with when their agent pins none. Set a model per agent under Customize → Crewmates, or pick one inside a session to override it there.",
         "which_part_of_a_subagent_s_stream_to_keep_when_i": "Which part of a subagent's stream to keep when injecting its completion event into the parent session. Head preserves the start (default). Tail preserves the final summary. Both keeps a slice from each end with a marker between them.",
         "widget_density": "Widget Density",
         "your_role": "Your Role",
@@ -8867,7 +8926,11 @@
         "compaction_wait_budget_description": "Longest a compaction may run. 0 = default (300 s). Otherwise 60 to 3,600 s.",
         "compaction_wait_budget_hint": "Past this limit the session restarts, or a manual compaction reports that it timed out. Raise it if compaction on a large context regularly needs more than 300 seconds.",
         "compaction_wait_budget_clamped": "Saved {{stored}}. {{requested}} is outside the allowed range ({{min}} to {{max}}).",
-        "failed_to_save_compaction_wait_budget": "Failed to save compaction wait budget"
+        "turn_time_limit": "Turn Time Limit (seconds)",
+        "turn_time_limit_description": "Longest one chat turn may run before it is stopped. 300 to 86,400 s (24 h). Default 14,400 s (4 h).",
+        "turn_time_limit_hint": "A turn that reaches this limit stops and keeps the work already written to disk; resume it to continue. Raise it for long unattended turns such as full test suites. Applies from the next turn.",
+        "failed_to_save_compaction_wait_budget": "Failed to save compaction wait budget",
+        "failed_to_save_turn_time_limit": "Failed to save turn time limit"
       },
       "computerUsePanel": {
         "accessibility": "Accessibility",
@@ -8977,7 +9040,7 @@
         "home_you_local_bin_kirocrew_leave_blank_for_stan": "/home/you/.local/bin/kirocrew  —  leave blank for standard installs",
         "host_1_alias": "host-1-alias",
         "instances_stay_warm_live_tunnel_at_once_the_rest": "remote crews stay warm (live tunnel) at once; the rest reconnect on\n                demand. Tune with",
-        "is_installed_somewhere_non_standard_on_the_remot": "is installed somewhere\n            non-standard on the remote. Leave blank for a normal pip install on PATH. To find\n            it, run on the remote host:",
+        "is_installed_somewhere_non_standard_on_the_remot": "is installed somewhere non-standard on the crew. Leave blank for a normal pip install on PATH. To find it, run on the crew:",
         "kirocrew": "kirocrew",
         "kirocrew_restart": "kirocrew restart",
         "loading": "Loading…",
@@ -8992,7 +9055,7 @@
         "optional": "(optional)",
         "port_2": "· remote port",
         "refresh": "Refresh",
-        "remote_host_1": "Remote Host 1",
+        "remote_host_1": "Crew 1",
         "remote_kirocrew_path": "Remote kirocrew path",
         "remote_port": "Remote port",
         "remote_user": "Remote user",
@@ -9106,7 +9169,7 @@
         "redaction_revoke": "Revoke"
       },
       "shortcutsPanel": {
-        "bind_chat_tab_switching_to_ctrl_digit_instead_of": "Bind chat-tab switching to Ctrl+digit instead of Option+digit",
+        "bind_chat_tab_switching_to_ctrl_digit_instead_of": "Bind chat-tab switching to Ctrl+digit instead of Option+digit. Option+digit does not switch chats while a text field has focus.",
         "enable_shortcuts": "Enable shortcuts",
         "preferences": "Preferences",
         "search": "Search",
@@ -9401,7 +9464,7 @@
         "delete_crew": "Delete {{name}}",
         "delete_warning": "Delete terminates the EC2 instance and ends its charges. This cannot be undone.",
         "deleting": "Deleting…",
-        "doesnt_manage": "{{productName}} does not manage this machine",
+        "doesnt_manage": "{{productName}} does not manage this crew",
         "edit_crew": "Edit {{name}}",
         "edit_reconnect_note": "Changing the host, port, or connection method closes the current tunnel. Reconnect when you are ready.",
         "edit_settings": "Edit settings",
@@ -9450,7 +9513,7 @@
         "no_profile_set": "none set (AWS CLI default)",
         "open_sign_in": "Open sign-in page",
         "plugin": "Session Manager plugin",
-        "plugin_missing": "Not installed — needed to reach the instance without opening any SSH port.",
+        "plugin_missing": "Not installed — needed to reach the crew without opening any SSH port.",
         "plugin_ok": "Installed.",
         "port_must_be_in_range": "Enter a port between 1 and 65535.",
         "prereq_cloudformation": "CloudFormation access",
@@ -9524,13 +9587,18 @@
         "type_fargate": "Fargate",
         "type_ssh": "SSH",
         "type_ssm": "SSM",
-        "unverified_cloud_note": "{{productName}} cannot verify whether this machine has AWS resources",
+        "unverified_cloud_note": "{{productName}} cannot verify whether this crew has AWS resources",
         "up_to_warm": "Up to {{n}} stay warm at once",
         "use_my_edits_anyway": "Apply my edits to the crew as it is now",
         "your_code": "Your code: {{code}}",
         "your_crews": "Your crews",
         "reported_host": "{{host}} (reported)",
-        "reported_host_hint": "This crew reports being on this machine. This dashboard has no route to it and never dials it — the connection rides the crew that reaches it."
+        "reported_host_hint": "This crew reports being on this machine. This dashboard has no route to it and never dials it — the connection rides the crew that reaches it.",
+        "crew_enabled": "Connections: On",
+        "crew_disabled": "Connections: Off",
+        "crew_enabled_named": "{{name}} enabled",
+        "crew_toggle_failed": "Could not change {{name}}: {{error}}",
+        "crew_switch_hint": "Off closes this dashboard's connection to that crew and keeps it closed. Sessions on the machine keep running."
       },
       "webhooksPanel": {
         "inbound_webhooks": "Inbound webhooks",
@@ -9941,6 +10009,15 @@
       "secret_value_aria": "Secret value",
       "save_error": "Could not save secret: {{error}}",
       "delete_error": "Could not delete secret: {{error}}"
+    }
+  },
+  "uiLocations": {
+    "description": {
+      "chat_memory_mode": "The memory mode button above the message box. It switches this chat to incognito or temporary memory, or back to persistent.",
+      "chat_model_picker": "The model button in the message box. It shows this chat's model and opens the model picker.",
+      "chat_session_title": "The session's title at the top of the chat. Its text is the session's name; click it to rename the session.",
+      "composer_approval_mode": "The approval-mode picker in the message box's control row. It sets whether tool calls ask first (Normal), run reads without asking (Reads), trust this session (Trust), or auto-approve everything (YOLO).",
+      "composer_voice_input": "The microphone button in the message box. Press it to dictate instead of typing; on a touchscreen it switches between the keyboard and hold-to-talk."
     }
   }
 }

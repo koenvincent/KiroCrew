@@ -31,7 +31,13 @@ from pathlib import Path
 from types import ModuleType
 from typing import TYPE_CHECKING, Any, Awaitable, Callable, NamedTuple, TypeVar
 
-from kiro_crew import acp_tool_gate, agent_scratch, platform_compat, runtime_death
+from kiro_crew import (
+    acp_tool_gate,
+    agent_scratch,
+    member_essential_context,
+    platform_compat,
+    runtime_death,
+)
 from kiro_crew.acp import runtime_process_tree, runtime_start
 from kiro_crew.acp._dispatch import (
     agent_version_from_init,
@@ -64,7 +70,7 @@ from kiro_crew.acp.harness import (
 )
 from kiro_crew.acp.harness.kas import PROTOCOL_VERSION_KAS
 from kiro_crew.acp.harness.kiro import KIRO_CLI_SUBCMD, PROTOCOL_VERSION
-from kiro_crew.acp.kas_agents import hoist_managed_servers, load_agent_spec
+from kiro_crew.acp.kas_agents import hoist_managed_servers
 from kiro_crew.acp.kas_host_auth import HostAuthCallbackError
 from kiro_crew.acp.kas_transport import (
     KAS_AUTH_CALLBACK_ERROR_CODE,
@@ -158,6 +164,7 @@ from kiro_crew.acp.types import (
     overlay_project_scope,
 )
 from kiro_crew.agent import ensure_agent_materialized, markdown_spec_for_agent
+from kiro_crew.agent_sdk.drivers import acp as acp_driver
 from kiro_crew.agent_sdk.tool_search import (
     ToolSearchSettings,
     kas_client_meta_settings,
@@ -176,12 +183,14 @@ from kiro_crew.constants import (
 from kiro_crew.dashboard.side_readonly_spec import unavailable_mode_explanation
 from kiro_crew.env import augmented_path, resolve_krb5_ccname
 from kiro_crew.executors import subprocess_executor
+from kiro_crew.json_line import parse_json_object_line
 from kiro_crew.mcp_gateway.claim import mint_stub_session_token, send_claim
 from kiro_crew.mcp_gateway.session_servers import (
     attach_stub_session_token,
     injection_server_names,
     pooled_session_servers,
 )
+from kiro_crew.member_essential_context import MemberEssentialContextError
 from kiro_crew.metrics.events import (
     CHILD_PERMISSION_DENIED,
     CHILD_PERMISSION_ROUTED,
@@ -451,6 +460,12 @@ _REQUEST_TIMEOUT = 30.0
 # so it sits past the longest attempt: a slot freed while the engine can still
 # send that attempt's link would hand the link to the next sign-in.
 _MCP_SIGN_IN_TIMEOUT = 630.0
+# How long a credential re-attempt (a reset without startOAuth) may hold off a
+# sign-in. It opens no consent URL, so the slot does not have to outlast the
+# longest connect: past the engine's default 60 s connect timeout it is freed,
+# and a URL the engine still sends for it is refused because no sign-in is in
+# flight, or would reach a sign-in started since, which shows its own server.
+_MCP_REATTEMPT_TIMEOUT = 75.0
 # JSON-RPC server-error code for a consent URL Crew did not show anyone.
 _MCP_URL_NOT_OPENED = -32000
 # ``initialize`` budget: a cold start, not a control-plane round trip. kiro-cli
@@ -975,6 +990,23 @@ def _point_private_state_at_scratch(
     env[env_var] = str(scratch)
 
 
+def _seed_private_state(env: dict[str, str], plan: SpawnPlan, scratch: Path | None) -> None:
+    """Let the host prepare its private-state directory before the child starts.
+
+    Runs only when the plan names both a private-state variable and a seed, the
+    process has scratch, and nobody already chose a location for the variable:
+    an operator's value means the child uses that directory, not scratch.
+    """
+    if (
+        plan.private_state_seed is None
+        or plan.private_state_env is None
+        or scratch is None
+        or env.get(plan.private_state_env)
+    ):
+        return
+    plan.private_state_seed(env, scratch)
+
+
 async def _retrying_spawn_factory(
     factory: "Callable[..., Awaitable[asyncio.subprocess.Process]]", **kwargs: Any
 ) -> asyncio.subprocess.Process:
@@ -1111,6 +1143,10 @@ class AcpRuntime:
         # most one sign-in runs at a time and its URL goes to the session that
         # started it -- see begin_mcp_sign_in.
         self._mcp_sign_in: tuple[str, str] | None = None
+        # MCP re-attempts in flight on this process, as (session_id,
+        # server_name): a reset without startOAuth for a server that failed
+        # for want of a credential -- see begin_mcp_reattempt.
+        self._mcp_reattempts: set[tuple[str, str]] = set()
         if model is not None:
             if not MODEL_ID_RE.match(model):
                 raise ValueError(
@@ -1124,6 +1160,11 @@ class AcpRuntime:
             raise ValueError("Invalid session memory mode")
         self.recording_allowed = memory_mode == "persistent"
         self._native_launch_sources: dict[str, str] = {}
+        # Set only by the non-member launch record below: the projected view
+        # alias the record was taken from, and the view's declared resources,
+        # whose on-disk total bounds every read of the record.
+        self._native_launch_view_alias: str | None = None
+        self._native_launch_resources: list[Any] | None = None
         self._extra_env = extra_env or {}
         self._mcp_gateway_overlay = str(mcp_gateway_overlay) if mcp_gateway_overlay else None
         self._mcp_gateway_socket = str(mcp_gateway_socket) if mcp_gateway_socket else None
@@ -1837,6 +1878,8 @@ class AcpRuntime:
             raise AcpRuntimeError(str(exc)) from exc
         self._kas_host_auth = plan.host_auth
         self._native_launch_sources = dict(plan.native_context_documents)
+        self._native_launch_view_alias = None
+        self._native_launch_resources = None
         return plan
 
     async def _initialize_handshake(self, client_capabilities: dict[str, Any]) -> dict[str, Any]:
@@ -1983,12 +2026,28 @@ class AcpRuntime:
         the pre-spawn gate's own refusal (a mirror that CANNOT be re-derived) arrives as
         ``AcpRuntimeError`` and is not retried, because a second attempt would fail the
         same way for the same reason.
+
+        The first attempt's reap is a ``kill()``, which marks this runtime dead, so the
+        retry runs only after :meth:`_revive_after_failed_start` has cleared that death.
+        When it cannot -- the reap did not confirm the first child gone, or a reply
+        task the first child started would not stop -- the stale spec is reported as
+        the failure, unretried: a second child beside a first one this handle still
+        holds is exactly the leak the failed-start guard exists to prevent.
         """
         from kiro_crew.agent import DerivedSpecStale
 
         try:
             await self._spawn_admitted()
         except DerivedSpecStale as first:
+            if not await self._revive_after_failed_start():
+                logger.warning(
+                    "acp_cold_start stage=rederive outcome=not_retried backend=%s reason=%s: "
+                    "the failed start left a child or a reply task this runtime could not "
+                    "confirm stopped",
+                    self._acp_backend or "kiro",
+                    first,
+                )
+                raise AcpRuntimeError(str(first)) from first
             logger.info(
                 "acp_cold_start stage=rederive outcome=retry backend=%s reason=%s",
                 self._acp_backend or "kiro",
@@ -1998,6 +2057,74 @@ class AcpRuntime:
                 await self._spawn_admitted()
             except DerivedSpecStale as second:
                 raise AcpRuntimeError(str(second)) from second
+
+    #: How long a revive waits for the failed child's reply tasks to stop once
+    #: cancelled. None of them absorbs a cancellation, so this is only a bound.
+    _REVIVE_ANSWER_DRAIN_TIMEOUT = 1.0
+
+    async def _revive_after_failed_start(self) -> bool:
+        """Clear the death a failed start's reap left, so this handle can start again.
+
+        The failed-start guard reaps the child with ``kill()``, and ``kill()`` marks
+        the runtime dead; every request path refuses a dead runtime, so a second
+        start on this handle would have its own ``initialize`` refused with "runtime
+        is dead" and never reach the check it is retrying. A start that failed
+        before ``initialize`` completed served no session, so its death has no
+        tenant left to tell, and clearing it is what lets the same handle start
+        again.
+
+        Clears what the dead child left behind that a later reading would attribute
+        to the next one: the death state and record, its stderr ring, the auth and
+        sandbox latches armed from it, and its scratch directory, which the next
+        launch would otherwise adopt as the session's tree. Fields the next spawn
+        assigns before it reads them (pid, start identity, capabilities) are left
+        for it to assign.
+
+        The child's reply tasks are cancelled and awaited first. ``kill()`` does
+        not stop them, and the runtime being dead is the only thing that keeps one
+        of them -- a host-auth answer waiting on a token refresh -- from writing its
+        reply into the next child's stdin under an id that child never sent.
+
+        Returns False, changing nothing about the death, unless the reap dropped the
+        process handle AND confirmed the root and its tracked descendants gone. A
+        declined kill, a Windows tree drain still pending, or a root that outlived
+        its signals all leave that unconfirmed, and spawning a second child beside
+        the first is the leak the guard prevents. Also False once a session is
+        registered, which a start that never initialized cannot have, and when a
+        reply task outlives its cancellation.
+        """
+        if (
+            not self._dead
+            or self._process is not None
+            or not self._process_tree_confirmed_dead
+            or self._initialized
+            or self._session_queues
+        ):
+            return False
+        replies = [task for task in self._answer_tasks if not task.done()]
+        for task in replies:
+            task.cancel()
+        if replies:
+            _, still_running = await asyncio.wait(
+                replies, timeout=self._REVIVE_ANSWER_DRAIN_TIMEOUT
+            )
+            if still_running:
+                return False
+        self._scratch_dir = None
+        self._dead = False
+        self._process_tree_confirmed_dead = False
+        self._death_summary = None
+        self._death_reason = ""
+        self._death_label = ""
+        self._death_tail = ""
+        self._death_expected = False
+        self._stdin_stall_death = False
+        self._stall_turn_sessions = frozenset()
+        self._stderr_lines.clear()
+        self._saw_auth_failure = False
+        self._saw_sandbox_init_failure = False
+        runtime_death.retract(self)
+        return True
 
     async def _spawn_admitted(self) -> None:
         """Spawn and initialize after the caller has acquired cold-start admission."""
@@ -2035,19 +2162,19 @@ class AcpRuntime:
 
                 async with self._skill_projection_lock():
                     generation = self._issue_skill_projection_generation()
-                    spawned = await asyncio.to_thread(
+                    projection = await asyncio.to_thread(
                         prepare_native_skill_projection, self._work_dir
                     )
                     # Issued and adopted under the lock, so nothing newer exists.
-                    self._native_skill_projection = spawned
+                    self._native_skill_projection = projection
                     self._skill_projection_generation = generation
                 # Held for the process's life: the aliases kiro-cli listed at
                 # startup are ones it is guaranteed to have loaded, so later
                 # projections keep translating them in inbound frames
                 # (_activate_mode_bracketed), and holding the object keeps its
                 # lease -- and them -- out of the prune.
-                self._spawn_skill_projection = self._native_skill_projection
-                if self._native_skill_projection is not None:
+                self._spawn_skill_projection = projection
+                if projection is not None:
                     # Deliberately do NOT set spawn_agent_name here. The shared
                     # runtime activates the launched agent through
                     # _activate_mode_bracketed, which allows self._agent at every
@@ -2063,13 +2190,11 @@ class AcpRuntime:
                     # an activatable mode (frame reads advertised_launch_name, which
                     # the shared runtime DOES set -- advertising is safe for both
                     # runtimes; only request()'s mid-session tolerance is withheld).
-                    self._native_skill_projection.advertised_launch_name = self._agent
+                    projection.advertised_launch_name = self._agent
                     argv = list(argv)
                     agent_position = argv.index("--agent") + 1
                     try:
-                        argv[agent_position] = self._native_skill_projection.spawn_agent(
-                            self._agent
-                        )
+                        launch_view_alias = projection.spawn_agent(self._agent)
                     except ValueError as exc:
                         # The projection refused this agent's view -- a
                         # ``kirocrew-core`` restriction authored in its spec, a
@@ -2085,6 +2210,62 @@ class AcpRuntime:
                         # with no prepared view keeps its authored name and never
                         # lands here.
                         raise AcpRuntimeError(str(exc)) from exc
+                    argv[agent_position] = launch_view_alias
+                    if not self._member_context and not self._native_launch_sources:
+                        if not await asyncio.to_thread(
+                            acp_driver.inherits_default_resources, self._work_dir
+                        ):
+                            projected_view = projection.specs.get(self._agent)
+                            if projected_view is not None:
+                                # kiro-cli re-reads the view's declared guides for
+                                # every request, so the record holds their paths
+                                # only; the folder skips those paths and an edited
+                                # guide reaches the model through kiro-cli. A
+                                # record that cannot be taken degrades to an
+                                # empty one: the folder then carries every guide
+                                # itself, and the session still starts. The empty
+                                # record lasts for the process's life, so the
+                                # reason is logged once here. The path walk
+                                # translates only OSError/ValueError into its own
+                                # error; an undeterminable home or a pre-3.13
+                                # symlink loop surfaces as RuntimeError, and a
+                                # literal declaration under a directory that
+                                # denies search as a bare PermissionError from
+                                # ``Path.is_file()``.
+                                try:
+                                    launch_paths = await asyncio.to_thread(
+                                        member_essential_context.projected_launch_paths,
+                                        projected_view,
+                                        str(self._work_dir),
+                                    )
+                                except (
+                                    MemberEssentialContextError,
+                                    OSError,
+                                    RuntimeError,
+                                    RecursionError,
+                                ) as exc:
+                                    logger.warning(
+                                        "launch steering record for agent %r skipped "
+                                        "(%r); the folder sends every guide itself, "
+                                        "so a guide kiro-cli loaded can arrive twice",
+                                        self._agent,
+                                        exc,
+                                    )
+                                    self._native_launch_sources = {}
+                                    self._native_launch_view_alias = None
+                                    self._native_launch_resources = None
+                                else:
+                                    if launch_paths:
+                                        # Paths only: no consumer of this record
+                                        # reads a body (build_message reads native
+                                        # bodies on the member path alone).
+                                        self._native_launch_sources = dict.fromkeys(
+                                            launch_paths, ""
+                                        )
+                                        self._native_launch_view_alias = launch_view_alias
+                                        self._native_launch_resources = list(
+                                            projected_view.get("resources", [])
+                                        )
         except _KiroExecutableTrustError as exc:
             raise AcpRuntimeError(str(exc)) from exc
         # The handshake declaration is the harness's constant. A host that takes
@@ -2168,6 +2349,9 @@ class AcpRuntime:
                 self._harness.apply_spawn_env(
                     env, spawned_binary=spawned_binary, cli_owned_auth=not plan.host_auth
                 )
+                # A host that keeps private state may prepare it in scratch before
+                # the child exists; one more blocking file copy, so it rides here.
+                _seed_private_state(env, plan, self._scratch_dir)
 
             await self._to_thread_guarding_sandbox(_resolve_env_off_loop)
             return env
@@ -3857,23 +4041,21 @@ class AcpRuntime:
 
                 self._last_activity = time.monotonic()
 
-                try:
-                    data = json.loads(line)
-                except json.JSONDecodeError:
+                # Only a JSON object is a frame. Every other line is skipped here
+                # and never reaches the crash arm below, which would mark this
+                # single-owner reader dead and end EVERY multiplexed session:
+                # text that is not JSON, a bare scalar or array (`123`, `"foo"`,
+                # `[1,2]`, `null`), nesting past the decoder's ceiling
+                # (RecursionError), and an integer past the int-string digit
+                # limit. Bytes that are not UTF-8 decode with replacement, as in
+                # AcpClient._read_message, so one bad byte inside a string costs
+                # that character, not the frame.
+                parsed = parse_json_object_line(line, errors="replace")
+                if parsed is None:
                     if self.recording_allowed:
-                        logger.debug("non-JSON stdout line: %s", line[:200])
+                        logger.debug("stdout line that is not a JSON object: %s", line[:200])
                     continue
-
-                # Valid JSON is not necessarily a JSON-RPC object: a bare scalar
-                # or array (e.g. `123`, `"foo"`, `[1,2]`, `true`, `null`) would
-                # make JsonRpcMessage.from_dict -> data.get(...) raise
-                # AttributeError, crashing this single-owner reader and tearing
-                # down EVERY multiplexed session. Skip anything that isn't an
-                # object so one stray line can't kill the demux.
-                if not isinstance(data, dict):
-                    if self.recording_allowed:
-                        logger.debug("non-object JSON stdout line: %s", line[:200])
-                    continue
+                data: dict[str, Any] = parsed
 
                 # Opt-in raw-frame recording for the replay corpus. A no-op
                 # unless KIROCREW_ACP_RECORD_FRAMES names a directory: it
@@ -4321,6 +4503,10 @@ class AcpRuntime:
             return False
         if self._mcp_sign_in is not None or session_id not in self._session_queues:
             return False
+        if self._mcp_reattempts:
+            # A consent URL the engine sent for a re-attempt would be handed
+            # to this sign-in's server; wait until the re-attempts are answered.
+            return False
         self._mcp_sign_in = (session_id, server_name)
         task = asyncio.ensure_future(self._run_mcp_sign_in(session_id, server_name))
         self._answer_tasks.add(task)
@@ -4345,6 +4531,64 @@ class AcpRuntime:
         finally:
             if self._mcp_sign_in == entry:
                 self._mcp_sign_in = None
+
+    @property
+    def reattempts_mcp_servers(self) -> bool:
+        """Whether this host can connect one failed MCP server of a session again.
+
+        The capability :meth:`begin_mcp_reattempt` checks first; a session asks
+        it to decide whether a credential failure is still being re-attempted
+        or should be named for a new session.
+        """
+        return bool(self._harness.opens_external_urls) and not self._dead
+
+    def begin_mcp_reattempt(self, session_id: str, server_name: str) -> bool:
+        """Ask the engine to connect a failed MCP server of one session again.
+
+        For a server that failed to start for want of a credential that may
+        exist now. Sends ``_kiro/mcp/resetServer`` with ``startOAuth``
+        false in the background; the server's next ``_kiro/mcp/status`` entry
+        reports whether it connected. The host that takes this request is the
+        one that sends consent URLs, so the same capability gates both.
+
+        Returns False, starting nothing, on a host without the request, when
+        the session is not registered, while an OAuth sign-in holds the slot
+        (a consent URL this reset produced would be handed to that sign-in's
+        server), or while a re-attempt of the same server is still unanswered.
+        Re-attempts of different servers may run together: none of them opens
+        a consent URL, and one that arrives with no sign-in in flight is
+        refused.
+        """
+        if not self.reattempts_mcp_servers:
+            return False
+        entry = (session_id, server_name)
+        if self._mcp_sign_in is not None or session_id not in self._session_queues:
+            return False
+        if entry in self._mcp_reattempts:
+            return False
+        self._mcp_reattempts.add(entry)
+        task = asyncio.ensure_future(self._run_mcp_reattempt(session_id, server_name))
+        self._answer_tasks.add(task)
+        task.add_done_callback(self._answer_tasks.discard)
+        return True
+
+    async def _run_mcp_reattempt(self, session_id: str, server_name: str) -> None:
+        """Hold the re-attempt until the engine's reset answer arrives."""
+        entry = (session_id, server_name)
+        try:
+            await self._send_and_await(
+                METHOD_KAS_MCP_RESET_SERVER,
+                {"sessionId": session_id, "serverName": server_name, "startOAuth": False},
+                timeout=_MCP_REATTEMPT_TIMEOUT,
+            )
+        except Exception as exc:  # noqa: BLE001 -- the next turn may try again
+            logger.info(
+                "MCP re-attempt for %s ended without an answer: %s",
+                sanitize_sink_text(server_name, NAME_CAP),
+                type(exc).__name__,
+            )
+        finally:
+            self._mcp_reattempts.discard(entry)
 
     async def _answer_open_external_url(self, request_id: int | str, params: Any) -> None:
         """Deliver an MCP consent URL to the session whose sign-in is in flight.
@@ -5960,7 +6204,7 @@ class AcpRuntime:
         budget: float,
         payload_snapshot: Any,
         wire_registered: bool,
-    ) -> None:
+    ) -> str | None:
         """Send ``session/set_mode`` for *mode_agent* inside the derived-spec bracket.
 
         ONE body for both session-start paths (create and resume), because the bracket
@@ -6204,6 +6448,7 @@ class AcpRuntime:
         except DerivedSpecStale as exc:
             await self.terminate_session(session_id)
             raise AcpRuntimeError(str(exc)) from exc
+        return sent_alias
 
     async def _handshake_client_capabilities(self) -> dict[str, Any]:
         """The ``clientCapabilities`` this spawn sends, with the settings channel filled.
@@ -6218,10 +6463,9 @@ class AcpRuntime:
         an explicit false for such a spec rather than being left to the host's
         default. The spec judged is the one the KAS projection will PUT ON THE
         WIRE at session/new -- the freshness gate's snapshot for a derived agent,
-        else the user-level file ``load_agent_spec`` reads -- never a project
-        checkout's ``.kiro/agents`` spec, which that projection does not consult:
-        a project spec granting the loader while the projected user-level spec
-        does not would otherwise turn deferral on for a session with no loader.
+        else the spec ``resolve_projected_spec`` resolves nearest-first, the same
+        call the projection makes: a spec judged here that differed from the one
+        projected would turn deferral on for a session with no loader.
         An unreadable spec grants nothing (fail closed: ``enabled: false``).
         """
         base = self._harness.client_capabilities
@@ -6248,9 +6492,9 @@ class AcpRuntime:
         branch reads NOTHING: the freshness gate that ran in ``_resolve_spawn_plan``
         already verified those bytes, and a second read here would be a second
         observation of a file a revocation could land in between. Every other
-        agent is read the way ``KasHarness.session_extras`` reads it, from the
-        user-level agents directory, so the two cannot disagree about which spec
-        a session runs.
+        agent is resolved the way ``KasHarness.session_extras`` resolves it,
+        through ``resolve_projected_spec``, so the two cannot disagree about which
+        spec a session runs.
         """
         snapshot = self._derived_spec_snapshot
         spec = getattr(snapshot, "spec", None)
@@ -6262,8 +6506,13 @@ class AcpRuntime:
         # decide "no loader" for the process while the projection, a moment later,
         # materializes a spec that grants one.
         ensure_agent_materialized(self._agent)
+        # Deferred: the harness module imports this package's types at its own top level.
+        from kiro_crew.acp.harness.kas import resolve_projected_spec
+
         try:
-            return load_agent_spec(kiro_agents_dir(), self._agent)
+            return resolve_projected_spec(
+                kiro_agents_dir(), self._agent, getattr(self, "_work_dir", None)
+            )[0]
         except Exception:
             logger.warning(
                 "agent %r: spec unreadable at spawn; MCP Tool Search stays off for this process",
@@ -6784,6 +7033,51 @@ class AcpRuntime:
         if source != agent:
             logger.info("skill view %s maps back to agent %s", agent, source)
         return source
+
+    def _copy_native_launch_sources(
+        self,
+        handle: AcpSessionHandle,
+        *,
+        set_mode_ran: bool = False,
+        activated_alias: str | None = None,
+    ) -> None:
+        """Copy the launch record to *handle*; the non-member record only on its view.
+
+        A member record (``plan.native_context_documents``) records no view alias
+        and is copied whole. The non-member record names the guides the projected
+        view it was taken from declares, so a session on another view of the same
+        agent gets none of it: that view may declare fewer guides, and the folder
+        would skip one kiro-cli never loads. When ``set_mode`` ran, the alias it
+        sent is the session's view; otherwise the session runs on the alias the
+        process was launched with, and the record applies while the projection
+        still names that alias for the agent.
+        """
+        launch_resources = self._native_launch_resources
+        work_dir = str(self._work_dir)
+        handle.native_context_documents_fit = (
+            functools.partial(
+                member_essential_context._declared_files_fit,
+                {"resources": launch_resources},
+                work_dir,
+            )
+            if launch_resources is not None
+            else None
+        )
+        recorded_alias = self._native_launch_view_alias
+        if recorded_alias is not None:
+            if set_mode_ran:
+                current_alias = activated_alias
+            else:
+                projection = getattr(self, "_native_skill_projection", None)
+                try:
+                    current_alias = (
+                        projection.agent(self._agent) if projection is not None else None
+                    )
+                except ValueError:
+                    current_alias = None
+            if current_alias != recorded_alias:
+                return
+        handle.native_context_documents.update(self._native_launch_sources)
 
     async def create_session(
         self,
@@ -7419,9 +7713,15 @@ class AcpRuntime:
         # as a bare list of names.
         handle.mcp_session_report().begin_session(mcp_servers)
         self._guard_unresolved_mcp_refs(handle, ref_spec, active_agent, mcp_servers)
+        # How the session's stdio servers were launched, from the spec and array
+        # already in hand: the watchdog's remote_flat scan finds the in-flight
+        # tool's own server process by it. In-memory, so no scheduling point.
+        handle.record_mcp_launches(ref_spec, mcp_servers)
 
         mode_switched = False
         staged_before_switch = 0
+        set_mode_ran = False
+        activated_alias: str | None = None
         # Set agent mode if specified. If set_mode raises, no handle is returned
         # to the caller, so terminate the session we just created above —
         # session/new already succeeded so the session exists in kiro-cli; a
@@ -7476,13 +7776,14 @@ class AcpRuntime:
             # then consumed without being recorded, leaving the panel at a false
             # "no report" for the rest of the session.
             staged_before_switch = handle.queued_frame_count()
-            await self._activate_mode_bracketed(
+            activated_alias = await self._activate_mode_bracketed(
                 session_id,
                 mode_agent,
                 budget=budget,
                 payload_snapshot=payload_snapshot,
                 wire_registered=kas_agents is not None,
             )
+            set_mode_ran = True
             handle.active_agent = mode_agent
             # Whether set_mode actually SWITCHED modes: the servers that
             # initialized during session/new belong to the mode kiro-cli
@@ -7530,7 +7831,9 @@ class AcpRuntime:
             await handle.drain_init(no_report_ceiling=0.0)
 
         if active_agent == self._agent and str(session_work_dir) == str(self._work_dir):
-            handle.native_context_documents.update(self._native_launch_sources)
+            self._copy_native_launch_sources(
+                handle, set_mode_ran=set_mode_ran, activated_alias=activated_alias
+            )
         handle.native_context_documents.update(projected_sources)
         # Inline prompt bytes and file resources come from the same activated
         # wire definition. Conditional and indexed resources remain native.
@@ -8005,9 +8308,13 @@ class AcpRuntime:
         # session gets its own report against the roster load re-declared.
         handle.mcp_session_report().begin_session(wire_servers)
         self._guard_unresolved_mcp_refs(handle, ref_spec, active_agent, wire_servers)
+        # Mirrors create_session: load re-declares the servers, so re-record them.
+        handle.record_mcp_launches(ref_spec, wire_servers)
 
         mode_switched = False
         staged_before_switch = 0
+        set_mode_ran = False
+        activated_alias: str | None = None
         # Activate the agent (mirrors AcpClient step 4 — set_mode applies to a
         # resumed session too, not just fresh ones). If set_mode raises, the
         # caller falls back to create_session() (a fresh sid + its own queue),
@@ -8039,13 +8346,14 @@ class AcpRuntime:
             # then consumed without being recorded, leaving the panel at a false
             # "no report" for the rest of the session.
             staged_before_switch = handle.queued_frame_count()
-            await self._activate_mode_bracketed(
+            activated_alias = await self._activate_mode_bracketed(
                 resume_sid,
                 mode_agent,
                 budget=budget,
                 payload_snapshot=payload_snapshot,
                 wire_registered=kas_agents is not None,
             )
+            set_mode_ran = True
             handle.active_agent = mode_agent
             # See create_session: after a real mode switch, registration frames
             # staged during session/load describe the pre-switch roster.
@@ -8087,6 +8395,11 @@ class AcpRuntime:
             )
         else:
             await handle.drain_init(no_report_ceiling=0.0)
+
+        if active_agent == self._agent and str(session_work_dir) == str(self._work_dir):
+            self._copy_native_launch_sources(
+                handle, set_mode_ran=set_mode_ran, activated_alias=activated_alias
+            )
 
         # A resume re-initializes the MCP servers and forks the same agent
         # processes a fresh session does, so it needs the same scan; without it

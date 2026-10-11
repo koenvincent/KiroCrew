@@ -205,7 +205,10 @@ export function createAgentsEndpoints({ post, put, del, j, jfetch: fetch, sessio
       fetch('/api/agents/catalog', {
         headers: sessionKey ? { 'X-Session-Key': sessionKey } : { ..._sk },
       }).then(j) as Promise<{ agents: KiroCrewAgent[]; default_agent: string }>,
-    createKirocrewAgent: (body: object) => post('/api/agents', body).then(j),
+    /** `extra` carries per-request headers (a guided create's `X-Guide-*`);
+     *  it rides THIS request only, never the shared transport. */
+    createKirocrewAgent: (body: object, extra?: Record<string, string>) =>
+      (extra ? post('/api/agents', body, undefined, extra) : post('/api/agents', body)).then(j),
     // Crew Members page — roster of GLOBAL crews with DM-thread binding and the
     // cheap live-status fields the backend can answer without IO (richer live
     // detail rides the already-subscribed WS `slots` frames).
@@ -215,6 +218,17 @@ export function createAgentsEndpoints({ post, put, del, j, jfetch: fetch, sessio
     // mode="member"), so this is also the only place a member slot key comes from.
     memberThread: (slug: string) =>
       post('/api/members/' + encodeURIComponent(slug) + '/thread').then(j) as Promise<{ slot_key: string; slug: string; member: string }>,
+    // Mate's once-only first greeting. The server decides: it starts one
+    // Mate turn only for Mate's own empty pinned thread, at most once
+    // ever, and answers every other case with the outcome that declined it.
+    memberGreet: (slug: string) =>
+      post('/api/members/' + encodeURIComponent(slug) + '/greet').then(j) as Promise<{ outcome: string }>,
+    // Fresh start on a crewmate's pinned thread: stop any turn, then drop the
+    // conversation so the next turn starts clean. Same slot key; the
+    // transcript stays. `reset_at` is the server's time of the reset; `outcome`
+    // is `queued` when the session was still busy and the clear waits for it.
+    memberFreshStart: (slug: string) =>
+      post('/api/members/' + encodeURIComponent(slug) + '/fresh-start').then(j) as Promise<{ slot: string; reset_at: string; outcome: 'cleared' | 'queued' }>,
     // A member's recent activity pointers (real recorded signal only: session
     // participations and routing decisions). `member` is the exact crew name —
     // slugs are lossy, so the backend filters the shared log by exact name.
@@ -264,10 +278,13 @@ export function createAgentsEndpoints({ post, put, del, j, jfetch: fetch, sessio
     // `member` is the exact crew name, as every member route takes it (slugs are lossy).
     // `locale` is the UI language the page should render its own words in; the
     // gateway checks it against the shipped catalogs and falls back to English.
-    memberDashboard: (slug: string, member: string, locale = '') =>
+    /** `preview`: the STAGED page `dashboard_preview` set aside, which no version
+     *  records; 404 `no_preview` once nothing is staged. */
+    memberDashboard: (slug: string, member: string, locale = '', preview = false) =>
       fetch(
         '/api/members/' + encodeURIComponent(slug) + '/dashboard?member=' + encodeURIComponent(member)
-          + (locale ? '&locale=' + encodeURIComponent(locale) : ''),
+          + (locale ? '&locale=' + encodeURIComponent(locale) : '')
+          + (preview ? '&preview=1' : ''),
       ).then(j) as Promise<{
         instance_version: number
         template: { id: string; version: number }

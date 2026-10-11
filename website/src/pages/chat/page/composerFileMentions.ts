@@ -11,6 +11,7 @@ import { findTokenRanges } from '../../../utils/pasteTokens'
 import { i18nT } from '../../../i18n/t'
 import { revealComposer } from '../composerFocus'
 import type { ComposerStaging } from './composerStaging'
+import type { MentionKeyMods } from '../../../components/chat-input/props'
 
 /**
  * The composer's `@`-mentions of files and folders, and the file chips they
@@ -739,6 +740,136 @@ export function useFileMentionActions({
     else if (liveToken) recordSlotToken(p, liveToken)
     setInput(prev => stripMentions(prev))
   }
+  // Backspace/Delete on or next to a STAGED file mention removes the whole
+  // `@mention` as one unit, so a hand-edit can never leave a half-reference
+  // (`@src/main.t`) in the text whose chip the reconciliation then silently
+  // unstages, sending the agent a file name with no attachment (#14675). The
+  // chip follows via the reconciliation effect, which drops a chip whose
+  // aliases no longer appear. Returns the atomic-delete result (new text and
+  // caret) when the keystroke lands on a staged mention, or null to let the
+  // key fall through to the default one-character edit -- a plain word, a
+  // typed `@token` with no staged chip behind it, or any key but a modifier-
+  // free Backspace/Delete on a collapsed caret. Only the recorded aliases of
+  // currently-staged files are treated atomically: a leftover alias of a
+  // removed chip is ordinary text the user is editing by hand.
+  const mentionKeyEdit = (
+    text: string, selStart: number, selEnd: number, key: string, mods: MentionKeyMods,
+  ): { value: string; caret: number } | null => {
+    if (key !== 'Backspace' && key !== 'Delete') return null
+    // Shift+Delete over a selection is the native Cut chord on Windows/Linux:
+    // handing it to the atomic delete would preventDefault the browser's cut,
+    // so the selection vanishes and nothing reaches the clipboard — the user
+    // loses the text. Let it fall through so the native cut runs (cut is the
+    // deferred value-change seam, #18263) (crew-pr-reviewer / Opus).
+    if (key === 'Delete' && mods.shift && selStart !== selEnd) return null
+    // Shift alone is a plain delete (Shift+Backspace == Backspace); a word-
+    // delete chord (Ctrl/Alt, not Cmd) deletes the adjacent mention whole, the
+    // way the paste-token atom does, so `@src/main.ts` never degrades to a
+    // half-reference `@src/main.` the chip then unstages (crew-pr-reviewer).
+    // Cmd (meta) line-delete is left to the browser — a mention sits mid-line
+    // and the native line delete is the user's intent, not a chip edit.
+    const wordDelete = (mods.alt || mods.ctrl) && !mods.meta
+    if (mods.meta) return null
+    if (!wordDelete && (mods.alt || mods.ctrl)) return null
+    const hasSelection = selStart !== selEnd
+    const slotTokens = currentSlotTokens()
+    if (!slotTokens) return null
+    const staged = new Set(pendingFilesRef.current)
+    const fold = foldWinSep(isWindowsShapedPath(currentProjectRef.current || ''))
+    const folded = fold(text)
+    const caret = selStart
+    // Every alias of every currently-staged file, each with the sibling set
+    // the shared matcher needs so one mention is never read as the prefix of
+    // a longer sibling's (`report` vs `report,`). Separators are folded on a
+    // Windows-shaped project so a respelled mention is still found; the fold
+    // is 1:1, so indices on the folded copy are the original's.
+    const aliases: string[] = []
+    for (const p of staged) for (const t of slotTokens[p] ?? []) aliases.push(fold(t.slice(1)))
+    // Longest alias first: when one staged mention is a prefix of another
+    // (`@report` vs `@report final.pdf`), the complete mention must win the
+    // scan, else the short alias matches inside the long one and leaves a
+    // half-reference whose chip then unstages (GPT 6.1 review).
+    aliases.sort((a, b) => b.length - a.length)
+    const siblingSet = new Set(aliases)
+    // The whole-mention spans [at, end) this keystroke should remove, each as
+    // original-string indices (the fold is 1:1). A collapsed caret keeps at
+    // most one; a selection keeps every mention the range overlaps.
+    const hits: { at: number; end: number }[] = []
+    for (const bare of aliases) {
+      const others = new Set([...siblingSet].filter(a => a !== bare))
+      const re = mentionTokenRegex(bare, 'g', others)
+      for (let m = re.exec(folded); m !== null; m = re.exec(folded)) {
+        if (m[0].length === 0) { re.lastIndex++; continue }
+        const at = m.index + m[1].length // the `@`
+        const end = m.index + m[0].length // just past the token (boundary is a lookahead)
+        let take: boolean
+        if (hasSelection) {
+          // A selection that overlaps any part of the mention takes it whole —
+          // a partial cover would otherwise slice it to a half-reference.
+          take = selStart < end && selEnd > at
+        } else if (wordDelete) {
+          // Word-delete chord (Ctrl/Alt+Backspace / +Delete): use the SAME
+          // predicate as a plain delete — the caret inside the mention or just
+          // at its near edge — so the two paths agree (a plain Backspace inside
+          // `@src/main.ts` is already atomic, so the word-delete must be too),
+          // AND treat the whitespace between the caret and the mention end as
+          // adjacent: a word delete deletes back/forward across spaces to the
+          // token, so Ctrl/Alt+Backspace with the caret after the trailing
+          // space of `@src/main.ts ` must take the whole mention, not leave the
+          // half-reference `@src/main.` the chip then unstages (crew-pr-reviewer).
+          const onlySpaceBetween = (a: number, b: number) => {
+            for (let i = a; i < b; i++) if (folded[i] !== ' ' && folded[i] !== '\t') return false
+            return true
+          }
+          take = key === 'Backspace'
+            ? (caret > at && caret <= end) || (caret > end && onlySpaceBetween(end, caret))
+            : (caret >= at && caret < end) || (caret < at && onlySpaceBetween(caret, at))
+        } else {
+          // Plain (or Shift-held) Backspace fires when the caret is just past
+          // the mention or inside it; Delete when it is just before or inside.
+          // Strictly inside is covered by both so a mid-mention edit is atomic.
+          take = key === 'Backspace' ? caret > at && caret <= end : caret >= at && caret < end
+        }
+        if (take && !hits.some(h => h.at === at && h.end === end)) hits.push({ at, end })
+      }
+    }
+    if (hits.length === 0) return null
+    hits.sort((a, b) => a.at - b.at)
+    if (hasSelection) {
+      // Remove the selection together with the whole of every mention it
+      // overlaps, so a partial-cover selection never strands a fragment.
+      // Span the FURTHEST end (and nearest start) across every hit, not the
+      // last one by start: when a prefix sibling shares a start (`@report` in
+      // `@report final.pdf`) the shorter span can sort last on `at`, and
+      // taking its end would truncate the longer mention and orphan
+      // `final.pdf` (GPT 6.1 review).
+      const s = Math.min(selStart, ...hits.map(h => h.at))
+      const e = Math.max(selEnd, ...hits.map(h => h.end))
+      return { value: text.slice(0, s) + text.slice(e), caret: s }
+    }
+    const { at, end } = hits[0]
+    // Word-delete across whitespace: when a Ctrl/Alt+Backspace fires with the
+    // caret after the mention's trailing space(s) (or +Delete before its
+    // leading space(s)), the native word delete would consume that whitespace
+    // too, so remove the mention together with the spaces between it and the
+    // caret. The adjacency was already proven whitespace-only above.
+    if (wordDelete) {
+      if (key === 'Backspace' && caret > end) {
+        return { value: text.slice(0, at) + text.slice(caret), caret: at }
+      }
+      if (key === 'Delete' && caret < at) {
+        return { value: text.slice(0, caret) + text.slice(end), caret }
+      }
+    }
+    // Consume one adjacent space so the surrounding text does not collapse
+    // to a double space (`a @f b` -> `a  b`); drop the leading one when
+    // there is no trailing space to take instead.
+    let s = at
+    let e = end
+    if (e < text.length && text[e] === ' ') e++
+    else if (s > 0 && text[s - 1] === ' ') s--
+    return { value: text.slice(0, s) + text.slice(e), caret: s }
+  }
   /** The folder chip's remove (ChatInput `onRemoveDir`). */
   const removeDirChip = (rel: string) => {
     // The chip derives from the `@rel/` token, so removing the
@@ -762,5 +893,5 @@ export function useFileMentionActions({
     if (token) recordSlotToken(canon, token)
     setPendingFiles(prev => addPendingFile(prev, canon))
   }
-  return { clampOutOfTokens, handleAddToContext, removeFileChip, removeDirChip, selectPickedFile }
+  return { clampOutOfTokens, handleAddToContext, removeFileChip, removeDirChip, selectPickedFile, mentionKeyEdit }
 }

@@ -100,7 +100,7 @@ describe('store/chat owners', () => {
 
 /** Reducers the facade wires inline next to the families: small UI flags and the live frame reducer. */
 const INLINE_REDUCERS = [
-  'setPendingInput', 'stageToMainComposer', 'setAgentSwitchNotice', 'setVoicePlaying', 'setVoiceAudio',
+  'setPendingInput', 'stageToMainComposer', 'setAgentSwitchNotice', 'setVoicePlaying', 'setVoicePreparing', 'setVoiceAudio',
   'requestSlotReveal', 'clearSlotReveal', 'requestFolderReveal', 'sseChatMessage', 'setCloseRefused',
 ]
 
@@ -161,7 +161,7 @@ const REEXPORTS: Array<[string, Record<string, unknown>, string[]]> = [
     'OLDER_PAGE_LIMIT', 'OLDER_WALK_PAGE_LIMIT', 'SLOT_DETAIL_MAX_LIMIT', 'PANE_HYDRATE_LIMIT', 'REFRESH_LIMIT_CEILING',
     'slotSwitchFetchLimit', 'slotCoverageShortfall', 'countMatchedFetchLimit', 'isSupersededPagingRejection', 'abortActiveOlderFetch',
   ]],
-  ['composerCards', composerCards, ['FOLDER_SUGGESTION_MAX_TURNS', 'capturePendingAskId', 'pendingQuestionFor', 'shouldResolveAskOnSend']],
+  ['composerCards', composerCards, ['FOLDER_SUGGESTION_MAX_TURNS', 'capturePendingAskId', 'isAnsweredQuestionEnding', 'pendingQuestionFor', 'shouldResolveAskOnSend']],
   ['mcpApps', mcpApps, ['mcpAppKey']],
   ['subagents', subagents, [
     'isAwaitingSpawnApproval', 'selectSidebarApprovalCounts', 'selectSidebarStartedSubagentCounts', 'selectSidebarSubagentCounts', 'selectSlotPendingSpawnApprovals',
@@ -173,7 +173,7 @@ const REEXPORTS: Array<[string, Record<string, unknown>, string[]]> = [
   ['selectors', selectors, [
     'selectActiveSlotProject', 'selectComposerBusy', 'selectContinuable', 'selectSendConfirmed', 'selectSlotMessages',
     'selectSlotPendingApproval', 'selectSlotRunEpoch', 'selectSlotStreamState', 'selectSlotToolLog', 'selectTrailingSendUnconfirmed',
-    'selectTurnInterrupted', 'QUIET_END_SERVER', 'QUIET_END_TOOL',
+    'selectSlotTurnFromWake', 'selectTurnInterrupted', 'QUIET_END_SERVER', 'QUIET_END_TOOL',
   ]],
   ['slotSwitch', slotSwitch, ['clearSwitchSlotGone', 'switchSlot', 'switchSlotNoticeCopy']],
   ['slotRefresh', slotRefresh, ['refreshSlot', 'warmSlotCache']],

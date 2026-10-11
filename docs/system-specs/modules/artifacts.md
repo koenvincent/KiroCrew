@@ -325,7 +325,7 @@ and keep their own rules. Pinned by `test/test_artifacts_owner_gate.py`.
 |---|---|---|
 | `slug` | string | URL-safe handle. Derived from `name` when not given, resolving a collision by suffixing (`-2`, `-3`, …); an explicitly-passed slug is refused — never renamed — when it is already taken or malformed |
 | `name` | string | Human-readable display name |
-| `kind` | enum | `widget`, `html`, `markdown`, `svg`, `json`, `text`, `webapp`, `image` — inferred on save when the caller omits it (see [Kind inference](#kind-inference)) |
+| `kind` | enum | `widget`, `html`, `markdown`, `svg`, `json`, `text`, `webapp`, `image`, `dashboard` — inferred on save when the caller omits it (see [Kind inference](#kind-inference)), except `dashboard`, which inference never returns and a caller passes explicitly (see [Dashboard packages](#dashboard-packages-kinddashboard)) |
 | `source` | enum | `chat` (default), `cron`, `subagent`, `manual`, `import`, `dashboard`, `slack`, `cli`, `task-runner`, `unknown` |
 | `pinned` | bool | "Starred" — user-curated keep flag (default `false`). Drives the Artifacts page **Starred** view. Metadata-only; toggling does NOT bump `version`. |
 | `auto_registered` | bool | `true` when the store created this record automatically from a chat-emitted `<mcwidget>` (see [Widget auto-registration](#widget-auto-registration)) rather than from an explicit save. Sweepable by the retention pass while unpinned; tolerant-loaded (pre-existing artifacts default `false`, so they are never swept). |
@@ -889,7 +889,14 @@ and on a scan override, exactly as before. A destination that declares `False`
 confirm click publishes directly, because both surfaces say the content is
 going onto the open internet, and a gate that lies where the destination is
 private teaches the user to click past it where it is public. The publish flow
-always requests `visibility: PUBLIC`, so `False` asserts that even a
+requests `visibility: PUBLIC` unless the user picks Private (offered only on a
+first publish, and only when the destination's sharing model supports both). A
+re-publish offers no choice and keeps the publication's current visibility,
+because the panel's copy of the publication can be stale. When a re-publish narrows
+who can see it (a lower visibility, or a shared list that drops someone), the
+publish engine changes sharing before it pushes content, so
+new content never reaches the audience being withdrawn. A
+Private request shows neither surface. So `False` asserts that even a
 publication the provider files as PUBLIC is served only to an authenticated
 reader; a provider whose PUBLIC publications are readable by anyone must leave
 it `True`. The default is
@@ -1089,7 +1096,9 @@ every `artifact_save` from the MCP path, which stores `session_key=""`. Since
 empty tab rather than a foreign one. This is not only a hostile-input case — a slot
 key can legitimately exceed the grammar's 128-char cap, because the artifact
 companion-chat flow names a slot `Artifact: <name>` and names run to
-`MAX_NAME_LEN` (200).
+`MAX_NAME_LEN` (200). The grammar is judged against the whole value, anchored
+at the true end of input (`\Z`), so a key carrying a trailing newline is a miss,
+not the key it resembles.
 
 Like `?folder=`, absent means "don't scope" while present-but-empty means "only
 unattributed" — the handler reads the raw key to keep the two distinct. `?pinned=`
@@ -1118,7 +1127,7 @@ version and auto-widget caps are the store's, in `kiro_crew.artifacts`.
 | `description` | ≤ 2,000 chars |
 | `tags` | ≤ 16 tags; each ≤ 64 code points of its NFC form (`MAX_TAG_LEN`), made of Unicode letters, the marks that attach to them (`Mn`/`Mc`, at most 4 on one character) and digits (`Nd`/`Nl`) plus `_`, `:`, `.`, `-`, opening with a letter or digit, every code point visible (no `Default_Ignorable_Code_Point`, no enclosing mark) and its own spelling (no compatibility form of other characters) (`normalize_tag`) |
 | `content` | ≤ 25 MiB (`MAX_CONTENT_BYTES`) |
-| `kind` | one of `widget` / `html` / `markdown` / `svg` / `json` / `text` / `image` / `webapp` |
+| `kind` | one of `widget` / `html` / `markdown` / `svg` / `json` / `text` / `image` / `webapp` / `dashboard` (see [Dashboard packages](#dashboard-packages-kinddashboard)) |
 | `source` | stored values: `chat` / `cron` / `subagent` / `manual` / `import` / `dashboard` / `slack` / `cli` / `task-runner` / `unknown`; the MCP save schema accepts the first five explicitly |
 | `MAX_VERSIONS` | 50 (oldest pruned beyond cap) |
 | `MAX_AUTO_WIDGET_ARTIFACTS` | 200 (oldest **unpinned auto-registered** widgets pruned beyond cap) |
@@ -1181,6 +1190,33 @@ one-way door: once non-ASCII tags are stored in `meta.json`, reverting this
 rule or narrowing it later strands them — an update that re-sends such a tag is
 refused and `list(tag=…)` cannot reach it — so a later narrowing ships with a
 migration that rewrites or drops the stranded tags first.
+
+### Dashboard packages (`kind="dashboard"`)
+
+A `dashboard` artifact holds one crewmate's layout package — `bound_to`,
+`model`, `view` and `theme` — canonicalised by
+`kiro_crew.artifact_store.dashboard_package` on every write. Two rules differ
+from every other kind, both enforced in `kiro_crew.artifacts`:
+
+- **The caller's `snapshot` is ignored; `layout_changed()` decides, either
+  way.** In `ArtifactStore.update`, a write that changes the layout versions
+  even when the caller passed `snapshot=False`, and a recompose that changes
+  nothing does not version even when the caller passed `snapshot=True`. The
+  reason is that the two writers default the flag in opposite directions: an MCP
+  write defaults it to `True` and would version every no-op recompose, while a
+  browser write defaults it to `False` and would leave a real layout change with
+  no version to revert to. An update carrying no content never versions.
+- **`source_path` is refused.** A package is store-owned, so its bytes are never
+  re-read from a file outside the store — content a page renders is content this
+  store validated. `ArtifactStore.create` refuses a `source_path` for this kind,
+  `ArtifactStore.update` refuses to keep a live pointer when it switches an
+  artifact INTO this kind, and `ArtifactStore.relocate` refuses one on an
+  artifact already of this kind.
+
+The kind is in `ALLOWED_KINDS` and deliberately NOT in
+`USER_SELECTABLE_KINDS`, and [Kind inference](#kind-inference) never returns it:
+a caller passes it explicitly or does not get it. Hand-flipping a prose document
+to this kind would store content no reader can parse.
 
 ## Security
 

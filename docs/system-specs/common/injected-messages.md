@@ -135,7 +135,11 @@ goal, synthesize across the agents rather than repeating each in turn, and give
 concrete next actions. A batch whose results all arrived in one turn (a lone
 sub-agent, or one wave digest) normally gets no synthesis turn: that turn's reply
 is the deliverable. The one exception is a task store the turn-end fire gate
-could not read; its later re-check fires the synthesis as before.
+could not read; its later re-check fires the synthesis as before. Because the
+synthesis turn is not always there, a completed run that made no tool call
+carries its own ``⚠ Agent `<id>` made no tool calls in this run…`` line, in the
+completion event or under its digest entry, asking the parent to check any
+reported change on disk.
 
 The prompt itself is appended to the slot as an `inject` row carrying
 `meta.injectKind = "synthesis"`, and the turn is dispatched with
@@ -194,7 +198,8 @@ usage because a run the restart caught has no settled terminal billing record:
   and a line saying the text stops wherever the restart landed. `result.txt` is
   appended per streamed chunk, so a run killed mid-turn leaves a non-empty file
   holding an opening sentence; this variant exists so the parent is not sent to
-  read a fragment as though it were the answer.
+  read a fragment as though it were the answer. It carries the same resume line
+  as the next variant, on the same condition.
 - `❌ lost to gateway restart` plus `No result was captured before the restart.`
   When the run's conversation is still resumable
   (`session_map.session_files_resumable` on the orphan's `session_id` /

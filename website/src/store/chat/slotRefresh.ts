@@ -43,7 +43,7 @@ let refreshSeqCounter = 0
 const nextRefreshSeq = (): number => ++refreshSeqCounter
 
 export const refreshSlot = createAsyncThunk<
-  (Awaited<ReturnType<typeof fetchSlotDetail>> & { refreshSeq: number }) | null,
+  (Awaited<ReturnType<typeof fetchSlotDetail>> & { refreshSeq: number; liveFrameSeqAtDispatch: number }) | null,
   string | { key: string; onlyIfUnchanged?: boolean; reachTs?: string },
   { fulfilledMeta: { recoveryRevision?: number } }
 >(
@@ -60,7 +60,7 @@ export const refreshSlot = createAsyncThunk<
     // Dispatch order, captured before any await (see `refreshAppliedSeq`).
     const refreshSeq = nextRefreshSeq()
     const finish = (page: Awaited<ReturnType<typeof fetchSlotDetail>> | null) =>
-      fulfillWithValue(page ? { ...page, refreshSeq } : null,
+      fulfillWithValue(page ? { ...page, refreshSeq, liveFrameSeqAtDispatch: liveAtStart } : null,
         onlyIfUnchanged ? { recoveryRevision: state.recoveryRevision ?? 0 } : {})
     const isStale = () => onlyIfUnchanged &&
       ((getState() as { chat: ChatState }).chat.recoveryRevision ?? 0) !== (state.recoveryRevision ?? 0)
@@ -463,7 +463,17 @@ export function addSlotRefreshCases(builder: ActionReducerMapBuilder<ChatState>)
       if (running && !state.slotRunning) bumpRunEpoch(state, key)
       state.slotRunning = running
       state.slotStopping = action.payload.stopping ?? false
-      if (action.meta?.recoveryRevision !== undefined && !running) {
+      /* A snapshot that says the slot is NOT running settles the stream state
+       * too, not only `slotRunning`. A turn that dies with the gateway sends no
+       * `_done`, so the tab that watched it stream still holds
+       * `slotState === 'streaming'` when the socket reconnects. Left there,
+       * `selectComposerBusy` keeps the composer on Stop and the Resume button
+       * for the restart's interruption row never renders, though the row and
+       * its card did arrive. The live-frame counter guards the one case where
+       * the snapshot is stale: a frame of a NEW turn reduced after this fetch
+       * was dispatched, which owns the stream state from then on. */
+      const noLiveFrameSince = (state.liveFrameSeq ?? 0) === action.payload.liveFrameSeqAtDispatch
+      if (!running && (action.meta?.recoveryRevision !== undefined || noLiveFrameSince)) {
         state.slotState = 'idle'
         state.slotStopping = false
         finalizeTrailingStreaming(state.messages)

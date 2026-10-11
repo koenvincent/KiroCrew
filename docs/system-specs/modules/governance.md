@@ -131,7 +131,12 @@ archetype: the reserved sandbox boot flags (`sandbox.require_isolation`,
 tiers set one, the subordinate's where the authority was silent — rather than handing
 it to `_compose_controls`, which would refuse it as a type mismatch and abort boot on
 an ordinary two-tier configuration. The flags are inert (nothing reads them), so
-neither direction can widen the ceiling. Everything outside `controls` stays the
+neither direction can widen the ceiling. `channels.posture` folds through
+`ScopedMap.compose` leaf by leaf (`_compose_posture`): a leaf both tiers set is the
+intersection of the two rulesets, a leaf or member only the subordinate sets is added
+(absent posture permits, so adding one restricts), and a leaf only the authority sets
+is kept. Over a profile this is a no-op, because a profile cannot carry posture.
+Everything outside `controls` stays the
 **authority's** — identity, signature state, tier and the `updates` *commands* — so a
 subordinate document cannot relabel whose ceiling this is or supply a command the
 gateway would run unsandboxed. The two `updates` pins that are themselves restrictions
@@ -899,7 +904,8 @@ scoped to this directory rather than every entry, because widening the others ha
 blast radius (a write deny on `.aws` would break a legitimate token refresh).
 
 Those dir entries are `$HOME`-relative, so `KIROCREW_HOME` moves the cache out from under
-them — a limitation shared with the vault entries. This one directory does not inherit it:
+them — a limitation the vault avoids through `_RELOCATED_CREW_HIDDEN_LEAVES`. This one
+directory does not inherit it:
 `sandbox._relocated_policy_cache_dirs()` additionally masks the data-home path whenever it
 differs. Compared with **`normpath`, not `realpath`**: this runs inside the launcher and
 seatbelt builders, which run on the event loop for every async spawn, and a link-resolving
@@ -1024,6 +1030,38 @@ apart (`conductor_agents._TRANSIENT_READ_BACKOFF_SECS`), because the pause costs
 hour of the previous ceiling's list; a path shape or bytes that can never be a spec are not
 retried, and a failure that outlasts the attempts holds the spec with the attempt count in the
 warning.
+
+A **governance profile** governs the same lists: the writers ask `may_skip_gate_now`, which
+withholds a grant whenever any configured profile could govern the ref, so a profile saved
+after the spec was written has to re-derive it exactly as a ceiling move does. The memo the
+hook compares is therefore `governance_answer_generation()` (ceiling plus profiles), read
+after `poll_profiles_fresh` re-stats the profiles directory. Every `rebuild_agent_config`
+reads that answer before it derives any grant and publishes it
+(`agent._rebuild_answer_generation`) only once it completes; a rebuild that raised (and only that: one
+still running does not) sets `agent._rebuild_incomplete` and clears the projection memo under the lock, because such a rebuild may have written grants derived under an older answer before it failed: the seed then leaves the baseline unseeded, and the next poll or watch tick re-projects, whatever a later rebuild's completion does to the flag. Otherwise
+`prime_ceiling_projection` seeds the baseline from the published answer: the boot rebuild and the seed are far
+apart, and a profile reader between them (a tool-approval check, a dashboard read) re-stats
+and publishes an edit, which a seed read at that point would absorb as projected. With no
+rebuild recorded, the seed reads the store as it stands, loading it first if nothing has,
+because no written grant consulted it. A profile is saved by editing a file, which no
+distribution poll observes, and a host without central distribution has no poll at all, so
+the gateway runs its own **profile watch**: every `_PROFILE_PROJECTION_POLL_S` (15 s), off
+the event loop, `agent.reproject_for_profile_change` re-stats the directory and calls the
+hook when the answer differs from the one the memo records. A projection that does not land
+(a declined rebuild or a held spec, each of which logs a refusal and an audit event per
+attempt) is retried by the watch every `agent._PROFILE_WATCH_RETRY_S` (an hour) rather than
+every tick, and one whose rebuild raised after `agent._PROFILE_WATCH_RAISE_RETRY_S` (five
+minutes). The hook and the watch run on
+different threads, so both hold `agent._REPROJECT_LOCK` across the whole read, rebuild and
+record: without it, a rebuild derived under an older answer could finish last and leave its
+grants on disk while the memo records the newer answer. The other rebuilds (a dashboard
+save, a config change, the maintenance retry) run without that lock, so each one, on
+completing, clears the memo when the answer moved since it started
+(`agent._invalidate_projection_if_answer_moved`, taken under the lock so it orders after any
+projection in flight), and the next poll or watch tick re-projects over its write. The watch starts in its own block
+ahead of the seed and `start_refresher`, so a failure in either does not take it down, and
+`_shutdown` cancels it beside the refresher, so no re-projection starts into a closing
+gateway.
 
 A builtin can also be governed by a **capability** rather than by its name:
 `BUILTIN_TOOL_CAPABILITIES` maps `use_subagent` to `capabilities.spawn`. A capability is not
@@ -1878,7 +1916,36 @@ read-your-writes should add it deliberately, with its own tests.
   is deliberately NOT added to the deny-floor targets: that plane matches raw
   text and operator regexes, where `mcp__<server>` is a different string from
   the canonical identity a rule is written against rather than a broader form of
-  it. A server-only identity never satisfies auto-approval. Because this
+  it. A server-only identity never satisfies auto-approval. **Several spellings
+  of one tool.** A KAS built-in reaches the gate under its raw engine id
+  (`str_replace`) while the operator's rule is written under the kiro-cli name
+  it governs (`fs_write`); the two are one tool, not two targets, and asking
+  them as two targets would demand that an allow-mode rule name a raw id no
+  operator wrote. `gate_decision` therefore takes `alias_groups` -- tuples of
+  spellings for ONE tool -- and answers each group as one question: DENIED if
+  any spelling meets an explicit deny rule at either level (a deny-mode
+  `tools.deny: ["str_replace"]` still binds), otherwise PERMITTED when EACH
+  governing level permits SOME spelling -- OR within a level, intersection
+  across levels, so a ceiling granting `str_replace` beneath a profile granting
+  `fs_write` admits the one tool both granted. A group member that is also the
+  display title covers the title, which is then not asked again as a lone item
+  the allow set would have to carry. `deny_aliases` is the one-way counterpart:
+  spellings whose rules may REFUSE the call but never admit it. A KAS
+  `delete_file` reads under `fs_write` because an operator who denied writes
+  denied deletes, yet kiro-cli's `fs_write` cannot delete, so an allow-mode rule
+  naming `fs_write` must not become a deletion grant -- each deny alias is asked
+  for an explicit deny only, an allow-mode miss on it is not a refusal, and the
+  identity itself still has to be permitted on its own name. Both are empty for
+  every first-class harness; `HookManager.on_tool_call` fills them from the KAS
+  vocabulary tables (`platform/tool_names.py`, `policy_aliases` /
+  `policy_alias_split`) only for a server-less trusted identity those tables
+  know, on a permission event the KAS harness built (`kas_builtin_ids`) -- an
+  MCP-served call keeps exactly the targets it had, and another harness that
+  stamps the same bare id is asked under that id alone. This admits more than
+  asking the raw id by itself did: an allow-mode `tools: ["fs_write"]` now
+  permits a KAS `str_replace` / `fs_append` (and `fs_read` / `grep` / `glob`
+  permit the KAS read and search ids), which is the kiro-cli parity the table
+  exists for; `delete_file` is not admitted by `fs_write`. Because this
   enforcement is
   on the common path, the first-party app-own auto-approve below does **not**
   repeat it; what remains load-bearing there is the identity requirement itself

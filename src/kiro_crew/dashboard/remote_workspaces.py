@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import errno
+import gzip
 import hashlib
 import io
 import json
@@ -38,6 +39,12 @@ from kiro_crew.platform_compat import rmtree_force
 _MAX_ARCHIVE_BYTES = 64 * 1024 * 1024
 _MAX_EXPANDED_BYTES = 512 * 1024 * 1024
 _MAX_MEMBERS = 100_000
+# The whole decompressed tar stream, framing included: the file bytes plus, per
+# member, a 512-byte header, up to 511 bytes of padding and a path-sized
+# extended header. ``tarfile`` reads an extended (PAX/GNU) header into memory
+# before the per-file size check sees the member, so only a bound on the stream
+# itself covers the metadata it retains.
+_MAX_STREAM_BYTES = _MAX_EXPANDED_BYTES + _MAX_MEMBERS * 4 * 512
 _DIGEST_RE = re.compile(r"^[a-f0-9]{64}\Z")
 _COMMIT_RE = re.compile(r"^[a-f0-9]{40,64}\Z")
 _MARKER = ".kirocrew-remote-workspace.json"
@@ -85,11 +92,63 @@ def _member_filter(member: tarfile.TarInfo, _destination: str) -> tarfile.TarInf
     return scrubbed
 
 
+class _BoundedTarStream:
+    """The payload's decompressed tar bytes, refusing any read past the stream bound.
+
+    ``tarfile`` asks its file object for a whole extended header in one
+    ``read``, so a crafted gigabyte PAX record would be decompressed and held
+    before any member size is counted. A read or seek whose range would cross
+    :data:`_MAX_STREAM_BYTES` is refused before it reaches the decompressor, so
+    nothing beyond the bound is ever allocated, for metadata or data alike. A
+    well-formed archive under the bound never asks past it: its own stream ends
+    first, with the zero blocks ``tarfile`` reads at the end inside it.
+    """
+
+    def __init__(self, payload: bytes) -> None:
+        self._inner = gzip.GzipFile(fileobj=io.BytesIO(payload), mode="rb")
+
+    @staticmethod
+    def _refuse() -> WorkspaceArchiveRejected:
+        return WorkspaceArchiveRejected("archive expands beyond the workspace limit")
+
+    def tell(self) -> int:
+        return self._inner.tell()
+
+    def seek(self, offset: int, whence: int = io.SEEK_SET) -> int:
+        if whence == io.SEEK_CUR:
+            offset += self._inner.tell()
+        elif whence != io.SEEK_SET:
+            raise io.UnsupportedOperation("the bounded tar stream seeks from its start only")
+        if offset > _MAX_STREAM_BYTES:
+            raise self._refuse()
+        return self._inner.seek(offset)
+
+    def read(self, size: int | None = -1) -> bytes:
+        remaining = _MAX_STREAM_BYTES - self._inner.tell()
+        if size is None or size < 0:
+            data = self._inner.read(remaining + 1)
+        elif size > remaining:
+            raise self._refuse()
+        else:
+            data = self._inner.read(size)
+        if self._inner.tell() > _MAX_STREAM_BYTES:
+            raise self._refuse()
+        return data
+
+    def close(self) -> None:
+        self._inner.close()
+
+
+def _open_archive(payload: bytes) -> tarfile.TarFile:
+    """*payload* as a tar archive read through :class:`_BoundedTarStream`."""
+    return tarfile.open(fileobj=_BoundedTarStream(payload), mode="r:")
+
+
 def _validate_archive(payload: bytes) -> None:
     count = 0
     expanded = 0
     try:
-        with tarfile.open(fileobj=io.BytesIO(payload), mode="r:gz") as archive:
+        with _open_archive(payload) as archive:
             while (member := archive.next()) is not None:
                 count += 1
                 if count > _MAX_MEMBERS:
@@ -362,7 +421,7 @@ def _fill_and_publish(
     """
     current = staging_name
     try:
-        with tarfile.open(fileobj=io.BytesIO(payload), mode="r:gz") as archive:
+        with _open_archive(payload) as archive:
             _extract_pinned(archive, staging_fd)
         _write_marker(staging_fd, digest, commit)
         if not _is_held_dir(base_fd, staging_name, staging_fd):

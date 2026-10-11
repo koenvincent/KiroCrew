@@ -897,8 +897,9 @@ class _PumpMixin(ManagerComponent):
             and self._manager._on_done
         ):
             try:
-                self._manager._tasks[f"reject-{drained.id}"] = asyncio.ensure_future(
-                    self._manager._safe_announce(drained)
+                self._hold_announce_task(
+                    f"reject-{drained.id}",
+                    asyncio.ensure_future(self._manager._safe_announce(drained)),
                 )
             except RuntimeError:
                 pass  # no running loop (sync/test context)
@@ -1422,6 +1423,7 @@ class _PumpMixin(ManagerComponent):
                 max_turns=info.max_turns,
                 context_groups=_context_groups_field(info),
                 delegation=info.delegation,
+                backend=info.backend,
                 memory_store=info.memory_store,
                 execution_context=info.execution_context,
                 memory_mode=info.memory_mode,

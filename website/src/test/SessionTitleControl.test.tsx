@@ -37,6 +37,7 @@ vi.mock('../api/client', () => ({
 import SessionTitleControl from '../pages/chat/SessionTitleControl'
 import { MOVE_UNDO_MS } from '../components/MoveUndoBar'
 import { api } from '../api/client'
+import { updateSlotPin } from '../store/dashboardSlice'
 
 const SLOT = 'pane-a'
 const TITLE = 'Alpha session'
@@ -805,5 +806,30 @@ describe('SessionTitleControl', () => {
     expect(screen.getByDisplayValue(TITLE)).toBeTruthy()
     // Beside the editor the glyph names itself.
     expect(screen.getByRole('img', { name: 'Incognito — memory writes disabled' })).toBeTruthy()
+  })
+
+  it('marks a pinned session beside the title and follows a pin toggled elsewhere', () => {
+    // The header menu's Pin moves the sidebar row into the pinned group, often
+    // out of view, so the header is where the user sees whether it took.
+    const { store } = renderControl()
+    expect(screen.queryByTestId('session-pinned-glyph')).toBeNull()
+    act(() => { store.dispatch(updateSlotPin({ key: SLOT, pinned: true })) })
+    const glyph = screen.getByTestId('session-pinned-glyph')
+    expect(glyph.getAttribute('title')).toBe('Pinned')
+    const trigger = screen.getByRole('button', { name: `${RENAME}, Pinned` })
+    expect(trigger.contains(glyph)).toBe(true)
+    // Beside the editor it names itself, as the memory glyph does.
+    fireEvent.click(glyph)
+    expect(screen.getByRole('img', { name: 'Pinned' })).toBeTruthy()
+    act(() => { fireEvent.keyDown(screen.getByDisplayValue(TITLE), { key: 'Escape' }) })
+    act(() => { store.dispatch(updateSlotPin({ key: SLOT, pinned: false })) })
+    expect(screen.queryByTestId('session-pinned-glyph')).toBeNull()
+    expect(screen.getByRole('button', { name: RENAME })).toBeTruthy()
+  })
+
+  it('orders the pin before the memory-mode glyph in the trigger name', () => {
+    const { store } = renderControl({ memoryMode: 'incognito' })
+    act(() => { store.dispatch(updateSlotPin({ key: SLOT, pinned: true })) })
+    expect(screen.getByRole('button', { name: `${RENAME}, Pinned, Incognito — memory writes disabled` })).toBeTruthy()
   })
 })

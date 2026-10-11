@@ -60,6 +60,7 @@ from pathlib import Path
 from types import ModuleType
 from typing import TYPE_CHECKING, Literal, NamedTuple
 
+import kiro_crew as _kiro_crew_pkg
 from kiro_crew import (
     platform_compat,
     sandbox_launcher,
@@ -525,6 +526,15 @@ _CREW_HIDDEN_LEAVES: tuple[str, ...] = (
 _CREW_UNREADABLE_MASK_LEAVES: frozenset[str] = frozenset({"token_signing.key"})
 assert _CREW_UNREADABLE_MASK_LEAVES <= set(_CREW_HIDDEN_LEAVES)
 
+#: Crew-home leaves masked at a RELOCATED data home on top of ``_CREW_HIDDEN_LEAVES``:
+#: the secret vault. The tier lists name the vault only at its two ``$HOME``-joined
+#: spellings, so a ``KIROCREW_HOME`` outside ``$HOME`` needs it re-anchored here the
+#: way ``kas`` is. Kept out of ``_CREW_HIDDEN_LEAVES`` on purpose: that list also
+#: drives the alias walk and the planted-link spawn refusal, and the vault's mask at
+#: the default home goes through neither. Joined at each call site, not here, so a
+#: patched ``_CREW_HIDDEN_LEAVES`` still reaches the plan.
+_RELOCATED_CREW_HIDDEN_LEAVES: tuple[str, ...] = (".vault",)
+
 #: Crew-home ceilings and gateway-managed data: readable by sandboxed code,
 #: never writable by it. See the READONLY note above for why hiding a ceiling
 #: inverts its effect; named memory stores need write integrity, not secrecy.
@@ -738,6 +748,13 @@ _CREW_READONLY_LEAVES: tuple[str, ...] = (
     # Gateway resolve-once artifacts choose the entry point substituted for an
     # approved npm launcher. The installer runs in the unsandboxed gateway.
     "mcp/resolved",
+    # This gateway's stable random identity (``gateway_identity.GATEWAY_ID_FILE``). The
+    # Remote Crew cycle guard compares it to refuse a chain that loops back on itself,
+    # so a sandboxed writer would choose whether a loop is detected. The read path
+    # already judges the descriptor it opens; this seal is the write half. Read-only,
+    # not hidden: the id is random, carries nothing secret, and is already served on
+    # ``/api/health``. The only writer is the unsandboxed gateway's first-read mint.
+    "gateway_id",
 )
 
 #: Crew-home leaves that MUST stay read-write for a sandboxed process. Every entry is
@@ -990,6 +1007,9 @@ _CREW_CHILD_READABLE_LEAVES: tuple[str, ...] = (
     # Launch trees and records contain no credential. Their integrity is enforced
     # by the read-only mount; foreign harnesses may read the resolved package tree.
     "mcp/resolved",
+    # A random id with no host, user or path in it, already published on
+    # ``/api/health``. Its risk is a write, answered by the read-only seal.
+    "gateway_id",
 )
 
 
@@ -1071,6 +1091,84 @@ def _resolved_kiro_agents_targets() -> list[str]:
         return [os.path.normpath(str(kiro_agents_dir()))]
     except Exception:
         return []
+
+
+#: Directory names an installer puts a packaged distribution under. A package that
+#: imports from beneath one of these was copied there by an installer (a wheel, the
+#: desktop bundle's embedded interpreter); one that does not is an editable or
+#: from-source checkout.
+_PACKAGED_INSTALL_DIR_NAMES: frozenset[str] = frozenset({"site-packages", "dist-packages"})
+
+
+def install_root_targets_for(package_dir: str) -> list[str]:
+    """The packaged install tree to seal read-only for a package at *package_dir*.
+
+    A packaged install is one whose package directory sits directly in a
+    ``site-packages`` (or ``dist-packages``) directory: an installer copied it there (a wheel, the desktop
+    bundle's embedded interpreter). The seal is the package directory itself, which
+    holds the gateway's own sources and its served static assets (``static/dist`` with
+    the precompressed ``.br``/``.gz`` siblings). The surrounding ``site-packages`` and
+    the rest of the environment (its ``bin`` scripts, ``pyvenv.cfg``, other
+    distributions, ``.pth`` files) stay writable to the child: sandboxed provisioning
+    steps (an optional extra, an app's Python build) install into that same
+    ``site-packages``, so sealing it would break them. A child can therefore still
+    change what the interpreter loads at start-up through those paths; this seal covers
+    the package directory only.
+
+    An editable or from-source checkout (``pip install -e``, ``install.sh``, a Dev Fleet
+    worktree) imports from a source tree, never directly from such a directory, and returns
+    ``[]``: its sources are the developer's own working copy and must stay writable.
+
+    Lexical only, so it never stats; :func:`_resolved_install_root_targets` adds the
+    canonical spelling.
+    """
+    return _install_root_targets_with(package_dir, os.path)
+
+
+def _install_root_targets_with(package_dir: str, paths: ModuleType) -> list[str]:
+    """:func:`install_root_targets_for` against one platform's path module."""
+    normalized = paths.normpath(paths.abspath(package_dir))
+    parent = paths.basename(paths.dirname(normalized))
+    if paths.normcase(parent) in _PACKAGED_INSTALL_DIR_NAMES:
+        return [normalized]
+    return []
+
+
+@functools.lru_cache(maxsize=1)
+def _install_root_targets_cached(package_dir: str) -> tuple[str, ...]:
+    lexical = install_root_targets_for(package_dir)
+    spellings: list[str] = []
+    for target in lexical:
+        spellings.append(target)
+        try:
+            spellings.append(os.path.realpath(target))
+        except (OSError, ValueError):
+            pass
+    return tuple(dict.fromkeys(spellings))
+
+
+def _resolved_install_root_targets() -> list[str]:
+    """The running gateway's packaged install tree, sealed read-only for every
+    sandboxed child.
+
+    Every write that changes the install tree changes what the gateway executes on its
+    next start, with the gateway's identity. The legitimate writer is the updater, which
+    runs in the gateway process itself and is never wrapped, so the seal costs it
+    nothing. Empty for an editable or from-source checkout (see
+    :func:`install_root_targets_for`).
+
+    Computed once per process: the install location does not move under a running
+    gateway, and caching keeps the one ``realpath`` off every later spawn. Never raises.
+    """
+    try:
+        return list(_install_root_targets_cached(_gateway_package_dir()))
+    except Exception:
+        return []
+
+
+def _gateway_package_dir() -> str:
+    """The directory the running gateway imports ``kiro_crew`` from."""
+    return os.path.dirname(os.path.abspath(_kiro_crew_pkg.__file__ or ""))
 
 
 #: Hidden crew-home leaves one app's OWN backend must read and write.
@@ -1337,7 +1435,7 @@ def carveout_shadowed_by_foreign_mask(path: str, mode: str = "standard") -> bool
     ancestors.extend(
         os.path.abspath(entry)
         for entry in (
-            *_relocated_crew_targets(_CREW_HIDDEN_LEAVES),
+            *_relocated_crew_targets((*_CREW_HIDDEN_LEAVES, *_RELOCATED_CREW_HIDDEN_LEAVES)),
             *_relocated_policy_cache_dirs(),
         )
     )
@@ -2538,6 +2636,29 @@ def _note_established(established: list[str] | None, target: str) -> None:
         established.append(target)
 
 
+def _mint_gateway_id_before_seal() -> None:
+    """Mint the real gateway id so the read-only seal has the gateway's own inode to bind.
+
+    The id is minted lazily on first read and never changes after that, and
+    ``mount(2)`` cannot seal an absent name. Minting here, before the launcher builds
+    its mounts, gives the ``gateway_id`` READONLY leaf a target on a fresh install.
+    A pre-created stub would not do: the gateway's later mint would ``os.replace`` the
+    bound name from the host namespace, which detaches the bind in a running sandbox.
+
+    Skipped for an absent data home, which this path deliberately never scaffolds.
+    Imported lazily so this module keeps not loading the config loader. Never raises:
+    ``gateway_id`` already falls back to a process-local id on any failure.
+    """
+    try:
+        if not os.path.isdir(config_dir()):
+            return
+        from kiro_crew import gateway_identity
+
+        gateway_identity.gateway_id()
+    except Exception:  # pragma: no cover - defensive; a spawn must not fail on this
+        logger.debug("could not mint the gateway id before sealing", exc_info=True)
+
+
 def _materialize_sealable_ceilings(established: list[str] | None = None) -> list[str]:
     """Create every absent sealable ceiling; return the paths actually created.
 
@@ -2581,6 +2702,7 @@ def _materialize_sealable_ceilings(established: list[str] | None = None) -> list
     """
     created: list[str] = []
     dir_targets, file_targets = _sealable_absent_ceilings()
+    _mint_gateway_id_before_seal()
 
     for target in dir_targets:
         normalized = os.path.normpath(target)
@@ -4939,7 +5061,7 @@ def _relocated_policy_cache_dirs() -> list[str]:
 
     Every entry in the dir lists above is ``$HOME``-relative and joined with
     ``Path.home()``, so ``KIROCREW_HOME=/srv/crew`` moves the data home out from under
-    all of them. That limitation is pre-existing and shared with the vault entries, but
+    all of them. ``_RELOCATED_CREW_HIDDEN_LEAVES`` lifts that limit for the vault, and
     this one directory must not inherit it: on a fleet using the environment channel
     there is no ``security_policy.json`` on disk at all, so the cache is the ONLY on-disk
     copy of the ceiling, and its metadata records the source the next boot trusts. An
@@ -7495,7 +7617,9 @@ def _live_plan_host(request: sandbox_plan.SandboxRequest) -> sandbox_plan.PlanHo
         tier_dirs = tuple(_sandbox_policy().cc_dirs())
     else:
         tier_dirs = tuple(_sandbox_policy().strict_dirs())
-    relocated_crew_hidden = tuple(_relocated_crew_targets(_CREW_HIDDEN_LEAVES))
+    relocated_crew_hidden = tuple(
+        _relocated_crew_targets((*_CREW_HIDDEN_LEAVES, *_RELOCATED_CREW_HIDDEN_LEAVES))
+    )
     # The pod's remapped home, gated on ``KIROCREW_POD == "1"`` exactly as
     # ``config.paths`` gates the resolver, so a non-pod session's mask is unchanged.
     pod_os_home = (
@@ -7508,6 +7632,14 @@ def _live_plan_host(request: sandbox_plan.SandboxRequest) -> sandbox_plan.PlanHo
     voice_runtime_ancestor_guards = () if namespace else tuple(_voice_runtime_ancestor_guards())
     relocated_crew_readonly = tuple(_relocated_crew_targets(_CREW_READONLY_LEAVES))
     kiro_agents_targets = tuple(_resolved_kiro_agents_targets())
+    install_root_targets = tuple(_resolved_install_root_targets())
+    # The namespace launcher binds the package directory itself, so a renamed parent
+    # carries the read-only mount with it; Seatbelt matches paths and needs the guards.
+    install_root_ancestor_guards = (
+        ()
+        if namespace
+        else _literal_ancestor_guards(tuple(os.path.dirname(t) for t in install_root_targets))
+    )
     carveout_probes = tuple(_carveout_probes(sandbox_plan.carveout_candidates(request)).values())
     host_paths = [
         home,
@@ -7520,6 +7652,8 @@ def _live_plan_host(request: sandbox_plan.SandboxRequest) -> sandbox_plan.PlanHo
         *voice_runtime_parents,
         *voice_runtime_ancestor_guards,
         *kiro_agents_targets,
+        *install_root_targets,
+        *install_root_ancestor_guards,
     ]
     return sandbox_plan.PlanHost(
         home=home,
@@ -7544,6 +7678,8 @@ def _live_plan_host(request: sandbox_plan.SandboxRequest) -> sandbox_plan.PlanHo
         voice_runtime_parents=voice_runtime_parents,
         voice_runtime_ancestor_guards=voice_runtime_ancestor_guards,
         kiro_agents_targets=kiro_agents_targets,
+        install_root_targets=install_root_targets,
+        install_root_ancestor_guards=install_root_ancestor_guards,
         carveout_probes=carveout_probes,
         uid=uid,
         gid=gid,
@@ -8069,7 +8205,9 @@ def delegated_workspace_exposes_sealed_target(
     :data:`_DELEGATED_OVERLAP_LEAF_REASONS`, each with its own stated reason -- for
     example the strict no-alias config leaf ``cloud.json``, which names the container
     image a Fargate launch runs and therefore the image the task's execution role hands
-    the model credential to.
+    the model credential to. The gateway's packaged install tree
+    (:func:`_resolved_install_root_targets`) is a target too: it is the code the
+    gateway runs on its next start.
 
     A spawn delegated to kiro-cli's internal sandbox (macOS with that sandbox
     enabled, every first-party Windows spawn) never passes through that launcher,
@@ -8102,10 +8240,11 @@ def delegated_workspace_exposes_sealed_target(
     )
     if not delegated:
         return None
+    install_targets = _resolved_install_root_targets()
     targets = _resolved_kiro_agents_targets() + [
         os.path.join(str(config_dir()), leaf) for leaf in _DELEGATED_OVERLAP_LEAF_REASONS
     ]
-    if not targets:
+    if not targets and not install_targets:
         return None
 
     def _reason(target: str, how: str) -> str:
@@ -8120,6 +8259,16 @@ def delegated_workspace_exposes_sealed_target(
             ),
             None,
         )
+        # The install directory refuses only a workspace at or inside it, so the advice
+        # for that target is to move the workspace out of it; every other target also
+        # refuses a workspace that contains it.
+        remedy = f"Choose a workspace that does not contain '{target}'."
+        if named is None and target in install_targets:
+            named = (
+                "Kiro Crew install directory",
+                "the agent could change the code the gateway runs on its next start",
+            )
+            remedy = f"Choose a workspace outside '{target}'."
         if named is not None:
             what, consequence = named
         else:
@@ -8131,7 +8280,7 @@ def delegated_workspace_exposes_sealed_target(
             f"workspace '{os.fspath(work_dir)}' overlaps the {what} "
             f"'{target}' ({how}); on this platform the spawn is delegated to kiro-cli's "
             f"internal sandbox, which treats the workspace as writable, so {consequence}. "
-            f"Choose a workspace that does not contain '{target}'."
+            f"{remedy}"
         )
 
     def _norm(path: str) -> str:
@@ -8140,6 +8289,14 @@ def delegated_workspace_exposes_sealed_target(
     def _spellings(path: str) -> tuple[str, ...]:
         # Lexical first, canonical second; de-duplicated when they coincide.
         return tuple(dict.fromkeys((_norm(path), _norm(os.path.realpath(path)))))
+
+    def _disk_spellings(path: str) -> tuple[str, ...]:
+        # The same two spellings WITHOUT case folding, for the identity layer: a
+        # case-sensitive share (\\wsl.localhost) reached from Windows does not
+        # resolve the lowercased spelling that normcase produces.
+        absolute = os.path.normpath(os.path.abspath(path))
+        canonical = os.path.normpath(os.path.abspath(os.path.realpath(path)))
+        return tuple(dict.fromkeys((absolute, canonical)))
 
     def _lexically_overlaps(a: str, b: str) -> bool:
         try:
@@ -8162,11 +8319,49 @@ def delegated_workspace_exposes_sealed_target(
     try:
         raw_work = os.fspath(work_dir)
         work_spellings = _spellings(raw_work)
+        work_disk = _disk_spellings(raw_work)
     except Exception:
-        return _reason(targets[0], "workspace path could not be resolved")
+        return _reason((targets or install_targets)[0], "workspace path could not be resolved")
+    # The install directory refuses only a workspace AT or INSIDE it. A workspace that
+    # merely contains it (a project holding its own non-editable venv) is allowed: that
+    # layout is common, and refusing it would stop every spawn in such a project. On
+    # these delegated platforms the install directory inside such a workspace stays as
+    # writable as the rest of the workspace.
+    for target in install_targets:
+        for work in work_spellings:
+            for sealed in _spellings(target):
+                try:
+                    inside = os.path.commonpath([work, sealed]) == sealed
+                except ValueError:
+                    inside = False
+                if inside:
+                    return _reason(target, "path")
+        # Filesystem identity, one direction only (the install directory at or above
+        # the workspace): a case-insensitive volume or a link reaches the same
+        # directory under a spelling the lexical check above does not match.
+        try:
+            for sealed in _spellings(target):
+                if not os.path.exists(sealed):
+                    continue
+                sealed_stat = os.stat(sealed)
+                sealed_id = (sealed_stat.st_dev, sealed_stat.st_ino)
+                for work in work_spellings:
+                    existing = os.path.abspath(work)
+                    while not os.path.exists(existing) and os.path.dirname(existing) != existing:
+                        existing = os.path.dirname(existing)
+                    if _identity_in_ancestor_chain(sealed_id, existing):
+                        return _reason(target, "alias")
+        except OSError as exc:
+            return _reason(
+                target,
+                "cannot verify: "
+                f"{getattr(exc, 'filename', None) or raw_work}: "
+                f"{getattr(exc, 'strerror', None) or exc}",
+            )
     for target in targets:
         try:
             agents_spellings = _spellings(target)
+            agents_disk = _disk_spellings(target)
         except Exception:
             return _reason(target, "sealed target path could not be resolved")
         # Layer 1+2: every spelling of one side against every spelling of the other.
@@ -8180,16 +8375,16 @@ def delegated_workspace_exposes_sealed_target(
         try:
             if not os.path.exists(raw_work):
                 continue
-            work_ids = {(s.st_dev, s.st_ino) for s in (os.stat(p) for p in work_spellings)}
+            work_ids = {(s.st_dev, s.st_ino) for s in (os.stat(p) for p in work_disk)}
             for work_id in work_ids:
-                for agents in agents_spellings:
+                for agents in agents_disk:
                     if os.path.exists(agents) and _identity_in_ancestor_chain(work_id, agents):
                         return _reason(target, "alias")
-            for agents in agents_spellings:
+            for agents in agents_disk:
                 if not os.path.exists(agents):
                     continue
                 agents_stat = os.stat(agents)
-                for work in work_spellings:
+                for work in work_disk:
                     if _identity_in_ancestor_chain((agents_stat.st_dev, agents_stat.st_ino), work):
                         return _reason(target, "alias")
         except OSError as exc:
@@ -8805,47 +9000,109 @@ def _unsandboxed_exec_key_declared() -> bool:
         return False
 
 
-def _forward_ssh_auth_sock() -> bool:
-    """Whether the operator has explicitly opted into keeping SSH_AUTH_SOCK in
-    the agent subprocess environment.
+#: Tiers whose sandbox leaves ``~/.ssh`` readable to the agent child. On these
+#: the forward is the default: a child that can already open the private key
+#: files gains nothing new from the agent socket except reach to keys that never
+#: sit in a readable file (a passphrase, a hardware token, an external agent).
+#: Spelled as an ALLOW set so an unknown or newly added tier falls to the consent
+#: path rather than forwarding by omission.
+_SSH_VISIBLE_TIERS = frozenset({"off", "standard", "cc"})
 
-    When False (default), SSH_AUTH_SOCK is scrubbed like every other entry in
-    ``_SENSITIVE_ENV_PREFIXES`` - today's behaviour, unchanged. When True, the
-    single ``SSH_AUTH_SOCK`` key is kept so git commit signing and git-over-SSH
-    inside the sandbox can reach the operator's ssh-agent. The socket grants USE
-    of the agent's keys, not possession; the private key material is never
-    forwarded, and under the strict tier ~/.ssh stays hidden/read-denied.
 
-    Consent lives on the KEYSTONE leaf ``ssh_auth_sock_consent.json``, NOT in the
-    agent-readable ``config.json``. Keeping the socket forwarded grants USE of the
-    operator's keys for the whole session, which is an authorization, not a
-    preference: an agent-writable enable could be flipped by a prompt-injected
-    shell, and the next subagent spawn -- which re-reads this per spawn -- would
-    then authenticate as the operator. The OS sandbox mounts the keystone
-    read-only for the agent's shell and ``is_sensitive_path`` fences the file
-    tools, so the consent cannot be flipped from inside the sandbox. This mirrors
-    ``computer_use.json`` and the other credential-class consents.
+def _ssh_dir_masked(hidden_dirs: tuple[str, ...] | list[str]) -> bool:
+    """Whether any entry of *hidden_dirs* masks ``~/.ssh`` or anything inside it.
 
-    Fail-closed: any failure to read consent returns False, so the socket is
-    scrubbed unless the operator positively enabled forwarding. Read lazily to
-    avoid an import cycle with the config loader.
+    An entry that is ``~/.ssh`` itself, one of its ancestors (a mask over the
+    whole home), or a leaf inside it all count: each means the child cannot read
+    every key file, so the socket would reach further than the files do.
+    """
+    ssh_dir = os.path.abspath(os.path.join(os.path.expanduser("~"), ".ssh"))
+    for raw in hidden_dirs:
+        hidden = os.path.abspath(os.path.expanduser(str(raw)))
+        if hidden == ssh_dir:
+            return True
+        if ssh_dir.startswith(hidden.rstrip(os.sep) + os.sep):
+            return True
+        if hidden.startswith(ssh_dir + os.sep):
+            return True
+    return False
+
+
+def _tier_lists_ssh(tier: str) -> bool:
+    """Whether *tier*'s own hidden-dir list names ``.ssh`` or something inside it.
+
+    Read from the same source the confinement plan reads: ``cc`` from the active
+    PlatformContext (a companion may extend it), ``standard`` from the module list,
+    ``off`` hides nothing.
+    """
+    if tier == "off":
+        return False
+    entries = _STANDARD_DIRS if tier == "standard" else _sandbox_policy().cc_dirs()
+    for entry in entries:
+        head = str(entry).replace("\\", "/").strip("/").split("/", 1)[0]
+        if head in (".ssh", "", "~"):
+            return True
+    return False
+
+
+def _forward_ssh_auth_sock(mode: str, hidden_dirs: tuple[str, ...] | list[str]) -> bool:
+    """Whether this agent spawn keeps ``SSH_AUTH_SOCK`` in its environment.
+
+    The socket grants USE of the operator's ssh-agent keys, not possession. Two
+    routes keep it:
+
+    * By default, when the spawn's sandbox leaves ``~/.ssh`` readable: the
+      effective tier (after the governed ``sandbox.min_level`` clamp, the same
+      one :func:`wrap_argv` applies) is in :data:`_SSH_VISIBLE_TIERS`, that
+      tier's own hidden-dir list (``cc`` is a PlatformContext extension
+      point) does not name ``.ssh``, AND no
+      entry of *hidden_dirs* -- the per-harness credential mask an enforced
+      host adds -- covers ``~/.ssh``. Scrubbing the socket there would block
+      git-over-SSH while the key files themselves stay open to the child, and
+      the ``standard`` tier keeps them visible precisely so git-over-SSH works.
+    * Otherwise (``strict``, or a harness whose mask hides ``~/.ssh``), only
+      with the operator's recorded consent on the KEYSTONE leaf
+      ``ssh_auth_sock_consent.json``. There the socket would reach keys the
+      sandbox hides, so it stays an authorization the agent cannot grant
+      itself: the OS sandbox mounts the keystone read-only for the agent's
+      shell and ``is_sensitive_path`` fences the file tools.
+
+    Fail-closed: any failure to resolve the tier or read consent returns False,
+    so the socket is scrubbed. Read lazily to avoid an import cycle with the
+    config loader.
 
     Windows has no ``SSH_AUTH_SOCK`` (Win32 OpenSSH's agent is a named pipe, not
-    a Unix-domain socket), so the forward is a no-op there regardless of consent:
-    an opt-in default-off feature must simply not be offered on a platform where
-    the concept it forwards does not exist. This mirrors ``_resolve_ssh_auth_sock``
-    returning early on Windows.
+    a Unix-domain socket), so the forward is a no-op there on every route. This
+    mirrors ``_resolve_ssh_auth_sock`` returning early on Windows.
     """
     if platform_compat.IS_WINDOWS:
         return False
     try:
-        from kiro_crew import (
-            ssh_auth_sock_consent,  # circular import: sandbox is a low-level dep of config.loader
-        )
-
-        return ssh_auth_sock_consent.is_granted()
+        return _forward_for_effective_tier(effective_sandbox_mode(mode), hidden_dirs)
     except Exception:
         return False
+
+
+def _forward_for_effective_tier(effective: str, hidden_dirs: tuple[str, ...] | list[str]) -> bool:
+    """The forward verdict for an ALREADY-CLAMPED tier; reads no governance floor.
+
+    :func:`wrap_argv` calls this with the tier it is about to apply, so a floor
+    raised between the launch tail's resolution and the wrap's own floor read
+    can only take the forward away, never leave it on a tier that hides
+    ``~/.ssh``. Raises on a consent read error; callers fail closed.
+    """
+    tier = _SANDBOX_MODE_ALIASES.get(effective, effective)
+    if (
+        tier in _SSH_VISIBLE_TIERS
+        and not _tier_lists_ssh(tier)
+        and not _ssh_dir_masked(hidden_dirs)
+    ):
+        return True
+    from kiro_crew import (
+        ssh_auth_sock_consent,  # circular import: sandbox is a low-level dep of config.loader
+    )
+
+    return ssh_auth_sock_consent.is_granted()
 
 
 def unsandboxed_exec_permitted_by() -> str:
@@ -10158,6 +10415,14 @@ def wrap_argv(
     # the carve-out condition can never disagree about the same host.
     governance_floor = _governance_sandbox_floor()
     mode = _clamp_sandbox_mode_to_floor(mode, governance_floor)
+    # The caller resolved the SSH forward against its own floor read. Re-judge
+    # it against the tier this wrap applies, so a floor raised in between can
+    # only drop the socket. Never turns a False into True.
+    if forward_ssh_auth_sock:
+        try:
+            forward_ssh_auth_sock = _forward_for_effective_tier(mode, extra_hidden_dirs)
+        except Exception:
+            forward_ssh_auth_sock = False
 
     if mode == "off":
         # Fix #2: verify kiro-cli delegation before honoring "off". The

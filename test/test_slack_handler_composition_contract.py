@@ -432,6 +432,11 @@ def world(monkeypatch: pytest.MonkeyPatch, tmp_path):
         # the work in place: the order then depends on the code alone.
         return func(*args, **kwargs)
 
+    async def _inline_gate(func, /, *args, on_queue_timeout, **kwargs):
+        # The gate's queue-bound refusal is the pool's, not the gate's: in place,
+        # the call always gets a worker.
+        return func(*args, **kwargs)
+
     for name, value in {
         "sel": lambda: _Sel(log),
         "Stats": _StatsFactory(log),
@@ -468,7 +473,7 @@ def world(monkeypatch: pytest.MonkeyPatch, tmp_path):
     monkeypatch.setattr(asyncio, "to_thread", _inline)
     # The tool gate hops onto its own pool rather than through to_thread; the same
     # in-place run keeps the transcript order a property of the code.
-    monkeypatch.setattr(handler, "run_in_tool_gate_pool", _inline)
+    monkeypatch.setattr(handler, "run_in_tool_gate_pool", _inline_gate)
     handler._trusted_sessions.clear()
     log.monkeypatch = monkeypatch  # type: ignore[attr-defined]
     yield log

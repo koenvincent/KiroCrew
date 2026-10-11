@@ -22,7 +22,9 @@ import {
 } from './src/lib/vendorPaths'
 import { precompressPlugin } from './scripts/precompress.mjs'
 import { atomicPublishPlugin } from './scripts/publish-dist.mjs'
+import { uiAutoStampPlugin } from './scripts/lib/ui-auto-stamp.mjs'
 import { CONTEXT_SINGLETON_DEDUPE } from './vite.shared'
+import { resolveBuildBase, vendorImportMap, withoutServiceWorker } from './scripts/lib/basePath.mjs'
 import {
   parseBrandingConfig,
   applyBrandingToHtml,
@@ -82,26 +84,20 @@ function tokenProxyPlugin(): Plugin {
  * so exports are never renamed or tree-shaken.
  */
 function appImportMapPlugin(): Plugin {
+  let base = '/'
   return {
     name: 'kirocrew-app-importmap',
     enforce: 'post',
+    configResolved(config) {
+      base = config.base
+    },
     transformIndexHtml: {
       order: 'post',
-      handler(html) {
-        const importMap = {
-          imports: {
-            'react': '/vendor/react.mjs',
-            'react-dom': '/vendor/react-dom.mjs',
-            'react-dom/client': '/vendor/react-dom-client.mjs',
-            'react/jsx-runtime': '/vendor/react-jsx-runtime.mjs',
-            '@kirocrew/app-sdk': '/vendor/kirocrew-app-sdk.mjs',
-            '@kirocrew/app-sdk/ui': '/vendor/kirocrew-ui.mjs',
-            '@tanstack/react-query': '/vendor/tanstack-react-query.mjs',
-            'lucide-react': '/vendor/lucide-react.mjs',
-          },
-        }
-        const tag = `<script type="importmap">${JSON.stringify(importMap)}</script>`
-        return html.replace('<head>', `<head>\n  ${tag}`)
+      handler(html, ctx) {
+        const tag = `<script type="importmap">${JSON.stringify(vendorImportMap(base))}</script>`
+        // Only the dashboard shell registers the service worker; app windows do not.
+        const shell = base === '/' || ctx.path !== '/index.html' ? html : withoutServiceWorker(html)
+        return shell.replace('<head>', `<head>\n  ${tag}`)
       },
     },
   }
@@ -687,10 +683,22 @@ function appWindowUrls(): Plugin {
 }
 
 export default defineConfig({
+  // Sub-path deployments (behind a reverse proxy) are a separate build:
+  // `KIROCREW_BASE_PATH=/proxy/kirocrew npm run build`. Unset builds for `/`.
+  base: resolveBuildBase(process.env.KIROCREW_BASE_PATH),
   // `editionExtensionPlugin()` precedes `tailwindcss()` on purpose: both run
   // `enforce: 'pre'` transforms, and the edition `@source` must be spliced into
   // index.css before Tailwind compiles it (see the plugin's `transform`).
-  plugins: [react(), tokenProxyPlugin(), appImportMapPlugin(), vendorRuntimePlugin(), excalidrawFontsPlugin(), swVersionPlugin(), editionExtensionPlugin(), editionLanguagesPlugin(), tailwindcss(), bundleReportPlugin(), appWindowUrls(), precompressPlugin(), atomicPublishPlugin()],
+  plugins: [
+    // Before react(): it stamps JSX source text (see scripts/lib/ui-auto-stamp.mjs).
+    uiAutoStampPlugin({
+      root: fileURLToPath(new URL('.', import.meta.url)),
+      manifestPath: fileURLToPath(new URL('./node_modules/.cache/kc-ui-auto/sites.json', import.meta.url)),
+      artifactPath: fileURLToPath(new URL('./node_modules/.cache/kc-ui-auto/ui-index.auto.json', import.meta.url)),
+      readFile: (f: string) => readFileSync(f, 'utf-8'),
+      exists: existsSync,
+    }),
+    react(), tokenProxyPlugin(), appImportMapPlugin(), vendorRuntimePlugin(), excalidrawFontsPlugin(), swVersionPlugin(), editionExtensionPlugin(), editionLanguagesPlugin(), tailwindcss(), bundleReportPlugin(), appWindowUrls(), precompressPlugin(), atomicPublishPlugin()],
   // Worker bundles do not inherit `plugins`; the hljs worker needs the edition
   // languages module (see editionLanguagesPlugin).
   worker: { plugins: () => [editionLanguagesPlugin()] },

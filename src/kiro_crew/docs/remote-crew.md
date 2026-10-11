@@ -120,6 +120,15 @@ reconnect because the token is re-minted and the remote dashboard boots again.
 Each row also carries badges read off its record: **SSM** or **SSH** for the
 transport, and **EC2** when the instance was provisioned by the cloud launcher.
 
+## Turning one crew off
+
+Each crew in **Settings → Remote Crew** has an on/off switch beside its status.
+Off closes that crew's tunnel and keeps it closed: no click, auto-connect or
+gateway restart opens it again. Its sidebar group reads **Disabled** with an
+**Enable** button, and an open pane for it shows offline. Turning it back on
+reconnects it. The crew's settings are kept the whole time. Only the owner can
+flip the switch.
+
 ## Crews reached through another crew
 
 A remote pane is a full dashboard, so it can list remote crews of its own. When
@@ -165,9 +174,10 @@ it answers `relay_archive_read_only`; open the crew's own session to keep going.
 
 ## Another machine's sessions in your list
 
-The opposite direction: sessions a connected machine **owns** can be listed in
-this dashboard's Sessions list. Turn on **Settings → Developer → Feature
-Previews → Remote crew sessions**. With it off, nothing is fetched at all.
+The opposite direction: sessions a connected machine **owns** are listed in
+this dashboard's Sessions list. The same switch holds both: **Settings →
+Developer → Feature Previews → Chat on a crew**. With it off, nothing is fetched
+at all.
 
 With it on, the list is grouped per machine: **Local** first, then one
 collapsible group per crew, its header badged **online**, **reconnecting**,
@@ -176,7 +186,8 @@ sessions it owns and any local session whose turns run on it. A crew that
 disconnects keeps its last listed rows, dimmed and without live status, until
 you reload; nothing asks it again while it is down. Collapsing a group never
 changes which session is open. With no crew to group, the list has no group
-headers and looks as it always did. The board view groups nothing.
+headers and looks as it always did. The board view groups nothing: it leaves
+peer rows out and says how many it left out.
 
 Clicking a crew's session opens it in a crew window, the same window **New
 chat on crew** opens: the remote machine's own transcript, running state and any

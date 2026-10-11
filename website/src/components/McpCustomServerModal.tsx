@@ -15,6 +15,7 @@
  */
 import { useEffect, useMemo, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
+import { Trans } from 'react-i18next'
 import { AlertTriangle, Check, Loader2 } from 'lucide-react'
 import { api, ApiError } from '../api/client'
 import Modal from './Modal'
@@ -23,6 +24,7 @@ import { Btn } from './ui'
 import type { McpCustomSpec } from '../types'
 
 import { i18nT } from '../i18n/t'
+import { guideAnchor, maybe } from '../uiLocations/targetRegistry'
 interface Props {
   open: boolean
   onClose: () => void
@@ -206,7 +208,7 @@ export default function McpCustomServerModal({ open, onClose, editName }: Props)
         : i18nT('components.mcpCustomServerModal.add_custom_server')}
       maxWidth={640}
     >
-      <div className="flex flex-col gap-3 p-1">
+      <div className="flex flex-col gap-3 p-1" {...maybe(editing ? undefined : 'mcp.custom-form', guideAnchor)}>
         {!editing && (
           <p className="text-xs text-muted m-0">
             {i18nT('components.mcpCustomServerModal.paste_an')} <code>{i18nT('components.mcpCustomServerModal.mcpservers')}</code> {i18nT('components.mcpCustomServerModal.block_from_a_readme_a')}{' '}
@@ -231,7 +233,13 @@ export default function McpCustomServerModal({ open, onClose, editName }: Props)
         )}
         {editing && !!specQuery.data && Object.keys(specQuery.data.spec.headers ?? {}).length > 0 && (
           <p className="text-xs text-text m-0" role="note">
-            {i18nT('components.mcpCustomServerModal.stored_header_values_are_hidden_and_read_only')}
+            <Trans
+              i18nKey="components.mcpCustomServerModal.stored_header_values_are_hidden"
+              // The value the read put in place of every stored header value:
+              // a save that sends it back unchanged keeps the stored value.
+              values={{ marker: Object.values(specQuery.data.spec.headers ?? {})[0] }}
+              components={{ marker: <code className="font-mono" /> }}
+            />
           </p>
         )}
 
@@ -241,7 +249,8 @@ export default function McpCustomServerModal({ open, onClose, editName }: Props)
           placeholder={editing ? '' : PLACEHOLDER}
           spellCheck={false}
           aria-label={editing ? i18nT('components.mcpCustomServerModal.server_spec_json') : i18nT('components.mcpCustomServerModal.servers_json')}
-          className={`w-full ${editing ? 'min-h-[220px]' : 'min-h-[400px]'} rounded-md border border-border bg-bg px-3 py-2 font-mono text-[12px] text-text focus:outline-hidden focus-visible:ring-1 focus-visible:ring-accent resize-y`}
+          {...maybe(editing ? undefined : 'mcp.custom-json', guideAnchor)}
+          className={`w-full ${editing ? 'min-h-[220px]' : 'min-h-[400px]'} rounded-md border border-border bg-bg px-3 py-2 font-mono text-[12px] text-text focus-ring-accent resize-y`}
         />
 
         {parsed && !parsed.ok && (
@@ -259,7 +268,7 @@ export default function McpCustomServerModal({ open, onClose, editName }: Props)
             onChange={(e) => setBareName(e.target.value)}
             placeholder={i18nT('components.mcpCustomServerModal.server_name')}
             aria-label={i18nT('components.mcpCustomServerModal.server_name_2')}
-            className="w-60 rounded-md border border-border bg-bg px-3 py-1.5 font-mono text-[12px] text-text focus:outline-hidden focus-visible:ring-1 focus-visible:ring-accent"
+            className="w-60 rounded-md border border-border bg-bg px-3 py-1.5 font-mono text-[12px] text-text focus-ring-accent"
           />
         )}
 

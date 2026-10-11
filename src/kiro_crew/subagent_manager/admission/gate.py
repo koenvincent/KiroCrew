@@ -238,6 +238,7 @@ class _GateMixin(ManagerComponent):
         crew: str = "",
         target_member: str | None = None,
         delegation: dict[str, str] | None = None,
+        backend: str | None = None,
         _execution_context: dict | None = None,
         _parent_spawn_policy: "ParentSpawnPolicy | None" = None,
         _agent_check: "AgentCheck | None" = None,
@@ -644,6 +645,9 @@ class _GateMixin(ManagerComponent):
             "max_turns": max_turns,
             "model": model,
             "reasoning_effort": reasoning_effort,
+            # The drain re-enters ``spawn`` from this dict alone: a run that hit
+            # the concurrency gate would otherwise start on the default backend.
+            "backend": backend,
             "allowed_tools": allowed_tools,
             "bare": bare,
             "cwd": resolved_cwd,
@@ -955,6 +959,7 @@ class _GateMixin(ManagerComponent):
             "parent_session_key": parent_session_key,
             "model": model or "",
             "reasoning_effort": reasoning_effort or "",
+            "backend": backend,
             "allowed_tools": list(allowed_tools) if allowed_tools else [],
             "bare": bare,
             "keep": keep,
@@ -2091,8 +2096,9 @@ class _GateMixin(ManagerComponent):
         self._manager._forget_pending_start(info.id)
         if info.batch_id and self._manager._on_done:
             try:
-                self._manager._tasks[f"reject-{info.id}"] = asyncio.ensure_future(
-                    self._manager._safe_announce(info)
+                self._hold_announce_task(
+                    f"reject-{info.id}",
+                    asyncio.ensure_future(self._manager._safe_announce(info)),
                 )
             except RuntimeError:
                 pass  # no running loop (sync/test context)

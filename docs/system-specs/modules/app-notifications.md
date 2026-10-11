@@ -184,9 +184,16 @@ ignores `silent` degrades to the prior double-sound behavior and no worse.
 
 ### Sound events
 
-Two sound kinds are synthesized by the websocket layer. `TURN_DONE_KIND`
+Two sound kinds are synthesized by the websocket layer, and a third by the
+dictation hook. `TURN_DONE_KIND`
 (`'turn'`, on `chat_done`) is sound-only: it never appears in the feed (no Redux
-entry, no toast, no badge). `APPROVAL_KIND` (`'approval'`) is synthesized at
+entry, no toast, no badge). `DICTATION_STOPPED_KIND` (`'dictation'`) is
+synthesized by `useStreamingStt` when a live dictation stops before the user ends
+it: an `error` frame or a socket close while still capturing, or the readiness
+buffer filling up. It is sound-only for the same reason as `'turn'`: the hook
+already shows the error, and the sound is for someone dictating without watching
+the screen. A stop the user makes, a cancel and an unmount stay silent.
+`APPROVAL_KIND` (`'approval'`) is synthesized at
 three sites:
 
 - an `approval` frame (a coordinator-registry approval: a Slack, cron, or
@@ -220,8 +227,9 @@ three sites:
   accepted residual, since holding the row back until the post settles would
   hide the card, the chime and the Board's pending state for the post's whole
   duration on every linked prompt. This site is
-  the `chat_done` layering: sound only, no feed row, no toast, no producer for
-  the protected `system.approval` bus channel (which still has none). A
+  the `chat_done` layering: no feed row and no producer for the protected
+  `system.approval` bus channel (which still has none); the same gate also
+  posts this prompt's OS toast (see "OS toast"). A
   prompt already parked when a tab opens or reconnects reaches it through the
   snapshot and the transcript rehydration, not through this frame, and stays
   silent.
@@ -236,7 +244,7 @@ gated on catch-up, only the frame's live banner is (see Trigger below).
 ### Settings and resolution
 
 Settings persist in `localStorage` under `mc-notification-sound`
-(`{ enabled, volume, perCategory }`). `presetForKind(kind, settings)` resolves
+(`{ enabled, volume, perCategory, customTones? }`). `presetForKind(kind, settings)` resolves
 the preset for a kind, in order:
 
 1. `enabled === false` → `'none'` (primary switch; WebAudio never plays).
@@ -254,6 +262,46 @@ the preset for a kind, in order:
 `presetForKind` (not a naive `perCategory[cat] ?? fallback`), so the settings
 row, its Test button, and runtime playback always agree — notably for approval,
 whose built-in `pulse` default the naive form did not show.
+
+### Custom sounds
+
+A user can add named sounds of their own (Settings > Notifications > Custom
+sounds), so instances in one room can sound different. They live in the same
+blob under `customTones` (`{ [name]: ToneStep[] }`, each step
+`{ freq, start, dur, gain }`, the shape of the built-in table). A category
+selects one as `custom:<name>`, so a custom name can never collide with a
+built-in id. The built-in presets, their ids and their levels are unchanged.
+
+`validateCustomTone` holds every sound to `CUSTOM_TONE_LIMITS`: 1-32 character
+name of letters, digits, space, `-` or `_`, not a built-in, `none` or `default`
+and not already used (case-insensitive); 1-16 steps; `freq` 20-20000 Hz; `dur`
+0.02-2 s; `gain` above 0 and at most 1; every step starting at 0 or later and
+ending within 5 s; at most 20 sounds. It runs when a sound is added AND inside
+`loadSoundSettings`, because the stored blob can be hand-edited or restored from
+`ui-prefs.json`: a sound that fails is dropped, and a category pointing at a
+missing custom sound falls back as if unset. The host backup stores the blob
+as an opaque string, like every other ui-pref, and never parses it: every
+reader goes through `loadSoundSettings`, so the load-time check is the one
+gate between a stored value and the speakers. Playback scales a custom sound by
+its loudest overlap of step gains, so it never drives the output past full
+scale. The form edits one row per tone (Pitch, Start, Length, Volume), starts
+from a two-note example, and can play the draft ("Test") before it is saved;
+the draft plays under a throwaway id and is never stored. Bound failures show
+as plain hints, not error banners, each under the field it is about (a name
+problem under Name, a tone bound under its row); the offending inputs get
+`aria-invalid`, and "Add sound" stays off until the user edits. A save that
+fails (add, delete, undo, or a sound, volume or category setting) shows through
+`ErrorNotice` with a next step (free up this site's browser storage, then try
+again), without the agent hand-off because the form holds an unsaved draft.
+Deleting a sound clears every category set to it (`all` returns to `chime`) and
+offers an Undo. Undo merges into the settings as they are at that moment: it
+puts back the one sound and each category that used it unless the user has
+since set that category to something else, so a sound added or a choice made
+after the delete survives. Saving a sound under the deleted name (any case)
+withdraws the Undo, and an Undo refused because the name was reused elsewhere
+is withdrawn after its hint, so no notice says a listed sound was deleted.
+Pickers label a custom sound
+"<name> (yours)". Crew avatar sounds still offer only the built-ins.
 
 ### Persistence and cross-surface sync
 
@@ -313,6 +361,8 @@ constructed by the socket's turn-completion owner
 `website/src/hooks/websocket/turnCompletion.ts` on `chat_done`) is a separate, default-OFF
 surface with its own `kirocrew-chat-done:<slot>` tag; it shares only the away
 predicate.
+
+An interactive chat's tool prompt (the chat runner's `permission` row, which has no feed note) is toasted by the socket's transcript owner `website/src/hooks/websocket/chatStream.ts` on the row's live arrival, behind the same gate as its chime (`shouldChimeOnPermissionRow`: not `resolved`, not a reconnect replay). It is on by default, posts only with the OS permission granted and while `isWindowAway()`, is `silent`, reads like the chat-complete toast (session title as the title, `Waiting for your approval: <tool>` as the body), and carries a `kirocrew-approval:<slot>:<request_id>` tag, so one pending prompt is one banner however many windows receive the row. A session's creator mute does not suppress it: a prompt is the session waiting on the user.
 
 ## Bell sheet dismissal (client)
 

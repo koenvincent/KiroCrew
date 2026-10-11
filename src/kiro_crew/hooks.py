@@ -178,6 +178,7 @@ from kiro_crew.hook_runtime.tool_identity import (  # noqa: F401
     set_builtin_app_agents,
     set_builtin_app_mcp_servers,
     set_builtin_app_names,
+    title_is_trusted_mcp_identity,
 )
 from kiro_crew.hook_runtime.windows_paths import (  # noqa: F401
     _fold_extended_length_local,
@@ -204,6 +205,10 @@ from kiro_crew.platform.governance import (
 # are defined). Imported here so ``hooks.TARGET_PATH_KEYS`` / ``hooks.TargetPaths``
 # / ``hooks.target_paths`` (and the work caps) stay importable at their historic
 # names; hooks keeps its HARD-DENY reading of ``TargetPaths.truncated``.
+from kiro_crew.platform.tool_names import (  # noqa: F401  (read by hook_runtime owners)
+    policy_alias_split,
+    policy_aliases,
+)
 from kiro_crew.platform.tool_paths import (  # noqa: F401  (re-exported for callers)
     _TARGET_PATH_MAX_NODES,
     _TARGET_PATH_MAX_PATHS,
@@ -1027,6 +1032,8 @@ class HookManager:
         mcp_server_name: str = "",
         mcp_tool_name: str = "",
         mcp_identity_trusted: bool = False,
+        mcp_identity_unreadable: bool = False,
+        kas_builtin_ids: bool = False,
         spawn_target: str = "",
         resolved_agent: str = "",
         classifier_only: bool = False,
@@ -1036,7 +1043,8 @@ class HookManager:
         ``tool_name`` is the call's display title; every other keyword is the
         :class:`ToolCall` field of the same meaning (``tool_kind`` -> ``kind``,
         ``mcp_server_name`` -> ``mcp_server``, ``mcp_tool_name`` -> ``mcp_tool``,
-        ``mcp_identity_trusted`` -> ``identity_trusted``) or a surface argument of
+        ``mcp_identity_trusted`` -> ``identity_trusted``, ``mcp_identity_unreadable``
+        -> ``identity_unreadable``) or a surface argument of
         :meth:`judge`. A dispatcher holding a permission event passes
         ``**hook_gate_kwargs(event)``, so an enforcement-relevant event field is
         threaded once. Each field's security meaning is documented on
@@ -1056,6 +1064,8 @@ class HookManager:
                 mcp_server=mcp_server_name,
                 mcp_tool=mcp_tool_name,
                 identity_trusted=mcp_identity_trusted,
+                identity_unreadable=mcp_identity_unreadable,
+                kas_builtin_ids=kas_builtin_ids,
                 spawn_target=spawn_target,
                 resolved_agent=resolved_agent,
             ),

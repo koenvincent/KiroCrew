@@ -35,6 +35,7 @@ import {
   requestSlotReveal,
   requestFolderReveal,
   mcpAppKey,
+  resumeFromHistory,
   } from '../store/chatSlice'
 import { confirmedDelivered } from '../utils/sendDelivery'
 import { sendTurn } from '../chat-core/transport/sendTurn'
@@ -93,7 +94,8 @@ import { useFollowUpChips } from './chat/page/followUpChips'
 import { useComposerSessionControls, useSessionControlChips } from './chat/page/sessionControls'
 import { useComposerChips } from './chat/page/composerChips'
 import { useTurnRecovery } from './chat/page/turnRecovery'
-import { useComposerAboveBand, useComposerDockMetrics } from './chat/page/composerDock'
+import { useComposerAboveBand } from './chat/page/composerDock'
+import { DOCK_CLEARANCE_PX, useComposerDockMetrics } from './chat/composerDockMetrics'
 import { useStableRowKeys, useTranscriptRows } from './chat/page/transcriptRows'
 import { useBusyTurnControls } from './chat/page/busyTurnControls'
 import { slotBusySteer } from '../components/chat-input/busySend'
@@ -189,19 +191,6 @@ const REAL_GESTURE_AUTH_MS = 20000
 const TRANSCRIPT_TAIL_SPACER_PX = 16
 
 /**
- * Breathing room, in px, between the composer dock's top edge and the last line of
- * the transcript, on top of the dock's own measured height.
- *
- * The transcript scroller runs the full height of the pane and the dock floats
- * over its bottom edge (iOS toolbar layout), so the scroller's `paddingBottom` is
- * `dockH + this`: exactly the strip the dock covers, plus this margin, so the last
- * line stops clear of the glass instead of under it. There is no opaque fade band
- * between the two any more — the transcript scrolls under the glass and the
- * material's own blur and tint are what keep the dock legible over it.
- * ChatPage.dockClearance.test.tsx pins the wiring.
- */
-const DOCK_CLEARANCE_PX = 16
-/**
  * Strip of screen the mobile sessions drawer deliberately leaves uncovered, so a
  * sliver of the conversation behind it stays visible.
  *
@@ -274,7 +263,7 @@ import { prevUserTextFor } from './chat/share/shareSupport'
 import { turnHadPolicyBlock } from '../app-sdk/turnPolicyBlock'
 import MarkdownRenderer from '../components/MarkdownRenderer'
 import { JiraHostsCtx } from '../lib/jiraHosts'
-import { SidebarFolderCtx, type SidebarFolderActions } from '../components/markdown/contexts'
+import { ClosedSessionCtx, SidebarFolderCtx, type ClosedSessionActions, type SidebarFolderActions } from '../components/markdown/contexts'
 import MessageErrorBoundary from '../components/MessageErrorBoundary'
 import SessionTitleControl from './chat/SessionTitleControl'
 import { useChatNavigation } from '../hooks/useChatNavigation'
@@ -336,6 +325,9 @@ import { closeCrewWindow, crewWindowShown, useCrewWindow } from './chat/crew-win
 
 
 import { i18nT } from '../i18n/t'
+import { uiLocation } from '../uiLocations/uiLocation'
+import { GuideRevealScope, useGuideRevealScope } from '../guide/GuideRevealScope'
+import { useGuidePredicate, useGuideSelection } from '../guide/guidePredicates'
 import { fmtDateFields } from '../i18n/format'
 import { fmtMessageTime, fmtMessageTimeFull } from './chat/messageTime'
 import { fetchDashboardConfig } from '../api/dashboardConfigQuery'
@@ -550,6 +542,11 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
   )
   const filteredSlotsRef = useRef(filteredSlots)
   filteredSlotsRef.current = filteredSlots
+  // Live guide predicates the sessions sidebar toggle needs to be drawn (see
+  // `guide/guidePredicates.ts`): a guide step through it shows a blocker
+  // instead of pointing when either is unmet.
+  useGuidePredicate('has_open_sessions', filteredSlots.length > 0)
+  useGuidePredicate('full_dashboard', embedMode !== 'chat' && embedMode !== 'sessions')
   const unreadSlots = useAppSelector(s => s.dashboard.unreadSlots)
   // Unified view: unread keys for all chat-like slots.
   const surfaceUnreadSlots = useMemo(
@@ -577,6 +574,16 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
   const unresumableResume = useAppSelector(s => s.chat.unresumableResume)
   const undeletableHistory = useAppSelector(s => s.chat.undeletableHistory)
   const activeSlot = useAppSelector(s => s.chat.activeSlot)
+  // The session picker's selection fact for a guide's "choose the session"
+  // step: whether one is open here, whether any is listed, and which one by
+  // its key, so a choice made there stays bound to that session. The key
+  // stays in this tab: only the selection's state is reported.
+  const sessionPicked = !!activeSlot && filteredSlots.some(s => s.key === activeSlot)
+  useGuideSelection('session_open', {
+    selected: sessionPicked,
+    available: filteredSlots.length > 0,
+    identity: sessionPicked ? activeSlot ?? undefined : undefined,
+  })
   // The store this page is rendered under (not the module singleton): the
   // opener reads live state after an await, and it must be the same store
   // its dispatches went to. Also read by the MCP-app openers below, so it is
@@ -730,6 +737,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
   // survey's baseline capture until the real transcript has settled.
   const slotSwitchTarget = useAppSelector(s => s.chat.slotSwitchTarget)
   const pendingQuestion = useAppSelector(s => pendingQuestionFor(s.chat.pendingQuestions, s.chat.activeSlot))
+  const restoredQuestionNotice = useAppSelector(s => (s.chat.activeSlot ? s.chat.restoredQuestionNotices?.[s.chat.activeSlot] : undefined))
   const pendingFollowup = useAppSelector(s => (s.chat.activeSlot ? s.chat.followups?.[s.chat.activeSlot] : undefined))
   const folderSuggestion = useAppSelector(s => (s.chat.activeSlot ? s.chat.folderSuggestions?.[s.chat.activeSlot] : undefined))
   const followupTsBySlot = useAppSelector(s => s.chat.followups) ?? EMPTY_FOLLOWUPS
@@ -816,6 +824,9 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
   // arrays here re-rendered this whole component per chunk for data it never
   // read.
   const activityOpen = useAppSelector(s => s.chat.activityOpen)
+  // The chat side panel's scope owner (`chat.side-panel`): a guide's step
+  // through its opener completes the moment it reads open.
+  useGuideRevealScope('chat.side-panel', activityOpen)
   const slotHasMore = useAppSelector(s => s.chat.slotHasMore)
   const slotOldestIndex = useAppSelector(s => s.chat.slotOldestIndex)
   const cursorIsForActiveSlot = useAppSelector(s => s.chat.slotCursorKey === s.chat.activeSlot)
@@ -1053,9 +1064,9 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
     // (`decisions/points/message_steer.py`). The receipt policy below is unchanged,
     // because the answer arrives as the `dispatched` of a steer or the `queued` of
     // a queue -- both rulings `applySteerReceipt` already owns.
-    mutationFn: ({ text, sendId, slot, auto, quote }: { text: string; sendId?: string; slot: string; auto?: boolean; quote?: MessageQuote | null }) =>
+    mutationFn: ({ text, sendId, slot, auto, quote }: { text: string; sendId?: string; slot: string; auto?: boolean; quote?: MessageQuote | null; askId?: string | null }) =>
       sendTurn({ message: text, slot, steer: auto ? 'auto' : true, ...(sendId ? { meta: { sendId, ...(quote ? { quote } : {}) } } : {}) }),
-    onSuccess: (receipt, { text, sendId, slot, quote }) => {
+    onSuccess: (receipt, { text, sendId, slot, quote, askId }) => {
       // Receipt policy for a steer, owned once in chat-core (issue #9457):
       // applySteerReceipt decides WHICH ruling applies; the adapter below is
       // ChatPage's HOW. The composer was cleared at submit and the optimistic
@@ -1125,6 +1136,10 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
         // demotion via the helper's queued path.
         stashDemoted: () => undefined,
       })
+      // Release a blocking card only once the gateway accepted the steer, so the agent is told to read a message that arrived.
+      if (askId && (receipt.status === 'dispatched' || receipt.status === 'queued')) {
+        void resolveAskAfterSend(receipt.body, askId, dispatch, slot)
+      }
     },
   })
   const {
@@ -1630,6 +1645,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
     addSourceCommentToChat,
     colorThemeRef,
     handleFileOpen,
+    handleOpenWorkingTreeDiff,
     handleFolderOpen,
     handleArtifactOpen,
     handleOpenDiff,
@@ -2549,7 +2565,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
     }
     // The user answered in the composer instead of the card; a blocking card
     // is resolved over the network, so this cannot be a store-only retirement.
-    void resolveAskAfterSend(body, slot === entrySendSlot ? askAtSend : null, dispatch)
+    void resolveAskAfterSend(body, slot === entrySendSlot ? askAtSend : null, dispatch, slot)
     // The delivery verdict (see the callback's doc above). Only an explicit
     // `refused` reads as not-delivered here; `unknown` (a 2xx whose body did
     // not parse) may have started a turn, so it counts as delivered for the
@@ -2828,7 +2844,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
   const announceAttachmentChange = useCallback((text: string) => {
     setAttachmentAnnouncement(prev => ({ text, nonce: prev.nonce + 1 }))
   }, [])
-  const { clampOutOfTokens, handleAddToContext, removeFileChip, removeDirChip, selectPickedFile } = useFileMentionActions({
+  const { clampOutOfTokens, handleAddToContext, removeFileChip, removeDirChip, selectPickedFile, mentionKeyEdit } = useFileMentionActions({
     staging,
     inputRef,
     setInput,
@@ -3212,7 +3228,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
   // ---- Continue the thread ---------------------------------------------------
   const {
     continuable, interrupted, sendUnconfirmed, continuing, handleContinue,
-    openModelPickerFromError, openDefaultModelSetting, openKiroSignIn, openMemberCapabilities,
+    openModelPickerFromError, openDefaultModelSetting, openKiroSignIn, openMemberCapabilities, openTurnLimitSetting,
     featureRequestRefused, sessionStartRepeated,
   } = useTurnRecovery({
     activeSlot,
@@ -4462,6 +4478,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
       onPickModel: openModelPickerFromError,
       onOpenDefaultModel: embedded || popout ? undefined : openDefaultModelSetting,
       onOpenSignIn: embedded || popout ? undefined : openKiroSignIn,
+      onOpenTurnLimit: embedded || popout ? undefined : openTurnLimitSetting,
       onOpenCapabilities: embedded || popout ? undefined : openMemberCapabilities,
       onSessionOpen: selectSessionTab,
       sessions: connected ? sessionTitles : undefined,
@@ -4500,7 +4517,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
       bubble,
     ])
     return { renderers, fallback: bubble }
-  }, [slotRunning, handleFileOpen, handleArtifactOpen, selectSessionTab, sessionTitles, connected, handleFork, handleQuote, handleAsk, quoteWholeMessage, handleJumpToQuote, chatConfig, activeSlot, regenerating, activeSlotRemoteBound, handleRegenerate, handleEditResend, editLast, handleEditConsumed, slotHasMore, loadingOlder, cursorIsForActiveSlot, slotOldestIndex, handleLoadEarlier, renderUserContentCb, highlightTs, activeSlotTitle, mode, embedded, popout, handleOpenDiff, planTaskId, artifactPaths, automationId, toolDisclosure, setToolDisclosureFor, linkPreviewsOn, socialShareOn, voiceRecoverySlot, handleSubagentPanelOpen, isPinned, handleTogglePinForMessage, showRefusedPress, transcriptHot, revealAppInPanel, continuable, interrupted, continuing, handleContinue, openModelPickerFromError, openDefaultModelSetting, openKiroSignIn, openMemberCapabilities, handleFolderOpen, handleSpeak, handleApplyPlan, mcpAppPanel, redactionCoachTs, setAutomationOpen])
+  }, [slotRunning, handleFileOpen, handleArtifactOpen, selectSessionTab, sessionTitles, connected, handleFork, handleQuote, handleAsk, quoteWholeMessage, handleJumpToQuote, chatConfig, activeSlot, regenerating, activeSlotRemoteBound, handleRegenerate, handleEditResend, editLast, handleEditConsumed, slotHasMore, loadingOlder, cursorIsForActiveSlot, slotOldestIndex, handleLoadEarlier, renderUserContentCb, highlightTs, activeSlotTitle, mode, embedded, popout, handleOpenDiff, planTaskId, artifactPaths, automationId, toolDisclosure, setToolDisclosureFor, linkPreviewsOn, socialShareOn, voiceRecoverySlot, handleSubagentPanelOpen, isPinned, handleTogglePinForMessage, showRefusedPress, transcriptHot, revealAppInPanel, continuable, interrupted, continuing, handleContinue, openModelPickerFromError, openDefaultModelSetting, openKiroSignIn, openMemberCapabilities, openTurnLimitSetting, handleFolderOpen, handleSpeak, handleApplyPlan, mcpAppPanel, redactionCoachTs, setAutomationOpen])
 
   const renderMessage = useCallback((i: number, m: ChatMessage) => {
     // Key identity rules (clientTs preference + streaming->assistant role
@@ -4763,6 +4780,34 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
   // the gateway. Provided once here rather than threaded through
   // MarkdownRenderer props, so subagent and workflow cards and system notices
   // offer the same chip as a message body.
+  // A link to a CLOSED session: probe that one key (`GET /api/sessions/{key}/meta`),
+  // and resume it the way the sidebar's Older-sessions row does (#9915). Only
+  // consulted while the open roster is wired, so offline it is off as well.
+  const closedSessionActions = useMemo<ClosedSessionActions>(() => ({
+    // Background: a failure leaves the text plain and says nothing, since the
+    // reader did not ask for anything yet.
+    lookup: async (key: string) => {
+      const row = await api.sessionMeta(key)
+      return row ? { key: row.key, title: row.title || row.key } : null
+    },
+    // The click: ask again, because the session may have been deleted since
+    // the chip appeared. A failed check is said by the chip itself, inline at
+    // the spot clicked, with a retry (`ClosedSessionNotice`).
+    open: async ({ key, title }) => {
+      let row: Awaited<ReturnType<typeof api.sessionMeta>>
+      try {
+        row = await api.sessionMeta(key)
+      } catch {
+        return 'failed'
+      }
+      if (!row) {
+        showActionError(i18nT('store.chatSlice.session_gone_open_failed_named', { name: title }))
+        return 'gone'
+      }
+      void dispatch(resumeFromHistory({ key: row.key, title: row.title || title }))
+      return 'opened'
+    },
+  }), [dispatch, showActionError])
   const sidebarFolderActions = useMemo<SidebarFolderActions>(() => ({
     folders: chatFolders,
     onFolderReveal: embedMode === 'chat' ? undefined : (folderId: string) => {
@@ -5226,7 +5271,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
    * held before it (page-layout.md, "The title belongs to the content column").
    */
   const topbarSessionsToggle = (
-    <button className="mc-touch-hit p-2 rounded-md text-text hover:text-text-strong hover:bg-bg-hover cursor-pointer bg-transparent border-none shrink-0" onClick={() => mobileSessions ? closeSidebar() : openSidebar()} aria-label={i18nT('pages.chatPage.toggle_sessions')} aria-expanded={mobileSessions} data-testid="mobile-topbar-sessions-toggle">
+    <button className="mc-touch-hit p-2 rounded-md text-text hover:text-text-strong hover:bg-bg-hover cursor-pointer bg-transparent border-none shrink-0" onClick={() => mobileSessions ? closeSidebar() : openSidebar()} aria-label={i18nT('pages.chatPage.toggle_sessions')} aria-expanded={mobileSessions} data-testid="mobile-topbar-sessions-toggle" {...uiLocation('chat.mobile-sessions-toggle')}>
       {mobileSessions ? <PanelLeftLight size={18} /> : <PanelLeftSolid size={18} />}
     </button>
   )
@@ -5357,6 +5402,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
         chips identically wherever it renders. Cloud URLs need no provider. */}
     <JiraHostsCtx.Provider value={jiraSourceHosts}>
     <SidebarFolderCtx.Provider value={sidebarFolderActions}>
+    <ClosedSessionCtx.Provider value={closedSessionActions}>
     <div
       ref={chatContainerRef}
       /* Both sides are this page's own: a rightward drag opens the sessions
@@ -5429,10 +5475,10 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
           hands that flyout's rect to the drawer so the panel grows out of it. */}
       {!isMobile && embedMode !== 'chat' && embedMode !== 'sessions' && filteredSlots.length > 0 && (
         <button
-          ref={flyoutTriggerRef}
           type="button"
           onClick={() => expandSidebar(flyout.open)}
           {...flyout.triggerProps}
+          {...uiLocation('chat.sessions-sidebar-toggle', flyoutTriggerRef)}
           aria-haspopup={flyoutEligible ? 'menu' : undefined}
           aria-expanded={flyoutEligible ? flyout.open : undefined}
           // Geometry mirrored by TOGGLE_RECT (chat/SessionFlyout) — every
@@ -5494,6 +5540,11 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
           />
         </div>
       ) : (
+      // The sessions sidebar's collapse owner (desktop) and the phone's
+      // sessions drawer owner: a guide's reveal step completes the moment
+      // this says open. Outside the drawer, so "closed" is said while the
+      // drawer's contents are unmounted.
+      <GuideRevealScope id={isMobile ? 'chat.sessions-drawer' : 'chat.sessions-sidebar'} open={sidebarOpen}>
       <OverlayDrawer open={isMobile ? drawerMounted : sidebarOpen} width={isMobile ? Math.max(0, winW - DRAWER_UNCOVERED_PX) : effectiveSidebarWidth} dragging={sidebarDragging} slideX={isMobile ? drawerX : undefined} slideRef={drawerPanelRef}
         // Mobile only: the same visible-band inset the scrim above carries, so the
         // two surfaces move together. Margins rather than restated edges is what
@@ -5566,6 +5617,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
         ) : sessionsPane
         })()}
       </OverlayDrawer>
+      </GuideRevealScope>
       )}
       <MobileTopBar
         topbarSlot={topbarSlot}
@@ -5746,6 +5798,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
             <Btn
               primary
               disabled={newSlotMutation.isPending}
+              {...uiLocation('chat.start-new-chat')}
               onClick={() => {
                 if (newSlotFailed) {
                   // Re-arm before state updates can let auto-selection run.
@@ -5878,6 +5931,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
                   onClick={toggleAct}
                   title={i18nT('pages.chatPage.open_activity_panel')}
                   aria-label={i18nT('pages.chatPage.open_activity_panel')}
+                  {...uiLocation('chat.side-panel-open')}
                 >
                   <SidePanelGlyph size={15} />
                 </Clickable>
@@ -6302,7 +6356,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
                   onSkip={() => knowledgeFetch.clearResults()}
                 />
               ) : null}
-              {pendingQuestion && (
+              {(pendingQuestion || restoredQuestionNotice) && (
                 <div className="px-4 pb-2 mx-auto w-full" style={{ maxWidth: 'var(--mc-content-width, 900px)' }}>
                   <PendingQuestionCard
                     slotKey={activeSlot}
@@ -6395,6 +6449,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
               // A tree row dropped on the composer is "Add to chat" by drag.
               onTreeEntryDrop={handleAddToContext}
               clampDropOffset={clampOutOfTokens}
+              onMentionKey={mentionKeyEdit}
               project={currentSlot?.project || ''}
               projectBranch={projectBranch}
               projectDetached={!projectGitError && !!projectGit?.detached}
@@ -6728,6 +6783,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
               onFileOpen={handleFileOpen}
               onArtifactOpen={handleArtifactOpen}
               onAddToContext={handleAddToContext}
+              onOpenWorkingTreeDiff={handleOpenWorkingTreeDiff}
               projectDir={currentSlot?.project || undefined} navLinks={chatNav.links} navResolving={chatNav.resolving}
               sources={panelSources} selectedSourceUrl={selectedSourceUrl} onSelectSource={selectSourceUrl} onReconcileSource={reconcileSourceUrl}
               issues={panelIssues} selectedIssueUrl={selectedIssueUrl} onSelectIssue={selectIssueUrl} onReconcileIssue={reconcileIssueUrl}
@@ -6769,6 +6825,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
                 onFileOpen={handleFileOpen}
                 onArtifactOpen={handleArtifactOpen}
                 onAddToContext={handleAddToContext}
+                onOpenWorkingTreeDiff={handleOpenWorkingTreeDiff}
                 projectDir={currentSlot?.project || undefined} navLinks={chatNav.links} navResolving={chatNav.resolving}
                 sources={panelSources} selectedSourceUrl={selectedSourceUrl} onSelectSource={selectSourceUrl} onReconcileSource={reconcileSourceUrl}
               issues={panelIssues} selectedIssueUrl={selectedIssueUrl} onSelectIssue={selectIssueUrl} onReconcileIssue={reconcileIssueUrl}
@@ -6786,6 +6843,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
         activitySlot
       )}
     </div>
+    </ClosedSessionCtx.Provider>
     </SidebarFolderCtx.Provider>
     </JiraHostsCtx.Provider>
     </TagPopoverProvider>

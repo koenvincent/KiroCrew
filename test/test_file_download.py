@@ -10,6 +10,7 @@ and the text-redaction defense in depth.
 from __future__ import annotations
 
 import base64
+import io
 import json
 import os
 import random
@@ -382,3 +383,70 @@ class TestFlaggedDownloadHonoursOwnerGrant:
             resp = await _download(f)
         assert resp.status == 200
         is_granted.assert_not_called()
+
+
+def _telegram_shaped() -> str:
+    """A bot-token-shaped run, built so no literal token sits in the source."""
+    return "123456789:" + _key_shaped(3, 35).replace("+", "_").replace("/", "-")
+
+
+class TestBinaryDownloadUsesTheBinaryScan:
+    """Non-UTF-8 bytes go through the shared binary scan, not the text redactor."""
+
+    @pytest.mark.asyncio
+    async def test_baseline_jpeg_downloads(self, tmp_path, mock_sel):
+        # Every baseline JPEG carries the standard Huffman table, whose
+        # printable run reads as a bot token to the text redactor.
+        image = pytest.importorskip("PIL.Image")
+        f = tmp_path / "shot.jpg"
+        image.new("RGB", (64, 36), (120, 30, 200)).save(f, "JPEG")
+        assert b"456789:CDEFGHIJ" in f.read_bytes()
+        resp = await _download(f)
+        assert resp.status == 200
+
+    @pytest.mark.asyncio
+    async def test_text_with_telegram_token_is_still_refused(self, tmp_path, mock_sel):
+        f = tmp_path / "config.txt"
+        f.write_text(f"bot_token = {_telegram_shaped()}\n")
+        resp = await _download(f)
+        assert resp.status == 400
+        assert json.loads(resp.text)["code"] == "content_redacted"
+
+    @pytest.mark.asyncio
+    async def test_binary_with_telegram_token_is_still_refused(self, tmp_path, mock_sel):
+        f = tmp_path / "blob.bin"
+        f.write_bytes(b"\xff\xd8\xff\xe0\x80 " + _telegram_shaped().encode() + b" \x80")
+        resp = await _download(f)
+        assert resp.status == 400
+        assert json.loads(resp.text)["code"] == "content_redacted"
+
+
+class TestBinaryScanReadsBothProjections:
+    """The shared binary scan reads latin-1 AND the replace-decoded UTF-8."""
+
+    @staticmethod
+    def _nbsp_bearer() -> bytes:
+        # A stray invalid byte, then a UTF-8 no-break space after "Bearer":
+        # latin-1 splits C2 A0 into two characters and breaks the match.
+        return b"\xff\n" + f"Authorization: Bearer\u00a0opaque-{_key_shaped(4, 12)}\n".encode()
+
+    def test_nbsp_bearer_is_flagged(self):
+        from kiro_crew.platform import binary_content_is_flagged
+
+        assert binary_content_is_flagged(self._nbsp_bearer())
+
+    def test_baseline_jpeg_is_not_flagged(self):
+        from kiro_crew.platform import binary_content_is_flagged
+
+        image = pytest.importorskip("PIL.Image")
+        buf = io.BytesIO()
+        image.new("RGB", (64, 36), (120, 30, 200)).save(buf, "JPEG")
+        assert not binary_content_is_flagged(buf.getvalue())
+
+    @pytest.mark.asyncio
+    async def test_nbsp_bearer_download_is_refused(self, tmp_path, mock_sel):
+        f = tmp_path / "trace.bin"
+        f.write_bytes(self._nbsp_bearer())
+        resp = await _download(f)
+        assert resp.status == 400
+        assert json.loads(resp.text)["code"] == "content_redacted"

@@ -525,7 +525,11 @@ async def turn_spec_hooks(provider: object, agent_id: str) -> TurnSpecHooks:
 
 
 async def floored_spec_hooks(
-    base_agent: str, cwd: str | None, base_spec: dict[str, Any] | None
+    base_agent: str,
+    cwd: str | None,
+    base_spec: dict[str, Any] | None,
+    *,
+    project_source: str | None = None,
 ) -> TurnSpecHooks:
     """The PreToolUse hooks a floored run is gated on: its BASE template's.
 
@@ -543,6 +547,13 @@ async def floored_spec_hooks(
     same name, while the derivation reads the project spec first. A missing or
     unconvertible source refuses every request, since a deny hook that was never
     loaded gave no verdict.
+
+    *project_source* is ``PublishedSpec.source_id``: the project's real path when
+    the checkout supplied *base_spec*. Its hooks are commands, so they fire only
+    when :func:`~kiro_crew.acp.session_mcp.trusted_project_agent_spec` lets that
+    checkout choose commands, the verdict an unfloored run's hooks read too.
+    Untrusted, every request is refused: its deny hooks cannot be honoured
+    without running its other commands, and a floor never weakens to "no hooks".
     """
     work_dir = cwd or None
     if not isinstance(base_spec, dict):
@@ -550,6 +561,19 @@ async def floored_spec_hooks(
             "floored base %r has no derivation source; tool calls are blocked", base_agent
         )
         return TurnSpecHooks([], work_dir, True, True)
+    if project_source is not None:
+        from kiro_crew.acp.session_mcp import trusted_project_agent_spec
+
+        _declared, trusted = await asyncio.to_thread(
+            trusted_project_agent_spec, base_agent, project_source
+        )
+        if trusted is None:
+            logger.warning(
+                "floored base %r comes from a project spec that is not trusted to run"
+                " commands; tool calls are blocked",
+                base_agent,
+            )
+            return TurnSpecHooks([], work_dir, True, True)
     try:
         hooks, _unconfirmable = await asyncio.to_thread(_convert, base_agent, base_spec)
     except Exception:  # noqa: BLE001 - the caller fails permission requests closed

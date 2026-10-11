@@ -974,7 +974,7 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "id": "chat.default-model",
     "label": "Default Model",
     "labelKey": "pages.settings.chatPanel.default_model",
-    "description": "Agents with their own configured model ignore this setting. 'Default' uses the model from the agent configuration, or the system default when none is configured. Changing this does not affect sessions that are already open. Which model new sessions start with when their agent pins none. Set a model per agent under Capabilities → Agents, or pick one inside a session to override it there.",
+    "description": "Agents with their own configured model ignore this setting. 'Default' uses the model from the agent configuration, or the system default when none is configured. Changing this does not affect sessions that are already open. Which model new sessions start with when their agent pins none. Set a model per agent under Customize → Crewmates, or pick one inside a session to override it there.",
     "tab": "chat",
     "type": "select",
     "occurrence": 1,
@@ -1499,6 +1499,43 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     }
   },
   {
+    "id": "chat.tool-calls-start-expanded",
+    "label": "Tool calls start expanded",
+    "labelKey": "pages.settings.chatPanel.tool_calls_start_expanded",
+    "description": "Open tool call rows with their input and output showing, instead of collapsed. Rows you open or close by hand keep your choice.",
+    "tab": "chat",
+    "type": "toggle",
+    "occurrence": 1,
+    "params": {
+      "sub": "transcript"
+    }
+  },
+  {
+    "id": "chat.topic-tags",
+    "label": "Topic tags",
+    "labelKey": "pages.settings.chatPanel.topic_tags",
+    "description": "Tags each new session in the sidebar with up to two topics, like \"debugging\". Uses one background-model call per new session.",
+    "tab": "chat",
+    "type": "toggle",
+    "occurrence": 1,
+    "params": {
+      "sub": "sessions"
+    }
+  },
+  {
+    "id": "chat.turn-time-limit-seconds",
+    "label": "Turn Time Limit (seconds)",
+    "labelKey": "pages.settings.chatPanel.turn_time_limit",
+    "description": "A turn that reaches this limit stops and keeps the work already written to disk; resume it to continue. Raise it for long unattended turns such as full test suites. Applies from the next turn. Longest one chat turn may run before it is stopped. 300 to 86,400 s (24 h). Default 14,400 s (4 h).",
+    "tab": "chat",
+    "type": "input",
+    "occurrence": 1,
+    "params": {
+      "sub": "advanced"
+    },
+    "configKey": "agent.chat_turn_timeout_secs"
+  },
+  {
     "id": "chat.what-enter-does-while-the-agent-is-working",
     "label": "What Enter does while the agent is working",
     "labelKey": "pages.settings.chatPanel.what_enter_does_while_the_agent_is_working",
@@ -1675,7 +1712,7 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "id": "developer.chat-on-a-crew",
     "label": "Chat on a crew",
     "labelKey": "pages.developer.featurePreviewsTab.chat_on_a_crew",
-    "description": "Adds “New chat on crew” to the create menu, which starts a session on a remote crew — another machine you have connected under Settings > Remote Crew. Unfinished: the session opens in that crew’s own pane and is not listed in this dashboard’s sessions yet, so to return to it later, switch to that crew’s pane.",
+    "description": "Adds “New chat on crew” to the create menu, which starts a session on a remote crew — another machine you have connected under Settings > Remote Crew — and shows each connected crew’s sessions in their own group in the Sessions list. Unfinished.",
     "tab": "developer",
     "type": "toggle",
     "occurrence": 1
@@ -1750,15 +1787,6 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "description": "Only used when the judge above is the small model. Leave it on the judge agent's own model unless you want a cheaper one.",
     "tab": "developer",
     "type": "select",
-    "occurrence": 1
-  },
-  {
-    "id": "developer.remote-crew-sessions",
-    "label": "Remote crew sessions",
-    "labelKey": "pages.developer.featurePreviewsTab.remote_instance_sessions",
-    "description": "Merge a connected remote crew's live sessions into the Sessions list, each marked with a server badge. A remote crew is another machine you have connected, not your agents. Functional, but not finished.",
-    "tab": "developer",
-    "type": "toggle",
     "occurrence": 1
   },
   {
@@ -2117,6 +2145,18 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "description": "Heartbeat task results"
   },
   {
+    "id": "notifications.sound-category-dictation",
+    "params": {
+      "sub": "percategory"
+    },
+    "labelKey": "pages.settings.notificationsPanel.category_dictation",
+    "tab": "notifications",
+    "type": "select",
+    "occurrence": 1,
+    "label": "Interrupted dictation",
+    "description": "Plays a sound when dictation stops before you end it"
+  },
+  {
     "id": "notifications.mark-sessions-unread-only-when-they-need-you",
     "label": "Mark sessions unread only when they need you",
     "labelKey": "pages.settings.notificationsPanel.unread_only_when_done_or_waiting",
@@ -2395,7 +2435,7 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "id": "shortcuts.use-ctrl-not-option-for-chat-1-9",
     "label": "Use ⌃ Ctrl (not ⌥ Option) for chat 1–9",
     "labelKey": "pages.settings.shortcutsPanel.use_ctrl_not_option_for_chat_1_9",
-    "description": "Bind chat-tab switching to Ctrl+digit instead of Option+digit",
+    "description": "Bind chat-tab switching to Ctrl+digit instead of Option+digit. Option+digit does not switch chats while a text field has focus.",
     "tab": "shortcuts",
     "type": "toggle",
     "occurrence": 1

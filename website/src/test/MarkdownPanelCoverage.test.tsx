@@ -343,6 +343,7 @@ interface MountOpts {
   onSubmitComments?: (m: string) => void | boolean | Promise<void | boolean>
   /** Omit the key entirely to let the auto-diff heuristic decide. */
   initialDiffMode?: boolean
+  readOnly?: boolean
 }
 
 function mountPanel(opts: MountOpts = {}) {
@@ -357,6 +358,7 @@ function mountPanel(opts: MountOpts = {}) {
     onSubmitComments: opts.onSubmitComments,
     savedBaseline: opts.savedBaseline,
     initialDiffMode: 'initialDiffMode' in opts ? opts.initialDiffMode : false,
+    readOnly: opts.readOnly,
   }
   const utils = render(<MarkdownPanel embedded {...props} />, { wrapper })
   return { ...utils, props }
@@ -749,14 +751,24 @@ describe('MarkdownPanel — diff chrome', () => {
 
   it('surfaces a git failure instead of presenting it as a clean file', async () => {
     // status error is a failed `git diff`, which the backend keeps distinct
-    // from clean so a failure is never read as "no changes".
+    // from clean so a failure is never read as "no changes". A real failure
+    // must reach the shared ErrorNotice (with its agent hand-off), not the
+    // muted ZeroDiffNotice text the no-change / no-baseline states use
+    // (errors-use-error-notice).
     vi.mocked(api.fileDiff).mockResolvedValue({ diff: '', original: 'same\n', status: 'error' } as never)
     mountPanel({ content: 'same\n', initialDiffMode: undefined })
     await waitFor(() => expect(api.fileDiff).toHaveBeenCalled())
     fireEvent.click(screen.getAllByLabelText('Toggle diff view')[0])
-    expect(await screen.findByText("Couldn't compute the diff — git failed for this file")).toBeInTheDocument()
+    // Rendered through ErrorNotice (carrying the message + agent hand-off),
+    // NOT the muted ZeroDiffNotice.
+    const notice = await screen.findByTestId('markdown-panel-diff-compute-error')
+    expect(notice).toBeInTheDocument()
+    expect(within(notice).getByText("Couldn't compute the diff — git failed for this file")).toBeInTheDocument()
     expect(screen.queryByTestId('pierre-diff')).toBeNull()
     expect(screen.queryByText('No changes in this file')).toBeNull()
+    // The no-change / no-baseline escape hatch ("Show full file") belongs to
+    // ZeroDiffNotice, not this error surface.
+    expect(screen.queryByText('Show full file')).toBeNull()
   })
 
   it('offers split/unified as a menu row only once a diff is on screen', async () => {
@@ -1769,5 +1781,80 @@ describe('MarkdownPanel — comment hint banner', () => {
   it('stays away when the panel has nowhere to submit comments', () => {
     mountPanel()
     expect(screen.queryByText('Got it')).toBeNull()
+  })
+})
+
+describe('MarkdownPanel — read-only working-tree diff (#9695)', () => {
+  it('locks a code file read-only: no editor, no Edit/Preview/Save, no diff toggle', async () => {
+    // A .py file would normally open straight in the editor; readOnly must keep
+    // it a non-editable view, so the wtdiff tab is never a second editable buffer.
+    vi.mocked(api.fileDiff).mockResolvedValue({ diff: 'x', original: 'a = 1\n', status: 'clean' } as never)
+    mountPanel({ filePath: '/tmp/mod.py', content: 'a = 2\n', savedBaseline: 'a = 1\n', readOnly: true })
+    await waitFor(() => expect(api.fileDiff).toHaveBeenCalled())
+    // No editable surface and no affordance that could open one or save.
+    expect(screen.queryByTestId('pierre-editor')).toBeNull()
+    expect(screen.queryByText('Edit')).toBeNull()
+    expect(screen.queryByText('Preview')).toBeNull()
+    // The unsaved-changes banner (its Save/Cancel stay mounted) is not shown:
+    // a read-only diff view is never dirty, so the banner never reveals.
+    expect(bannerShown()).toBe(false)
+    expect(screen.queryByLabelText('Toggle diff view')).toBeNull()
+    // The stripped toolbar reads as intentional: a muted "Read-only" label
+    // stands where the Edit button would be.
+    expect(screen.getAllByText('Read-only').length).toBeGreaterThan(0)
+  })
+
+  it('never calls onSave — there is no edit or save surface to reach it', async () => {
+    const onSave = vi.fn(async () => {})
+    vi.mocked(api.fileDiff).mockResolvedValue({ diff: 'x', original: 'a = 1\n', status: 'clean' } as never)
+    mountPanel({ filePath: '/tmp/mod.py', content: 'a = 2\n', savedBaseline: 'a = 1\n', readOnly: true, onSave })
+    await screen.findByTestId('pierre-diff')
+    // Ctrl/Cmd+S is gated on `editing`, which read-only forces off.
+    fireEvent.keyDown(document, { key: 's', ctrlKey: true })
+    expect(onSave).not.toHaveBeenCalled()
+  })
+
+  it('carries no comment drafts: leaves the path\'s stored comments untouched (#9695)', async () => {
+    // The file tab already has a pending comment draft for this path. A read-only
+    // wtdiff panel on the SAME path must not hydrate or rewrite that entry — it is
+    // the file tab's alone, so two coexisting panels cannot overwrite each other.
+    const FILE = '/tmp/mod.py'
+    const fileTabDraft = { [FILE]: [{ id: 'file-1', anchor: 'a = 1', text: 'from the file tab' }] }
+    localStorage.setItem('mc-comment-drafts', JSON.stringify(fileTabDraft))
+    vi.mocked(api.fileDiff).mockResolvedValue({ diff: 'x', original: 'a = 1\n', status: 'clean' } as never)
+    // onSubmitComments IS passed, to prove it is the readOnly flag — not a missing
+    // callback — that keeps this panel out of the comment store.
+    mountPanel({ filePath: FILE, content: 'a = 2\n', savedBaseline: 'a = 1\n', readOnly: true, onSubmitComments: vi.fn() })
+    await waitFor(() => expect(api.fileDiff).toHaveBeenCalled())
+    // Read-only confirmed by its label; the stored draft is exactly as the file
+    // tab left it — not cleared, not rewritten by the read-only panel.
+    expect(screen.getAllByText('Read-only').length).toBeGreaterThan(0)
+    expect(JSON.parse(localStorage.getItem('mc-comment-drafts')!)).toEqual(fileTabDraft)
+  })
+
+  it('shows no dead "Show full file" button when a read-only diff has no changes (#9695)', async () => {
+    // A wtdiff tab whose file is identical to its baseline (after a commit or
+    // revert, or on reload) hits the zero-diff notice. In a NORMAL tab that
+    // notice offers "Show full file" to leave diff mode — but a read-only tab
+    // is locked to diff (toggleDiffMode returns early when readOnly), so that
+    // button would be dead and leave the tab showing nothing. It must be hidden.
+    vi.mocked(api.fileDiff).mockResolvedValue({ diff: '', original: 'same\n', status: 'clean' } as never)
+    mountPanel({ filePath: '/tmp/same.ts', content: 'same\n', savedBaseline: 'same\n', readOnly: true, initialDiffMode: undefined })
+    await waitFor(() => expect(api.fileDiff).toHaveBeenCalled())
+    // The notice is shown…
+    expect(await screen.findByText('No changes in this file')).toBeInTheDocument()
+    // …but with no escape-hatch button, because there is nothing to escape to.
+    expect(screen.queryByText('Show full file')).toBeNull()
+  })
+
+  it('still offers "Show full file" in a NORMAL (editable) zero-diff tab (#9695)', async () => {
+    // The read-only hiding must not regress the editable case: a normal tab's
+    // zero-diff notice keeps its escape hatch out of diff mode.
+    vi.mocked(api.fileDiff).mockResolvedValue({ diff: '', original: 'same\n', status: 'clean' } as never)
+    mountPanel({ filePath: '/tmp/same.ts', content: 'same\n', initialDiffMode: undefined })
+    await waitFor(() => expect(api.fileDiff).toHaveBeenCalled())
+    fireEvent.click(screen.getAllByLabelText('Toggle diff view')[0])
+    expect(await screen.findByText('No changes in this file')).toBeInTheDocument()
+    expect(screen.getByText('Show full file')).toBeInTheDocument()
   })
 })

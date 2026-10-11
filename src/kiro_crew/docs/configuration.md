@@ -147,6 +147,14 @@ gateway for access tokens and the encrypted refresh token stays in Kiro Crew;
 otherwise `--auth-method cli` uses kiro-cli's existing login. A sign-in or
 sign-out takes effect on the next KAS process.
 
+When the gateway starts with KAS as the selected main or member backend, it runs the
+same `kiro-cli acp --help` check `kirocrew doctor` reports, in the background, so
+startup does not wait for it. If that kiro-cli has no
+`--agent-engine` flag, or does not offer engine `v3`, Kiro Crew logs a warning and
+runs kiro-cli instead; the dashboard's KAS row lists `kiro-cli acp --agent-engine
+v3` as missing. `config.json` keeps `kas`, so updating kiro-cli and restarting
+returns to KAS. A check that cannot run leaves KAS selected.
+
 Harness capabilities differ: agent-spec projection, MCP transport, model
 selection, permission routing, resume, compaction, and subagent continuation are
 not inferred from the harness name. See [Agent Spec Field
@@ -258,6 +266,7 @@ Set a registered value with, for example,
 | `agent.soft_stop_budget_secs` | Seconds to wait for a cooperative cancel before hard-killing the session | `10.0` |
 | `agent.max_subagents` | Max concurrent subagents. `0` = auto: the `agent.subagent_auto_max` ceiling (32), with free memory bounding each start through `agent.spawn_min_memory_gb` long before that on most hosts (sized from host memory when `agent.spawn_min_memory_gb` is `0`, 3 if host memory cannot be read). A pin of 1 or 2 is raised to 3, the floor an explicit cap keeps | `0` |
 | `agent.subagent_max_turns` | Default tool-call budget per subagent; stored user values are preserved on upgrade | `1000` |
+| `agent.chat_turn_timeout_secs` | Wall-clock limit for one chat turn, in seconds. A turn that reaches it ends with a notice naming the limit. Clamped to 300–86400 (24h) and cannot be turned off; for work spanning many hours, use a monitor loop or a task instead of one long turn | `14400` |
 | `agent.spawn_min_memory_gb` | Free memory (GB) that must remain available after a subagent start is admitted. A dedicated-process start is priced at what such a runtime settles at: about 1 GB until runs of that agent have been measured, then their learned size capped at 2 GB, never below `agent.subagent_cost_gb`. A start that shares its parent's runtime is priced about 0.35 GB lower. A nested start that shares its parent's runtime is admitted at the floor itself, since its parent already holds its memory. A spawn that does not fit waits in the queue, never refused: in the durable queue, or in memory for a temporary or incognito memory mode. It is re-checked when memory can have moved (a subagent ending, or a reading every few seconds while something waits, which also sees a warming subagent settle), and while another chat's subagents wait, a chat already running its share of dedicated subagents (weighted by `agent.lane_weights`) waits for its next top-level start. On macOS a start also waits while the kernel reports memory pressure and one of this gateway's dedicated subagents is running. An install still carrying the old `4.0` default moves to `2.0` once; a value set back afterwards is kept. 0 disables the check, that wait included | `2.0` |
 | `agent.subagent_queue_max_wait_secs` | Longest a subagent spawn may wait for memory, counted as the time `agent.spawn_min_memory_gb` has held it back, in the durable queue or in memory. Past it the spawn ends without starting: its parent gets the result `never started: waiting for memory` like any other subagent result, and the spawn leaves the parent's queued count. Time a spawn spends waiting only for a free slot is not counted. It also bounds the macOS memory-pressure hold: a start it has held that long ends without starting, and while one pressure episode lasts longer than this, new starts it would hold end at once. Applies live, without a restart. `0` waits without a bound | `1800` (30 min) |
 | `agent.completion_keep` | Which end of the subagent transcript to keep in the completion event injected into the parent session: `"head"`, `"tail"`, or `"both"` (head + middle marker + tail) | `"head"` |
@@ -271,7 +280,7 @@ Set a registered value with, for example,
 | Key | Description | Default |
 |-----|-------------|---------|
 | `session.timeout_secs` | Idle session timeout in seconds (0 disables the idle sweep) | `3600` (60 min) |
-| `session.idle_exempt_keys` | Session keys the idle timeout never ends, for a chat that automation wakes hours apart and that would otherwise start cold on every wake. A dashboard chat's key is `dashboard:` followed by the `sid` in its URL, unless the tab is linked to a cron job or a channel thread, which uses that link's key instead (for example `cron:<job id>`). Closing a dashboard or cron tab still ends its process; a channel thread's session belongs to the channel, so closing its viewer does not. `session.watchdog_rss_max_mb`, when set, still applies. A listed session with no tab, such as a cron job that runs without one, is reaped only by that limit or a gateway restart, even after its job is deleted, so take a deleted job's key off the list. Re-read every cleanup tick, so a change needs no restart. At most 10 keys of up to 512 characters each are kept, because each listed key can keep a whole kiro-cli process tree running; a longer key is dropped, not cut short, and the gateway log warns once per load when any key is dropped | `[]` |
+| `session.idle_exempt_keys` | Session keys the idle timeout never ends, for a chat that automation wakes hours apart and that would otherwise start cold on every wake. A dashboard chat's key is `dashboard:` followed by the `sid` in its URL, unless the tab is linked to a cron job or a channel thread, which uses that link's key instead (for example `cron:<job id>`). Closing a dashboard or cron tab still ends its process; a channel thread's session belongs to the channel, so closing its viewer does not. `session.watchdog_rss_max_mb`, when set, still applies. A listed session with no tab, such as a cron job that runs without one, keeps running even after its job is deleted, so take a deleted job's key off the list. The RSS limit or a gateway restart still ends it. On the kiro-cli or KAS backend, a Kiro sign-out from the dashboard ends it at once, whatever account it signed in with. After any other switch or sign-out of the Kiro account it signed in with, the next dashboard chat turn ends it, and so does the next agent cron run unless Kiro Crew then cannot tell which account is signed in, as with a social login. A session that is mid-turn then ends later instead, when its next turn starts or at a later dashboard chat turn or agent cron run. Re-read every cleanup tick, so a change needs no restart. At most 10 keys of up to 512 characters each are kept, because each listed key can keep a whole kiro-cli process tree running; a longer key is dropped, not cut short, and the gateway log warns once per load when any key is dropped | `[]` |
 | `session.empty_response_auto_continue` | After two consecutive empty model responses, send transcript-visible `continue` nudges on the same session | `true` |
 | `session.empty_response_max_continues` | How many `continue` nudges may run back to back before the give-up card (clamped 1-10; above 1 the notice shows "recovery N of M") | `1` |
 | `session.autocompact_pct` | Context usage percentage at which auto-compaction triggers (5-90). Lower compacts sooner and keeps per-turn cost down; higher retains more conversation before rewriting it. Applies to new installs: an existing `config.json` keeps its stored value | `70.0` |
@@ -307,7 +316,7 @@ Set a registered value with, for example,
 
 | Key | Description | Default |
 |-----|-------------|---------|
-| `slack.allowed_users` | User records (`{slack_id, name}`) recorded for Slack access | `[]` |
+| `slack.allowed_users` | Ignored for access (Slack is owner-only); a name is only a display-name fallback | `[]` |
 | `slack.tracking_channels` | Channels to monitor for new members | `[]` |
 | `slack.open_channels` | Channel records retained in config | `[]` |
 | `slack.command` | Slash-command name | `"kirocrew"` |

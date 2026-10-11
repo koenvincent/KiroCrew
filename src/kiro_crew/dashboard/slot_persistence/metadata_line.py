@@ -337,6 +337,7 @@ def merge_empty_window(
     refusal_under_lock: Callable[[dict], str | None] | None = None,
     mutes_opened_override: bool | None = None,
     after_commit_under_lock: Callable[[], None] | None = None,
+    queue_deferred_under_lock: Callable[[dict], bool] | None = None,
 ) -> str | None:
     """Commit a forced or closing save of a message-less slot as a metadata merge.
 
@@ -344,6 +345,12 @@ def merge_empty_window(
     cross-process lock, after the existence check. A non-``None`` reason skips
     the write and is returned, so the caller can keep the slot owed; ``None``
     is returned on a commit and on the by-design skip of a line-less tab.
+
+    ``queue_deferred_under_lock`` is evaluated at the same point. ``True``
+    commits every other field but leaves the line's queued prompts as they are
+    on disk and does not move the queue witness, so a snapshot older than a
+    queue another writer committed cannot overwrite it, and the queue stays
+    owed for the next save.
 
     Raises ``OSError`` when the record is unreadable, so a close or an
     acknowledged edit is never reported durable on a merge that did not happen.
@@ -393,6 +400,13 @@ def merge_empty_window(
     def _refresh_under_lock(meta: dict) -> bool:
         guard_state["ran"] = True
         if not meta:
+            # A line-less tab has no transcript, so no restart can restore its
+            # queue and nothing on disk is owed. Credit the witness, or the
+            # flush would re-run this save for the same drift on every tick.
+            # The tab's first line comes from a full save, which writes the
+            # live queue itself.
+            if slot_history_key(slot) == history_key:
+                slot._queue_persisted_sig = queue_persist_signature(queue_snapshot)
             return False
         if refusal_under_lock is not None:
             refusal = refusal_under_lock(meta)
@@ -439,6 +453,10 @@ def merge_empty_window(
             mutes_opened=mutes_opened_override,
         )
         merged_fields.update(cp._metadata_codec.encode(slot, merge=True, folds=folds))
+        if queue_deferred_under_lock is not None and queue_deferred_under_lock(meta):
+            # A merge never deletes a key, so dropping it keeps the on-disk
+            # queue, and the witness below then has nothing to credit.
+            merged_fields.pop("queued_prompts", None)
         return True
 
     def _after_commit_under_lock() -> None:

@@ -24,7 +24,7 @@ CONFIG = ROOT / "src" / "kiro_crew" / "config"
 # so the section's bytes still count against the budget after moving into
 # `context_assembly/sections.py`. The `{{MAX_SUBAGENTS}}` and `{{WIDGET_BLOCK}}`
 # slots are still counted as their raw tokens.
-PROMPT_BYTE_CEILINGS = {"prompt.md": 40_725}
+PROMPT_BYTE_CEILINGS = {"prompt.md": 40_850}
 _COMPUTER_USE_TOKEN = "{{COMPUTER_USE_BLOCK}}"
 
 
@@ -143,7 +143,7 @@ def test_cron_modes_and_session_ownership_remain_explicit() -> None:
         r"IANA `timezone`.*global config timezone, then UTC",
         r"THIS session's jobs only; empty does not mean none exist elsewhere",
         r"`timeout` bounds.*subprocess; `timeout_secs` bounds the whole wake",
-        r"NON-BLOCKING: END YOUR TURN.*next user message, not the result",
+        r"BLOCKING in a dashboard session: the call waits for the user and the answers are its result",
     )
     for value in ("persistent_session=false", "minimal_context=true", "hide_in_chat=true"):
         assert value in capabilities

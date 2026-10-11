@@ -155,7 +155,7 @@ export function FileHeaderBreadcrumb({ filePath }: { filePath: string }) {
             below. Same focusable-region pattern as CodeBlock / FileRenderers. */}
         {/* eslint-disable-next-line jsx-a11y/no-noninteractive-element-interactions */}
         <div
-          className="flex items-center min-w-0 outline-hidden focus-visible:ring-1 focus-visible:ring-accent rounded-sm"
+          className="flex items-center min-w-0 focus-ring-accent rounded-sm"
           title={filePath}
           role="group"
           aria-label={filePath}
@@ -332,6 +332,12 @@ interface Props {
   /** Restored file-tab preference. Undefined allows the initial modified-file
    *  auto-diff; false explicitly keeps the normal preview/source view. */
   initialDiffMode?: boolean
+  /** Lock the panel to a read-only working-tree DIFF (the `wtdiff` tab, #9695):
+   *  the tab stays in diff mode, cannot be toggled into the editor, and shows
+   *  no Edit/Save affordance. The plain `file:` tab remains the single editable
+   *  buffer for the path, so there is never a second editor to race a save
+   *  against. */
+  readOnly?: boolean
   onDiffModeChange?: (diffMode: boolean) => void
   /** Render as a SidePanel tab body (fills parent, no resize handle/border). */
   embedded?: boolean
@@ -1129,15 +1135,21 @@ function MissingFileBanner({ onDownload, onCopy, copied, partial }: { onDownload
   )
 }
 
-function ZeroDiffNotice({ onExitDiff, message }: { onExitDiff: () => void; message?: string }) {
+function ZeroDiffNotice({ onExitDiff, message }: { onExitDiff?: () => void; message?: string }) {
   return (
     <div className="h-full flex flex-col items-center justify-center gap-2.5 text-muted px-6 text-center">
       <FileDiff size={20} className="opacity-50" />
       <span className="text-[12.5px]">{message ?? i18nT('components.markdownPanel.no_changes_in_file')}</span>
-      <button
-        className="px-2.5 h-[26px] rounded-md text-[11.5px] font-medium text-muted hover:text-text border border-border bg-transparent cursor-pointer transition-colors"
-        onClick={onExitDiff}
-      >{i18nT('components.markdownPanel.show_full_file')}</button>
+      {/* The escape hatch leaves diff mode for the full file. A read-only diff
+          tab (#9695) is locked to diff mode (toggleDiffMode returns early), so
+          the host passes no onExitDiff there and the dead button is hidden —
+          the plain file: tab is the editable view of the path instead. */}
+      {onExitDiff && (
+        <button
+          className="px-2.5 h-[26px] rounded-md text-[11.5px] font-medium text-muted hover:text-text border border-border bg-transparent cursor-pointer transition-colors"
+          onClick={onExitDiff}
+        >{i18nT('components.markdownPanel.show_full_file')}</button>
+      )}
     </div>
   )
 }
@@ -1204,7 +1216,7 @@ export interface MarkdownPanelHandle {
   requestNavigate: (nav: (stillClean: () => boolean) => void) => void
 }
 
-export default memo(forwardRef<MarkdownPanelHandle, Props>(function MarkdownPanel({ filePath, content, binary, partial, onContentChange, onDiskContent, onSave, onClose, liveWatch, onSubmitComments, connected = true, onRefresh, reserveWidth, initialDiffMode, onDiffModeChange, embedded, active = true, savedBaseline, revealLine, onRevealConsumed, browserRail, railOpen, onRailToggle, scrollMemoryKey }: Props, ref) {
+export default memo(forwardRef<MarkdownPanelHandle, Props>(function MarkdownPanel({ filePath, content, binary, partial, onContentChange, onDiskContent, onSave, onClose, liveWatch, onSubmitComments, connected = true, onRefresh, reserveWidth, initialDiffMode, readOnly = false, onDiffModeChange, embedded, active = true, savedBaseline, revealLine, onRevealConsumed, browserRail, railOpen, onRailToggle, scrollMemoryKey }: Props, ref) {
   useLanguageGeneration() // memo() bails out of the provider-level repaint; subscribe directly
   const ime = useImeGuard()
   const qc = useQueryClient()
@@ -1237,23 +1249,25 @@ export default memo(forwardRef<MarkdownPanelHandle, Props>(function MarkdownPane
     // Undecodable bytes have no buffer to edit, and a code file's default IS
     // the editor -- so this has to be refused in the initializer, not in an
     // effect, or the editor paints for a frame before the card replaces it.
+    if (readOnly) return false // the wtdiff diff view is never an editor (#9695)
     if (binary && !BYTE_BACKED_FILE_TYPES.has(detectFileType(filePath))) return false
     if (revealLine && revealTargetsSource) return true
     if (MD_EXTS.has(extOf(filePath))) return false
     return !RICH_FILE_TYPES.includes(detectFileType(filePath))
   })
-  const [diffMode, setDiffMode] = useState(initialDiffMode ?? false)
+  const [diffMode, setDiffMode] = useState(readOnly ? true : (initialDiffMode ?? false))
   const toggleDiffMode = useCallback(() => {
+    if (readOnly) return // locked to diff view
     const next = !diffMode
     setDiffMode(next)
     onDiffModeChange?.(next)
-  }, [diffMode, onDiffModeChange])
+  }, [readOnly, diffMode, onDiffModeChange])
   // Unified vs side-by-side diff rendering — persisted, and shares its key
   // with SidePanel's diff tabs so the preference is app-wide.
   const [diffSplit, setDiffSplit] = useDiffSplit()
   const diffInitFileRef = useRef<string | null>(null)
   const [saving, setSaving] = useState(false)
-  const [dirty, setDirty] = useState(() => savedBaseline != null && content !== savedBaseline)
+  const [dirty, setDirty] = useState(() => !readOnly && savedBaseline != null && content !== savedBaseline)
   // Mirrors `dirty` for callers that must read it AFTER an await, where a value
   // captured in a closure would answer for the moment they started rather than
   // the moment they are about to discard the buffer.
@@ -1271,8 +1285,9 @@ export default memo(forwardRef<MarkdownPanelHandle, Props>(function MarkdownPane
   // No-op for document tabs (savedBaseline undefined) — they keep the manual
   // edit-driven dirty model below.
   useEffect(() => {
+    if (readOnly) { setDirty(false); return } // a read-only diff view is never dirty (#9695)
     if (savedBaseline != null) setDirty(content !== savedBaseline)
-  }, [content, savedBaseline])
+  }, [content, savedBaseline, readOnly])
   const [saveError, setSaveError] = useState<string | null>(null)
   // The outcome of the last row action (add to knowledge, promote, snapshot,
   // save-as-artifact, download, open/reveal) that FAILED. These used to raise a
@@ -1295,9 +1310,15 @@ export default memo(forwardRef<MarkdownPanelHandle, Props>(function MarkdownPane
   const mdPreviewStyle: React.CSSProperties = { maxWidth: 'var(--mc-content-width, 900px)', margin: '0 auto' }
   // Hydrate pending draft comments for this file from localStorage so they
   // survive panel close, refresh, and crash. Submitting clears them.
+  // A read-only panel (the `wtdiff:` tab, #9695) carries NO comment drafts: it
+  // never shows the composer or overlay and must not touch the per-path store,
+  // so the plain `file:` tab is the single owner of a path's comments and two
+  // coexisting panels cannot overwrite each other's drafts. Hydrating `[]` here
+  // (plus skipping the persistence effect below) keeps the read-only panel out
+  // of the store entirely.
   const draftsRef = useRef<ReturnType<typeof loadCommentDrafts>>(null!)
   if (draftsRef.current === null) draftsRef.current = loadCommentDrafts()
-  const [comments, setComments] = useState<InlineComment[]>(() => draftsRef.current[filePath] ?? [])
+  const [comments, setComments] = useState<InlineComment[]>(() => readOnly ? [] : (draftsRef.current[filePath] ?? []))
   // Sync state to the new filePath during render (not in a useEffect) so
   // `comments` and `filePath` never disagree within a single render — otherwise
   // a callback firing in the transition window would persist against the wrong
@@ -1306,7 +1327,7 @@ export default memo(forwardRef<MarkdownPanelHandle, Props>(function MarkdownPane
   const prevFilePathRef = useRef(filePath)
   if (prevFilePathRef.current !== filePath) {
     prevFilePathRef.current = filePath
-    setComments(draftsRef.current[filePath] ?? [])
+    setComments(readOnly ? [] : (draftsRef.current[filePath] ?? []))
   }
   // The anchor of the selection the composer is currently open over, resolved
   // while the DOM selection was still live (focus in the input collapses it).
@@ -1377,12 +1398,12 @@ export default memo(forwardRef<MarkdownPanelHandle, Props>(function MarkdownPane
     if (!showBinaryCard) {
       // Bytes that decoded after all: a code file's default view IS the editor and
       // `canPreview` renders no Edit toggle for it, so a stale false strands the tab.
-      if (wasShowing) setEditing(!isMarkdown && !isRichType)
+      if (wasShowing) setEditing(!readOnly && !isMarkdown && !isRichType)
       return
     }
     setDiffMode(false)
     setEditing(false)
-  }, [showBinaryCard, isMarkdown, isRichType])
+  }, [showBinaryCard, isMarkdown, isRichType, readOnly])
   // ── Preview-mode find (Cmd+F) ─────────────────────────────────────────────
   // Three surfaces compete for Cmd+F: the editor owns it while editing (it stops
   // propagation before anything else sees the key), and ChatPage's chat-find
@@ -1999,6 +2020,14 @@ export default memo(forwardRef<MarkdownPanelHandle, Props>(function MarkdownPane
     : diffUnavailable === 'error'
       ? i18nT('components.markdownPanel.diff_failed_to_compute')
       : null
+  // `not_git` is a benign "no baseline here" state (informational), but `error`
+  // means git itself failed computing the diff — a real failure that must reach
+  // the shared ErrorNotice (and its agent hand-off), not be shown as muted text
+  // like the no-change / no-baseline notices (errors-use-error-notice). Split
+  // the two: the error text renders through ErrorNotice, the not_git text keeps
+  // the lightweight ZeroDiffNotice.
+  const diffErrorText = diffUnavailable === 'error' ? diffUnavailableText : null
+  const diffNoBaselineText = diffUnavailable === 'not_git' ? diffUnavailableText : null
   // Auto-open diff mode once for a genuine edit unless this file tab already
   // carries an explicit choice. File-tab metadata survives ChatPage unmounts,
   // so returning to a session restores preview/source instead of re-enabling
@@ -2278,8 +2307,11 @@ export default memo(forwardRef<MarkdownPanelHandle, Props>(function MarkdownPane
   // place avoids duplicate writes from StrictMode double-invoked updaters and
   // eliminates persistComments from callback dep arrays.
   useEffect(() => {
+    // A read-only panel (wtdiff) owns no drafts, so it never writes to the
+    // per-path store (#9695) — otherwise it would clobber the file tab's.
+    if (readOnly) return
     persistFileComments(draftsRef.current, filePath, comments)
-  }, [comments, filePath])
+  }, [comments, filePath, readOnly])
 
   // ── Inline comment anchor highlights (CSS Custom Highlight API) ─────────
   // The markdown preview is react-markdown-reconciled, so we must NOT inject
@@ -2344,9 +2376,10 @@ export default memo(forwardRef<MarkdownPanelHandle, Props>(function MarkdownPane
   // panel back out of a view the user switched to in between.
   useEffect(() => {
     if (!revealLine || !revealTargetsSource) return
+    if (readOnly) return // the diff view has no editor to reveal into (#9695)
     setEditing(true)
     setDiffMode(false)
-  }, [revealLine, revealTargetsSource])
+  }, [revealLine, revealTargetsSource, readOnly])
 
   useLayoutEffect(() => {
     const HL = 'mc-comment'
@@ -2707,7 +2740,7 @@ export default memo(forwardRef<MarkdownPanelHandle, Props>(function MarkdownPane
   }, [fullscreen])
 
   const editorToolbarButtons = (<>
-    {!isRichType && !showBinaryCard && (
+    {!isRichType && !showBinaryCard && !readOnly && (
       <button className={`p-1.5 rounded-md border cursor-pointer ${diffMode ? 'border-accent text-accent bg-accent-subtle' : 'border-border text-muted hover:text-text hover:border-border-strong'}`} onClick={toggleDiffMode} title={i18nT('components.markdownPanel.toggle_diff_view')} aria-label={i18nT('components.markdownPanel.toggle_diff_view')}><FileDiff size={14} /></button>
     )}
     {!isRichType && editing && (
@@ -2716,8 +2749,11 @@ export default memo(forwardRef<MarkdownPanelHandle, Props>(function MarkdownPane
     {!isRichType && editing && (
       <button className={`p-1.5 rounded-md border cursor-pointer transition-all ${lineNums ? 'border-accent text-accent bg-accent-subtle' : 'border-border text-muted hover:text-text hover:border-border-strong'}`} onClick={() => setLineNums(!lineNums)} title={i18nT('components.markdownPanel.toggle_line_numbers')} aria-label={i18nT('components.markdownPanel.toggle_line_numbers')}><Hash size={14} /></button>
     )}
-    {canPreview && (
+    {canPreview && !readOnly && (
       <button className={`px-2 py-1 rounded-md text-[12px] font-medium border cursor-pointer transition-all ${editing ? 'border-accent text-accent bg-accent-subtle' : 'border-border text-muted hover:text-text hover:border-border-strong'}`} onClick={() => { void guardDraft(() => setEditing(!editing)) }}>{editing ? i18nT('components.markdownPanel.preview') : i18nT('components.markdownPanel.edit')}</button>
+    )}
+    {readOnly && (
+      <span className="px-2 py-1 text-[12px] font-medium text-muted select-none" aria-label={i18nT('components.markdownPanel.read_only')}>{i18nT('components.markdownPanel.read_only')}</span>
     )}
     {!isRichType && editing && (
       <button className={`px-2 py-1 rounded-md text-[12px] font-medium border transition-all disabled:opacity-40 ${dirty ? 'border-accent text-accent-fg bg-accent cursor-pointer hover:bg-accent-hover' : 'border-border text-muted cursor-default'}`} disabled={saving || !dirty} onClick={handleSave}>{saving ? i18nT('components.markdownPanel.saving') : i18nT('components.markdownPanel.save')}</button>
@@ -2774,14 +2810,17 @@ export default memo(forwardRef<MarkdownPanelHandle, Props>(function MarkdownPane
               if (!canK) return null
               return <KnowledgeToggleIconButton state={knowledge} />
             })()}
-            {canPreview && (
+            {canPreview && !readOnly && (
               <button
                 className="px-2.5 h-[26px] rounded-md text-[11.5px] font-medium text-muted hover:text-text hover:bg-bg-hover bg-transparent border-none cursor-pointer transition-colors shrink-0"
                 onClick={() => { void guardDraft(() => setEditing(!editing)) }}
                 aria-pressed={editing}
               >{editing ? i18nT('components.markdownPanel.preview') : i18nT('components.markdownPanel.edit')}</button>
             )}
-            {!isRichType && !showBinaryCard && (
+            {readOnly && (
+              <span className="px-2.5 h-[26px] inline-flex items-center text-[11.5px] font-medium text-muted select-none shrink-0" aria-label={i18nT('components.markdownPanel.read_only')}>{i18nT('components.markdownPanel.read_only')}</span>
+            )}
+            {!isRichType && !showBinaryCard && !readOnly && (
               <button className={barIconBtn(diffMode)} onClick={toggleDiffMode} title={i18nT('components.markdownPanel.toggle_diff_view')} aria-label={i18nT('components.markdownPanel.toggle_diff_view')} aria-pressed={diffMode}><FileDiff size={14} /></button>
             )}
             {onRailToggle && (
@@ -2841,8 +2880,11 @@ export default memo(forwardRef<MarkdownPanelHandle, Props>(function MarkdownPane
               pr-6 keeps the text clear of the ticks. */}
           <div ref={sidePanelScrollRef} onScroll={scrollMemory.onScroll} className={`flex-1 min-h-0 overflow-auto ${isMarkdown && !editing ? 'scrollbar-overlay pr-6' : ''}`}>
             {showBinaryCard && <BinaryFileCard filePath={filePath} />}
-            {!showBinaryCard && zeroDiff && <ZeroDiffNotice onExitDiff={toggleDiffMode} />}
-            {!showBinaryCard && diffUnavailableText && !editing && <ZeroDiffNotice message={diffUnavailableText} onExitDiff={toggleDiffMode} />}
+            {!showBinaryCard && zeroDiff && <ZeroDiffNotice onExitDiff={readOnly ? undefined : toggleDiffMode} />}
+            {!showBinaryCard && diffErrorText && !editing && (
+              <div className="p-3"><ErrorNotice message={diffErrorText} askAgent={!dirty} testId="markdown-panel-diff-compute-error" /></div>
+            )}
+            {!showBinaryCard && diffNoBaselineText && !editing && <ZeroDiffNotice message={diffNoBaselineText} onExitDiff={readOnly ? undefined : toggleDiffMode} />}
             {!showBinaryCard && !zeroDiff && !diffUnavailable && !diffChecking && !isRichType && (
               <DiffViewBlock flush sideBySide={diffSplit} diffMode={diffMode && !editing} fileName={fileName} originalContent={originalContent} content={content} lineNums={lineNums} wordWrap={wordWrap} collapseUnchanged={collapseUnchanged} />
             )}
@@ -2922,8 +2964,11 @@ export default memo(forwardRef<MarkdownPanelHandle, Props>(function MarkdownPane
           {findBar}
           <div ref={fullscreenBodyRef} className="h-full overflow-auto px-16 py-4">
             {showBinaryCard && <BinaryFileCard filePath={filePath} />}
-            {!showBinaryCard && zeroDiff && <ZeroDiffNotice onExitDiff={toggleDiffMode} />}
-            {!showBinaryCard && diffUnavailableText && !editing && <ZeroDiffNotice message={diffUnavailableText} onExitDiff={toggleDiffMode} />}
+            {!showBinaryCard && zeroDiff && <ZeroDiffNotice onExitDiff={readOnly ? undefined : toggleDiffMode} />}
+            {!showBinaryCard && diffErrorText && !editing && (
+              <div className="p-3"><ErrorNotice message={diffErrorText} askAgent={!dirty} testId="markdown-panel-diff-compute-error-fullscreen" /></div>
+            )}
+            {!showBinaryCard && diffNoBaselineText && !editing && <ZeroDiffNotice message={diffNoBaselineText} onExitDiff={readOnly ? undefined : toggleDiffMode} />}
             {!showBinaryCard && !zeroDiff && !diffUnavailable && !isRichType && <DiffViewBlock sideBySide={diffSplit} diffMode={diffMode && !editing} fileName={fileName} originalContent={originalContent} content={content} lineNums={lineNums} wordWrap={wordWrap} collapseUnchanged={collapseUnchanged} />}
             {!showBinaryCard && !zeroDiff && (!diffUnavailable || editing) && (!diffMode || editing) && <ContentRenderer isRichType={isRichType} fileType={fileType} filePath={filePath} content={content} editing={editing} lang={lang} lineNums={lineNums} wordWrap={wordWrap} onChange={handleChange} onSave={handleSave}
               diffBase={diffMode && editing ? (originalContent || null) : undefined} diffSplit={diffSplit} diffExpandUnchanged={!collapseUnchanged}

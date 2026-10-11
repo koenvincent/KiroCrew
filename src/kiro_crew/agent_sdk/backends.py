@@ -156,6 +156,9 @@ with no row here.
        driver-internal everywhere else (whether ``_kiro.dev/commands/execute`` exists)
    * - ``ACP_BACKENDS_NATIVE_TODOS``
      - semantic question (``SessionCapabilities.supports_native_todos``)
+   * - ``ACP_BACKENDS_LOCAL_CLEAR``
+     - pre-session registry query (whether the dashboard answers ``/clear``
+       itself rather than handing it to the harness as prompt text)
    * - ``ACP_BACKENDS_TOOL_SEARCH_OVERLAY``
      - driver-internal (whether the workspace ``cli.json`` Tool Search keys are written)
    * - ``ACP_BACKENDS_CLIENT_META_SETTINGS``
@@ -167,6 +170,9 @@ with no row here.
    * - ``ACP_BACKENDS_UNATTRIBUTED_TERMINAL_ERROR``
      - driver-internal (whether an adapter-authored text chunk that ends a turn
        is the turn's provider failure rather than an answer)
+   * - ``ACP_BACKENDS_PERMISSION_KIND_FROM_TOOL_CALL``
+     - driver-internal (whether a kindless permission frame takes the preceding
+       tool_call's ``kind``; read per frame by the session handle's wire accessor)
    * - ``ACP_BACKENDS_HOOKS_LIST``
      - driver-internal (whether this harness's agent asks its client for the hooks
        matching a trigger and to run one, read by the session dispatch loop that
@@ -602,6 +608,12 @@ GOVERNANCE_FLOOR_BACKEND: str = ACP_BACKEND_KIRO
 _baseline: Set[str] = set(BASELINE_SELECTABLE_BACKENDS)
 _selectable: Set[str] = set(BASELINE_SELECTABLE_BACKENDS)
 
+# Backends THIS HOST cannot serve, keyed to the reason, e.g. KAS on a kiro-cli whose
+# ``acp`` subcommand cannot select the KAS engine. A third input beside the two sets
+# above: it is a fact about the machine, not the build or the policy, so every policy
+# recompute subtracts it again rather than restoring what the host cannot run.
+_host_unservable: dict[str, str] = {}
+
 
 def register_selectable_backend(backend: str) -> None:
     """Make *backend* selectable in ``agent.acp_backend``.
@@ -698,13 +710,33 @@ def apply_selectable_denials(denied: Set[str]) -> FrozenSet[str]:
     the install with no startable harness, a state the dashboard cannot repair
     because the trust-root policy is the one file it may not write.
     """
-    keep = {b for b in _baseline if b not in denied}
+    keep = {b for b in _baseline if b not in denied and b not in _host_unservable}
     if GOVERNANCE_FLOOR_BACKEND in _baseline:
         keep.add(GOVERNANCE_FLOOR_BACKEND)
-    removed = frozenset(_baseline - keep)
+    # Only what *denied* removed: a host mark is reported by whoever placed it, so
+    # a policy recompute never logs the host's removal as its own.
+    removed = frozenset(b for b in _baseline - keep if b in denied)
     _selectable.clear()
     _selectable.update(keep)
     return removed
+
+
+def mark_backend_unservable(backend: str, reason: str) -> None:
+    """Record that this host cannot serve *backend*, and drop it from the selectable set.
+
+    Survives every later :func:`apply_selectable_denials` recompute, so a policy
+    refresh cannot put back a harness the machine cannot start. The floor is never
+    marked: it is what keeps the install startable.
+    """
+    if backend == GOVERNANCE_FLOOR_BACKEND:
+        return
+    _host_unservable[backend] = reason
+    _selectable.discard(backend)
+
+
+def host_unservable_reason(backend: str) -> str | None:
+    """Why this host cannot serve *backend*, or ``None`` when nothing was recorded."""
+    return _host_unservable.get(backend)
 
 
 def selectable_backend_values() -> list[str]:
@@ -748,6 +780,10 @@ def resolve_selected_backend(value: object) -> str:
     selectable = selectable_backends()
     if isinstance(value, str) and value in selectable:
         return value
+    # A host mark was announced once by whoever placed it; repeating it on every
+    # config load would bury that notice under copies of a vaguer one.
+    if isinstance(value, str) and value in _host_unservable:
+        return ACP_BACKEND_KIRO
     if value not in (None, ACP_BACKEND_KIRO):
         logger.warning(
             "Ignoring agent.acp_backend %r (not selectable in this build); using "
@@ -970,19 +1006,38 @@ ACP_BACKENDS_MEMBER_CAPABILITIES = frozenset({ACP_BACKEND_KIRO})
 # pi is excluded on the evidence in ``ACP_BACKENDS_SESSION_MCP_ARRAY``: the array is
 # accepted and never forwarded to the agent, so a member dispatch mounted through it
 # would be inert.
-# deepseek is excluded, and since Crew's gate plugin was composed into it the ground
-# is H6 alone. It has the mount -- it is a member of ``ACP_BACKENDS_SESSION_MCP_ARRAY``
-# -- and its routing (``Routing.VERIFIED_GATE_EXTENSION``, read back from the
-# plugin's load marker before the first prompt) sits inside
-# ``tool_gate.ENFORCED_ROUTINGS``, so both of codex's preconditions now hold where
-# the second once failed. What it lacks is the DECISION for THIS harness: H6 is
-# explicit that supporting one harness establishes nothing about another, and no
-# member-dispatch round trip has been driven on it. A member session on it stays
-# plain chat -- the dispatch tools are not mounted, never mounted-and-refused.
+# deepseek is a member, and it holds the same two things goose does:
+#
+#   * the per-session mount exists, on a RECORDED ROUND TRIP --
+#     ``test/fixtures/acp_frames/deepseek/mcp-stdio-mount-live.jsonl`` carries one
+#     ``session/new`` element shaped as a broker stub, and the named child is asked
+#     ``initialize``, ``tools/list`` and ``tools/call`` with the tool's own result
+#     coming back. The harness reads no agent file of Crew's, so that array is the
+#     ONLY channel any tool set reaches it on;
+#   * the session is GATED -- its routing is ``VERIFIED_GATE_EXTENSION``, one of the
+#     mechanisms in ``tool_gate.ENFORCED_ROUTINGS``. Crew's plugin answers every tool
+#     call, MCP calls included, with ``ask``, and its load marker is READ BACK before
+#     the first prompt, so a session that cannot establish it is REFUSED rather than
+#     run.
+#
+# H6 again: goose's membership establishes nothing here, so both facts are held for
+# THIS harness. The decision is that a member DM thread on deepseek holds the
+# session-control tools.
+#
+# One thing is deepseek's ALONE: it has no mirror. The client's resolver answers a
+# mirror-less backend from ``AcpClient._mirrorless_member_mounts``, so its array is
+# only the member mounts, and the pooled broker stubs ride beside it unchanged.
+# With no mirror there is no per-tool deny channel either, so a narrowed dashboard
+# tool withholds the whole mount and the thread runs as plain chat. ``disabled``
+# binds as it does on every backend. And an element whose command cannot start
+# fails the WHOLE session here (``mcp-stdio-rollback-live.jsonl``), so an entry that
+# does not resolve is never placed (``member_dispatch_session_server`` answers
+# ``None``).
 #
 # WHERE the mount happens differs by backend, and opencode's is the client's.
 # ``AcpClient._append_member_dispatch_server`` serves the backends whose array the
-# CLIENT composes -- claude's and opencode's -- while codex and KAS are served by
+# CLIENT composes -- claude's, opencode's, goose's and deepseek's -- while codex and
+# KAS are served by
 # ``AcpRuntime``: their arrays come from ``AcpRuntime._mirrored_session_mcp`` and
 # ``create_session`` / ``load_session`` append the entry themselves, on a non-empty
 # ``member_session_key``. That key is where membership is read
@@ -1008,6 +1063,7 @@ ACP_BACKENDS_MEMBER_DISPATCH = frozenset(
         ACP_BACKEND_CODEX,
         ACP_BACKEND_OPENCODE,
         ACP_BACKEND_GOOSE,
+        ACP_BACKEND_DEEPSEEK,
     }
 )
 
@@ -1039,11 +1095,14 @@ ACP_BACKENDS_MEMBER_DISPATCH = frozenset(
 #   (claude's ``settings.local.json``), so a verb Crew did not grant is not
 #   silently pre-approved in a file Crew does not write.
 #
-# pi and deepseek are excluded for the reasons the dispatch set states and neither
-# reason is about session control specifically: pi accepts the array and never
-# forwards it, so a mounted panel server would be inert, and deepseek, though its
-# routing (``Routing.VERIFIED_GATE_EXTENSION``) is enforced, has had no member
-# round trip driven on it, so H6 gives no decision for this harness.
+# deepseek is a member on the two preconditions above, held for THIS harness: its
+# array is one this core composes (``AcpClient._mirrorless_member_mounts``), and its
+# routing (``Routing.VERIFIED_GATE_EXTENSION``) is enforced. The decision is that a
+# member session on deepseek gets a panel.
+#
+# pi is excluded for the reason the dispatch set states, and it is not about session
+# control specifically: pi accepts the array and never forwards it, so a mounted
+# panel server would be inert.
 #
 # kiro is excluded and cannot be added by this set alone: a member session's key is
 # what every mount reads, and ``providers/acp.py`` ``_member_session_key`` gates
@@ -1057,6 +1116,7 @@ ACP_BACKENDS_MEMBER_PANEL = frozenset(
         ACP_BACKEND_CODEX,
         ACP_BACKEND_OPENCODE,
         ACP_BACKEND_GOOSE,
+        ACP_BACKEND_DEEPSEEK,
     }
 )
 
@@ -1192,12 +1252,24 @@ ACP_BACKENDS_STEERING_REQUEST = frozenset({ACP_BACKEND_CODEX})
 # logs a WARNING naming the memberships it lacks, instead of being told its harness
 # manages compaction itself on no evidence at all.
 #
-# kas and deepseek are the other two non-members, and none of the four is the same
-# case.
-# :data:`ACP_BACKENDS_HARNESS_MANAGED_COMPACTION` carries the difference and the
-# consequence: KAS compacts on its own initiative AND says so on the wire, so
-# declining its ``/compact`` costs nothing, while deepseek says nothing at all, so a
-# decline leaves its context unbounded.
+# kas is a member on a LIVE drive against kiro-cli 2.29.0's relay (``--agent-engine
+# v3``), and it is the one member that is not handed the ``/compact`` prompt. Sent
+# as prompt text, ``/compact`` makes the model WRITE a summary as its answer and
+# the meter does not move (5.57% -> 5.61%). What compacts is the engine's own
+# verb, ``_kiro/session/compact``, advertised in ``initialize``'s
+# ``_meta.kiro.extensionMethods``: driven after three large turns, it answered
+# ``{"success": true}`` after 13.8s, sent ``summarization_completed`` before
+# the answer, and the next ordinary turn read 5.64% where the last one read
+# 18.21%, with the model still naming the three words it was told to keep. The
+# same verb answers ``{"success": false}`` while a turn is running. So
+# ``AcpSessionHandle.prompt`` sends the verb for a KAS ``/compact``, and the
+# outcome arrives as a compaction status inside that turn. KAS stays in
+# :data:`ACP_BACKENDS_HARNESS_MANAGED_COMPACTION` too: membership here opens the
+# MANUAL command, and the threshold still leaves KAS to its own summarization.
+#
+# deepseek is the other non-member, and it is not the same case as pi:
+# :data:`ACP_BACKENDS_CONTEXT_RECYCLE` carries the consequence, because deepseek
+# reports no compaction at all, so a decline leaves its context unbounded.
 ACP_BACKENDS_COMPACT = frozenset(
     {
         ACP_BACKEND_KIRO,
@@ -1205,6 +1277,7 @@ ACP_BACKENDS_COMPACT = frozenset(
         ACP_BACKEND_CODEX,
         ACP_BACKEND_OPENCODE,
         ACP_BACKEND_GOOSE,
+        ACP_BACKEND_KAS,
     }
 )
 
@@ -1213,7 +1286,10 @@ ACP_BACKENDS_COMPACT = frozenset(
 #
 # This is the set that makes a decline HONEST. A backend outside
 # :data:`ACP_BACKENDS_COMPACT` cannot be handed a ``/compact`` prompt, and the
-# question that remains is what happens instead. A member answers it: KAS runs
+# question that remains is what happens instead. A member of this set is also
+# left alone at ``session.autocompact_pct`` when it IS in that set, which is
+# KAS's case: its manual ``/compact`` is served, and its threshold is its own.
+# A member answers the question: KAS runs
 # auto-summarization and emits ``summarization_started`` /
 # ``summarization_completed``, which ``acp.kas_wire`` maps to a compaction status and
 # which calls ``reset_after_compaction()`` on the meter
@@ -1295,7 +1371,9 @@ ACP_BACKENDS_CONTEXT_RECYCLE = frozenset({ACP_BACKEND_DEEPSEEK})
 # non-member it is done leaves the user's ``/compact`` silently unacknowledged.
 #
 # A STRICT SUBSET of ``ACP_BACKENDS_COMPACT``, which answers the earlier question
-# "is a manual /compact offered at all". kas and deepseek are in neither. kiro-cli
+# "is a manual /compact offered at all". deepseek is in neither. kas is in that
+# set and not this one: its compaction is a separate request, not a prompt, and
+# its outcome is a compaction status the turn carries. kiro-cli
 # is in ``ACP_BACKENDS_COMPACT`` but not here: it ACKs the prompt and then emits
 # ``_kiro.dev/compaction/status``, which is exactly the asynchronous result this
 # set says a non-member has. codex-acp IS a member, and its evidence is the same
@@ -1479,26 +1557,27 @@ ACP_BACKENDS_ACP_CLIENT_SPAWNABLE = frozenset(
 # because none of them reads ``~/.kiro/agents`` at all.
 ACP_BACKENDS_MARKDOWN_AGENT_SPECS = frozenset({ACP_BACKEND_KAS})
 
-# Backends whose agent spec comes from the USER-LEVEL directory alone, so a
-# checkout's same-named spec is not the agent their session is running.
+# Backends whose agent's MCP SERVERS come from the USER-LEVEL spec alone, so a
+# checkout's same-named spec never puts a server of its own in their session.
 #
-# Every other host resolves the nearer layer too: kiro-cli reads
+# Every other host takes the nearer layer's servers too: kiro-cli reads
 # ``<project>/.kiro/agents/`` itself for ``--agent``, and a MIRRORED host receives
 # the array ``acp/session_mcp.py`` translates, which is project-nearest-first. KAS
-# is the exception -- ``acp/kas_agents.load_agent_spec`` is handed
-# ``paths.kiro_agents_dir()`` and reads nothing else, which
-# ``agent_discovery.project_agent_files`` already states, so a project-only agent
-# selected on a KAS session is refused at session start rather than projected.
+# resolves the agent nearest-first as well (``acp.harness.kas.resolve_projected_spec``),
+# but a checkout's spec there never supplies a server: a project-only agent gets
+# its prompt and visible tools and no servers, and a name the user level declares
+# keeps the user-level spec, because a server is a command and a cloned repository
+# is untrusted input.
 #
 # What membership decides is the SCOPE of the broker-overlay lookup
 # (``mcp_gateway.session_servers``). That overlay is keyed by agent name and is
 # also written from the user-level directory, so for every OTHER host a
 # checkout-declared name means the overlay holds no stubs for this session. For a
-# member the reverse holds: the user-level agent IS the one running, so scoping
+# member the reverse holds: the user-level servers ARE the ones running, so scoping
 # its lookup would suppress the stubs for servers the session really has and run
 # them outside the pool, outside caller-identity attribution and outside broker
 # governance. Read through the runtime's own scope helper, never as "is KAS": a
-# host added later that reads the user level alone joins here.
+# host added later whose servers come from the user level alone joins here.
 ACP_BACKENDS_USER_LEVEL_AGENT_SPECS_ONLY = frozenset({ACP_BACKEND_KAS})
 
 
@@ -1540,7 +1619,7 @@ def overlay_project_scope(backend: str, work_dir: Any) -> dict[str, Any]:
 
     :data:`ACP_BACKENDS_MARKDOWN_AGENT_SPECS` -- a host reading the markdown form
     from a checkout itself -- is deliberately NOT OR-ed in: its only member also
-    reads the user level alone and leaves above, so the term would have no caller
+    takes its servers from the user level alone and leaves above, so the term would have no caller
     able to reach it. ``test_agent_sdk_capabilities`` pins that containment, so a
     host which breaks it fails there naming this function.
 
@@ -1730,8 +1809,23 @@ def model_refusal_phrase(backend: str) -> str:
 # effort one offering off, low, high and max. It advertises that option under its own
 # id, ``reasoning_effort``, which ``EFFORT_CONFIG_OPTION_IDS`` below records --
 # membership says the channel exists, the table says what to call it.
+#
+# kas IS a member, under its own id ``effortLevel`` (category ``thought_level``).
+# KAS serves that select once the session has a concrete model -- it is absent on
+# ``auto`` and appears in the ``session/set_config_option model=...`` result -- and
+# offers the model's own levels (low through max on the Claude 5.x family). It
+# reads none of the cli.json ``chat.modelDefaults`` overlay the kiro family spawns
+# with, so without this channel a KAS session always ran at the model's built-in
+# default. A value KAS does not offer is answered with success and left unchanged
+# (probed against kiro-cli 2.28.0), so the step-down ladder never fires on it.
 ACP_BACKENDS_EFFORT_VIA_CONFIG_OPTION = frozenset(
-    {ACP_BACKEND_CLAUDE, ACP_BACKEND_CODEX, ACP_BACKEND_DEEPSEEK, ACP_BACKEND_PI}
+    {
+        ACP_BACKEND_CLAUDE,
+        ACP_BACKEND_CODEX,
+        ACP_BACKEND_DEEPSEEK,
+        ACP_BACKEND_KAS,
+        ACP_BACKEND_PI,
+    }
 )
 
 # Backends whose ADVERTISED model ids are ``<model>[<effort>]`` pairs that the
@@ -1748,8 +1842,8 @@ ACP_BACKENDS_MODEL_EFFORT_PAIR_IDS = frozenset({ACP_BACKEND_CODEX})
 
 # The ``configId`` each backend spells its reasoning-effort option with. One home
 # for a fact that is per-harness vocabulary, not a constant: claude-agent-acp
-# advertises ``effort``, codex-acp advertises ``reasoning_effort`` and pi-acp
-# advertises ``thought_level``, and a session that writes another one's spelling is
+# advertises ``effort``, codex-acp advertises ``reasoning_effort``, KAS advertises
+# ``effortLevel`` and pi-acp advertises ``thought_level``, and a session that writes another one's spelling is
 # answered with "unknown config option" and silently keeps whatever effort it
 # already had.
 #
@@ -1764,6 +1858,7 @@ ACP_BACKENDS_MODEL_EFFORT_PAIR_IDS = frozenset({ACP_BACKEND_CODEX})
 EFFORT_CONFIG_OPTION_IDS: Mapping[str, str] = {
     ACP_BACKEND_CODEX: "reasoning_effort",
     ACP_BACKEND_DEEPSEEK: "reasoning_effort",
+    ACP_BACKEND_KAS: "effortLevel",
     ACP_BACKEND_PI: "thought_level",
 }
 
@@ -1792,14 +1887,18 @@ DEFAULT_EFFORT_CONFIG_OPTION_ID = "effort"
 # no name heuristic carries, while the ``thought_level`` select sits on the same
 # ``session/new`` result for all of them.
 #
-# deepseek is NOT a member, though its model ids are equally foreign to the
-# registry and it advertises its own ``reasoning_effort`` select. Membership here
-# would light a write path whose vocabulary gap is unmeasured: deepseek advertises
-# off, low, high and max, so Crew's ``medium`` and ``xhigh`` land on nothing it
-# offers, and ``EFFORT_CONFIG_OPTION_VALUES`` carries no deepseek row to fold them
-# onto. A member whose stored level is silently dropped at its own cold start is
-# the defect this set exists to remove, so deepseek waits for its own fold rows
-# and its own round-trip coverage rather than riding in on pi's.
+# deepseek is a member for the same reason: its model ids are equally foreign to
+# the registry, and its own ``reasoning_effort`` select sits on every
+# ``session/new`` result. Its vocabulary omits two of Crew's levels -- it offers
+# off, low, high and max, so ``medium`` and ``xhigh`` have no counterpart -- and
+# those two are HIDDEN rather than folded: the dropdown is filled from what the
+# session advertised, so it never offers them, the dashboard refuses either one
+# before it reaches the session (``AcpProvider.accepts_effort_level``), and the
+# push's step-down skips any rung the session did not advertise. Folding them
+# onto a neighbour would apply a level the user did not pick while the UI reports
+# the one they did; offering them unmapped would write a value the harness never
+# advertised. The levels it does share with Crew are spelled identically, so
+# ``EFFORT_CONFIG_OPTION_VALUES`` carries no deepseek row.
 #
 # The kiro family and claude are NOT members, and that is the split this set
 # exists for: there the level rides the MODEL. kiro-cli refuses effort with
@@ -1807,7 +1906,7 @@ DEFAULT_EFFORT_CONFIG_OPTION_ID = "effort"
 # claude-agent-acp rebuilds its effort options per model from
 # ``supportedEffortLevels`` -- so the registry, which knows which model families
 # take a level, is the right authority for them.
-ACP_BACKENDS_EFFORT_FROM_ADVERTISED_OPTION = frozenset({ACP_BACKEND_PI})
+ACP_BACKENDS_EFFORT_FROM_ADVERTISED_OPTION = frozenset({ACP_BACKEND_DEEPSEEK, ACP_BACKEND_PI})
 
 
 def effort_config_option_id(backend: str) -> str:
@@ -2068,6 +2167,42 @@ ACP_BACKENDS_KIRO_SLASH_COMMANDS = frozenset({ACP_BACKEND_KIRO, ACP_BACKEND_KAS}
 # it may interpret as an ordinary user request.
 ACP_BACKENDS_NATIVE_TODOS = frozenset({ACP_BACKEND_CLAUDE})
 
+# Backends where the dashboard answers ``/clear`` itself, by dropping the
+# conversation the way ``reset_conversation`` does, instead of sending it on.
+#
+# A non-kiro harness has no ``_kiro.dev/commands/execute``, so ``stream_command``
+# hands it ``/clear`` through ``session/prompt``. A member is a harness whose own
+# prompt handler has no ``clear`` command: the text reaches the model as a user
+# message, the model may answer "Context cleared", and the context stays.
+#
+# - kas: driven live, context usage read 8.42% -> 8.44% across ``/clear``.
+# - codex: codex-acp's ``tryHandleCommand`` knows plan, mcp, skills, status,
+#   review, review-branch, review-commit, compact, goal, rename, logout; any other
+#   name returns ``handled: false`` and the prompt goes to the model. The 1.11.0
+#   capture's ``available_commands_update`` lists no ``clear``.
+# - opencode: its ACP prompt step special-cases only ``compact``; any other slash
+#   name resolves against the configured command catalog (``init``, ``review``,
+#   ``customize-opencode`` on the 1.18.30 capture) or is sent as text.
+# - pi: pi-acp's built-ins are compact, autocompact, export, session, name,
+#   steering, follow-up, changelog; anything else goes to ``session.prompt``.
+# - deepseek: the ``dsh-acp`` bridge admits every prompt block as a user message
+#   with no slash parsing at all.
+#
+# goose is NOT a member: its prompt handler runs ``/clear`` itself
+# (``CompactionOperation.run_command`` returns an empty conversation), so it keeps
+# the prompt path. kiro is not a member: it runs ``/clear`` natively over
+# ``_kiro.dev/commands/execute``. claude is not a member: its harness owns its own
+# command set. A harness added later stays out until its ``/clear`` is checked.
+ACP_BACKENDS_LOCAL_CLEAR = frozenset(
+    {
+        ACP_BACKEND_KAS,
+        ACP_BACKEND_CODEX,
+        ACP_BACKEND_OPENCODE,
+        ACP_BACKEND_PI,
+        ACP_BACKEND_DEEPSEEK,
+    }
+)
+
 # Backends on which an agent spec's ``"tools": []`` is honoured as a total ban --
 # no MCP server AND no harness-native tool (Bash, file edit, ...) is callable --
 # rather than merely an MCP-server allowlist that leaves native tools reachable.
@@ -2164,6 +2299,21 @@ ACP_BACKENDS_MCP_CONFIG_HOT_RELOAD = frozenset({ACP_BACKEND_KIRO})
 # unavailable there. A harness joins by demonstrating that every tool call it
 # serves reaches ``session/request_permission`` under the derived spec.
 #
+# KAS is a member on measurement. It takes the derived spec over the wire
+# (``acp.kas_agents`` projects ``<agent>--readonly`` into ``customAgents``), and
+# the derivation empties its ``permissions`` block with the other grants, so the
+# projected agent carries no allow rule. Captured on kiro-cli 2.29.0
+# (``--agent-engine v3``): ``read_file``, ``run_command``, ``grep_search`` and
+# ``fs_write`` each raised ``session/request_permission`` under it, and a rejected
+# write left no file. An ``allow_always`` answer does not outlive its session: on
+# one process, after a normal session's ``run_command`` and ``fs_write`` were
+# answered ``allow_always``, the same calls from a ``--readonly`` side session, from
+# a second normal session, and from a fresh process each asked again. What the
+# READ_ONLY gate can then PROVE on KAS is narrower
+# than on kiro-cli: a shell command is judged from the ``_meta.kiro.command`` the
+# engine states, so a read-only one is approved, while ``read_file`` and
+# ``grep_search`` frames carry no ``_meta.kiro.toolName`` and stay refused.
+#
 # opencode is NOT a member. Its tool calls do reach ``session/request_permission``
 # (captured live), but that is by way of its own ``permission`` setting, not the
 # derived ``<agent>--readonly`` spec this allowance is built on -- the harness reads
@@ -2180,7 +2330,7 @@ ACP_BACKENDS_MCP_CONFIG_HOT_RELOAD = frozenset({ACP_BACKEND_KIRO})
 # see: that posture is enforced by the harness's own sandbox, which denies rather
 # than asks, so no call reaches the host gate and no SEL row is written. A side turn
 # on it runs ``REJECT_ALL``.
-ACP_BACKENDS_SIDE_READONLY = frozenset({ACP_BACKEND_KIRO})
+ACP_BACKENDS_SIDE_READONLY = frozenset({ACP_BACKEND_KIRO, ACP_BACKEND_KAS})
 
 # Backends whose process answers ``session/new``, ``session/load`` and
 # ``session/set_mode`` one at a time, so a session start sent while one of those is
@@ -2251,6 +2401,34 @@ ACP_BACKENDS_STRUCTURED_REFUSAL = frozenset({ACP_BACKEND_KIRO, ACP_BACKEND_KAS})
 # opencode, goose, pi and deepseek are not members: none of them was read writing a
 # provider failure as message text.
 ACP_BACKENDS_UNATTRIBUTED_TERMINAL_ERROR = frozenset({ACP_BACKEND_CODEX})
+
+# Backends whose ``session/request_permission`` names no ``kind`` and whose
+# tool_call ``kind`` is SAFE to carry onto the permission event in its place,
+# so the gate's write-plane routing for ``edit``/``delete`` sees the
+# classification the harness gave the call. Only the write-plane kinds are
+# carried (``_dispatch.build_permission_event`` withholds every other cached
+# kind), so membership decides whether a member's edits and deletes are
+# routed by kind at all; the read-only proof is never fed a carried kind.
+# KAS is the member: its permission ``toolCall`` is id, status and title only
+# (``test/fixtures/acp_frames/kas/session.jsonl``), and it is the harness that
+# has ``delete_file``. The kind it stamps on every built-in is recorded in
+# ``test/fixtures/kas_builtin_tool_ids.json`` (``tool_call_kind``, from the
+# engine's ``mapActionTypeToToolKind``): ``search`` on ``grep_search``,
+# ``file_search`` AND ``list_directory``, ``other`` on ``code``/``tool_search``,
+# ``read``/``edit``/``delete``/``execute``/``fetch`` on the rest -- which is
+# why the carry is confined to the write plane rather than "every kind KAS
+# stamps is one the gate reads".
+# kiro-cli is NOT a member although its permission frames omit ``kind`` as
+# well (``test/fixtures/acp_frames/kiro/session.jsonl``): its gates already
+# route edits by the diff content block and it has no delete tool, and a
+# carried ``edit`` would change what its kindless governance classification
+# sees (the additive read pairs), so it needs nothing carried (H13).
+# claude-agent-acp, codex-acp and the rest are not members: unmeasured, and a
+# wrong kind on a permission event can only narrow or veto.
+# Membership decides whether ``AcpSessionHandle`` hands its ``tool_kind_cache``
+# (allocated for every backend) to ``_dispatch.build_permission_event``; a
+# non-member's parser receives none and the frame's own ``kind`` stands.
+ACP_BACKENDS_PERMISSION_KIND_FROM_TOOL_CALL: FrozenSet[str] = frozenset({ACP_BACKEND_KAS})
 
 # Backends whose child may ask THIS host for an access token over the
 # ``_kiro/auth/getAccessToken`` connection-level request, to be answered from Kiro

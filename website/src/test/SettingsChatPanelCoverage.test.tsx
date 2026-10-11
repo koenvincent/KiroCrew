@@ -373,6 +373,7 @@ describe('ChatPanel — Messages', () => {
     ['Double-click to edit your messages', 'doubleClickToEdit', true],
     ['Pin the latest turn', 'pinLastPrompt', false],
     ['Simplified Tool Call Names', 'simplifiedToolNames', false],
+    ['Tool calls start expanded', 'toolCallsStartExpanded', true],
     ['Show Context Percentage', 'showContextPct', true],
   ])('stores %s locally when flipped', async (label, key, expected) => {
     wrap()
@@ -426,6 +427,18 @@ describe('ChatPanel — Messages', () => {
     await waitFor(() =>
       expect(updateDashboardConfigMock).toHaveBeenCalledWith({
         folder_suggestions_enabled: false,
+      })
+    )
+  })
+
+  it('shows topic tags off by default and persists turning them on', async () => {
+    wrap('sessions')
+    const sw = await settledSwitch('Topic tags')
+    expect(sw).toHaveAttribute('aria-checked', 'false')
+    fireEvent.click(sw)
+    await waitFor(() =>
+      expect(updateDashboardConfigMock).toHaveBeenCalledWith({
+        topic_tags_enabled: true,
       })
     )
   })

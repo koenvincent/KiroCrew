@@ -19,7 +19,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from conftest import make_dir_link, requires_symlinks
-from kiro_crew import cli_doctor, cron, extras
+from kiro_crew import cli_doctor, cron, extras, kiro_cli
 from kiro_crew.agent_sdk.backends import ACP_BACKEND_PI
 
 
@@ -1829,7 +1829,7 @@ class TestDoctorKas:
         cli_doctor._doctor_kas(issues)
         out = capsys.readouterr().out
         assert "does not offer engine v3" in out
-        assert any("does not support the KAS engine" in i for i in issues)
+        assert any("does not offer engine v3" in i for i in issues)
 
     def test_help_without_the_flag_is_a_failure_not_unknown(self, monkeypatch, capsys) -> None:
         """A kiro-cli predating engine selection must FAIL the check.
@@ -1850,7 +1850,20 @@ class TestDoctorKas:
         out = capsys.readouterr().out
         assert "no --agent-engine flag" in out
         assert "engine support unknown" not in out
-        assert any("too old to select the KAS engine" in i for i in issues)
+        assert any("no --agent-engine flag" in i for i in issues)
+
+    def test_engine_verdict_comes_from_the_shared_classifier(self, monkeypatch, capsys) -> None:
+        """The doctor and the boot floor read ``acp --help`` through ONE function."""
+        self._patch_cfg(monkeypatch, "kas")
+        monkeypatch.setattr(cli_doctor, "resolve_kiro_cli", lambda: "/x/kiro-cli")
+        self._patch_vault(monkeypatch)
+        monkeypatch.setattr(cli_doctor, "_kas_relay_help", lambda _binary: "any help")
+        monkeypatch.setattr(cli_doctor, "kas_engine_gap", lambda _text: "a stubbed gap")
+        issues: list[str] = []
+        cli_doctor._doctor_kas(issues)
+        out = capsys.readouterr().out
+        assert "engine:      ❌ a stubbed gap" in out
+        assert any("a stubbed gap" in i for i in issues)
 
     def test_unreadable_help_is_reported_unknown_not_failed(self, monkeypatch, capsys) -> None:
         """Only a FAILED probe is unknown; a diagnostic must not invent a verdict.
@@ -1880,7 +1893,7 @@ class TestDoctorKas:
             stdout = "Usage: kiro-cli acp [OPTIONS]"
             stderr = ""
 
-        monkeypatch.setattr(cli_doctor.subprocess, "run", lambda *a, **k: _Proc())
+        monkeypatch.setattr(kiro_cli.subprocess, "run", lambda *a, **k: _Proc())
         got = cli_doctor._kas_relay_help("/x/kiro-cli")
         assert got is not None
         assert "--agent-engine" not in got
@@ -1889,7 +1902,7 @@ class TestDoctorKas:
         def _boom(*_a, **_k):
             raise OSError("no such binary")
 
-        monkeypatch.setattr(cli_doctor.subprocess, "run", _boom)
+        monkeypatch.setattr(kiro_cli.subprocess, "run", _boom)
         assert cli_doctor._kas_relay_help("/x/kiro-cli") is None
 
     def test_no_credential_probe_is_performed(self, monkeypatch, capsys) -> None:
@@ -2018,6 +2031,88 @@ class TestTheKasBlockReportsAWithheldPermissionsField:
         cli_doctor._doctor_kas(issues)
         assert "auto-approve:" not in capsys.readouterr().out
         assert issues == []
+
+
+class TestTheKasBlockReportsToolVocabularyDrift:
+    """The KAS tool-name tables (``platform.tool_names``) were measured on one
+    kiro-cli release. A newer engine may rename or add a built-in; the policy
+    direction fails permissive on an unknown id, so the doctor's KAS block says
+    when the installed engine is newer than the measurement. Advisory only."""
+
+    def _run(self, monkeypatch, capsys, version) -> tuple[str, list[str]]:
+        monkeypatch.setattr(
+            cli_doctor.KiroCrewConfig,
+            "load",
+            classmethod(
+                lambda cls: type("C", (), {"agent": type("A", (), {"acp_backend": "kas"})()})()
+            ),
+        )
+        monkeypatch.setattr(cli_doctor, "resolve_kiro_cli", lambda: "/x/kiro-cli")
+        monkeypatch.setattr(
+            cli_doctor,
+            "_kas_relay_help",
+            lambda _binary: f"--agent-engine <ENGINE>  {cli_doctor.KAS_RELAY_ENGINE}",
+        )
+        monkeypatch.setattr("kiro_crew.auth.bridge.vault_holds_identity", lambda: False)
+        monkeypatch.setattr("kiro_crew.auth.bridge.describe_vault_identity", lambda: None)
+        monkeypatch.setattr(cli_doctor, "installed_kiro_cli_version", lambda: version)
+        issues: list[str] = []
+        cli_doctor._doctor_kas(issues)
+        return capsys.readouterr().out, issues
+
+    def test_the_measured_version_is_reported_as_matching(self, monkeypatch, capsys) -> None:
+        from kiro_crew.platform.tool_names import KAS_TOOL_IDS_VERIFIED_ON_KIRO_CLI
+
+        out, _ = self._run(monkeypatch, capsys, KAS_TOOL_IDS_VERIFIED_ON_KIRO_CLI[0])
+        assert "tool names:  ✅" in out
+
+    def test_every_verified_release_is_quiet_not_a_drift_warning(self, monkeypatch, capsys) -> None:
+        """The pin is a LIST, not one exact release: a routine kiro-cli release the
+        tables were re-measured on (2.24.1 here, the release the write-plane path
+        shapes were measured on) is ✅, so the row does not cry drift on every
+        release until someone notices and erode the one guard on fail-permissive
+        drift."""
+        from kiro_crew.platform.tool_names import KAS_TOOL_IDS_VERIFIED_ON_KIRO_CLI
+
+        assert len(KAS_TOOL_IDS_VERIFIED_ON_KIRO_CLI) >= 2
+        for verified in KAS_TOOL_IDS_VERIFIED_ON_KIRO_CLI:
+            out, issues = self._run(monkeypatch, capsys, verified)
+            assert "tool names:  ✅" in out, verified
+            assert "⚠️" not in out.split("tool names:")[1].splitlines()[0]
+            assert ".".join(str(p) for p in verified) in out
+
+    def test_an_older_engine_is_unverified_not_compatible(self, monkeypatch, capsys) -> None:
+        """The tables were read from ONE release; an older KAS may lack an id or
+        spell it differently, so ``<=`` marking it ✅ attested what nothing measured."""
+        from kiro_crew.platform.tool_names import KAS_TOOL_IDS_VERIFIED_ON_KIRO_CLI
+
+        major, minor, patch = KAS_TOOL_IDS_VERIFIED_ON_KIRO_CLI[0]
+        out, issues = self._run(monkeypatch, capsys, (major, minor - 1, patch))
+        assert "tool names:  ⚠️" in out
+        assert "tool names:  ✅" not in out
+        assert "older than" in out
+        assert f"{major}.{minor - 1}.{patch}" in out
+        assert not any("tool" in i and "vocabul" in i for i in issues)
+
+    def test_a_newer_engine_warns_and_names_both_versions_and_the_fixture(
+        self, monkeypatch, capsys
+    ) -> None:
+        from kiro_crew.platform.tool_names import KAS_TOOL_IDS_VERIFIED_ON_KIRO_CLI
+
+        major, minor, patch = KAS_TOOL_IDS_VERIFIED_ON_KIRO_CLI[-1]
+        out, issues = self._run(monkeypatch, capsys, (major, minor + 1, patch))
+        assert "tool names:  ⚠️" in out
+        assert f"{major}.{minor + 1}.{patch}" in out
+        assert f"{major}.{minor}.{patch}" in out
+        assert "kas_builtin_tool_ids.json" in out
+        assert "verified_kiro_cli_versions" in out
+        # Advisory: not known to have drifted, only not known not to have.
+        assert not any("tool" in i and "vocabul" in i for i in issues)
+
+    def test_an_unknown_version_is_its_own_row(self, monkeypatch, capsys) -> None:
+        out, _ = self._run(monkeypatch, capsys, None)
+        assert "tool names:  ➖" in out
+        assert "installed version unknown" in out
 
 
 class TestPathLauncherOwnership:

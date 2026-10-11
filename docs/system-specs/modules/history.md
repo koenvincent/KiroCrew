@@ -182,6 +182,13 @@ intent whose scroll event has not dispatched yet — an UPWARD input, or a point
 that grabbed the scrollbar (`scrollIntentPending`): the automatic pin is held
 until that scroll event decides, and retried once when the intent expires
 without one (a click on the thumb, a wheel-up on an unscrollable transcript). A
+scroll event that lands inside `SELF_SCROLL_EPSILON` of follow's own write does
+not decide it: it is either the pin landing or the first frame of the engine's
+answer to a wheel notch or a slow touchpad step, and it cannot say which, so the
+hold outlives it until a frame outside the epsilon lands (and releases follow) or
+the intent expires. Retiring the hold on that frame is how a row appended inside
+it pinned a reader who had just started to leave, cancelling their notch with it
+([#18421](https://github.com/kirodotdev/KiroCrew/issues/18421)). A
 reader whose scroll took them off that write has left: follow releases, an idle
 append leaves them where
 they are, and only their return to the bottom, the jump pill, or sending a message
@@ -224,11 +231,51 @@ older-page request with it; it reads the page before `slotOldestIndex` and lands
 it only while the slot it was read for is still active. None of these owners filters rows by memory
 mode, so a restricted transcript is cached and paged like any other.
 
+### Card rows: change cards and guide offers
+
+A change card (`propose_change`) or a guide offer (`guide_start`) is part of the
+conversation, so it is a transcript row: `dashboard/chat_cards.py` appends ONE
+`card` row to the proposing slot when the agent-half propose/start route accepts
+it. The proposal is an MCP tool call of the running turn, so the row lands after
+that call's `tool` row and before the turn's later text, and the turn-end refresh
+keeps it there. The live frame is placed the same way client-side (ahead of the
+open streaming row, like a tool row), and the "tools finished" scan that runs when
+text resumes reads past it like a tool row.
+
+The row's `meta.card` is a reference and nothing more: `surface` (`change` /
+`guide`), the store `id`, the `slot`, `kind`, a redacted `title`, and the LAST
+status the gateway recorded (`summary` on a finished change card; `actions` ids on
+a guide). It never carries a parameter, an edited field or a typed value. When the
+card or guide store publishes a new status for it, the row is patched in place by
+`mid` and a `chat_message_update` frame carries the patch, so a finished card is
+still drawn in its final state after the store prunes it. The same step writes the
+`card/*` / `guide/*` crew-log entries ([crew-log-core](crew-log-core.md) section 5,
+"Cards and guides").
+
+`card` is in `history_projection.DISPLAY_ONLY_ROLES`: no model-bound reader
+(provenance citations, consolidation, skill detection) carries it, and the other
+model-bound readers already filter to conversation roles. The agent hears an outcome
+only through the change-card results it already receives.
+
+The dashboard draws the row through `cards/ConversationCard` (registered in
+`pages/chat/transcriptRenderers`, so the single-chat page and every `ChatPane` share
+it; the store-free SDK registry leaves the role undrawn). The LIVE card comes from
+the card store's own read (`GET /api/cards/pending`, `card_update`) and the live
+offer from the guide store's (`GuideContext`), and a row is only ever matched to a
+card or guide of the slot drawing it: the transcript is agent-writable, so a row is
+a placement, never an authority. A card the store no longer holds draws its recorded
+status as a one-line result with no actions; an unfinished record the store has
+forgotten reads as expired, once the store's first read has answered. A read that
+FAILED is not an answer: the row shows the failure through `ErrorNotice` (no agent
+hand-off, since the row sits beside the composer's unsent draft) and draws a
+finished record's line beside it, but never calls an unfinished one expired. A collapsed
+turn never folds a `card` row into its steps.
+
 ### The Sessions sidebar (frontend)
 
 The dashboard's session list, `website/src/pages/ChatSidebar.tsx`, draws two
 projections of this history. The live list shows the open slots. With the
-instance-sessions preview on and a crew group to show, it groups them per machine:
+Chat on a crew preview on and a crew group to show, it groups them per machine:
 `Local` first, then one collapsible group per crew holding that crew's peer rows and
 the local slots whose turns run there, under a badge read from the tunnel state. A
 disconnected crew keeps its last listed rows, dimmed and without live state, until a
@@ -692,7 +739,11 @@ reads they share); the reasoning-effort allowlist; the persisted-entry memo
 `_build_message_entry` with its bounds; the private member-store assignment; and
 the request-side retired-mode coercion (`_coerce_requested_mode`). The rules those
 consult live in `dashboard/slot_persistence/`, and each file names the work that
-belongs in it:
+belongs in it. Both open-tab restore drivers build tabs newest first and stop
+building ordinary ones at `slot_retention.RESTORE_SLOT_BUDGET`; pinned,
+foldered, loop-driven and crew-bound tabs are always built, and one notification reports
+the tabs left in history (see the `slot_retention.py` entry in
+learn-cron-dashboard):
 
 - `write_guards.py` -- the paired window/queue snapshot, the routing snapshot, the
   note-row filter, the line a full save folds, the delete witness with the

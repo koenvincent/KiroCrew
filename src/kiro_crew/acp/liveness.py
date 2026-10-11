@@ -39,10 +39,11 @@ macOS, no new dependencies):
 - **MCP ``wait`` tool**: declared-duration contract — WORKING until the parsed
   ``seconds`` (+ slack) elapse, then UNKNOWN.
 - **Other MCP tools**: sample the descendant tree's CPU/IO movement across
-  successive checks; moving -> WORKING, flat -> UNKNOWN. A flat tree in which a
-  tool-side process holds an established TCP connection carries the
-  :data:`EVIDENCE_REMOTE_FLAT` tag (a tool blocked on its own remote call), read
-  from ``/proc`` on Linux and from libproc's socket fd info on macOS.
+  successive checks; moving -> WORKING, flat -> UNKNOWN. A flat tree in which
+  the in-flight tool's OWN MCP server (or a process below it) holds an
+  established TCP connection carries the :data:`EVIDENCE_REMOTE_FLAT` tag (a
+  tool blocked on its own remote call), read from ``/proc`` on Linux and from
+  libproc's socket fd info on macOS.
 - **Model-wait (no tool in flight)**: sample the tree's IO/CPU counters across
   checks (token/keepalive receipt moves them) and its established TCP sockets.
   Flat counters with NO established backend socket is the done-but-lost-frame
@@ -59,14 +60,14 @@ cmdline the SAME matching rules run against, and ``PROC_PIDTASKINFO`` sums the
 subtree's CPU time. That gives macOS the shell-child match / exit detection /
 absence narrowing and the MCP-subtree movement probe, with movement being
 CPU-only (the evidence string says so — there is no per-process IO counter to
-read). libproc's socket fd info feeds only the tool-side ``remote_flat``
-scan. What has no libproc equivalent stays exactly as absent: no model-wait
-socket evidence (so a flat model wait is UNKNOWN, never DEAD, and never tagged
-``established_flat``), no wchan / blocked-fd evidence (so STUCK_INPUT is never
-claimed — a live tracked child whose subtree is flat is UNKNOWN tagged
-``platform_limited`` instead of WORKING, so it is bounded rather than deferred
-forever). The backend is injectable (``darwin_backend`` ctor arg), and the
-Linux path is untouched by its presence.
+read). libproc's socket fd info feeds only the ``remote_flat`` scan of the
+in-flight tool's own server. What has no libproc equivalent stays exactly as
+absent: no model-wait socket evidence (so a flat model wait is UNKNOWN, never
+DEAD, and never tagged ``established_flat``), no wchan / blocked-fd evidence (so
+STUCK_INPUT is never claimed — a live tracked child whose subtree is flat is
+UNKNOWN tagged ``platform_limited`` instead of WORKING, so it is bounded rather
+than deferred forever). The backend is injectable (``darwin_backend`` ctor arg),
+and the Linux path is untouched by its presence.
 
 Every probe is wrapped: any error degrades the verdict to UNKNOWN — never to a
 kill. Each check is cheap (<10ms of file reads); two-sample deltas are computed
@@ -115,10 +116,14 @@ probe rather than claimed for the module:
 
 - the cmdline match keys shell evidence to THIS session's in-flight command, so
   the shell branch attributes;
-- the movement and socket probes read the WHOLE tree, so a co-tenant's build
-  reads as this session's progress and a co-tenant's backend connection
-  suppresses this session's wedge signature. Both of those err toward
-  forbearance, which costs detection latency and no work;
+- the ``remote_flat`` socket scan reads only the subtree of the process that
+  was launched as the in-flight tool's own MCP server, and declines when that
+  process is not found exactly once (a second copy of the server is another
+  session's or a subagent's), so it attributes too;
+- the movement and model-wait socket probes read the WHOLE tree, so a
+  co-tenant's build reads as this session's progress and a co-tenant's backend
+  connection suppresses this session's wedge signature. Both of those err
+  toward forbearance, which costs detection latency and no work;
 - the one reading that is acted on at once, the model-wait DEAD, is therefore
   gated on declared tenancy: with co-tenants it degrades to UNKNOWN tagged
   :data:`EVIDENCE_SHARED_TREE` and the caller's stale window governs instead.
@@ -140,6 +145,7 @@ import os
 import re
 import sys
 import time
+from collections.abc import Mapping
 from concurrent.futures import Executor
 from dataclasses import dataclass
 from typing import Any, Callable, Iterable, Protocol
@@ -233,11 +239,12 @@ EVIDENCE_SAMPLING = "sampling"
 EVIDENCE_PLATFORM_LIMITED = "platform_limited"
 
 # Evidence prefix for an opaque MCP tool whose subtree is genuinely flat (a
-# real two-sample delta, not the baseline tick) while a process on the TOOL
-# side of the tree — anything below the kiro-cli runtime itself — holds an
-# established TCP connection to a non-loopback peer. That is the shape of a
-# tool blocked on its own remote call: the MCP server sits in ``recv`` with
-# zero CPU and zero bytes,
+# real two-sample delta, not the baseline tick) while the in-flight tool's OWN
+# MCP server -- the process launched as the server named in the call's trusted
+# ``_meta.kiro.mcpServerName``, or a process below it -- holds an established
+# TCP connection to a non-loopback peer. That is the shape of a tool blocked on
+# its own remote call: the MCP server sits in ``recv`` with zero CPU and zero
+# bytes,
 # which is also exactly what a remote call with no client timeout looks like
 # when the peer never answers. The caller narrows the UNKNOWN window on this
 # tag to ``watchdog.remote_flat_probe_secs``, and only once the tree has also
@@ -245,15 +252,14 @@ EVIDENCE_PLATFORM_LIMITED = "platform_limited"
 # bytes now and then is never cut off between two quiet samples.
 #
 # Deliberately distinct from :data:`EVIDENCE_ESTABLISHED_FLAT`, which is keyed
-# on kiro-cli's OWN backend connection and a model-wrapping tool name. The
-# runtime's own sockets never count here, and neither do those of the
-# sandbox launcher's direct child (the real kiro-cli under the Linux namespace
-# sandbox), so kiro-cli's model connection cannot pass for a tool's remote
-# call. Because the scan reads the whole tree, the tag also needs a declared
-# tenancy of exactly one session (see :data:`EVIDENCE_SHARED_TREE`): on a
-# shared runtime the socket may be a co-tenant's. Where no socket view exists
-# (Windows, a tree that cannot be read) the tag is never set and the
-# build-scale window holds.
+# on kiro-cli's OWN backend connection and a model-wrapping tool name. Only the
+# named server's subtree is read, so another server's persistent connection (a
+# keepalive, ``mcp-remote``) or a shell tool's background tunnel cannot tag a
+# quiet tool of a different server, and kiro-cli's model connection never
+# counts. The server is found from how the session launched it (see
+# :func:`launch_matches`); a call with no trusted server name, a server the
+# tree does not show exactly once, a host with no socket view (Windows) or a
+# tree that cannot be read never sets the tag, and the build-scale window holds.
 EVIDENCE_REMOTE_FLAT = "remote_flat"
 
 # Evidence prefix for an opaque MCP tool whose runtime subtree moved. It is the
@@ -722,6 +728,50 @@ def select_darwin_backend(proc_root: str) -> DarwinProcessBackend | None:
     return None
 
 
+# ── MCP server attribution ──
+
+#: ``{server name: (launch argv, ...)}`` -- how a session started each stdio MCP
+#: server, one argv per source that names it (the agent spec, the session's
+#: ``mcpServers`` array). A name with two sources keeps both, because which one
+#: the host launched under a shared name is the host's call. Built and bounded by
+#: ``session_handle.mcp_launch_roster``; this module only reads it.
+LaunchRoster = Mapping[str, tuple[tuple[str, ...], ...]]
+
+
+def launch_matches(cmdline: str, launch: tuple[str, ...]) -> bool:
+    """Whether a process whose argv reads *cmdline* is *launch* as started.
+
+    *cmdline* is argv joined by single spaces (the shape :func:`read_cmdline`
+    and :class:`ProcessRow` hold), so both sides are compared as space-split
+    tokens. Three shapes count, and nothing looser:
+
+    - the launch exactly;
+    - the same program reached by another path (a PATH lookup, a relative
+      command), with exactly the declared args after it;
+    - an interpreter running the command as its script (a ``#!`` line), with
+      exactly the declared args after the script.
+
+    A launcher that execs into a different argv is NOT matched. Missing such a
+    server costs only the narrowing: the call keeps its full window.
+    """
+    if not cmdline or not launch:
+        return False
+    command = launch[0]
+    want = " ".join(launch).split(" ")
+    got = cmdline.split(" ")
+    if got == want:
+        return True
+    if " " in command:
+        # A command path with a space spans several tokens; only the exact
+        # shape above can be read back reliably.
+        return False
+    args = want[1:]
+    program = os.path.basename(command)
+    if os.path.basename(got[0]) == program and got[1:] == args:
+        return True
+    return len(got) >= 2 and os.path.basename(got[1]) == program and got[2:] == args
+
+
 # ── Command matching ──
 
 
@@ -1011,6 +1061,58 @@ def _has_flag(args: list[str], flag: str) -> bool:
     return False
 
 
+# Global git options that take their value as the NEXT token, so the
+# subcommand scan must skip that token too (``git -C /x rebase``).
+_GIT_VALUE_OPTIONS = frozenset(
+    {"-c", "-C", "--git-dir", "--work-tree", "--namespace", "--config-env", "--super-prefix"}
+)
+# Editor values that exit at once and keep the message git prepared.
+_NON_INTERACTIVE_EDITORS = frozenset({"true", ":"})
+# Sequencer steps that write a commit message, keyed by subcommand. ``git am
+# --continue`` is absent: it commits with the patch's own message.
+_GIT_CONTINUE_EDITS = frozenset({"rebase", "cherry-pick", "merge", "revert"})
+# ``git revert`` flags that skip the message editor or end the revert.
+_GIT_REVERT_KEEPS_MESSAGE = ("--no-edit", "-n", "--no-commit", "--abort", "--quit", "--skip")
+
+
+def _git_editor_settings(env_prefix: list[str], args: list[str]) -> tuple[dict[str, str], int]:
+    """Editor settings visible in one git command line, and the subcommand index.
+
+    Returns ``({"editor": ..., "sequence": ...}, sub_i)``. ``editor`` and
+    ``sequence`` hold the effective value only when the command line itself
+    sets it: an inline ``GIT_EDITOR=`` wins over ``-c core.editor=``, and
+    ``GIT_SEQUENCE_EDITOR=`` over ``-c sequence.editor=``; the sequence editor
+    falls back to the editor. ``sub_i`` is ``len(args)`` when ``-P`` /
+    ``--no-pager`` is present, so no subcommand is read.
+    """
+    env = {}
+    for tok in env_prefix:
+        name, sep, value = tok.partition("=")
+        if sep:
+            env[name] = value.strip("'\"")
+    config = {}
+    sub_i = 0
+    while sub_i < len(args) and args[sub_i].startswith("-"):
+        opt = args[sub_i]
+        if opt in ("-P", "--no-pager"):
+            return {}, len(args)
+        if opt in _GIT_VALUE_OPTIONS:
+            if opt == "-c" and sub_i + 1 < len(args):
+                key, _, value = args[sub_i + 1].partition("=")
+                config[key.lower()] = value.strip("'\"")
+            sub_i += 2
+            continue
+        sub_i += 1
+    settings = {}
+    editor = env.get("GIT_EDITOR", config.get("core.editor"))
+    if editor is not None:
+        settings["editor"] = editor
+    sequence = env.get("GIT_SEQUENCE_EDITOR", config.get("sequence.editor", editor))
+    if sequence is not None:
+        settings["sequence"] = sequence
+    return settings, sub_i
+
+
 def _classify_segment(segment: str, *, last: bool) -> InteractiveClassification:
     stripped = segment.strip()
     if not stripped:
@@ -1021,6 +1123,7 @@ def _classify_segment(segment: str, *, last: bool) -> InteractiveClassification:
     program, args = _segment_program(tokens)
     if not program:
         return NOT_INTERACTIVE
+    env_prefix = tokens[: len(tokens) - len(args) - 1]
     positional = [a for a in args if not a.startswith("-") and not a.startswith("<")]
 
     if program in _EDITOR_PROGRAMS:
@@ -1044,15 +1147,19 @@ def _classify_segment(segment: str, *, last: bool) -> InteractiveClassification:
             side_effecting=False,
         )
     if program == "git" and args:
-        sub_i = 0
-        while sub_i < len(args) and args[sub_i].startswith("-"):
-            if args[sub_i] in ("-P", "--no-pager"):
-                return NOT_INTERACTIVE
-            sub_i += 1
+        settings, sub_i = _git_editor_settings(env_prefix, args)
         sub = args[sub_i] if sub_i < len(args) else ""
         rest = args[sub_i + 1 :]
-        if sub == "commit" and not any(
-            _has_flag(rest, f) for f in ("-m", "--message", "-F", "--file", "--no-edit", "-C", "-c")
+        editor_quiet = settings.get("editor") in _NON_INTERACTIVE_EDITORS
+        sequence_quiet = settings.get("sequence") in _NON_INTERACTIVE_EDITORS
+        editor_hint = "GIT_EDITOR=true git " + " ".join(args)
+        if (
+            not editor_quiet
+            and sub == "commit"
+            and not any(
+                _has_flag(rest, f)
+                for f in ("-m", "--message", "-F", "--file", "--no-edit", "-C", "-c")
+            )
         ):
             return InteractiveClassification(
                 INTERACTIVE_EDITOR,
@@ -1061,7 +1168,37 @@ def _classify_segment(segment: str, *, last: bool) -> InteractiveClassification:
                 "git commit -m '<message>' (or GIT_EDITOR=true)",
                 side_effecting=True,
             )
-        if sub == "rebase" and (_has_flag(rest, "-i") or _has_flag(rest, "--interactive")):
+        if (
+            not editor_quiet
+            and sub in _GIT_CONTINUE_EDITS
+            and "--continue" in rest
+            and "--no-edit" not in rest
+        ):
+            return InteractiveClassification(
+                INTERACTIVE_EDITOR,
+                f"git {sub} --continue",
+                f"{sub} --continue opens an editor for the commit message",
+                editor_hint,
+                side_effecting=True,
+            )
+        if (
+            not editor_quiet
+            and sub == "revert"
+            and any(not a.startswith("-") for a in rest)
+            and not any(_has_flag(rest, f) for f in _GIT_REVERT_KEEPS_MESSAGE)
+        ):
+            return InteractiveClassification(
+                INTERACTIVE_EDITOR,
+                "git revert",
+                "git revert without --no-edit opens an editor for the commit message",
+                editor_hint,
+                side_effecting=True,
+            )
+        if (
+            sub == "rebase"
+            and not sequence_quiet
+            and (_has_flag(rest, "-i") or _has_flag(rest, "--interactive"))
+        ):
             return InteractiveClassification(
                 INTERACTIVE_EDITOR,
                 "git rebase -i",
@@ -1212,7 +1349,8 @@ class ToolCallState:
     # Trusted MCP server from the adapter identity channel, set only when the
     # tool_call frame's identity is provenance-verified
     # (``AcpEvent.mcp_identity_trusted``); empty otherwise (fail-closed). Read by
-    # :meth:`is_trusted_wait`.
+    # :meth:`is_trusted_wait`, and by the ``remote_flat`` scan, which reads only
+    # the subtree of the server this names.
     mcp_server_name: str = ""
     # Pre-dispatch verdict of :func:`classify_interactive_command` for a shell
     # tool (one of the ``INTERACTIVE_*`` classes; ``none`` for a non-shell tool
@@ -1466,7 +1604,7 @@ class LivenessOracle:
         wall_now=time.time,
         steady_now_fn=steady_now,
         tenancy: Callable[[], int | None] | None = None,
-        socket_tenancy: Callable[[], int | None] | None = None,
+        server_launches: Callable[[], LaunchRoster | None] | None = None,
     ) -> None:
         self._proc = str(proc_root)
         self._now = now
@@ -1495,11 +1633,13 @@ class LivenessOracle:
         # about tenancy keeps today's verdicts exactly; a caller whose runtime
         # CAN host a second session is the one that must pass this.
         self._tenancy = tenancy
-        # How many sessions the probed runtime hosts, read ONLY by the
-        # tool-side socket scan behind the opt-in ``remote_flat`` tag. Kept apart
-        # from ``tenancy`` so declaring it leaves the model-wait DEAD reading as
-        # it was. ``None`` here means "not declared", which keeps the tag off.
-        self._socket_tenancy = socket_tenancy
+        # How this session launched its MCP servers (see :data:`LaunchRoster`),
+        # read ONLY by the socket scan behind the ``remote_flat`` tag, which
+        # uses it to find the in-flight tool's own server process. Asked at
+        # verdict time because a resumed session re-declares its servers.
+        # ``None`` -- undeclared, or the callable answering None -- keeps the
+        # tag off.
+        self._server_launches = server_launches
         # sample key -> (ts, counter). Keys: "io", "cpu".
         self._samples: dict[str, tuple[float, int]] = {}
 
@@ -1538,7 +1678,7 @@ class LivenessOracle:
             wall_now=self._wall_now,
             steady_now_fn=self._steady_now,
             tenancy=self._tenancy,
-            socket_tenancy=self._socket_tenancy,
+            server_launches=self._server_launches,
         )
 
     # ── Public checks ──
@@ -1639,76 +1779,130 @@ class LivenessOracle:
                 EVIDENCE_SAMPLING,
                 "no readable counters",
             )
-            and self._tree_is_this_sessions()
+            and tool.mcp_server_name
         ):
-            holder = self._tool_side_established(runtime_pid)
-            if holder is not None:
+            located = self._own_server_remote_holder(runtime_pid, tool.mcp_server_name)
+            if located is not None:
+                root, holder = located
                 return (
                     VERDICT_UNKNOWN,
-                    f"{EVIDENCE_REMOTE_FLAT}: mcp subtree flat, pid {holder} holds an "
-                    f"established TCP connection ({evidence})",
+                    f"{EVIDENCE_REMOTE_FLAT}: mcp subtree flat, pid {holder} of the tool's "
+                    f"own server (pid {root}) holds an established TCP connection ({evidence})",
                 )
         return VERDICT_UNKNOWN, f"mcp subtree flat ({evidence})"
 
-    def _tree_is_this_sessions(self) -> bool:
-        """Whether the runtime's tree is DECLARED to hold this session alone.
+    def _launch_roster(self) -> LaunchRoster | None:
+        """The declared :data:`LaunchRoster`, or None when none is declared.
 
-        The tool-side socket scan reads the whole tree, and the narrowing it
-        feeds is the one that cancels sooner. With a co-tenant (another chat, or
-        a subagent riding this runtime) the socket may be the co-tenant's call,
-        so the tag needs a declared ``socket_tenancy`` of exactly 1. Undeclared,
-        unreadable, raising or above 1 all keep the full window.
+        Undeclared, raising, or anything but a mapping all read as None, which
+        keeps the ``remote_flat`` tag off.
         """
-        if self._socket_tenancy is None:
-            return False
+        if self._server_launches is None:
+            return None
         try:
-            count = self._socket_tenancy()
+            roster = self._server_launches()
         except Exception:
-            logger.debug("liveness: socket tenancy probe failed", exc_info=True)
-            return False
-        return isinstance(count, int) and count == 1
+            logger.debug("liveness: launch roster probe failed", exc_info=True)
+            return None
+        return roster if isinstance(roster, Mapping) else None
 
-    def _tool_side_established(self, runtime_pid: int) -> int | None:
-        """A tool-side pid holding an ESTABLISHED TCP socket, or None.
+    def _own_server_remote_holder(self, runtime_pid: int, server: str) -> tuple[int, int] | None:
+        """``(server root pid, holder pid)`` when *server*'s own subtree holds an
+        ESTABLISHED TCP connection to a non-loopback peer, else None.
 
-            Only a connection to a NON-loopback peer counts: a loopback peer is a
-        local service (Kiro Crew's gateway above all), not a remote call.
+        Only the subtree of the process that IS the named server counts, so a
+        sibling server's persistent connection (a keepalive, ``mcp-remote``) or a
+        shell tool's background tunnel elsewhere in the tree never tags this
+        call. The server root is found by :meth:`_own_server_root`; a server that
+        cannot be found exactly once answers None. A loopback peer is a local
+        service (Kiro Crew's gateway above all), not a remote call.
 
-        "Tool side" is the runtime's tree minus the runtime process itself. On
-            ``/proc`` a root that holds no socket at all is read as the namespace
-            sandbox's launcher parent, and its direct children (the real kiro-cli)
-            are excluded too, so kiro-cli's own model connection never counts. A
-            non-sandboxed kiro-cli that happens to hold no socket then excludes its
-            MCP servers as well — the direction that keeps the full window.
-
-            On darwin the runtime pid IS kiro-cli (``sandbox-exec`` execs in place),
-            so only the root is excluded. A backend without ``established_tcp``, and
-            a host with neither backend (Windows), answer None.
+        On darwin a backend without ``established_tcp``, and a host with neither
+        backend (Windows), answer None.
         """
+        roster = self._launch_roster()
+        if roster is None or not roster.get(server):
+            return None
         if self._darwin is not None:
             probe = getattr(self._darwin, "established_tcp", None)
             if probe is None:
                 return None
-            descendants = self._darwin.descendants(runtime_pid)
-            if not descendants:
+            root = self._own_server_root(runtime_pid, server, roster)
+            if root is None:
                 return None
-            for pid in descendants:
-                count = probe(pid)
-                if count:
-                    return pid
+            for pid in (root, *(self._darwin.descendants(root) or ())):
+                if probe(pid):
+                    return root, pid
             return None
         if not os.path.isdir(self._proc):
             return None
-        excluded = {runtime_pid}
-        if not socket_inodes(self._proc, runtime_pid):
-            excluded.update(direct_children(self._proc, runtime_pid))
-        for pid in iter_descendants(self._proc, runtime_pid):
-            if pid in excluded:
-                continue
+        root = self._own_server_root(runtime_pid, server, roster)
+        if root is None:
+            return None
+        for pid in iter_descendants(self._proc, root):
             held = socket_inodes(self._proc, pid)
             if held and held & remote_established_inodes(self._proc, pid):
-                return pid
+                return root, pid
         return None
+
+    def _own_server_root(self, runtime_pid: int, server: str, roster: LaunchRoster) -> int | None:
+        """The one process below the runtime that was launched as *server*.
+
+        A process is the server when its argv matches one of the server's launch
+        vectors (:func:`launch_matches`). A launcher that starts a versioned copy
+        of itself as its child matches twice; the topmost match is the server
+        and the rest sit in its subtree. Anything other than exactly ONE topmost
+        match answers None, and so does a match that also reads as another
+        declared server:
+
+        - two matches is a second copy -- another session's server on a shared
+          runtime, or a subagent's -- and which copy serves this call is
+          unknowable from the tree;
+        - a process that fits two names cannot be attributed to either.
+
+        The runtime pid itself is never a server. On ``/proc`` a root that holds
+        no socket at all is the namespace sandbox's launcher parent, and its
+        direct children (the real kiro-cli) are excluded too, so kiro-cli's own
+        model connection can never stand in for a server's. On darwin the
+        runtime pid IS kiro-cli, so only the root is excluded.
+        """
+        launches = roster.get(server) or ()
+        if self._darwin is not None:
+            listed = self._darwin.descendants(runtime_pid)
+            if not listed:
+                return None
+            rows: list[tuple[int, str]] = []
+            for pid in listed:
+                row = self._darwin.row(pid)
+                if row is not None:
+                    rows.append((pid, row.cmdline))
+        else:
+            excluded = {runtime_pid}
+            if not socket_inodes(self._proc, runtime_pid):
+                excluded.update(direct_children(self._proc, runtime_pid))
+            rows = [
+                (pid, read_cmdline(self._proc, pid))
+                for pid in iter_descendants(self._proc, runtime_pid)
+                if pid not in excluded
+            ]
+        matches = [pid for pid, cmd in rows if any(launch_matches(cmd, la) for la in launches)]
+        if not matches:
+            return None
+        nested: set[int] = set()
+        for pid in matches:
+            if self._darwin is not None:
+                nested.update(self._darwin.descendants(pid) or ())
+            else:
+                nested.update(p for p in iter_descendants(self._proc, pid) if p != pid)
+        topmost = [pid for pid in matches if pid not in nested]
+        if len(topmost) != 1:
+            return None
+        root = topmost[0]
+        cmdline = next(cmd for pid, cmd in rows if pid == root)
+        for other, other_launches in roster.items():
+            if other != server and any(launch_matches(cmdline, la) for la in other_launches):
+                return None
+        return root
 
     def _check_shell_child(self, runtime_pid: int, tool: ToolCallState) -> tuple[str, str]:
         if self._darwin is not None:

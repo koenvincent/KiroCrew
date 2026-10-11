@@ -425,7 +425,7 @@ unconfirmed.
 
 | Field | Type | Effect |
 |---|---|---|
-| `tools` | list \| `"*"` | What is MOUNTED. `"*"` (the whole value or an entry) means every tool; `@server` mounts an MCP server whole; `@server/tool` mounts one action. Absent or malformed on the KAS path sends an empty allowlist and logs that the agent will run with no tool access (`_project_tools`) — it does not infer a default. `@kirocrew-core` here is what grants Crew's own MCP server. |
+| `tools` | list \| `"*"` | What is MOUNTED. `"*"` (the whole value or an entry) means every tool; `@server` mounts an MCP server whole; `@server/tool` mounts one action. Absent or malformed on the KAS path sends an empty allowlist and logs that the agent will run with no tool access (`_project_tools`) — it does not infer a default. On the KAS path a kiro-cli built-in name is projected with its KAS family beside it (`fs_read` → `read_file`, `list_directory`; `grep` → `grep_search`; `glob` → `file_search`; `fs_write` → `str_replace`, `fs_append`; `KAS_TOOL_FAMILY_BY_KIRO_CLI_NAME`), because KAS matches an entry against a tool's exact id and translates nothing — spelled only for kiro-cli, the entry mounts nothing there. A family stops at what the kiro-cli tool can do: `fs_write` cannot delete, so `delete_file` mounts only when a spec names it — while an `excludedTools` entry reaches everything governed under the name, so excluding `fs_write` also excludes `delete_file` (`expand_kiro_cli_tool_exclusions`). `@kirocrew-core` here is what grants Crew's own MCP server. |
 | `allowedTools` | list | What is AUTO-APPROVED. Entries are globs, not names: `@srv`, `@srv/`, `@srv/*` all match the whole server (`_canonical_grant_pattern`). This is the ONE path that never reaches Crew's PreToolUse gate, so every writer filters it through the governance ceiling (`_apply_allowed_tools_ceiling`) and the KAS projection re-filters on read (`_ceiling_permitted`), because a file can predate the ceiling that now governs it. |
 | `excludedTools` | list | A RESTRICTION, subtracted after `tools`. `spec_grants_tool_search` reads it: a spec that grants `"*"` then excludes `tool_search` grants no loader. Mirrored onto the worker spec alongside the grants, so "superset of what the default grants" cannot quietly become "superset of what it permits". |
 | `permissions` | object | KAS's own currency: `{"rules": [{"capability", "match", "effect"}]}`. Crew WRITES this derived from `allowedTools` (`derived_agent_permissions`) **only when the installed kiro-cli accepts the field** — `spec_permissions_supported(installed_kiro_cli_version())`, floor `SPEC_PERMISSIONS_MIN_VERSION` (2.23.0) in `kiro_cli.py`. kiro-cli validates specs with `deny_unknown_fields`, so a release below the floor refuses the WHOLE file and drops every Crew MCP server; an unknown version (no pinned binary, refused or unparseable `--version`) withholds too. The default spec's seed (`_seed_kas_permissions`) preserves an existing block before calling the shared gate (`_write_derived_permissions`), so a block already on disk is never removed by seeding; `kirocrew setup --agent-only --clean` repairs a default spec an older release already refuses. Generated conductor and worker writers use the same gate to replace an inherited value on an accepting release and remove it on an older or unknown one. Fork and publish (`_align_permissions` in `agent_capabilities.py`) route the TARGET block through the same `_write_derived_permissions`, so the published spec carries it only on an accepting kiro-cli and has it removed otherwise; the review of the SOURCE block described below runs whatever the version. `kirocrew doctor` prints the verdict as the KAS block's `auto-approve:` row. A block in the file is not an input to DERIVATION, which reads `allowedTools` and nothing else — but on the wire it is a second input, merged by `merge_user_permissions`: parsed against KAS's own shape and refused whole when it does not fit, `deny`/`ask` relayed unconditionally, `allow` relayed only where the same ceiling permits that capability and that resource, the shell and filesystem families never relayed as an `allow`, and an `allow` the `allowedTools` derivation could have emitted itself not relayed at all when the spec carries such a list — that list is the governed input and is re-derived every projection, so a block that has gone stale against it (including one the seeder wrote and preserved) cannot put a revoked grant back. Every decision, relay and withhold alike, is recorded in the security event log. Without that merge a pure-KAS agent — `permissions` authored, no `allowedTools` — reaches the backend with the field absent, and absent resolves every request to `ask`. On disk the block is left untouched and the backend reads it. One path does read it: fork and publish (`agent_capabilities.py`, `_align_permissions`) compares it against a fresh derivation and refuses with `alternate_permissions_require_review` when the two disagree, so a hand-edited block blocks forking that template. `src/kiro_crew/acp/kas_permissions.py` owns the translation, and refuses the shell and filesystem families outright: a tool-name allowlist carries no resource pattern, so the rule it would produce is unscoped. |
@@ -735,6 +735,34 @@ can be read and warns again while it cannot.
 warning saying nothing behind it was carried: that is what puts a loadable spec
 back.)
 
+
+`kirocrew.json`, and every spec derived from it (the worker, every crewmate
+built from it), mounts Crew's platform guide server `kirocrew-guide` (where-is
+and how-to answers through `find_ui` and `search_docs`, dashboard guides, and
+change cards). The conductor specs and the background agents (knowledge,
+research, heartbeat) keep their own narrower server sets without it. Its entry carries no `autoApprove`; exactly the twelve tools in
+`agent._GUIDE_AUTO_GRANTS` are added to `allowedTools` as exact names, subject to
+the same governance ceiling as every grant: the reads, `guide_start` and
+`propose_change` (each only offers a card the user must press), and
+`guide_cancel` (which stops this conversation's guide and undoes nothing saved).
+A spec from before the server was a platform capability gains the ref and those
+grants once (`guide_platform_granted.json` marks it), and keeps whatever you do
+with them afterwards. Its guide and card tools work only for a turn the user
+sent from the dashboard and refuse with one line anywhere else, a message from
+Slack or another channel included; `find_ui` and `search_docs` still answer
+there.
+
+`rebuild_agent_config` creates the first crewmate (`mate`, shown as
+Mate) once, bound to the same template a crewmate you create gets, with its
+own private memory store; the reserved `default` member is never changed. The
+`mate_member_created.json` sidecar keeps the creation one-time, so a first
+crewmate you delete is not created again. It is an ordinary crewmate you may
+rename, rebind and delete. The first-crewmate creation lives in
+`src/kiro_crew/agent_materialization/first_crewmate.py`. The one-time guide grant
+lives in `src/kiro_crew/agent_materialization/guide_platform.py`; the grant tuple stays in
+`src/kiro_crew/agent.py`.
+
+
 What you may safely hand-edit: a spec you authored yourself; a conductor spec's
 `allowedTools`; and in any other owned or app-generated field, nothing — change
 `~/.kiro/crew/agent.json` or the Template pane instead.
@@ -779,6 +807,8 @@ fence requirement, the JSON-twin precedence, and which backends run the form.
 | `allowedTools`, `autoApprove`, `permissions` — the governance ceiling | `src/kiro_crew/agent_materialization/auto_approve.py` |
 | the default spec's locked write | `src/kiro_crew/agent_materialization/default_spec_commit.py` |
 | derived specs — lite, guest, knowledge, research; the conductors; the worker | `src/kiro_crew/agent_materialization/service_agents.py`, `conductor_agents.py`, `worker_agent.py`; their prompts and grant tuples, and the heartbeat installer, stay in `src/kiro_crew/agent.py` |
+| the one-time guide grant on an existing default spec | `src/kiro_crew/agent_materialization/guide_platform.py` |
+| the first crewmate, created once | `src/kiro_crew/agent_materialization/first_crewmate.py` |
 | the fork refresh | `src/kiro_crew/agent_materialization/fork_refresh.py` |
 | owned filenames | `src/kiro_crew/agent_files.py` |
 | `model_managed`, `cc_model`, fork lineage | `src/kiro_crew/agent_state.py` |

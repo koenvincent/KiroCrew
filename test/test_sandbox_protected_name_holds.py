@@ -321,7 +321,19 @@ class TestLeafOnlyPopulationIsRecorded:
     #: launch fingerprints; ``mcp/resolved`` holds executables substituted for an
     #: approved launch. Each sits beside writable siblings, so no parent stand-in
     #: can hold it.
-    EXPECTED: dict[str, int] = {"standard": 265, "cc": 272, "strict": 273}
+    #:
+    #: One more root-level leaf, three more entries per tier:
+    #:
+    #: * ``gateway_id`` -- the id the Remote Crew cycle guard compares, sealed
+    #:   read-only so an agent cannot choose whether a chaining loop is detected.
+    #:   The spawn mints it before sealing and it never changes after that, so no
+    #:   later host-side replace lands on the bound name.
+    #:
+    #: One entry per tier for the secret vault at a relocated data home. The
+    #: tier lists hold ``.vault`` only at the two ``$HOME``-joined spellings,
+    #: so the resolved ``config_dir()`` spelling is a third, leaf-only name,
+    #: the same hold ``kas`` gets there.
+    EXPECTED: dict[str, int] = {"standard": 269, "cc": 276, "strict": 277}
 
     @pytest.mark.parametrize("tier", TIERS)
     def test_leaf_only_count_has_not_grown(self, tier: str) -> None:

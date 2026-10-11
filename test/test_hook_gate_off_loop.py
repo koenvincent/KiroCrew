@@ -59,6 +59,10 @@ def _stalled_resolver(_floor_monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     ex.shutdown_maintenance_executor()
 
 
+def _busy(waited: float):
+    raise AssertionError(f"the gate pool refused a call after {waited:.1f}s in its queue")
+
+
 def _read_kwargs() -> dict:
     return {
         "session_key": "dashboard:f6",
@@ -100,7 +104,9 @@ def test_the_awaitable_gate_keeps_the_loop_ticking_through_a_stalled_resolver() 
     async def main():
         start = time.monotonic()
         result, ticks = await _ticking(
-            ex.run_in_tool_gate_pool(mgr.on_tool_call, f"Reading {_TARGET}", **_read_kwargs())
+            ex.run_in_tool_gate_pool(
+                mgr.on_tool_call, f"Reading {_TARGET}", on_queue_timeout=_busy, **_read_kwargs()
+            )
         )
         return result, ticks, time.monotonic() - start
 
@@ -118,7 +124,9 @@ def test_the_awaitable_gate_returns_the_sync_verdict_word_for_word(tmp_path) -> 
     sync = mgr.on_tool_call(title, **_read_kwargs())
     paths._path_resolve_degraded.clear()
     paths._path_resolve_thread_waits.clear()
-    off = asyncio.run(ex.run_in_tool_gate_pool(mgr.on_tool_call, title, **_read_kwargs()))
+    off = asyncio.run(
+        ex.run_in_tool_gate_pool(mgr.on_tool_call, title, on_queue_timeout=_busy, **_read_kwargs())
+    )
     assert (off.action, off.reason) == (sync.action, sync.reason)
     assert off.action == TOOL_DENY
 
@@ -152,9 +160,9 @@ def test_the_gate_runs_on_its_own_pool_not_the_default_executor() -> None:
         asyncio.get_running_loop().set_default_executor(refusing)
         try:
             result = await ex.run_in_tool_gate_pool(
-                mgr.on_tool_call, f"Reading {_TARGET}", **_read_kwargs()
+                mgr.on_tool_call, f"Reading {_TARGET}", on_queue_timeout=_busy, **_read_kwargs()
             )
-            verdict = await ex.run_in_tool_gate_pool(channel_gate, object())
+            verdict = await ex.run_in_tool_gate_pool(channel_gate, object(), on_queue_timeout=_busy)
         finally:
             refusing.shutdown(wait=False)
         return result, verdict

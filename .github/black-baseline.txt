@@ -147,7 +147,6 @@ src/kiro_crew/connections/l0_record.py
 src/kiro_crew/connections/tool_aliases.py
 src/kiro_crew/cron_history.py
 src/kiro_crew/dashboard/channel_folders.py
-src/kiro_crew/dashboard/chat_auto_tag.py
 src/kiro_crew/dashboard/chat_folder_suggest.py
 src/kiro_crew/dashboard/chat_nav.py
 src/kiro_crew/dashboard/chat_title.py
@@ -157,7 +156,6 @@ src/kiro_crew/dashboard/handlers/ask_question.py
 src/kiro_crew/dashboard/handlers/files.py
 src/kiro_crew/dashboard/handlers/kiro_usage_api.py
 src/kiro_crew/dashboard/handlers/knowledge.py
-src/kiro_crew/dashboard/handlers/mcp_custom.py
 src/kiro_crew/dashboard/handlers/notifications_push.py
 src/kiro_crew/dashboard/handlers/security.py
 src/kiro_crew/dashboard/handlers/sso_login.py
@@ -200,7 +198,6 @@ src/kiro_crew/eval/runner.py
 src/kiro_crew/eval/scenario.py
 src/kiro_crew/frontend.py
 src/kiro_crew/gateway_shutdown_budget.py
-src/kiro_crew/image_artifacts.py
 src/kiro_crew/imaging.py
 src/kiro_crew/knowledge/agent_fetch.py
 src/kiro_crew/knowledge/agent_source.py
@@ -259,7 +256,6 @@ src/kiro_crew/skill_providers/skillsh.py
 src/kiro_crew/skill_usage.py
 src/kiro_crew/skills_dedupe.py
 src/kiro_crew/skills_script_validator.py
-src/kiro_crew/slack/blocks.py
 src/kiro_crew/slack/enterprise.py
 src/kiro_crew/slack/events.py
 src/kiro_crew/slack/sessions_view.py
@@ -395,7 +391,6 @@ test/test_chat_slot_end_wait.py
 test/test_chat_slot_interrupt.py
 test/test_chat_slot_reasoning_effort.py
 test/test_chat_title.py
-test/test_chat_turn_timeout_consistency.py
 test/test_cli_desktop.py
 test/test_cli_lazy_imports.py
 test/test_close_guard_parity.py
@@ -547,9 +542,7 @@ test/test_frontmatter.py
 test/test_gateway_appkit_endpoints.py
 test/test_gatewayd_more_coverage.py
 test/test_gatewayd_self_exit.py
-test/test_github_runner.py
 test/test_gitlab_client_coverage.py
-test/test_governance_policy.py
 test/test_governance_policy_viewer.py
 test/test_handler_cron_list.py
 test/test_handlers_channel_clear_context.py
@@ -627,7 +620,6 @@ test/test_mcp_core_wait.py
 test/test_mcp_cron_list_compact.py
 test/test_mcp_cron_orphan_validation.py
 test/test_mcp_cron_persistent_session.py
-test/test_mcp_custom_api.py
 test/test_mcp_gateway_apps_spool.py
 test/test_mcp_gateway_backend_coverage.py
 test/test_mcp_gateway_claim.py
@@ -840,7 +832,6 @@ test/test_subagent_stall.py
 test/test_subquestion_queue.py
 test/test_sweep_stale_permissions.py
 test/test_system_metrics_coalescing.py
-test/test_tag_session.py
 test/test_tail_fork_config.py
 test/test_tailnet_cli.py
 test/test_tailnet_e2e.py

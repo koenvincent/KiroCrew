@@ -591,16 +591,50 @@ def plain_markdown_document(path: Path) -> bool:
     Every failure is ``False``: a file that cannot even be probed is unknown,
     not ignorable, so the caller keeps raising.
     """
-    if _unc_refused(str(path)):
+    probed = _probe_spec_head(path)
+    if probed is None:
         return False
+    head, truncated = probed
+    return markdown_head_is_fenceless(head, complete=not truncated)
+
+
+#: The magic numbers that open an AppleDouble and an AppleSingle file (RFC 1740).
+_APPLE_DOUBLE_MAGICS = (b"\x00\x05\x16\x07", b"\x00\x05\x16\x00")
+
+
+def apple_double_sidecar(path: Path) -> bool:
+    """Whether *path* is a macOS AppleDouble sidecar, judged by its name AND its bytes.
+
+    A macOS archive leaves a ``._<name>`` sidecar beside every file it carries.
+    The name alone does not settle what the file is: kiro-cli applies no
+    filename filter, so a ``._x.json`` that holds a spec is loaded under the
+    name it declares. A file that opens with the AppleDouble or AppleSingle
+    magic starts with a NUL byte, which neither spec form can start with, so
+    no spec reader loads it. The head is read exactly as
+    :func:`plain_markdown_document` reads it, through the strict reader's gates
+    and bounded at ``_FENCE_PROBE_BYTES``. Every failure is ``False``.
+    """
+    if not path.name.startswith("._"):
+        return False
+    probed = _probe_spec_head(path)
+    return probed is not None and probed[0].startswith(_APPLE_DOUBLE_MAGICS)
+
+
+def _probe_spec_head(path: Path) -> tuple[bytes, bool] | None:
+    """The head of *path* and whether the file runs past it, or ``None`` when refused.
+
+    The gates and the bound :func:`plain_markdown_document` documents.
+    """
+    if _unc_refused(str(path)):
+        return None
     try:
         real = path.resolve(strict=True)
     except (OSError, RuntimeError):
         # RuntimeError: pathlib's signal for a symlink loop on the Pythons
         # that raise it as such.
-        return False
+        return None
     if _unc_refused(str(real)) or _fence_refuses(real):
-        return False
+        return None
     try:
         fd = open_fenced_for_read(
             real,
@@ -608,14 +642,13 @@ def plain_markdown_document(path: Path) -> bool:
             refusal=_SpecReadRefused,
         )
     except OSError:
-        return False
+        return None
     try:
-        head, truncated = _read_head(fd, _FENCE_PROBE_BYTES)
+        return _read_head(fd, _FENCE_PROBE_BYTES)
     except OSError:
-        return False
+        return None
     finally:
         os.close(fd)
-    return markdown_head_is_fenceless(head, complete=not truncated)
 
 
 class AmbiguousAgentSpecError(ValueError):
@@ -838,13 +871,13 @@ def project_agent_files(
     Returns the kiro-cli-native ``<project>/.kiro/agents/*.json`` and the markdown
     ``*.md`` form beside it — the only project location the backends resolve
     ``--agent`` against, and therefore the only one whose names are dispatchable.
-    Dispatchable by the kiro-cli backend, which reads the checkout itself: the
-    KAS projection (:func:`kiro_crew.acp.kas_agents.load_agent_spec`) reads the
-    user-level directory only, for either form, so a project-only agent selected
-    on a KAS session is refused at session start there. Whether a checkout's
-    spec may be projected at all is a governance question (a checkout can
-    shadow a managed agent), not a question of which form is scanned, and the
-    two forms are treated alike here.
+    Dispatchable by the kiro-cli backend, which reads the checkout itself, and by
+    the KAS projection (:func:`kiro_crew.acp.harness.kas.resolve_projected_spec`),
+    which projects a project-only agent's prompt and visible tools and nothing it
+    could grant, and reads the user-level spec for a name both levels declare.
+    Whether a checkout's spec may be projected at all is a governance question (a
+    checkout can shadow a managed agent), not a question of which form is
+    scanned, and the two forms are treated alike here.
 
     *include_legacy* additionally returns ``<project>/.kiro/*.agent-spec.json``, Kiro
     Crew's own older convention. It defaults to ``False`` because every dispatch

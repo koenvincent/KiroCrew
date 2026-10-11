@@ -27,6 +27,7 @@ import json
 import logging
 import os
 import signal
+import sys
 import time
 import weakref
 from pathlib import Path
@@ -1543,6 +1544,58 @@ async def test_non_object_json_line_does_not_crash_reader():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "bad",
+    [
+        # About 60 KB: under the reader's 64 KiB buffer, so the line reaches the
+        # parser instead of being dropped as oversize.
+        pytest.param(b"[" * 30_000 + b"]" * 30_000 + b"\n", id="nested-past-decoder-ceiling"),
+        pytest.param(b"1" * 5_000 + b"\n", id="integer-past-digit-limit"),
+        pytest.param(b"\x80 stray bytes\n", id="invalid-utf8"),
+        pytest.param(b"\xff\xfe stray bytes\n", id="utf16-bom"),
+    ],
+)
+async def test_line_json_loads_rejects_without_decode_error_does_not_crash_reader(bad):
+    """A line that ``json.loads`` rejects with something other than
+    ``json.JSONDecodeError`` is skipped like a non-JSON line.
+
+    Nesting past the decoder's ceiling raises ``RecursionError``, an integer
+    past the int-string digit limit a plain ``ValueError``, and undecodable
+    bytes ``UnicodeDecodeError``. None of them may reach the loop's crash arm,
+    which marks the runtime dead and ends every multiplexed session on it.
+    """
+    rt, reader, _ = _make_runtime()
+    q = _register(rt, "sA")
+    task = await _start_reader(rt)
+    try:
+        reader.feed_data(bad)
+        _feed(reader, {"method": "session/update", "params": {"sessionId": "sA"}})
+        msg = await asyncio.wait_for(q["sA"].get(), timeout=1.0)
+        assert not rt._dead, "one stray stdout line marked the shared runtime dead"
+        assert msg.params["sessionId"] == "sA"
+    finally:
+        await _stop_reader(task)
+
+
+@pytest.mark.asyncio
+async def test_frame_with_an_invalid_utf8_byte_in_a_string_is_still_routed():
+    """An invalid byte inside a string value costs that character, not the frame:
+    the reader decodes with replacement, as ``AcpClient._read_message`` does."""
+    rt, reader, _ = _make_runtime()
+    q = _register(rt, "sA")
+    task = await _start_reader(rt)
+    try:
+        reader.feed_data(
+            b'{"method":"session/update","params":{"sessionId":"sA","note":"a\xffb"}}\n'
+        )
+        msg = await asyncio.wait_for(q["sA"].get(), timeout=1.0)
+        assert not rt._dead, "one invalid byte marked the shared runtime dead"
+        assert msg.params == {"sessionId": "sA", "note": "a\ufffdb"}
+    finally:
+        await _stop_reader(task)
+
+
+@pytest.mark.asyncio
 async def test_oversize_stdout_frame_is_dropped_not_fatal():
     """A single JSON-RPC line over the stdout buffer must cost ONE frame, not
     the whole runtime.
@@ -2192,9 +2245,11 @@ async def test_runtime_spawn_passes_installed_path_through_exact_wrappers(
     # runtime-owned, so only its presence and shape are pinned here.
     extra_private = wrap_kwargs.pop("extra_private_dirs")
     assert isinstance(extra_private, (list, tuple))
+    # The default tier leaves ~/.ssh readable, so the ssh-agent socket is kept.
     assert wrap_kwargs == {
         "strip_python_env": True,
         "is_kiro_cli": True,
+        **({} if sys.platform == "win32" else {"forward_ssh_auth_sock": True}),
     }
     voice_guard.assert_called_once_with(runtime._work_dir)
     assert strip_spawn_shim(wrapped["spawn_args"]) == (
@@ -6855,7 +6910,11 @@ class TestAcpRuntimeLoadSession:
 
         load_params = sent[0][1]
         servers = load_params["mcpServers"]
-        assert [entry["name"] for entry in servers] == ["kirocrew-core", "kirocrew-cron"]
+        assert [entry["name"] for entry in servers] == [
+            "kirocrew-core",
+            "kirocrew-cron",
+            "kirocrew-guide",
+        ]
         assert all(_identity_tokens(servers))
         assert load_params == {
             "sessionId": "sid-123",
@@ -7199,7 +7258,11 @@ class TestAcpRuntimeLoadSession:
         # Direct managed tools retain per-session caller attribution on resume;
         # the pooled case is covered by test_load_session_redeclares_pooled_stubs.
         servers = captured["mcpServers"]
-        assert [entry["name"] for entry in servers] == ["kirocrew-core", "kirocrew-cron"]
+        assert [entry["name"] for entry in servers] == [
+            "kirocrew-core",
+            "kirocrew-cron",
+            "kirocrew-guide",
+        ]
         assert all(_identity_tokens(servers))
         expected = {
             "sessionId": "sid",
@@ -7288,6 +7351,7 @@ class TestAcpRuntimeLoadSession:
             "builder-mcp",
             "kirocrew-core",
             "kirocrew-cron",
+            "kirocrew-guide",
         ]
 
         # Parity with create_session for the same agent + overlay: the two
@@ -9291,12 +9355,18 @@ async def test_runtime_spawn_scrubs_sensitive_env_on_default_auto(monkeypatch):
         "SLACK_BOT_TOKEN",
         "KIROCREW_OWNER_ID",
         "AWS_SECRET_ACCESS_KEY",
-        "SSH_AUTH_SOCK",
         "PYTHONPATH",
         "PYTHONPYCACHEPREFIX",
         "PYTHONDONTWRITEBYTECODE",
     ):
         assert key not in env, f"{key} leaked into runtime child env"
+    # The default tier leaves ~/.ssh readable, so the agent socket is kept:
+    # git-over-SSH works while every other credential above stays scrubbed.
+    if sys.platform == "win32":
+        # Windows has no SSH_AUTH_SOCK (a named-pipe agent): never forwarded.
+        assert "SSH_AUTH_SOCK" not in env, "SSH_AUTH_SOCK leaked into runtime child env"
+    else:
+        assert env.get("SSH_AUTH_SOCK") == "/tmp/fake-agent.sock"
     assert env.get("KIROCREW_UNRELATED_KEEPME") == "keep-this-value"
     assert env.get("AWS_ACCESS_KEY_ID") == "FAKE-akid"
     assert env.get("KIROCREW_RUNTIME_PYTHON") == runtime_mod.sys.executable

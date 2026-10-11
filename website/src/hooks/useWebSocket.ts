@@ -1,4 +1,5 @@
 import { useEffect, useRef, useCallback } from 'react'
+import { isLookPreviewFrame } from '../utils/lookPreview'
 import { useQueryClient } from '@tanstack/react-query'
 import { useAppDispatch } from '../store'
 import { sseTodoUpdate, sseMcpReportUpdate, sseSlotTitle, triggerRefresh, fetchSlots, remoteSlotRead, sseSubagentStatus, sseSubagentText, type SubagentDetail } from '../store/dashboardSlice'
@@ -9,6 +10,9 @@ import {
 } from '../store/chatSlice'
 import { store } from '../store'
 import { TAB_ID } from '../api/tabId'
+import { applyGuideUpdate } from '../api/guide'
+import { handleGuideObserveFrame } from '../guide/liveObservation'
+import { applyCardUpdate } from '../api/cards'
 import type { Notification, TodoList, McpSessionReport } from '../types'
 import { i18nT } from '../i18n/t'
 import { teamRoots } from '../pages/chat/command-center/model'
@@ -214,6 +218,11 @@ export function useWebSocket() {
     // next frame routes normally.
     ws.onmessage = (e) => {
       if (socket.wsRef.current === ws) lastFrameAtRef.current = Date.now()
+      // The look-preview frame (utils/lookPreview.ts) is a still picture of the
+      // product drawn from fixtures: no live frame may repaint it with the
+      // user's real sessions, runs or notices. The socket stays open only so
+      // the frame never shows a disconnected state.
+      if (isLookPreviewFrame()) return
       try {
         const { type, data, msg } = decodeFrame(e.data)
         switch (type) {
@@ -233,6 +242,24 @@ export function useWebSocket() {
             // the panel's visibility depends on the pending count.
             queryClient.invalidateQueries({ queryKey: ['skills-pending'] })
             queryClient.invalidateQueries({ queryKey: ['skills'] })
+            break
+          }
+          case 'guide_update': {
+            // Owner-only frame; folded into the pending-guides cache, which
+            // is also re-read on reconnect (frames are one-shot).
+            applyGuideUpdate(queryClient, (data as { guide?: unknown }).guide)
+            break
+          }
+          case 'guide_observe': {
+            // Owner-only frame naming ONE tab; that tab answers with ids and
+            // enum states only, every other tab ignores it.
+            handleGuideObserveFrame(data)
+            break
+          }
+          case 'card_update': {
+            // Owner-only frame; folded into that slot's change-cards cache,
+            // which is also re-read on reconnect (frames are one-shot).
+            applyCardUpdate(queryClient, (data as { card?: unknown }).card)
             break
           }
           case 'todo_update': {
@@ -336,6 +363,11 @@ export function useWebSocket() {
             // A crewmate wrote one of its own dashboard fields mid-turn. The frame
             // carries only {slug}; the tab's refetch re-asks the server, which
             // re-composes the page and re-checks ownership.
+            handleDashboardMoved(queryClient, data)
+            break
+          case 'dashboard_instance_changed':
+            // The crewmate's dashboard PAGE changed: a template applied or a
+            // version rolled back. Same {slug}-only frame, same re-read.
             handleDashboardMoved(queryClient, data)
             break
           case 'notification_ack':
@@ -905,6 +937,7 @@ export function useWebSocket() {
   useEffect(() => {
     socket.resume()
     connect()
+    const detachQuestionRetirements = store.subscribe(cards.onQuestionStateChange)
     const detachVoice = voice.attachWindowEvents()
     const detachFocus = attachFocusRelay({
       socket,
@@ -916,10 +949,11 @@ export function useWebSocket() {
       buffers.flushForUnmount()
       socket.closeForUnmount()
       voice.dispose()
+      detachQuestionRetirements()
       detachVoice()
       detachFocus()
     }
-  }, [socket, connect, voice, buffers])
+  }, [socket, connect, voice, buffers, cards])
 
   return { subscribeLogs: socket.subscribeLogs, subscribeSubagents: socket.subscribeSubagents, forceReconnect }
 }

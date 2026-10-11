@@ -271,6 +271,36 @@ describe('SearchableSelect — free-text values', () => {
     expect(onChange).not.toHaveBeenCalled()
   })
 
+  it('commits an exact match on Enter even when a broader row sits above it', async () => {
+    // "Inherit (Hack)" contains "hack" and is first; typing the full name must
+    // still pick Hack itself rather than the row that merely mentions it.
+    const onChange = vi.fn()
+    render(
+      <SearchableSelect
+        options={[{ value: '', label: 'Inherit (Hack)' }, { value: 'Hack', label: 'Hack' }]}
+        value=""
+        onChange={onChange}
+        aria-label="Font"
+      />,
+    )
+    fireEvent.click(screen.getByRole('button', { name: 'Font' }))
+    await screen.findByRole('listbox')
+    fireEvent.change(screen.getByRole('textbox'), { target: { value: 'hack' } })
+    fireEvent.keyDown(screen.getByRole('textbox'), { key: 'Enter' })
+    expect(onChange).toHaveBeenCalledWith('Hack')
+  })
+
+  it('never treats the free-text row as the exact match', async () => {
+    // The free-text row's value IS the typed text, so an exact-match rule that
+    // counted it would always commit the free text over the top real option.
+    const onChange = openFonts()
+    await screen.findByRole('listbox')
+    fireEvent.change(screen.getByRole('textbox'), { target: { value: 'Men' } })
+    fireEvent.keyDown(screen.getByRole('textbox'), { key: 'Enter' })
+    expect(onChange).toHaveBeenCalledWith('Menlo')
+    expect(onChange).not.toHaveBeenCalledWith('Men')
+  })
+
   it('previews the typed row the way the caller shapes it', async () => {
     openFonts({
       customValueOption: typed => ({

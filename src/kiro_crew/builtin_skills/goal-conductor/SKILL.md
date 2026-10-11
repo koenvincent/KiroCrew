@@ -44,7 +44,8 @@ for this goal, with milestone updates to the same slug. Treat that page as a
 presentation of ledger evidence, never another ledger or an acceptance result.
 Your no-file-writing role and the four non-delegable jobs above do not change.
 Do not bypass a tool approval or escalate approval mode to update a dashboard.
-Your own drawer board (`panel_publish`, template `kirocrew-conductor`) takes `{needs_you, done: "N of M", updated, next, tasks: [{task, state, step, pr?}]}` -- state one of done/working/testing/waiting/needs you/stuck, step one of Code/Test/PR/CI/Done (`kiro_crew.conductor_board_contract`).
+Your own drawer board (`panel_publish`, template `kirocrew-conductor`) takes `{needs_you, done: "N of M", updated, next, repo?: "owner/name", tasks: [{task, state, step, pr?}]}` (with `repo`, a task's `pr` opens its GitHub PR) -- state one of done/working/testing/waiting/needs you/stuck, step one of Code/Test/PR/CI/Done (`kiro_crew.conductor_board_contract`).
+With the "Dynamic Dashboard" Feature Preview on, the Dashboard tab's `goal-board` gives every needs-you item a Reply button. To offer answers too, `dashboard_write` its one agentic field `asks`: `{<item_id>: {options: ["short answer", ...]}}`, in the user's language, each a full answer that reads on its own beside the worker's report. Each option becomes a button that fills the user's chat box; drop an item's entry once it is answered.
 
 ### Work-item qualification
 
@@ -298,7 +299,16 @@ python3 <this skill's dir>/scripts/patrol_budget.py renew \
 
 Each cycle:
 
-1. **`work_ledger_read` with `compact=true` first, every cycle.** It returns the
+1. **`work_ledger_read` with `compact=true` first, every cycle, unless the turn
+   already carries the board.** A cycle a worker's report woke you for arrives with a
+   `[work-ledger wake]` line naming each item that moved and a
+   `[work-ledger snapshot]` block holding the same document this read returns,
+   built when the turn was delivered. When you see that block, **act on it and
+   skip this read**: repeating it spends a round-trip to re-fetch what you are
+   already holding. Read for yourself when the turn carries no snapshot (a
+   scheduled patrol tick), or when you need a field the compact form omits.
+
+   The read returns the
    conductor record and, per item, the status columns plus the derived
    `orphaned`, `stale` and `acceptance_concrete` flags — no events, acceptance or
    `accept_batch`. This one read replaces the whole transcript-reading cycle, and
@@ -397,9 +407,9 @@ Each cycle:
    already-green pull request, which is exactly why the claim and the condition
    are separate fields.
 
-   **A `human_approval` item is verified by asking, and the ask is fragile.** The evaluator answers `pending` for it forever, so put the decision to the user with `ask_question`, which ends your turn. Leave the loop and its interval as they are: the `work-ledger` watch already makes a quiet cycle free, and the cycle after the user answers reads it.
+   **A `human_approval` item is verified by asking.** The evaluator answers `pending` for it forever, so put the decision to the user with `ask_question`. The call BLOCKS until the user responds and returns the answers as its tool result, so your turn does not end and no later patrol cycle has to pick the answer up: read the result and record the verdict in the same turn. The card waits up to 30 minutes; if the result says it expired, was dismissed, or that the user replied in chat instead, act on that outcome (re-ask, or read their next message) rather than inventing an answer.
 
-   If the user says the card is gone, re-issue it. A report that the card vanished is not an answer.
+   A result saying the card was withdrawn (dashboard restarted, tab reset) is not an answer: re-issue it.
 4. `work_ledger_record` `action=close` with the item's `state` when an item is
    finally done with — that is what ends it. **Closing the item and closing
    its session happen together.** When a work item reaches a terminal verdict
@@ -492,8 +502,20 @@ finished work.
 
 One exception: if their message directly invalidates an item that is still
 running, deal with that item now — `session_stop` it and `close` its ledger item,
-or `session_send` the correction straight into it. Do not tear down the whole
-round for one item.
+or `session_send` the correction straight into it with `steer: true`. Do not
+tear down the whole round for one item.
+
+**Steer corrections, queue everything else.** A plain `session_send` to a busy
+worker waits for its current turn to end, so a correction sent that way arrives
+only after the worker has spent the whole turn — a build, a long investigation —
+going the wrong way. Pass `steer: true` for a correction, a changed direction,
+or "stop, that is already done": it lands in the running turn, and when the
+worker is idle or mid-turn injection is unavailable it starts or queues a turn
+exactly like a plain send, so it is never dropped. Leave `steer` off for answers
+to a `question`, seeds, and anything that can wait for the turn boundary.
+A steer does not withdraw what is already queued: if `session_read_message`
+reports a non-zero `queue_depth`, those messages still run after the turn, so
+say in the steered message which earlier instruction it supersedes.
 
 ## When a conductor dispatched you
 
@@ -634,7 +656,7 @@ what the composer renders:
 
 ## Known limits of this version
 
-- **A question card can be displaced by your own later turns.** `ask_question` posts a card into the dashboard transcript, and every patrol turn you take while it is outstanding can push it out of the user's view. A quiet cycle takes no turn under the `work-ledger` watch, but a worker's report does. So while any question is open, put it first in every turn that speaks to the user ("Needs you" on the task board), with the one answer that unblocks it.
+- **A question card holds your turn open.** `ask_question` blocks until the user responds, so nothing else runs in this session meanwhile; keep patrol work out of the turn that asks, and ask only when the goal genuinely cannot advance without the answer.
 - **The session and ledger tools may not be in your tool list yet.** With MCP
   Tool Search active their specs are deferred, so a first `session_create` fails
   with `A tool with the name 'session_create' does not exist`. That means

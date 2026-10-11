@@ -670,7 +670,10 @@ def memory_store_version(store: str) -> int:
 
 def _require_legacy_store_files(store: str, target: Path) -> None:
     """An explicit member database cannot be opened through the V1 API."""
-    import sqlite3
+    # The same SQLite library the store opens this file with: a second copy keeps
+    # its own lock table, and closing its connection drops the POSIX locks the
+    # open store holds on the file, letting another process write mid-transaction.
+    from kiro_crew._sqlite_compat import sqlite3
 
     database = target / MEMORY_DB_FILE
     if not database.exists():
@@ -1437,7 +1440,7 @@ def _provision_member_memory(config, member: str) -> str:
     from kiro_crew.memory import PREFERENCES_FILE, PROJECTS_FILE
 
     manual = target / "memory"
-    manual.mkdir()
+    manual.mkdir(mode=0o700)
     atomic_write(manual / PREFERENCES_FILE, "# Member Preferences\n", fsync=True)
     atomic_write(manual / PROJECTS_FILE, "# Member Projects\n", fsync=True)
     agent.member_id = member_id

@@ -147,6 +147,7 @@ from kiro_crew.config.loader import (
     CONTEXT_WARN_MARGIN_PCT,
     POOL_SIZE_MAX,
     build_provider_factory,
+    crew_autocompact_pct,
     default_project_dir,
     normalize_agent_model,
     published_autocompact_pct,
@@ -990,6 +991,32 @@ def _provider_has_unfinished_turn(provider: LLMProvider) -> bool:
     return res is True
 
 
+def _provider_turn_is_known_terminal(provider: LLMProvider) -> bool:
+    """True only when *provider* explicitly reports no unfinished native turn.
+
+    Missing, raising, or awaitable stand-ins are unknown rather than terminal.
+    The deadline path may treat ``no_turn`` as settled only with this independent
+    done-boundary proof; collapsing unknown to False would recreate the original
+    false-success race on minimal providers and test doubles.
+    """
+    fn = getattr(provider, "has_unfinished_turn", None)
+    if not callable(fn):
+        return False
+    try:
+        res = fn()
+    except Exception:
+        return False
+    if inspect.isawaitable(res):
+        close = getattr(res, "close", None)
+        if callable(close):
+            try:
+                close()
+            except Exception:
+                pass
+        return False
+    return res is False
+
+
 StopOutcome = Literal["soft", "hard", "idle", "compacting"]
 
 
@@ -1060,6 +1087,10 @@ class _Session:
     # the caller's existing stale-provider path evicts it and cold starts. Default
     # False so every existing construction site is unaffected.
     retire_on_identity_change: bool = False
+    # The ``backend_override`` the session was cold-started with (``None``: the
+    # factory's default backend). Carried by ``allocation_identity`` so a reset
+    # successor or a compaction restart starts on the same harness.
+    backend_override: str | None = None
     # True while the lease is held for a LIFETIME rather than a turn -- see
     # ``session_lifecycle._turn_in_flight``, which is what asks.
     lifecycle_lease: bool = False
@@ -1367,6 +1398,9 @@ class SessionManager:
             get_claude_code_provider_type=lambda: ClaudeCodeProvider,
             provider_label=lambda provider: _provider_label(provider),
             provider_has_unfinished_turn=lambda provider: _provider_has_unfinished_turn(provider),
+            provider_turn_is_known_terminal=lambda provider: (
+                _provider_turn_is_known_terminal(provider)
+            ),
             provider_uses_kiro_identity_store=lambda provider: (
                 _provider_uses_kiro_identity_store(provider)
             ),
@@ -2047,6 +2081,12 @@ class SessionManager:
                 compact_failure_cooldown_secs=_COMPACT_FAILURE_COOLDOWN_SECS,
                 compact_min_effect_pct_points=_COMPACT_MIN_EFFECT_PCT_POINTS,
                 post_compact_reset_pct=_POST_COMPACT_RESET_PCT,
+                # Reads ``self._cfg`` at call time: the config watcher replaces it
+                # on every write, so a crew's new default reaches its live
+                # sessions on their next reading, with no file read on the loop.
+                agent_autocompact_pct=lambda session: crew_autocompact_pct(
+                    self._cfg, getattr(session, "capability_member", "") or ""
+                ),
             ),
             state=self._compaction_state,
         )
@@ -2739,7 +2779,10 @@ class SessionManager:
         return self._compaction.check_context_usage(key, provider)
 
     def effective_autocompact_pct(self, key: str) -> float:
-        """Delegate *key*'s live compaction threshold: its override, else the global.
+        """Delegate *key*'s live compaction threshold.
+
+        Precedence, highest first: the session's own override, the default its
+        agent declares (``agents.<name>.autocompact_pct``), the global.
 
         The READ half of :meth:`set_autocompact_pct`, for a caller that must know
         what a context reading fires at before it changes that reading's window.
@@ -2751,6 +2794,19 @@ class SessionManager:
         """
         self._sync_autocompact_pct()
         return self._compaction.effective_autocompact_pct(key)
+
+    def agent_autocompact_default(self, key: str) -> tuple[str, float] | None:
+        """The crew behind *key*'s live session and the threshold it declares.
+
+        What a session with no override of its own follows instead of the
+        global, for a surface that names which default is in force. ``None``
+        when that crew declares none, or when no live session holds *key*.
+        """
+        pct = self._compaction.agent_autocompact_pct(key)
+        if pct is None:
+            return None
+        session = self._sessions.get(self._fold_key(key))
+        return (getattr(session, "capability_member", "") or "", pct)
 
     def set_autocompact_pct(self, key: str, pct: float | None) -> None:
         """Set or clear (``None``) *key*'s per-session compaction threshold.
@@ -3779,6 +3835,20 @@ class SessionManager:
         """Cancel the in-flight operation without destroying its session."""
         return await self._lifecycle_boundary().cancel_current(
             key,
+            wait_ack_timeout=wait_ack_timeout,
+        )
+
+    async def cancel_owned_turn(
+        self,
+        key: str,
+        owner_task: Any,
+        *,
+        wait_ack_timeout: float = 0.0,
+    ) -> CancelOutcome | None:
+        """Cancel only if *owner_task* still owns the session's turn lease."""
+        return await self._lifecycle_boundary().cancel_owned_turn(
+            key,
+            owner_task,
             wait_ack_timeout=wait_ack_timeout,
         )
 

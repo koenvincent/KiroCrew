@@ -125,7 +125,9 @@ class DashboardPersistenceCoordinator:
         # a sidebar color, title or similar edit made before its first message
         # only marks it dirty. The forced save takes the empty-window merge for
         # it, which writes into an existing line only, so a plain empty tab
-        # still gets no file.
+        # still gets no file. Queue drift alone (an enqueue or a cancel) is saved
+        # too. A line-less tab writes nothing, and the merge credits the queue
+        # witness for it, so the drift does not re-run the save on every tick.
         force = not slot.messages
         save_slot_to_history = self._slot_saver_provider()
 
@@ -148,7 +150,13 @@ class DashboardPersistenceCoordinator:
             # metadata rebuild -- it does not request the ``rows_only`` deferral
             # that keeps another holder's folder, title and tag.
             if force:
-                save_slot_to_history(owner, slot, expected_slot_name=slot.key, force=True)
+                save_slot_to_history(
+                    owner,
+                    slot,
+                    expected_slot_name=slot.key,
+                    force=True,
+                    refuse_stale_empty_merge=True,
+                )
             else:
                 save_slot_to_history(owner, slot, expected_slot_name=slot.key)
         except Exception:

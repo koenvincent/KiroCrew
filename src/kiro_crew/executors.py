@@ -266,6 +266,16 @@ _CRON_GATE_QUEUE_SHARE = 0.25
 # a full gate pool is never larger than the pool it is kept off.
 _MAX_TOOL_GATE_WORKERS = 4
 
+# How long one tool-gate call may wait for a ``mc-toolgate`` worker before it is
+# refused unjudged.  Bounds the WAIT only: a call a worker has claimed runs to
+# its own verdict, which the path tier already bounds.  Sized from the 100-agent
+# load run against two numbers: healthy queue waits
+# are milliseconds, so the bound never binds outside starvation, and a worker on
+# a dead mount holds at most one resolve budget plus grace (5 s) per call and
+# about 12 s per 25 s window (the per-thread allowance in ``security.paths``),
+# so a call queued behind four such workers is still served inside the bound.
+_TOOL_GATE_QUEUE_WAIT_SECS = 15.0
+
 # Pillow work for the gateway's tool-result image budget is CPU-bound (a
 # decode plus up to seven LANCZOS resize+encode passes per oversized raster,
 # seconds each) and paced by whatever a brokered MCP server returns.  Two
@@ -835,12 +845,18 @@ def tool_gate_executor() -> ThreadPoolExecutor:
     return _tool_gate_pool
 
 
-async def run_in_tool_gate_pool(func: Callable[..., _T], /, *args: Any, **kwargs: Any) -> _T:
+async def run_in_tool_gate_pool(
+    func: Callable[..., _T],
+    /,
+    *args: Any,
+    on_queue_timeout: Callable[[float], _T],
+    **kwargs: Any,
+) -> _T:
     """Await ``func(*args, **kwargs)`` on :func:`tool_gate_executor`.
 
     The form of the tool gate a coroutine uses:
-    ``await run_in_tool_gate_pool(hooks.on_tool_call, title, **kwargs)``. The
-    gate's path tier resolves agent-supplied paths in the ``mc-pathres`` child
+    ``await run_in_tool_gate_pool(hooks.on_tool_call, title, on_queue_timeout=..., **kwargs)``.
+    The gate's path tier resolves agent-supplied paths in the ``mc-pathres`` child
     and waits for the answer on the CALLING thread, for up to the resolve budget
     plus its grace. Called inline from a coroutine, that wait parks the whole
     loop -- every other session's stream, the websockets and the stall watchdog.
@@ -849,13 +865,31 @@ async def run_in_tool_gate_pool(func: Callable[..., _T], /, *args: Any, **kwargs
     The resolve deadline is armed on the thread that waits, so the hop is not
     charged against the budget. Synchronous callers keep calling the gate inline.
 
+    The wait for a worker is bounded by :data:`_TOOL_GATE_QUEUE_WAIT_SECS`. A call
+    no worker claimed in that time never runs, and the caller gets
+    ``on_queue_timeout(waited)`` instead: its own refusal, because the gate never
+    judged the call and so cannot have allowed it. Required, so no caller can
+    forget the fail-closed answer. A call a worker claimed runs to its verdict
+    (:func:`run_in_cron_pool`'s two phases, which tell queued from claimed).
+
     Copies the caller's context onto the worker the way ``asyncio.to_thread``
     does, so context variables the gate reads (``uncounted_gate`` among them)
     see the caller's values.
     """
-    loop = asyncio.get_running_loop()
     call = functools.partial(copy_context().run, func, *args, **kwargs)
-    return await loop.run_in_executor(tool_gate_executor(), call)
+    try:
+        return await run_in_cron_pool(
+            call,
+            timeout=None,
+            queue_timeout=_TOOL_GATE_QUEUE_WAIT_SECS,
+            executor=tool_gate_executor(),
+        )
+    except CronQueueTimeout as exc:
+        logger.warning(
+            "tool gate refused a call unjudged: no mc-toolgate worker freed in %.1fs",
+            exc.waited,
+        )
+        return on_queue_timeout(exc.waited)
 
 
 class CronQueueTimeout(asyncio.TimeoutError):
@@ -913,7 +947,7 @@ async def run_in_cron_pool(
     func: Callable[..., _T],
     /,
     *args: Any,
-    timeout: float,
+    timeout: float | None,
     queue_timeout: float | None = None,
     executor: ThreadPoolExecutor | None = None,
 ) -> _T:
@@ -945,6 +979,9 @@ async def run_in_cron_pool(
     deliberately NOT derived from *timeout*: a 30s job behind a wedged worker
     should wait well past 30s and then run, not be killed on its own clock for
     something it did not do.
+
+    *timeout* ``None`` leaves the execution phase unbounded, for a caller whose
+    work bounds itself (the tool gate, :func:`run_in_tool_gate_pool`).
 
     *executor* defaults to :func:`cron_executor`.  It exists so the fire-time
     gate can reuse this two-phase discipline on its own pool

@@ -55,10 +55,13 @@ __all__ = [
     "derived_agent_permissions",
     "finish_suspended_spawn",
     "forget_cached_resolution",
+    "kas_engine_gap",
+    "kas_engine_unsupported_reason",
     "kiro_cli_resolves",
     "provider_error_client",
     "resolve_pin_spelling",
     "resolve_pin_spelling_on",
+    "resolve_usable_model",
     "run_kiro_native_commands",
     "drain_skill_view_aliases",
     "skill_view_alias_census",
@@ -143,6 +146,20 @@ def resolve_pin_spelling_on(model_id: str, advertised: object, backend: str) -> 
     from kiro_crew.acp.client import resolve_pin_spelling_on as _impl
 
     return _impl(model_id, advertised, backend=backend)  # type: ignore[arg-type]
+
+
+def resolve_usable_model(preferred: str, advertised: object, *, backend: str = "") -> str:
+    """The model a substitute choice *preferred* resolves to, or ``""`` to inherit.
+
+    Thin delegation to :func:`kiro_crew.acp.client.resolve_usable_model` so
+    application code (the diagnose probes) reaches it through the SDK surface
+    instead of importing the ACP layer (the agent-sdk-boundary gate refuses a new
+    edge). Plain data in, plain data out. Function-local import for the same
+    reason as :func:`resolve_pin_spelling`.
+    """
+    from kiro_crew.acp.client import resolve_usable_model as _impl
+
+    return _impl(preferred, advertised, backend=backend)  # type: ignore[arg-type]
 
 
 def catalog_row_would_drop(model_id: str, advertised: object) -> bool:
@@ -289,6 +306,46 @@ def kiro_cli_resolves() -> bool:
     from kiro_crew.acp.client import _resolve_kiro_bin
 
     return bool(_resolve_kiro_bin())
+
+
+def kas_engine_gap(help_text: str) -> str | None:
+    """What ``acp --help`` *help_text* lacks for KAS, as one short clause, or ``None``.
+
+    The one reading of that text: ``kirocrew doctor`` and the gateway's boot floor
+    both call it. Two distinct gaps: the engine flag is absent entirely (a kiro-cli
+    predating engine selection), or it is present without the KAS engine.
+    """
+    from kiro_crew.acp.kas_transport import KAS_RELAY_ENGINE, KAS_RELAY_ENGINE_FLAG
+
+    if KAS_RELAY_ENGINE_FLAG not in help_text:
+        return f"this kiro-cli has no {KAS_RELAY_ENGINE_FLAG} flag"
+    if KAS_RELAY_ENGINE not in help_text:
+        return f"this kiro-cli does not offer engine {KAS_RELAY_ENGINE}"
+    return None
+
+
+def kas_engine_unsupported_reason() -> str | None:
+    """Why the pinned kiro-cli cannot serve KAS, or ``None`` when it can or nobody knows.
+
+    The same ``acp --help`` probe ``kirocrew doctor`` reports from. A reason comes
+    back only for help text that RAN and lacks the engine. Every unknown — no pinned
+    binary, a failed spawn — is ``None``, so a runtime gate built on this never moves
+    a host off KAS on a verdict it could not establish.
+
+    Blocking: one bounded spawn. Never raises.
+    """
+    from kiro_crew import kiro_cli
+
+    try:
+        binary, _unpinned = kiro_cli.pin_kiro_cli()
+    except Exception:  # noqa: BLE001 - an unanswerable probe is unknown, not an error
+        return None
+    if binary is None:
+        return None
+    help_text = kiro_cli.kas_relay_help(binary)
+    if help_text is None:
+        return None
+    return kas_engine_gap(help_text)
 
 
 def claude_components_resolve() -> tuple[bool, bool]:

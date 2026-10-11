@@ -544,6 +544,59 @@ service installer such as `cloudflared service install`).
 > forward or a socat relay adds no such header, so it looks local and is not
 > refused.
 
+### Behind a reverse proxy
+
+Your own nginx, Caddy or similar works the same way as a tunnel: it terminates
+TLS on a public name and forwards to the loopback port.
+
+1. Serve the whole dashboard (page, API and WebSocket) from one host name, at
+   the root path. The dashboard's Content-Security-Policy admits `'self'` for
+   `connect-src`, so the browser accepts `wss://<that name>` sockets. It admits
+   no other public host, and no setting adds one. A split setup, with the
+   socket on a second host, is refused by the browser.
+2. Set `dashboard.url` to that public URL, as shown above, and restart. This
+   adds the origin to the allowed-origin set, so the CSRF check, the
+   WebSocket handshake and the DNS-rebinding `Host` barrier accept it.
+3. Pass these headers to the gateway:
+   - `Host`: the public name (or `localhost:<port>`). Any other value is
+     refused by the `Host` barrier.
+   - `X-Forwarded-Proto: https`. Without it the auth cookie is set without
+     `Secure`, and mobile browsers drop it from the `wss://` upgrade.
+   - `Upgrade` and `Connection`, so WebSocket upgrades pass through.
+
+nginx:
+
+```nginx
+server {
+    listen 443 ssl;
+    server_name kirocrew.example.com;
+    # ssl_certificate / ssl_certificate_key ...
+
+    location / {
+        proxy_pass http://127.0.0.1:5476;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-Proto https;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_read_timeout 1h;
+        proxy_buffering off;
+    }
+}
+```
+
+Caddy forwards `Host`, `X-Forwarded-Proto` and WebSocket upgrades by default:
+
+```
+kirocrew.example.com {
+    reverse_proxy 127.0.0.1:5476
+}
+```
+
+The public-internet notes above apply here too: put an auth layer in front of
+the proxy, and change settings over SSH, since proxied requests stay
+read-only.
+
 ### Getting a link on your phone
 
 1. In your Kiro Crew DM, send `/kirocrew dashboard` (or `/kirocrew dashboard 6h`).
@@ -661,23 +714,36 @@ Safari's address bar.
 
 **The service worker provides a limited offline shell.**
 [`website/public/sw.js`](../../website/public/sw.js) caches exactly `/` and
-`/index.html`. Every other same-origin `GET` is either passed straight to the
-browser or handled network-first; no other response is cached:
+`/index.html`. Every other same-origin `GET` falls into one of two buckets: a
+small set of **boot-critical assets** the worker takes over only so a transient
+`5xx` can be retried (never cached — the HTTP immutable cache still owns them),
+and the paths it **declines** and hands straight to the network. Only the shell is
+ever cached.
 
-| Path | Service-worker behavior |
+Retried (intercepted so one transient `5xx` cannot dead-page the boot):
+
+| Path | Why it earns a retry |
 |---|---|
-| any URL with a `token` query parameter (the `/?token=...` sign-in link) | Declines to intercept, never answers from the cached shell and never caches it, so the gateway's token exchange always runs |
-| `/api`, `/sandbox-doc/`, `/app-windows/`, `/apps/` | Declines to intercept API, one-shot document, standalone app-window, and app-backend responses |
-| `/assets/`, `/vendor/` | Retries network errors and 5xx responses twice with jitter, but never caches the response |
-| `/fonts/`, `/sprites/` | Declines to intercept non-critical static resources |
-| `/logo.png`, `/static/` | Declines to intercept gateway-served brand assets |
+| `/assets/` | Vite content-hashed bundles a document cannot boot without; one 502 leaves a dark skeleton no reload clears |
+| `/vendor/` | Bare-specifier module stubs the import map depends on; boot-critical on standalone app-window documents |
+| `/pcm-worklet.js` | The dictation/STT worklet; `addModule` is called once with no retry. It previously fell through to the network-first shell handler, which fetched it once with no retry, so a transient `5xx` rejected `addModule`. Adding it here gives it the same bounded retry as `/assets/` and `/vendor/` |
 
-Every other same-origin `GET` is network-first, with the cached shell used only
-for failed navigation requests. So offline you get the shell and its reconnecting
-state — and only while the browser's own HTTP cache still holds the hashed
-`/assets/` bundles, which the worker never caches. After a build that changes
-those hashes, the cached shell references bundle URLs nothing has downloaded yet.
-Sessions, history, and notifications are never served from disk.
+Declined (handed straight to the network, never intercepted):
+
+| Path | Why it is not intercepted |
+|---|---|
+| any URL with a `token` query parameter (the `/?token=...` sign-in link) | Never answers from the cached shell and never caches it, so the gateway's token exchange always runs |
+| `/api`, `/apps/` | Gateway and app-backend responses must never be served stale |
+| `/fonts/`, `/sprites/` | Cost looks, not boot — a failed font or sprite does not stop the page running, so it earns no retry |
+| `/logo.png`, `/static/` | Gateway-served brand assets; intercepting them strands a broken image across a gateway restart |
+| `/sandbox-doc/`, `/app-windows/`, navigations into a widget frame | One-shot credentialed URLs, standalone app-window documents, and the shell fallback must not render into a widget frame |
+
+Everything not listed above is intercepted network-first, but only the shell is
+ever cached. So offline you get the shell and its reconnecting state — and only
+while the browser's own HTTP cache still holds the hashed `/assets/` bundles, which
+the worker never caches. After a build that changes those hashes, the cached shell
+references bundle URLs nothing has downloaded yet. Sessions, history, and
+notifications are never served from disk.
 
 **Two current limits**, documented here so they read as boundaries rather than
 bugs:
@@ -789,6 +855,28 @@ fi
 
 open "$URL"
 ```
+
+### Behind a reverse proxy at a sub-path
+
+The stock dashboard expects to sit at the root of its origin. To serve it under
+a prefix such as `https://gateway.example.com/proxy/kirocrew/`, build the
+frontend for that prefix:
+
+```bash
+cd website
+KIROCREW_BASE_PATH=/proxy/kirocrew npm run build
+cd .. && PYTHONPATH=src python -m kiro_crew.frontend stage .
+```
+
+`KIROCREW_BASE_PATH` is read only at build time. It becomes the prefix of every
+asset URL, the router base, and the path of the dashboard's own API, stream and
+WebSocket calls. The gateway serves the built page unchanged and does not read
+the variable, so a sub-path deployment is its own build. Unset, or `/`, builds
+the stock root dashboard. A value with a scheme, a host, a query, or a `.`/`..`
+segment stops the build.
+
+The proxy strips the prefix before forwarding, relays cookies, and rewrites
+`Location` headers on redirects. It no longer needs to rewrite the JavaScript.
 
 ---
 

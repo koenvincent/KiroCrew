@@ -23,6 +23,7 @@ from kiro_crew.task_models import (
     Task,
     TaskStatus,
 )
+from kiro_crew.tool_gate_busy import hook_gate_busy
 
 if TYPE_CHECKING:
     from kiro_crew.context import ContextBuilder
@@ -341,6 +342,7 @@ async def decompose(
                     hook_result = await run_in_tool_gate_pool(
                         ctx.hooks.on_tool_call,
                         event.title,
+                        on_queue_timeout=hook_gate_busy,
                         session_key=session_key,
                         agent=agent,
                         **hook_gate_kwargs(event),

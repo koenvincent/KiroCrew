@@ -402,6 +402,9 @@ export interface AssistantBubbleOptions {
    *  `messageTs`, which also versions this row's local image URLs, so a host
    *  passes it with the triple rather than on its own. */
   messageTs?: string
+  /** The bubble's own Regenerate action (its hover row), for the host that
+   *  can regenerate this reply. Absent: no Regenerate. */
+  onRegenerate?: () => void
 }
 
 /**
@@ -486,6 +489,7 @@ export function renderAssistantBubble(
       decisionsStrip={decisionStripFieldOf(m)}
       fileChanges={(m.meta as Record<string, unknown> | undefined)?.file_changes as FileChangeEntry[] | undefined}
       fileChangesOmittedFiles={(m.meta as Record<string, unknown> | undefined)?.file_changes_omitted_files}
+      onRegenerate={opts.onRegenerate}
       suppressSteerAck={opts.suppressSteerAck || turnHadPolicyBlock(ctx.messages, ctx.index)}
       bubbleClassName={bubbleClassName}
       onReplyInThread={isStreaming ? undefined : replyInThreadFor(m, ctx)}
@@ -662,7 +666,9 @@ export const defaultMessageRenderers: readonly MessageRenderer[] = [
     // Reasoning roles derive from the shared classification (see
     // pages/chat/groupDisplayItems.ts) so this default cannot drift from the
     // surfaces that DO draw them; the lifecycle roles are local to this entry.
-    roles: [...REASONING_ROLES, 'system', 'done', 'queued'],
+    // `card` is a change card / guide offer: drawn only by a host that
+    // has the card stores (pages/chat/transcriptRenderers), never as a bubble.
+    roles: [...REASONING_ROLES, 'system', 'done', 'queued', 'card'],
     render: () => null,
   },
   {

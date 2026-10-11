@@ -1490,7 +1490,24 @@ html:lang(ko) {
      than `:focus` so a pointer click never paints it — the ring is drawn only
      for the keyboard and AT interactions that have no other cue to where focus
      sits. `outline` is used (not border/box-shadow) because it is painted
-     outside the box and so cannot shift layout. */
+     outside the box and so cannot shift layout.
+     OUTLINE-ONLY BY DESIGN. The accent `outline` carries the theme's identity.
+     It is deliberately NOT paired with a `box-shadow` hairline at the global
+     level, because the house opt-out — `outline-hidden`/`outline-none` — resets
+     only `outline`, not `box-shadow`. A global hairline would therefore survive
+     the opt-out and paint a hard high-contrast rectangle on every element that
+     meant to opt out: the chat composer and docked SearchBar, the
+     programmatically-focused `<h1 tabIndex={-1} outline-hidden>` page titles
+     (OnboardingFlow, AgentImportFlow, PrivacyChapter) and the `focus-visible:
+     bg-*` menu rows. Keeping the global rule outline-only means opting out stays
+     a complete opt-out, exactly as on main.
+     WHERE THE 3:1 HAIRLINE LIVES: controls that need to clear WCAG 1.4.11's 3:1
+     non-text floor in the three light palettes where `--accent` alone is below
+     it (rosepine-light 2.60, everforest-light 2.81, intellij-light 2.92) opt IN
+     to `.focus-ring` / `.focus-ring-accent*`, which add the opaque `--text-strong`
+     hairline on top of the accent band. Those utilities are the migrated call
+     sites from issue #4428; the global accent outline is the baseline cue for
+     everything else. */
   :focus-visible{outline:2px solid var(--accent);outline-offset:2px}
   @media(prefers-reduced-motion:reduce){*:not([data-virtuoso-scroller] *),*::before,*::after{animation-duration:0.01ms !important;animation-iteration-count:1 !important}}
   /* The rule above zeroes animation-DURATION but not animation-DELAY, and both
@@ -2760,7 +2777,7 @@ body.mc-focus-mode.mc-focus-rail .focus-chrome-rail{
    `outline:none` opts out of the global ring in favour of this border + glow,
    and the extra class raises specificity so the two never stack. */
 .focus-ring:focus-visible{outline:none;border-color:var(--ring);
-  box-shadow:0 0 0 3px var(--accent-subtle),0 0 20px color-mix(in srgb,var(--accent) 8%,transparent)}
+  box-shadow:0 0 0 1px var(--text-strong),0 0 0 3px var(--accent-subtle),0 0 20px color-mix(in srgb,var(--accent) 8%,transparent)}
 /* The desktop Settings search bar (pages/settings/SettingsSearch.tsx) is a boxed
    input, not a glass pane, so it keeps a focus ring -- the shared shape with a
    neutral colour: a stronger neutral border and a neutral halo, never the theme
@@ -2771,6 +2788,71 @@ body.mc-focus-mode.mc-focus-rail .focus-chrome-rail{
    name only. Same specificity chain plus one class, so it wins here only. */
 .settings-search .focus-ring:focus-visible{border-color:color-mix(in srgb,var(--text) 60%,var(--border));
   box-shadow:0 0 0 3px color-mix(in srgb,var(--text) 22%,transparent),0 0 20px rgba(0,0,0,.06)}
+
+/* ── Shared accent focus ring (WCAG 1.4.11-safe) ── */
+/* The house keyboard-focus cue for controls that want the THEME ACCENT ring
+   rather than the neutral `.focus-ring` glow (completion-card scroll regions,
+   row-pill buttons, icon buttons, text inputs). Replaces the old per-site
+   `focus-visible:ring-2 focus-visible:ring-accent focus-visible:outline-hidden`
+   cluster — see issue #4428.
+
+   WHY A SHARED UTILITY AND NOT `ring-accent`: `--accent` is where each theme
+   spends its identity, so it must stay the ring colour, but it is NOT a token
+   with a contrast contract — it falls below WCAG 1.4.11's 3:1 non-text floor
+   against `--bg` in three light palettes (rosepine-light 2.60, everforest-light
+   2.81, intellij-light 2.92) and lower still against the accent-tinted card fill
+   (2.39 / 2.56 / 2.66). A translucent `ring-accent/40` or `/50` cannot reach the
+   floor with ANY opaque token at that alpha. So the identity hue cannot also
+   carry the minimum.
+
+   HOW: hue identifies, a neutral hairline carries the minimum. The inner 1px
+   layer is opaque `--text-strong`, which clears 3:1 against both `--bg` and the
+   card fill in every one of the 36 built-in themes (worst case 6.48:1,
+   everforest-light); the accent band outside it supplies the theme identity. A
+   control stays legible even in the themes where the accent alone would not.
+   `outline:2px solid transparent` opts out of the global `:focus-visible` ring
+   in favour of this `box-shadow` cue, and the `.focus-ring-accent` class raises
+   specificity so the two never stack. The outline is TRANSPARENT rather than
+   `none` so that in `forced-colors: active` (Windows High Contrast) — where the
+   UA forces every `box-shadow` to `none` and would otherwise leave these
+   migrated controls with no focus ring at all (a WCAG 2.4.7 regression) — the
+   system repaints the transparent outline in its own highlight colour. This
+   matches the `outline-hidden` behaviour every call site had before migration
+   (Tailwind 4's `outline-hidden` expands to a transparent forced-colors
+   outline) and the repo's established `forced-colors` handling elsewhere.
+   `box-shadow` (like `outline`) paints outside the border box, so it never
+   shifts layout. The `-inset` variant uses `outline-offset:-2px` so its forced-
+   colors ring is drawn inside the clipped box, matching its inset shadow. */
+.focus-ring-accent:focus-visible{outline:2px solid transparent;outline-offset:2px;
+  box-shadow:0 0 0 1px var(--text-strong),0 0 0 3px var(--accent)}
+/* A control that marks SELECTION with its own `ring-1 ring-accent ring-offset-1`
+   (the colour swatches in `TagManagerList`) loses that selection cue while it
+   is keyboard-focused, because `.focus-ring-accent`'s `box-shadow` replaces the
+   Tailwind ring. Re-add the selection as an OUTER layer beyond the focus band
+   so a focused + selected swatch still reads as chosen: 1px gap (`--bg`) then a
+   2px `--accent` selection ring outside the 3px focus band. `aria-pressed=true`
+   is the selected state the swatch sets.
+   NARROWED to the swatch's own `.swatch-cue` class: the bare
+   `.focus-ring-accent[aria-pressed="true"]` selector also matched two toggles
+   that carry no selection ring to restore (the TagManagerList status toggle and
+   the band filter chip), giving them an unwanted outer accent ring. Only the
+   colour swatch combines `.swatch-cue` + `.focus-ring-accent` + `aria-pressed`,
+   so this reaches exactly the one consumer that needs it. */
+.swatch-cue.focus-ring-accent[aria-pressed="true"]:focus-visible{
+  box-shadow:0 0 0 1px var(--text-strong),0 0 0 3px var(--accent),
+             0 0 0 4px var(--bg),0 0 0 6px var(--accent)}
+/* Gap variant: a 1px `--bg` gap between the control edge and the hairline, for
+   a BORDERED option whose pre-migration cue carried `ring-offset-1
+   ring-offset-bg` (the `SessionPulseSurveyCard` rating options). The gap keeps
+   the ring from sitting flush against the option's own border. The hairline and
+   accent band shift out by 1px; the hairline still carries the 3:1 floor. */
+.focus-ring-accent-gap:focus-visible{outline:2px solid transparent;outline-offset:2px;
+  box-shadow:0 0 0 1px var(--bg),0 0 0 2px var(--text-strong),0 0 0 4px var(--accent)}
+/* Inset variant for a scroll region flush inside an `overflow-hidden` box (the
+   completion / compaction / workflow card digests), where an outset ring would
+   be clipped. `inset` draws the same two layers INSIDE the content edge. */
+.focus-ring-accent-inset:focus-visible{outline:2px solid transparent;outline-offset:-2px;
+  box-shadow:inset 0 0 0 1px var(--text-strong),inset 0 0 0 3px var(--accent)}
 
 /* ── Colour-swatch hover cue ── */
 /* The colour swatches (session colours, folder/tag colours) carry no built-in
@@ -2865,6 +2947,17 @@ body.mc-focus-mode.mc-focus-rail .focus-chrome-rail{
 .side-tab-inactive:hover::before{
   content:'';position:absolute;left:0;right:0;top:2px;bottom:4px;
   border-radius:8px;background:var(--bg-hover);z-index:-1}
+/* Narrow strip: the pinned views (Changes / Artifacts / Files) are labelled,
+   but at a strip too narrow for three labels an INACTIVE pinned chip drops to
+   its icon, so all three stay on screen instead of the last one scrolling out
+   of view. The active chip keeps its word; every chip keeps its aria-label and
+   tooltip. Unlayered, so it beats the chip's Tailwind width/padding utilities.
+   The strip is the query container (`side-panel-strip-cq`). */
+.side-panel-strip-cq{container-type:inline-size}
+@container (max-width:400px){
+  .side-tab-pinned-idle{width:2rem;max-width:none;justify-content:center;padding-left:0;padding-right:0}
+  .side-tab-pinned-idle .side-tab-label,.side-tab-pinned-idle .side-tab-badge{display:none}
+}
 /* Reveal-in-sidebar confirmation: an accent outline the reveal handler holds
    briefly and then fades (ChatSidebar reveal effect, issue #912). Outline, not
    background, because the revealed row is usually the active one and already

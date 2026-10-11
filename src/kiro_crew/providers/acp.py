@@ -51,7 +51,6 @@ from kiro_crew.acp.types import (
     ACP_BACKENDS_COMPACT,
     ACP_BACKENDS_CONTEXT_RECYCLE,
     ACP_BACKENDS_EFFORT_FROM_ADVERTISED_OPTION,
-    ACP_BACKENDS_EFFORT_VIA_CONFIG_OPTION,
 )
 from kiro_crew.acp.types import (
     ACP_BACKENDS_HARNESS_MANAGED_COMPACTION as ACP_BACKENDS_HARNESS_MANAGED,
@@ -446,6 +445,8 @@ def _is_transient_resume_lock_error(exc: BaseException) -> bool:
 class AcpProvider(LLMProvider):
     """LLMProvider backed by ACP JSON-RPC over stdio (kiro-cli or claude-agent-acp)."""
 
+    reports_effort_support = True
+
     def __init__(
         self,
         work_dir: str | Path | None = None,
@@ -558,6 +559,8 @@ class AcpProvider(LLMProvider):
         # backend applies it live via session/set_config_option (no overlay).
         self._effort_per_model: dict[str, str] = dict(effort_per_model or {})
         self._effort_defaults = effort_defaults
+        # The spelling the factory keyed ``effort_per_model`` under.
+        self._configured_model: str = model or ""
         # MCP Tool Search toggle (kiro-cli backend only). None = caller did not
         # specify (e.g. claude_code factory), so leave the overlay untouched.
         # True/False = write the kiro settings overlay deterministically so the
@@ -840,11 +843,11 @@ class AcpProvider(LLMProvider):
 
         Answered from ``ACP_BACKENDS_COMPACT`` membership (harness-parity H6):
         kiro-cli answers the ``/compact`` prompt with
-        ``_kiro.dev/compaction/status`` and claude-agent-acp compacts natively
-        in-prompt, while KAS treats the prompt as ordinary text and never emits
-        a status — its ``summarization_*`` frames fire only for KAS-initiated
-        auto-summarization — so an ungated dispatch strands
-        ``wait_for_compaction()`` for the full ``COMPACT_WAIT_TIMEOUT_SECS``.
+        ``_kiro.dev/compaction/status``, claude-agent-acp compacts natively
+        in-prompt, and on KAS the session handle sends the engine's
+        ``_kiro/session/compact`` verb instead of the prompt. A non-member
+        dispatched anyway strands ``wait_for_compaction()`` for the full
+        ``COMPACT_WAIT_TIMEOUT_SECS``.
         Read off the backend STRING, not the ``is_*_backend``
         properties, matching ``provider_label``'s MagicMock caution; a
         non-``str`` value answers ``None`` so a spec'd double never reads as a
@@ -870,6 +873,18 @@ class AcpProvider(LLMProvider):
         if not isinstance(backend, str):
             return True
         return backend in ACP_BACKENDS_COMPACT or backend in ACP_BACKENDS_HARNESS_MANAGED
+
+    @property
+    def harness_managed_compaction_backend(self) -> str | None:
+        """Backend id when the harness compacts on its own, else ``None``.
+
+        Membership in ``ACP_BACKENDS_HARNESS_MANAGED_COMPACTION``, with the same
+        ``str`` caution as :attr:`manual_compact_unsupported_backend`.
+        """
+        backend = getattr(self._client, "backend", ACP_BACKEND_KIRO)
+        if not isinstance(backend, str) or backend not in ACP_BACKENDS_HARNESS_MANAGED:
+            return None
+        return backend
 
     @property
     def compaction_unmanaged_backend(self) -> str | None:
@@ -1749,6 +1764,22 @@ class AcpProvider(LLMProvider):
             return None
         return self._client.get_valid_effort_levels()
 
+    def accepts_effort_level(self, level: str) -> bool:
+        """False when this session's advertised vocabulary has no spelling of *level*.
+
+        Only a harness in ``ACP_BACKENDS_EFFORT_FROM_ADVERTISED_OPTION`` can answer
+        False, and only once it has advertised a non-empty option: there a Crew
+        level the harness has no value for -- after its own spelling is applied --
+        is HIDDEN rather than mapped onto a neighbour, so a write of it is refused
+        before it reaches the session. Everywhere else the model registry and the
+        step-down in :meth:`_set_effort_config_option` stay the authority, and this
+        answers True.
+        """
+        advertised = self._advertised_effort_levels()
+        if not advertised:
+            return True
+        return effort_config_option_value(self._client.backend, level) in advertised
+
     def supports_effort(self) -> bool:
         """True when this session accepts a reasoning-effort level.
 
@@ -1806,6 +1837,11 @@ class AcpProvider(LLMProvider):
         instead. Also a no-op when the model is not effort-capable or no level
         resolves. Called before every (re)spawn so resume/restart keeps the same
         level.
+
+        KAS is written too, though kiro-cli's KAS engine never reads the file:
+        Crew does, re-seeding the slot's levels from it at construction, so a
+        level set on a KAS session survives a gateway restart. The live level
+        there travels as the ``effortLevel`` config option instead.
 
         Membership rather than "not claude": the companion clear
         (``_clear_cli_overlay_effort`` in :meth:`change_effort`) is already
@@ -1942,12 +1978,28 @@ class AcpProvider(LLMProvider):
             )
         # Descend from the requested level through lower levels (e.g.
         # max → xhigh → high). Never escalate above what was asked.
+        #
+        # On a harness that is the authority on its own vocabulary, the descent
+        # walks only the rungs that session advertised, and a target it never
+        # advertised is not written at all: such a level is hidden there, not
+        # stepped onto a neighbour, and every value this sends is one the harness
+        # offered -- so no refusal shape has to be recognised for it.
+        advertised = self._advertised_effort_levels()
+        if advertised and target not in advertised:
+            logger.info(
+                "effort %r is not advertised by backend %s; skipping effort push",
+                level,
+                self._client.backend,
+            )
+            return
         try:
             start = EFFORT_LEVELS.index(target)
         except ValueError:
             await self._client.set_config_option(effort_option, target)
             return
         ladder = [lvl for lvl in reversed(EFFORT_LEVELS[: start + 1])]
+        if advertised:
+            ladder = [lvl for lvl in ladder if lvl in advertised]
         last_exc: Exception | None = None
         for candidate in ladder:
             try:
@@ -1993,8 +2045,10 @@ class AcpProvider(LLMProvider):
                 model,
             )
             return False
-        via_config_option = self._client.backend in ACP_BACKENDS_EFFORT_VIA_CONFIG_OPTION
-        via_slash_command = self._client.backend in ACP_BACKENDS_KIRO_SLASH_COMMANDS
+        # The capability answers, not raw set membership: KAS sits in both sets
+        # and the capability layer is where the config option wins for it.
+        via_config_option = self.capabilities.effort_via_config_option
+        via_slash_command = self.capabilities.effort_via_slash_command
         if not (via_config_option or via_slash_command):
             # Both channels are opt-in, so a harness in neither has to be reported
             # unsupported here. Guessing one would push into a verb the adapter
@@ -2025,6 +2079,12 @@ class AcpProvider(LLMProvider):
 
         if not level or level not in get_reasoning_effort_values():
             raise ValueError(f"invalid effort level {level!r}")
+        if not self.accepts_effort_level(level):
+            # A level this session's own vocabulary hides is refused before
+            # anything persists, so no override re-pushes it on a respawn.
+            raise ValueError(
+                f"effort level {level!r} is not offered by backend {self._client.backend!r}"
+            )
         # Snapshot so a failed live push doesn't leave a poisoned override/
         # overlay that would re-push the rejected level on every respawn.
         _prev = self._effort_per_model.get(model)
@@ -2110,6 +2170,10 @@ class AcpProvider(LLMProvider):
             # capable one, the same "persisted no-op" the effort endpoint applies.
             return True
         if level:
+            if not self.accepts_effort_level(level):
+                # Hidden by this session's own vocabulary: the same persisted
+                # no-op, since a cold start drops it too and a reset gains nothing.
+                return True
             return bool(await self.change_effort(level))
         # No override: re-resolve so a workspace default reaches the new model. A
         # False here only means there was no default to push, so nothing is stale.
@@ -2132,9 +2196,9 @@ class AcpProvider(LLMProvider):
                 await self.reapply_live_effort(own)
             elif self.supports_effort():
                 # Live only: persisting it would overwrite the target's stored state.
-                if self._client.backend in ACP_BACKENDS_EFFORT_VIA_CONFIG_OPTION:
+                if self.capabilities.effort_via_config_option:
                     await self._set_effort_config_option(carried)
-                elif self._client.backend in ACP_BACKENDS_KIRO_SLASH_COMMANDS:
+                elif self.capabilities.effort_via_slash_command:
                     await self._client.send_command("/effort", args={"level": carried})
         except Exception:
             # The model DID switch; failing here would make a fallback walk skip it.
@@ -2194,7 +2258,12 @@ class AcpProvider(LLMProvider):
                     model,
                 )
                 return None
-            await self._client.send_command("/effort", args={"level": level})
+            # Same channel choice as change_effort: KAS takes the level as a
+            # config option, not the kiro-cli slash command.
+            if self.capabilities.effort_via_config_option:
+                await self._set_effort_config_option(level)
+            else:
+                await self._client.send_command("/effort", args={"level": level})
             logger.info("ACP effort cleared to workspace default %s (kiro)", level)
             return True
         # No default to push live — clear the overlay and let the caller reset
@@ -2251,6 +2320,12 @@ class AcpProvider(LLMProvider):
         else:
             # ── CC path: legacy AcpClient (unchanged) ──
             await self._client.ensure_ready()
+            # Startup records the advertised spelling of the pin, or the backend
+            # default when every spelling was refused; the level follows a pin.
+            running = self._client._model
+            if running != DEFAULT_MODEL and self._configured_model in self._effort_per_model:
+                level = self._effort_per_model.pop(self._configured_model)
+                self._effort_per_model.setdefault(running, level)
 
         await self._apply_initial_effort()
 
@@ -2325,14 +2400,15 @@ class AcpProvider(LLMProvider):
         ``session/set_config_option`` is a fact the table already holds, and
         "runs on the shared runtime" is a different fact. The kiro family is
         outside the channel set because it reads effort from the spawn-time
-        cli.json overlay instead, so it still skips the push; opencode is
+        cli.json overlay instead, so it still skips the push; KAS is the
+        exception, since it reads no overlay and is a member; opencode is
         outside it because its ``session/new`` advertises no ``effort`` option at
         all. Reading the runtime answer here instead drops a codex session's
         configured effort as soon as the preview switch puts codex on the
         runtime, because codex IS in the channel set and takes effort no other
         way.
         """
-        if self._client.backend not in ACP_BACKENDS_EFFORT_VIA_CONFIG_OPTION:
+        if not self.capabilities.effort_via_config_option:
             return
         level = self._resolve_effort()
         if not level:
@@ -2480,6 +2556,8 @@ class AcpProvider(LLMProvider):
             spawn_target=e.spawn_target,
             tool_identity_trusted=e.tool_identity_trusted,
             mcp_identity_trusted=e.mcp_identity_trusted,
+            mcp_identity_unreadable=e.mcp_identity_unreadable,
+            kas_builtin_ids=e.kas_builtin_ids,
             server_name=e.server_name,
             oauth_url=e.oauth_url,
             subagents=e.subagents,

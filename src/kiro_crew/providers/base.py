@@ -105,6 +105,11 @@ class LLMProvider(ABC):
     #: provider started anywhere else starts BACKGROUND.
     start_priority: StartPriority = StartPriority.BACKGROUND
 
+    #: True only on a provider whose ``supports_effort()`` reports the live
+    #: model. The base ``supports_effort()`` returns a placeholder False, so a
+    #: caller that acts on a False answer must check this first.
+    reports_effort_support: bool = False
+
     @cached_property
     def essential_delivery(self) -> EssentialDelivery:
         """Private prompt receipts belong to this provider, never the builder."""
@@ -696,6 +701,19 @@ class LLMProvider(ABC):
         the ACP implementations answer from
         ``ACP_BACKENDS_HARNESS_MANAGED_COMPACTION`` membership."""
         return True
+
+    @property
+    def harness_managed_compaction_backend(self) -> str | None:
+        """Backend id when the harness compacts on its own initiative, else ``None``.
+
+        Asked by the automatic threshold, never by a manual ``/compact``. A
+        harness that summarizes unasked and reports it is left to do so at the
+        threshold, even when Crew can also hand it a manual ``/compact``.
+        Default ``None``: a provider that has not named one is compacted by
+        Crew at the threshold as before. The ACP implementations answer from
+        ``ACP_BACKENDS_HARNESS_MANAGED_COMPACTION`` membership. Consumers must
+        act only on a non-empty ``str`` value."""
+        return None
 
     @property
     def compaction_unmanaged_backend(self) -> str | None:

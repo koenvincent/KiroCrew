@@ -14,6 +14,7 @@ import { isReasoningBurst } from './groupDisplayItems'
 import { isSystemNoticeRow } from './CompactionCard'
 import { parseRecoveryMessage } from './RecoveryCard'
 import { isDiffToolMessage } from './toolDiff'
+import { isAskAnsweredToolMessage } from '../../utils/askQuestionAnswers'
 import { findOptionMarkers, stripOptionMarkers } from '../../app-sdk/protocol/optionMarker'
 import { hasKeepVisibleMarker } from '../../app-sdk/protocol/keepVisibleMarker'
 import { i18nT } from '../../i18n/t'
@@ -57,9 +58,13 @@ const isMcpAppItem = (it: TurnItem, appToolCallIds: ReadonlySet<string>) =>
 // not an immovable wall (see rfc-tool-derived-diff-cards.md).
 const isDiffCardItem = (it: TurnItem) =>
   it.kind === 'single' && isDiffToolMessage(it.msg)
+// An answered ask_question row carries the only record of the user's answers (its chip), so like a diff card it stays out of both folds.
+const isAskAnsweredItem = (it: TurnItem) =>
+  it.kind === 'single' && isAskAnsweredToolMessage(it.msg)
 const isTool = (it: TurnItem, appToolCallIds: ReadonlySet<string>) =>
   it.kind === 'single' && it.msg.role === 'tool' && !isWorkflowRunItem(it) &&
-  !isSpawnRunItem(it) && !isMcpAppItem(it, appToolCallIds) && !isDiffCardItem(it)
+  !isSpawnRunItem(it) && !isMcpAppItem(it, appToolCallIds) && !isDiffCardItem(it) &&
+  !isAskAnsweredItem(it)
 const isHiddenTool = (it: TurnItem) => it.kind === 'single' && it.msg.role === 'tool' && !it.msg.content.startsWith('🔧')
 const isConclusion = (it: TurnItem) => it.kind === 'single' && (it.msg.role === 'assistant' || it.msg.role === 'streaming' || it.msg.role === 'file')
 /**
@@ -69,9 +74,11 @@ const isConclusion = (it: TurnItem) => it.kind === 'single' && (it.msg.role === 
  * mcp_app inject: an embedded app's ui/message delivery is the USER'S OWN action
  * (an Acknowledge click, a form submit) landing in the transcript — folding it
  * into the steps pane hides the record of what they did behind a toggle.
+ * card: a change card or guide offer — only the user can confirm it, so
+ * it is never folded away with the tool steps that proposed it.
  */
 const isAlwaysVisible = (it: TurnItem) => it.kind === 'single' && (
-  it.msg.role === 'mcp_oauth' || it.msg.role === 'error' ||
+  it.msg.role === 'mcp_oauth' || it.msg.role === 'error' || it.msg.role === 'card' ||
   (it.msg.role === 'inject' && it.msg.meta?.injectKind === 'mcp_app')
 )
 
@@ -148,8 +155,9 @@ const isCrewReply = (it: TurnItem) =>
  *  ([OPTIONS:] marker), a keep-visible-marked deliverable (#7948), a legacy
  *  crew-mode answer, a role that must surface inline (mcp_oauth, error), a
  *  workflow_run / spawn_run / workflow-completion / sub-agent-completion card,
- *  an MCP App-bearing tool call (interactive iframe anchored to the row), or a
- *  row the caller pins (`pinnedRows`, see findAnsweredRefusalRows).
+ *  an MCP App-bearing tool call (interactive iframe anchored to the row), a
+ *  diff card, an answered ask_question row, or a row the caller pins
+ *  (`pinnedRows`, see findAnsweredRefusalRows).
  *  All bypass the collapse pane. */
 const NO_PINNED_ROWS: ReadonlySet<TurnItem> = new Set()
 const isVisibleInline = (it: TurnItem, appToolCallIds: ReadonlySet<string>, pinnedRows = NO_PINNED_ROWS) =>
@@ -158,7 +166,7 @@ const isVisibleInline = (it: TurnItem, appToolCallIds: ReadonlySet<string>, pinn
   isWorkflowRunItem(it) || isSpawnRunItem(it) ||
   isSubagentCompletionItem(it) ||
   isWorkflowCompletionItem(it) || isMcpAppItem(it, appToolCallIds) ||
-  isDiffCardItem(it)
+  isDiffCardItem(it) || isAskAnsweredItem(it)
 
 /** One ordered run of the collapse split: a contiguous run of items that hide
  *  behind the toggle, or a single item that must render in place. */

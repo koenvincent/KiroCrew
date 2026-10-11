@@ -162,6 +162,33 @@ class TestAgentRegistration:
         target = json.loads(link.read_text(encoding="utf-8"))
         assert target["name"] == "my-agent"
 
+    def test_register_agents_leaves_a_foreign_owned_shared_dir_alone(
+        self, tmp_path, app_env, monkeypatch
+    ):
+        """From a data home that does not own the shared agents dir, the app's
+        agent is not written there: the owner's specs are left in place."""
+        from kiro_crew import agent as agent_mod
+
+        src = _make_app_source(tmp_path)
+        install_app(src)
+        manifest = AppManifest.from_json_file(
+            app_env["home"] / "apps" / "test-app" / APP_MANIFEST_FILENAME
+        )
+        app_root = app_env["home"] / "apps" / "test-app"
+        shared = app_env["kiro_agents"]
+        monkeypatch.setattr(agent_mod, "KIRO_AGENTS_DIR", shared)
+        monkeypatch.setattr(agent_mod, "ambient_agents_dir", lambda: shared)
+        monkeypatch.setattr(
+            agent_mod,
+            "_decline_shared_agent_home",
+            lambda **_kw: shared / agent_mod.AGENT_FILENAME,
+        )
+
+        registered = _register_agents("test-app", manifest, app_root)
+
+        assert registered == []
+        assert not (shared / "test-app--my-agent.json").exists()
+
     def test_deregister_agents(self, tmp_path, app_env):
         src = _make_app_source(tmp_path)
         install_app(src)
@@ -744,6 +771,91 @@ class TestCronRegistration:
         registered = _register_crons("test-app", manifest)
         assert registered == []
 
+    @pytest.mark.parametrize(
+        "cut",
+        [lambda whole: whole[: len(whole) // 2], lambda whole: b"\xff" + whole[1:]],
+        ids=["truncated", "not-utf8"],
+    )
+    def test_an_unreadable_cron_manifest_is_reported_not_dropped_silently(
+        self, cut, tmp_path, app_env, caplog
+    ):
+        """A torn manifest still loads as no crons, and the log says why."""
+        import logging
+
+        src = _make_app_source(tmp_path)
+        install_app(src)
+        manifest = AppManifest.from_json_file(
+            app_env["home"] / "apps" / "test-app" / APP_MANIFEST_FILENAME
+        )
+        _register_crons("test-app", manifest)
+        path = _app_crons_path("test-app")
+        path.write_bytes(cut(path.read_bytes()))
+
+        with caplog.at_level(logging.WARNING, logger="kiro_crew.apps.bridges"):
+            assert load_app_cron_defs("test-app") == []
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert any(str(path) in r.getMessage() for r in warnings), (
+            "an unreadable cron manifest drops the app's crons without a word"
+        )
+
+    def test_a_missing_cron_manifest_is_no_crons_without_a_warning(
+        self, tmp_path, app_env, caplog
+    ):
+        import logging
+
+        src = _make_app_source(tmp_path)
+        install_app(src)
+        with caplog.at_level(logging.WARNING, logger="kiro_crew.apps.bridges"):
+            assert load_app_cron_defs("test-app") == []
+        assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+
+    def test_a_rewrite_that_fails_part_way_keeps_the_previous_manifest(
+        self, tmp_path, app_env, monkeypatch
+    ):
+        """A disk that fills half way through a rewrite costs nothing already saved.
+
+        The same fault is injected into whichever primitive puts the bytes down:
+        half of them land, then the write fails with a full disk.
+        """
+        import errno
+
+        from kiro_crew import atomic_write as atomic_mod
+
+        src = _make_app_source(tmp_path)
+        install_app(src)
+        manifest = AppManifest.from_json_file(
+            app_env["home"] / "apps" / "test-app" / APP_MANIFEST_FILENAME
+        )
+        _register_crons("test-app", manifest)
+        before = load_app_cron_defs("test-app")
+        assert [d["name"] for d in before] == ["test-app/refresh"]
+
+        def _disk_full() -> OSError:
+            return OSError(errno.ENOSPC, "No space left on device")
+
+        real_write_text = Path.write_text
+        real_write_all = atomic_mod._write_all
+
+        def _half_write_text(self, data, *args, **kwargs):  # type: ignore[no-untyped-def]
+            if self.name == "app-crons.json":
+                real_write_text(self, data[: len(data) // 2], *args, **kwargs)
+                raise _disk_full()
+            return real_write_text(self, data, *args, **kwargs)
+
+        def _half_write_all(fd, data, path):  # type: ignore[no-untyped-def]
+            if Path(path).name == "app-crons.json":
+                real_write_all(fd, data[: len(data) // 2], path)
+                raise _disk_full()
+            return real_write_all(fd, data, path)
+
+        with monkeypatch.context() as patched:
+            patched.setattr(Path, "write_text", _half_write_text)
+            patched.setattr(atomic_mod, "_write_all", _half_write_all)
+            with pytest.raises(OSError):
+                _register_crons("test-app", manifest)
+
+        assert load_app_cron_defs("test-app") == before
+
     @pytest.mark.asyncio
     async def test_register_with_running_service_arms_timer_on_loop(self, tmp_path, app_env):
         # register_app_crons_with_service is async: it awaits the async CronSDK
@@ -866,7 +978,8 @@ class TestTopLevel:
         refreshed = refresh_app_agents("test-app")
 
         assert refreshed == []
-        assert not any(app_env["kiro_agents"].iterdir())
+        # The agent-spec lock file spec writers share is not a spec.
+        assert not list(app_env["kiro_agents"].glob("*.json"))
 
     def test_install_while_execution_denied_registers_nothing(self, tmp_path, app_env, monkeypatch):
         import kiro_crew.apps.execution as execution_mod

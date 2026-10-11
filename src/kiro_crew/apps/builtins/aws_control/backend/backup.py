@@ -150,7 +150,6 @@ import io
 import json
 import logging
 import os
-import sqlite3
 import stat
 import sys
 import sys as _sys
@@ -165,8 +164,16 @@ from typing import IO, Any, NamedTuple, Optional
 from kiro_crew import hooks
 from kiro_crew import platform_compat as _platform_compat
 from kiro_crew import snapshot
+
+# kiro-cli's data.sqlite3 is also read in this process through the shim (kiro_cli,
+# kiro_prerequisite). One SQLite library keeps the export's read lock when one of
+# those connections closes; a second library's close would drop it.
+from kiro_crew._sqlite_compat import sqlite3
 from kiro_crew.apps.builtins.aws_control.backend import accounts as accounts_mod
 from kiro_crew.apps.builtins.aws_control.backend import storage
+from kiro_crew.apps.builtins.aws_control.backend.backup_parts.catalog import (
+    other_install_ids,
+)
 from kiro_crew.apps.builtins.aws_control.backend.backup_parts.egress_text import (
     _redact_egress,
 )
@@ -191,6 +198,7 @@ from kiro_crew.apps.builtins.aws_control.backend.backup_parts.identity import (
 from kiro_crew.apps.builtins.aws_control.backend.backup_parts.layer_b import (
     _audit_layer_b_decision,
     layer_b_grant_covers_conversations,
+    sel,
     sessions_layer_b_enabled,
 )
 from kiro_crew.apps.builtins.aws_control.backend.backup_parts.ledger import (
@@ -198,6 +206,10 @@ from kiro_crew.apps.builtins.aws_control.backend.backup_parts.ledger import (
     _record_skip,
     uploaded_objects,
     uploaded_versions,
+)
+from kiro_crew.apps.builtins.aws_control.backend.backup_parts.nightly import (
+    nightly_run_witness,
+    record_nightly_failure,
 )
 from kiro_crew.apps.builtins.aws_control.backend.backup_parts.retention import (
     _audit_retention,
@@ -218,7 +230,13 @@ from kiro_crew.apps.builtins.aws_control.backend.backup_parts.traversal import (
     _add_pinned,
 )
 from kiro_crew.apps.builtins.aws_control.backend.backup_parts.uploads import (
+    _STOP,
     CALLER_OWNER,
+    CALLER_SCHEDULED,
+    JOB_PARAM_CALLER,
+    JOB_PARAM_PROFILE,
+    JOB_PARAM_REGION,
+    ScheduledUploadWithheld,
     _authorize_recovery_read,
     _authorize_upload,
     _refuse_upload,
@@ -1784,6 +1802,34 @@ def run_sessions_backup(
 JOB_KINDS = (KIND_SNAPSHOT, KIND_SESSIONS)
 
 
+def _nightly_subject(kind: str) -> str:
+    """The SEL subject for one scheduled backup kind. One spelling, so a run's
+    records all file under the same subject for the kind."""
+    return f"backup/{KIND_SUBPATHS[kind]}"
+
+
+def _nightly_audit(operation: str, resources: str, outcome: str, *, error: str = "") -> None:
+    """SEL record for an UNATTENDED backup step.
+
+    The HTTP handlers get their audit from the dashboard layer; a scheduled run
+    has no request, so without this the one S3 mutation this app makes with nobody
+    present would leave no trail of having run, succeeded, found nothing to do, or
+    failed. Best-effort by the same rule the handlers use: an audit failure must
+    never abort the backup.
+    """
+    try:
+        sel().log_api_access(
+            caller="aws-control-nightly",
+            operation=f"aws_control.{operation}",
+            outcome=outcome,
+            source=APP_NAME,
+            resources=resources[:200],
+            error=error[:200],
+        )
+    except Exception:
+        logger.debug("aws-control nightly SEL audit failed", exc_info=True)
+
+
 def make_job_runner(sdk: Any, kind: str) -> Any:
     """Build the Job SDK runner for ``kind``. Registered once, at app startup.
 
@@ -1795,8 +1841,8 @@ def make_job_runner(sdk: Any, kind: str) -> Any:
     property is the app's to keep.
 
     That constraint is what shapes the resolution below. The SDK gives a runner
-    its handle and nothing else -- there is no ``params`` channel in P1 -- so the
-    run's target is read back out of its own record, where ``start`` put it:
+    its handle and nothing else, so the run's target is read back out of its own
+    record, where ``start`` put it:
 
     * The ACCOUNT comes from ``dedupe_key``. It is the right carrier on its own
       merits, because the account is exactly this run's concurrency identity --
@@ -1805,9 +1851,34 @@ def make_job_runner(sdk: Any, kind: str) -> Any:
       same account still run independently. It is also the only field a runner
       can read without a private attribute (``get`` is public; the key is
       withheld from the HTTP view and never logged by the SDK).
+    * The CALLER role comes from ``handle.params`` under ``JOB_PARAM_CALLER``.
+      This is what lets ONE runner serve both the owner click and the nightly
+      loop: the loop states ``CALLER_SCHEDULED`` when it starts the run, and this
+      reads it back so the run applies the scheduled-only gates. An absent or
+      unrecognised value is the owner path, the safe default. Because both
+      callers share one ``(kind, dedupe_key)``, an owner's "Back up now" during a
+      nightly ADOPTS the in-flight scheduled run -- the SDK returns the first
+      caller's run and params do not merge, so the adopted run keeps
+      ``CALLER_SCHEDULED`` and still runs the scheduled-only gates. The rule that
+      keeps this honest for the owner is in the failure handler below: a
+      scheduled-only precondition the owner controls (``ScheduledUploadWithheld``:
+      the unattended grant is withdrawn, or scheduled transcripts are blocked here)
+      is audited ``withheld`` and NOT fed into the nightly backoff, so an owner
+      whose adopting click surfaces one of those gates never sees the schedule's
+      backoff grow for a run they asked for.
     * profile/region/bucket are RE-RESOLVED here rather than carried, which is
       the rule this app already documents for the nightly loop: the drive is
-      tag-discovered per run rather than trusted from memory.
+      tag-discovered per run rather than trusted from memory. The one exception
+      is the SCHEDULED path's profile/region: ``resolve_account_profile_cached``
+      serves only from the warm snapshot and returns ``None`` once it is past
+      ``accounts._PROBE_TTL_SECS``, and ``start_async`` is fire-and-forget, so
+      this runner resolves LATER than the loop's live probe -- a gap longer than
+      the TTL would audit a just-verified nightly as failed. The loop names the
+      ``(profile, region)`` it freshly probed under ``JOB_PARAM_PROFILE`` /
+      ``JOB_PARAM_REGION``, and a scheduled run falls back to it when the cache
+      has expired. Wrong-account risk stays closed: the live
+      ``sts:GetCallerIdentity`` below re-verifies the account before any byte
+      leaves. The bucket is still always re-discovered.
 
     Every resolution step is therefore sync. ``accounts.resolve_account_profile``
     and ``aws_consent.authorize`` are coroutines and are NOT reachable from a
@@ -1834,6 +1905,19 @@ def make_job_runner(sdk: Any, kind: str) -> Any:
     def _run(handle: Any) -> None:
         run = sdk.get(handle.run_id)
         account = run.dedupe_key if run is not None else ""
+        # The caller role rides in `params` under JOB_PARAM_CALLER; the account
+        # already rides in `dedupe_key`. This is the one extra fact a start has to
+        # carry so a single registered runner serves BOTH the owner click and the
+        # nightly loop: the loop states CALLER_SCHEDULED, and reading it back here
+        # is what makes `_authorize_upload` and `work` apply the unattended grant
+        # and sessions-redaction re-reads a scheduled payload must honour. Absent,
+        # empty or unrecognised means the owner path -- the safe default, since
+        # only the scheduled loop sets it and the owner path is the fuller one at
+        # the drive gate.
+        params = handle.params if hasattr(handle, "params") else {}
+        caller = (
+            CALLER_SCHEDULED if params.get(JOB_PARAM_CALLER) == CALLER_SCHEDULED else CALLER_OWNER
+        )
         # An empty key reaches here from `POST /_jobs/{kind}/start` with no body:
         # the generic surface defaults `dedupe_key` to "". There is no account to
         # act on, and picking one would be acting on an account nobody named.
@@ -1843,34 +1927,136 @@ def make_job_runner(sdk: Any, kind: str) -> Any:
             raise RuntimeError(
                 "this backup run does not name an account id; nothing was sent to AWS"
             )
-        resolved = accounts_mod.resolve_account_profile_cached(account)
-        if resolved is None:
-            raise RuntimeError(
-                "no working connection for this account — reconnect it, then run the backup again"
-            )
-        profile, region = resolved
-        # Authorize BEFORE discovery, not just before the upload. `find_drive`
-        # reaches AWS to resolve the bucket by tags, so with consent withdrawn or
-        # the app disabled the old order sent tagging-API requests on the owner's
-        # credentials before any gate had run -- unauthorized calls made in the
-        # course of refusing the work. The gate needs no bucket, so nothing forces
-        # it to wait for discovery.
-        #
-        # This does NOT replace the pre-upload re-check inside `work`: an archive
-        # build takes minutes, and consent can be withdrawn during it. This one
-        # decides whether we may touch AWS at all; that one decides whether the
-        # bytes may leave. Both are needed, and both audit through the same helper.
-        _authorize_upload(account, profile, region, caller=CALLER_OWNER, payload_kind=kind)
-        bucket = storage.find_drive(profile, region, account=account)
-        if not bucket:
-            raise RuntimeError("this account has no drive yet; nothing was sent to AWS")
-        # Resolved by NAME at call time, not captured at registration: the module
-        # attribute stays the single definition of what a snapshot backup is.
-        work = run_snapshot_backup if kind == KIND_SNAPSHOT else run_sessions_backup
-        # A job exists because an owner asked for one through the app's route or
-        # the `_jobs` surface, both owner-gated. The nightly loop does not come
-        # through here and states `CALLER_SCHEDULED` for itself.
-        work(account, profile, region, bucket, caller=CALLER_OWNER)
+        # The run slot's identity, read BEFORE the attempt and only for a scheduled
+        # run: `record_nightly_failure` refuses to write when the slot has moved
+        # since, so the witness has to be the slot as it stood before this attempt
+        # could change it. An owner run never records a backoff (someone is present
+        # and sees the failure), so it needs no witness.
+        scheduled = caller == CALLER_SCHEDULED
+        run_witness = nightly_run_witness(account, kind) if scheduled else None
+        try:
+            resolved = accounts_mod.resolve_account_profile_cached(account)
+            if resolved is None and scheduled:
+                # The cache serves only from the warm snapshot and returns None once
+                # it is past `accounts._PROBE_TTL_SECS`. `start_async` is
+                # fire-and-forget, so this runner thread resolves LATER than the
+                # nightly loop's live `probe_identity` check; a gap longer than the
+                # TTL would audit a just-verified nightly as failed. The loop names
+                # the `(profile, region)` it freshly probed in `params`, so fall back
+                # to it rather than re-failing. No wrong-account risk: the live
+                # `sts:GetCallerIdentity` in `_authorize_upload` below still verifies
+                # the account before anything leaves. The owner path keeps the
+                # cache-only resolve: its route pre-flight has just warmed the snapshot.
+                verified_profile = params.get(JOB_PARAM_PROFILE) or ""
+                verified_region = params.get(JOB_PARAM_REGION) or ""
+                if verified_profile and verified_region:
+                    resolved = (verified_profile, verified_region)
+            if resolved is None:
+                raise RuntimeError(
+                    "no working connection for this account — reconnect it, "
+                    "then run the backup again"
+                )
+            profile, region = resolved
+            # Authorize BEFORE discovery, not just before the upload. `find_drive`
+            # reaches AWS to resolve the bucket by tags, so with consent withdrawn or
+            # the app disabled the old order sent tagging-API requests on the owner's
+            # credentials before any gate had run -- unauthorized calls made in the
+            # course of refusing the work. The gate needs no bucket, so nothing forces
+            # it to wait for discovery.
+            #
+            # This does NOT replace the pre-upload re-check inside `work`: an archive
+            # build takes minutes, and consent can be withdrawn during it. This one
+            # decides whether we may touch AWS at all; that one decides whether the
+            # bytes may leave. Both are needed, and both audit through the same helper.
+            _authorize_upload(account, profile, region, caller=caller, payload_kind=kind)
+            bucket = storage.find_drive(profile, region, account=account)
+            if not bucket:
+                # The scheduled loop checks the drive BEFORE claiming a run, so a
+                # scheduled run never reaches here with no drive; this guards the
+                # generic `_jobs` entry point, where it is an honest failure for a
+                # request that named a target with nowhere to push.
+                raise RuntimeError("this account has no drive yet; nothing was sent to AWS")
+            # A scheduled run spends the owner's money with nobody present, so it
+            # records that another install already backs up to this drive -- evidence
+            # a later panel view cannot reconstruct, since the console's `others`
+            # count is LIVE. A NOTICE, not a gate: the keys carry an install id, so
+            # two installs write to two prefixes and refusing would silently stop
+            # backing one machine up. ONE list call, against the snapshot prefix only
+            # (so the snapshot kind carries it, not sessions): a both-due wake must
+            # not pay a second LIST, and a sessions-only wake must not pay a
+            # snapshot-prefix LIST for a question about a run that is not happening.
+            # Never raises -- a listing failure is one less log line, not a missed
+            # nightly.
+            if scheduled and kind == KIND_SNAPSHOT:
+                try:
+                    others = other_install_ids(profile, region, bucket, account=account)
+                except Exception:
+                    others = []
+                    logger.debug("aws-control nightly: shared-drive check failed", exc_info=True)
+                if others:
+                    logger.warning(
+                        "aws-control nightly: %d other install(s) also back up to this "
+                        "drive (%s); each writes under its own prefix, so this run proceeds",
+                        len(others),
+                        ", ".join(others[:5]),
+                    )
+                    _nightly_audit("backup_shared_drive", f"installs={len(others)}", "invoked")
+            # Resolved by NAME at call time, not captured at registration: the module
+            # attribute stays the single definition of what a snapshot backup is.
+            work = run_snapshot_backup if kind == KIND_SNAPSHOT else run_sessions_backup
+            # Both callers reach this one runner now: an owner click through the app's
+            # route or the `_jobs` surface, and the nightly loop, which claims its run
+            # through `start_async` and names CALLER_SCHEDULED in `params` so this run
+            # applies the unattended gates rather than attributing a 03:00 push to a
+            # human who is not present.
+            #
+            # A scheduled run has no HTTP handler to add the audit the dashboard layer
+            # puts on every owner-driven mutation, so it emits the same invoked /
+            # (succeeded|unchanged) / failed trail here. The split matters: a run that
+            # found the tree unchanged sent nothing, so recording it as a push would
+            # file a SEL entry against a key no bytes reached tonight -- which the SDK's
+            # own `done` record cannot tell apart from an ordinary upload.
+            if scheduled:
+                _nightly_audit("backup_nightly", _nightly_subject(kind), "invoked")
+            record = work(account, profile, region, bucket, caller=caller)
+            if scheduled:
+                if isinstance(record, dict) and record.get("uploaded") is False:
+                    _nightly_audit("backup_nightly", str(record.get("key", "")), "unchanged")
+                else:
+                    key = str(record.get("key", "")) if isinstance(record, dict) else ""
+                    _nightly_audit("backup_nightly", key, "succeeded")
+        except Exception as exc:
+            # A SCHEDULED failure feeds the loop's backoff so a deterministic fault
+            # is not re-attempted every wake (`due_for_nightly` reads this record,
+            # not the SDK run), then re-raises so `_execute` still records the run
+            # `failed`. The loop only claims a scheduled run once a drive exists, so
+            # "no drive yet" never reaches here as a scheduled fault. A TEARDOWN is
+            # not a fault: app disable / gateway stop surface as the stop-event
+            # refusal `_authorize_upload` raises once `_STOP` is set, and counting
+            # that would let a restart push the next night out, so it is recorded
+            # nowhere. A scheduled-only precondition the owner controls -- the
+            # unattended grant withdrawn, or scheduled transcripts blocked here
+            # (`ScheduledUploadWithheld`) -- is likewise not a fault: it is the owner's
+            # own setting declining the upload, so it is audited `withheld` and NOT
+            # recorded into the backoff. This is the rule an ADOPTED run keeps: because
+            # both callers share one `(kind, dedupe_key)`, an owner's "Back up now"
+            # during a nightly adopts the in-flight scheduled run (the SDK keeps the
+            # first caller's `CALLER_SCHEDULED` params; they do not merge), so without
+            # this branch an owner surfacing one of these gates would see a failure they
+            # did not cause and watch the backoff grow. An owner run just re-raises --
+            # its failure is the owner's to see, not the schedule's.
+            if scheduled and isinstance(exc, ScheduledUploadWithheld):
+                # Owner-controlled withdrawal, not a fault: audited as withheld and
+                # NOT recorded, so a withdrawn grant cannot push the next night out.
+                _nightly_audit("backup_nightly", _nightly_subject(kind), "withheld")
+            elif scheduled and not _STOP.is_set():
+                _nightly_audit("backup_nightly", _nightly_subject(kind), "failed", error=str(exc))
+                record_nightly_failure(account, kind, str(exc), run_witness=run_witness)
+            elif scheduled:
+                # Teardown, not a fault: audited as such and NOT recorded, so a clean
+                # shutdown cannot push the next night out.
+                _nightly_audit("backup_nightly", _nightly_subject(kind), "cancelled")
+            raise
 
     return _run
 
@@ -2360,7 +2546,6 @@ if _typing.TYPE_CHECKING:
         _checked,
         _install_folders,
         list_remote_backups,
-        other_install_ids,
         read_remote_label,
     )
     from kiro_crew.apps.builtins.aws_control.backend.backup_parts.egress_text import (  # noqa: F401
@@ -2400,7 +2585,6 @@ if _typing.TYPE_CHECKING:
         SESSIONS_LAYER_B_SCOPE_KEY,
         SESSIONS_LAYER_B_SCOPE_WITH_CONVERSATIONS,
         _audit_layer_b_grant,
-        sel,
         set_sessions_layer_b,
     )
     from kiro_crew.apps.builtins.aws_control.backend.backup_parts.ledger import (  # noqa: F401
@@ -2432,9 +2616,7 @@ if _typing.TYPE_CHECKING:
         nightly_enabled,
         nightly_failures,
         nightly_retry_delay_secs,
-        nightly_run_witness,
         nightly_sessions_enabled,
-        record_nightly_failure,
         scheduled_sessions_blocked_code,
         scheduled_sessions_blocked_reason,
         set_nightly,
@@ -2511,8 +2693,6 @@ if _typing.TYPE_CHECKING:
         kind_unavailable_reason,
     )
     from kiro_crew.apps.builtins.aws_control.backend.backup_parts.uploads import (  # noqa: F401
-        _STOP,
-        CALLER_SCHEDULED,
         SEL_OP_BASELINE_PROBE,
         SEL_OP_RETENTION,
         SEL_OP_UPLOAD,

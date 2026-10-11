@@ -36,6 +36,33 @@ from kiro_crew.sel import sel
 logger = logging.getLogger(_FACADE_MODULE)
 
 
+class ScheduledUploadWithheld(RuntimeError):
+    """A scheduled-only precondition said "do not upload" — a policy outcome, not a fault.
+
+    Raised by the two re-checks in :func:`_authorize_upload` that only a
+    ``CALLER_SCHEDULED`` run is subject to: the per-kind unattended grant does
+    not hold, or a scheduled transcript upload is blocked here
+    (redaction turned on mid-build). These are the owner's own settings deciding
+    the bytes may not leave — not a connection, credential, consent, or AWS
+    failure.
+
+    It is a distinct type because the drive gate cannot otherwise tell the two
+    apart: every refusal raises, and :func:`backup._run`'s scheduled handler
+    feeds a raised exception into ``record_nightly_failure`` so a deterministic
+    fault is not re-attempted every wake. A withheld-by-policy run must NOT grow
+    that backoff — it did not fail, the owner withdrew the authorization — and
+    the distinction matters most on the ADOPTED path: because both callers share
+    one ``(kind, dedupe_key)``, an owner's "Back up now" during a nightly adopts
+    the in-flight scheduled run (the SDK returns the first caller's run; params
+    do not merge, so it stays ``CALLER_SCHEDULED``). If that adopted run met one
+    of these scheduled-only gates and the refusal counted as a nightly failure,
+    the owner would see a failure they did not cause and watch the backoff grow.
+    Subclassing ``RuntimeError`` keeps every existing ``except RuntimeError`` and
+    the Job SDK's own ``failed`` recording unchanged — the run is still a failed
+    SDK run — this type only steers the backoff decision.
+    """
+
+
 #: Who triggered an upload, as the SEL record names them.
 #:
 #: An attribution field only earns its place if it DISTINGUISHES, so neither of
@@ -48,6 +75,35 @@ CALLER_OWNER = "dashboard-owner"
 
 
 CALLER_SCHEDULED = f"app:{APP_NAME}"
+
+
+#: Job SDK ``params`` key under which a run names its caller role. The run's
+#: target already rides in ``dedupe_key`` (the account); this is the one other
+#: fact a runner needs the start to carry, so a single registered runner can
+#: serve both the owner click and the nightly loop. A run that omits it is the
+#: owner path -- the safe default, since only the scheduled loop sets it and the
+#: owner path is the fuller one at the drive gate.
+JOB_PARAM_CALLER = "caller"
+
+
+#: The profile/region the SCHEDULED loop already verified LIVE, carried so the
+#: runner can fall back to it. The runner re-resolves the drive per run (the
+#: tag-discovered rule this app documents), but ``resolve_account_profile_cached``
+#: serves only from the in-process snapshot and returns ``None`` once that snapshot
+#: is past ``accounts._PROBE_TTL_SECS``. ``start_async`` is fire-and-forget, so the
+#: runner thread resolves LATER than the loop's ``probe_identity`` check; if that
+#: gap crosses the TTL, a nightly the loop JUST verified resolves to ``None`` and is
+#: audited as failed. The loop already holds a freshly probed ``(profile, region)``
+#: (``use_cache=False``), so it names them here and the scheduled path falls back to
+#: them when the cache has expired -- the "let the scheduled path use the profile it
+#: verified" fix. No wrong-account risk: ``_authorize_upload`` still re-verifies the
+#: LIVE account with ``sts:GetCallerIdentity`` before any byte leaves. Only the
+#: scheduled loop sets these; an owner run omits them and the route's pre-flight has
+#: just warmed the snapshot, so the cached resolve answers for it.
+JOB_PARAM_PROFILE = "profile"
+
+
+JOB_PARAM_REGION = "region"
 
 
 #: SEL operation names for the two decisions the backup engine asks
@@ -96,6 +152,7 @@ def _refuse_upload(
     caller: str,
     outcome: str = "denied",
     operation: str = SEL_OP_UPLOAD,
+    withheld: bool = False,
 ) -> NoReturn:
     """Record why an upload was refused in the SEL, then refuse.
 
@@ -134,6 +191,15 @@ def _refuse_upload(
     denied upload is a denial recorded against a transfer that completed. See
     :data:`SEL_OP_UPLOAD` and :data:`SEL_OP_RETENTION`.
 
+    ``withheld`` distinguishes a scheduled-only PRECONDITION the owner controls
+    (the unattended grant is withdrawn, or scheduled transcripts are blocked
+    because redaction is on) from a genuine fault. Both still
+    raise and both still audit, but a withheld refusal raises
+    :class:`ScheduledUploadWithheld` so ``backup._run`` does not grow the nightly
+    backoff for a run the owner chose to stop -- which matters most for the
+    adopted-run case an owner's "Back up now" click lands on. The SEL ``outcome``
+    stays ``denied``: it is still an access decision that refused the bytes.
+
     Best-effort, like the route's audit: a failed audit must never convert a
     refusal into an upload.
     """
@@ -148,6 +214,12 @@ def _refuse_upload(
         )
     except Exception:
         logger.debug("aws-control SEL audit failed", exc_info=True)
+    if withheld:
+        # A scheduled-only precondition the owner controls said "do not upload".
+        # Distinct from a fault so `backup._run` does not feed it into the nightly
+        # backoff; see `ScheduledUploadWithheld`. Still an exception, so the Job
+        # SDK records the run `failed` and no upload proceeds.
+        raise ScheduledUploadWithheld(reason)
     raise RuntimeError(reason)
 
 
@@ -278,6 +350,7 @@ def _authorize_upload(
                 account,
                 "the unattended grant for this payload no longer holds; upload refused",
                 caller=caller,
+                withheld=True,
             )
     # The same re-read, for the other precondition a scheduled transcript upload
     # stands on. The grant above answers "does the owner still want this sent";
@@ -299,6 +372,7 @@ def _authorize_upload(
                 account,
                 f"a scheduled transcript upload is no longer allowed here: {blocked_now}",
                 caller=caller,
+                withheld=True,
             )
     # Last, and deliberately after every other check: app teardown. A worker
     # thread cannot be killed, so cancelling the loop's await leaves the archive

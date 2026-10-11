@@ -45,6 +45,7 @@
  */
 import { useCallback, useEffect, useLayoutEffect, useRef, useState, type RefObject } from 'react'
 import type { ChatFolder } from '../../types'
+import { holdScrollFloor } from './collapseFloor'
 
 /** How long a click's arm waits for its collapse to render. The optimistic
  *  update lands within a few ticks; this only bounds a dropped one. */
@@ -84,6 +85,9 @@ export function holdPinnedHeaderThroughCollapse(
   const pinnedBy = pinnedOffset(block, headerTop)
   if (pinnedBy <= PINNED_EPSILON_PX) return 0
   const before = lane.scrollTop
+  // Near the end of the list the closing body would otherwise leave too
+  // little content to stay scrolled this far (see collapseFloor.ts).
+  holdScrollFloor(lane, Math.max(0, before - pinnedBy))
   lane.scrollTop = before - pinnedBy
   return before - lane.scrollTop
 }

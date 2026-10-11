@@ -1353,7 +1353,15 @@ class CancellationCoordinator(ManagerComponent):
             # registered run is never in the stagger queue, so no unqueue (and
             # no store call on the loop) is attempted for it either.
             return False
-        if not info or info.done:
+        if not info or info.done or info.queued:
+            # A registered ``queued`` record is a queued stop's terminal record
+            # (``_report_queued_stop``), registered with ``done=False`` until its
+            # report task runs. Its row never started and it holds no lane slot,
+            # so a second Stop landing in that window (a double-clicked Stop, a
+            # second client) is answered below, after the batched-stop join, and
+            # never reaches the reap, which would free a slot the record does
+            # not hold.
+            #
             # A row a Stop all batch is cancelling and has not yet reported: the
             # batch owns its cancel and its one report, so this joins that
             # answer. Cancelling here too would land first and report the row,
@@ -1365,6 +1373,11 @@ class CancellationCoordinator(ManagerComponent):
                 if isinstance(outcome, Exception):
                     raise outcome
                 return bool(outcome)
+            if info is not None and info.queued:
+                # The queued stop's terminal record: its row has already ended
+                # and its report is pending, so nothing is left to cancel. The
+                # answer is "not running", with no store call on the loop.
+                return False
             # A run still WAITING behind the stagger has no `_agents` record at
             # all: `spawn` builds its queued SubagentInfo and returns it without
             # registering. Unqueueing prevents startup; the synthetic terminal

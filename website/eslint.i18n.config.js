@@ -114,6 +114,9 @@ export default [
       // parser, never read as words. Extracted from `PullRequestPanel.tsx` so that
       // panel -- which does carry copy -- stays fully covered.
       'src/components/unifiedPatchHeaders.ts',
+      // Parses the ask_question tool result that mcp_tools/control.py writes: wire
+      // format matched verbatim, never shown. Keep it parse-only; copy goes in AskAnswersCard.tsx.
+      'src/utils/askQuestionTool.ts',
       // Per-shell env-var export command builders for SettingRef's env popover:
       // every string is CLI syntax handed to a terminal (`export`, `$env:`,
       // `set`, `=1`), never user-visible copy — translating a fragment would
@@ -1506,6 +1509,24 @@ export default [
   // and any real copy later added elsewhere still belongs in the catalog.
   {
     files: ['src/components/commandPalette/settingsKeywords.ts'],
+    rules: {
+      'i18next/no-literal-string': 'off',
+    },
+  },
+
+  // FIND_UI LOCATION DATA ONLY: the registered UI locations the find_ui index is
+  // generated from (scripts/gen-ui-index.mjs). Three kinds of string live here,
+  // and none is ever rendered: per-locale search terms (`terms`, `SEARCH_TERMS`:
+  // the words a newcomer types, matched against the query in THAT locale, the
+  // same job as settingsKeywords.ts above, which is why each locale's list is
+  // already written in its own language), catalog KEY names (`label.key`,
+  // `aliasKeys`, ids), and the English condition descriptions in conditions.ts,
+  // which the index hands to the assistant, not to the screen. Every label a
+  // person sees is read from the render site's catalog key; a descriptor that
+  // wrote one would be refused by the generator. Scoped to these files because
+  // a shape rule cannot express "search terms and key names, but only here".
+  {
+    files: ['src/uiLocations/areas/*.ts', 'src/uiLocations/conditions.ts', 'src/uiLocations/descriptors.ts'],
     rules: {
       'i18next/no-literal-string': 'off',
     },

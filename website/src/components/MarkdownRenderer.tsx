@@ -10,15 +10,13 @@
  */
 import React, { useContext, memo, useEffect, useLayoutEffect, useMemo, useCallback, useRef, useState } from 'react'
 import { GitPullRequest } from 'lucide-react'
-import { capWhitespaceRuns, remarkBoundDepth, rehypeBoundRawDepth } from '../utils/markdownDepthBound'
+import { capWhitespaceRuns, rehypeBoundRawDepth } from '../utils/markdownDepthBound'
+import { REMARK_BASE_PLUGINS } from './markdown/remarkBase'
 import { canonicalChatHref, chatHrefSid, namesASession } from '../utils/sessionKeys'
 import ReactMarkdown from 'react-markdown'
 import type { Components, ExtraProps } from 'react-markdown'
-import remarkGfm from 'remark-gfm'
 import remarkAutolinkRules from '../utils/remarkAutolinkRules'
 import { remarkLatexDelimiters } from '../utils/remarkLatexDelimiters'
-import remarkCjkFriendly from 'remark-cjk-friendly'
-import remarkCjkFriendlyGfmStrikethrough from 'remark-cjk-friendly-gfm-strikethrough'
 import remarkMath from 'remark-math'
 import remarkParse from 'remark-parse'
 import { unified } from 'unified'
@@ -83,7 +81,9 @@ import {
   type PathActions,
   type SessionActions,
 } from './markdown/contexts'
-import { artifactSlugFromHref, resolveSessionChip, soleLinkInParagraph, useUnfurlHref } from './markdown/linkTargets'
+import { artifactSlugFromHref, soleLinkInParagraph, useSessionChip, useUnfurlHref } from './markdown/linkTargets'
+import { dashboardPreviewRef, dashboardPreviewSlugFromHref } from '../utils/dashboardPreview'
+import { ClosedSessionNotice } from './markdown/ClosedSessionNotice'
 import { activatePath, usePathResolution } from './markdown/pathReferences'
 import { ELEMENT_OVERRIDES, sp } from './markdown/elements'
 import { InlineCode } from './markdown/InlineCode'
@@ -96,6 +96,7 @@ import { ALLOWED_TAGS, VERBATIM_CONTENT_TAGS, rehypeSanitize, remarkVerbatimUnkn
 import { rehypeMarkFencedCode, rehypeSourcepos, rehypeStableRootKeys, rehypeUnwrapBlocks, remarkSoftBreaks } from './markdown/treeTransforms'
 import { GLOW_TAIL_CHARS, REVEAL_IDLE_SETTLE_MS, rehypeStreamingCaret, rehypeStreamingGlow, rehypeStreamingReveal } from './markdown/streamingEffects'
 import { closeCjkAutolinkBoundaries, encodeRefusedLinkDestinations } from './markdown/linkBoundaryRepair'
+import { guideUntrusted } from '../guide/guideMarkers'
 
 export { artifactSlugFromHref, soleLinkInParagraph, unfurlableHref } from './markdown/linkTargets'
 export { isPathCandidate, splitLineRef } from './markdown/pathReferences'
@@ -189,7 +190,8 @@ function MdAnchor({ node, href, children }: React.AnchorHTMLAttributes<HTMLAncho
   const sessionRouting = !!(sessionActions.onSessionOpen && sessionActions.sessions)
   // Same gate as the inline chip, so a link and a bare key naming one session
   // cannot disagree about whether it is reachable.
-  const sessionLink = sessionHrefSid ? resolveSessionChip(sessionHrefSid, sessionActions) : null
+  // A closed session the page can resume counts too (`useSessionChip`).
+  const sessionLink = useSessionChip(sessionHrefSid, sessionActions)
   // The attribute carries the canonical key: a modified click goes to the browser,
   // and an authored `dashboard_…` sid would open a session `?sid=` cannot resolve.
   const sessionHref = sessionLink && sessionCandidate ? canonicalChatHref(sessionCandidate, sessionLink.key) : null
@@ -199,10 +201,11 @@ function MdAnchor({ node, href, children }: React.AnchorHTMLAttributes<HTMLAncho
     const plainPrimaryClick = e.button === 0 && !e.metaKey && !e.ctrlKey && !e.altKey && !e.shiftKey
     if (!plainPrimaryClick) return
     // A resolvable session opens in place. A chat-session href that does NOT
-    // resolve is swallowed rather than left to the browser. `resolveSessionChip`
+    // resolve is swallowed rather than left to the browser. `useSessionChip`
     // returns null in two cases, both correctly declined here:
-    //   - a closed / unknown key — its raw `?sid=` would navigate to a session
-    //     the controller cannot load, landing on a dead/blank view (#9914);
+    //   - an unknown key, or a closed one whose probe has not answered yet — its
+    //     raw `?sid=` would navigate to a session the controller cannot load,
+    //     landing on a dead/blank view (#9914);
     //   - the ACTIVE session's own key (`resolveSessionChip` rejects
     //     `key === activeSession`) — a plain click is a no-op on the session you
     //     are already in, matching the backtick chip, which renders the active
@@ -215,7 +218,7 @@ function MdAnchor({ node, href, children }: React.AnchorHTMLAttributes<HTMLAncho
     // external link and keeps navigating as before, never a dead no-op.
     if (sessionLink) {
       e.preventDefault()
-      sessionActions.onSessionOpen!(sessionLink.key)
+      sessionLink.open(sessionLink.key)
     } else if (sessionHrefNamesSession && sessionRouting) {
       e.preventDefault()
     }
@@ -341,7 +344,7 @@ function MdAnchor({ node, href, children }: React.AnchorHTMLAttributes<HTMLAncho
       // active session's own key) is intercepted and declined rather than left to
       // navigate the browser to a dead `?sid=` view (#9914) or a duplicate tab.
       onClick={sessionHrefNamesSession ? onSessionClick : (pathResolution.candidate ? onPathClick : undefined)}
-      title={sessionLink
+      title={sessionLink && !sessionLink.failure
         ? `${sessionLink.title}\n${i18nT('components.markdownRenderer.click_to_switch_to_this_session')}`
         : undefined}
       {...(ext ? {} : { target: '_blank', rel: 'noopener noreferrer' })}
@@ -358,6 +361,7 @@ function MdAnchor({ node, href, children }: React.AnchorHTMLAttributes<HTMLAncho
     >
       <InsideLinkCtx.Provider value={true}>{children}</InsideLinkCtx.Provider>
     </a>
+    <ClosedSessionNotice failure={sessionLink?.failure} name={sessionLink?.key ?? ''} />
     {reveal.error && (
       <ErrorNotice variant="inline" className="ml-1.5 align-baseline" message={reveal.error} askAgent onDismiss={reveal.clear} testId="md-link-reveal-error" />
     )}
@@ -536,13 +540,10 @@ const MD_COMPONENTS = {
 // delimiters are classified), and the strikethrough companion AFTER, because it
 // extends gfm's own `~~` construct.
 const REMARK_PLUGINS: PluggableList = [
-  // FIRST: bounds the parsed tree's depth as part of parse(), ahead of
-  // remark-gfm's own post-parse transform, which recurses over the tree.
-  // Input-controlled nesting otherwise overflows the call stack there.
-  remarkBoundDepth,
-  remarkCjkFriendly,
-  remarkGfm,
-  remarkCjkFriendlyGfmStrikethrough,
+  // FIRST: depth bound, CJK-friendly emphasis, gfm and its strikethrough
+  // companion, in the order `remarkBase.ts` explains. Shared with the
+  // rich-text copy so both parse a reply the same way.
+  ...REMARK_BASE_PLUGINS,
   [remarkMath, { singleDollarTextMath: false }],
   // LaTeX-native `\( … \)` / `\[ … \]` → the same math nodes remark-math emits,
   // from ELIGIBLE TEXT NODES only (code, html, link destinations and reference
@@ -1019,7 +1020,8 @@ export default memo(function MarkdownRenderer({ content, streaming = false, onFi
   rearmConfigScanBudget()
 
   /** Chip activation lives on the chip itself (see InlineCode); this handler is
-   *  only link delegation: `#heading` jumps and `/artifacts/<slug>` links. */
+   *  only link delegation: `#heading` jumps, `/artifacts/<slug>` links and
+   *  staged-dashboard links. */
   const handleClick = useCallback((e: React.MouseEvent<HTMLDivElement>) => {
     const el = e.target as HTMLElement
     // `#heading` links scroll within THIS message, never the whole document:
@@ -1044,6 +1046,17 @@ export default memo(function MarkdownRenderer({ content, streaming = false, onFi
           onArtifactOpen(slug)
           return
         }
+      }
+    }
+    // A staged dashboard's link opens beside the chat, through the same host
+    // action. Only a PLAIN click: Cmd/Ctrl/Alt/Shift-click and middle-click keep
+    // the real href, so the browser can still open the URL itself.
+    if (onArtifactOpen && e.button === 0 && !e.metaKey && !e.ctrlKey && !e.altKey && !e.shiftKey) {
+      const anchor = el.closest('a[href]') as HTMLAnchorElement | null
+      const previewSlug = dashboardPreviewSlugFromHref(anchor?.getAttribute('href'))
+      if (previewSlug) {
+        e.preventDefault()
+        onArtifactOpen(dashboardPreviewRef(previewSlug))
       }
     }
   }, [onArtifactOpen])
@@ -1192,6 +1205,7 @@ export default memo(function MarkdownRenderer({ content, streaming = false, onFi
     // root; `data-tip-flow` is the InstantTip flow container (one rendered
     // message, so a chip's bubble opens off the words it reports on) — two
     // attributes on the one per-message root, each owned by its feature.
+    // `data-guide-untrusted`: authored content is never a guide target.
     // eslint-disable-next-line jsx-a11y/click-events-have-key-events, jsx-a11y/no-static-element-interactions
     <div
       ref={rootRef}
@@ -1199,6 +1213,8 @@ export default memo(function MarkdownRenderer({ content, streaming = false, onFi
       onClick={handleClick}
       data-image-scope=""
       data-tip-flow=""
+      // Authored content: nothing in it is a control a guide points at.
+      {...guideUntrusted}
     >
       {/* PathProbeCtx: suppress path stat probes while the message is still
           streaming, so partial paths ('/Users' en route to '/Users/me/x.ts')

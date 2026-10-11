@@ -80,21 +80,40 @@ def test_cgroup_quota_takes_tightest_ancestor(tmp_path: Path):
             "system.slice/kirocrew.service/inner": "max 100000",
         },
     )
-    quota = sss.cgroup_cpu_quota("0::/system.slice/kirocrew.service/inner\n", root=tmp_path)
+    leaf = tmp_path / "system.slice/kirocrew.service/inner"
+    quota = sss.cgroup_cpu_quota([(leaf, tmp_path)])
     assert quota == 8.0
 
 
 def test_cgroup_quota_container_namespace_root(tmp_path: Path):
     """Under cgroupns (docker --cpus) the quota sits on the namespace root itself."""
     _cgroup_tree(tmp_path, {"": "300000 100000"})
-    assert sss.cgroup_cpu_quota("0::/\n", root=tmp_path) == 3.0
+    assert sss.cgroup_cpu_quota([(tmp_path, tmp_path)]) == 3.0
 
 
-def test_cgroup_quota_absent_or_v1(tmp_path: Path):
+def test_cgroup_quota_absent_or_no_v2_mount(tmp_path: Path):
     _cgroup_tree(tmp_path, {"user.slice": "max 100000"})
-    assert sss.cgroup_cpu_quota("0::/user.slice\n", root=tmp_path) is None
-    assert sss.cgroup_cpu_quota("4:cpu,cpuacct:/docker/abc\n", root=tmp_path) is None
-    assert sss.cgroup_cpu_quota("0::/../escape\n", root=tmp_path) is None
+    assert sss.cgroup_cpu_quota([(tmp_path / "user.slice", tmp_path)]) is None
+    assert sss.cgroup_cpu_quota([]) is None
+
+
+def test_cgroup_quota_stops_at_the_mount_boundary(tmp_path: Path):
+    """A quota above the mount is outside this process's view and is not read."""
+    _cgroup_tree(tmp_path, {"": "100000 100000", "mnt/app": "max 100000"})
+    assert sss.cgroup_cpu_quota([(tmp_path / "mnt/app", tmp_path / "mnt")]) is None
+
+
+def test_cgroup_quota_reads_the_shared_cgroup_walk(monkeypatch, tmp_path: Path):
+    """The cpu probe takes its directories from the memory probe's mountinfo walk."""
+    from kiro_crew import subagent
+
+    _cgroup_tree(tmp_path, {"svc": "200000 100000"})
+    monkeypatch.setattr(
+        subagent,
+        "_cgroup_memory_roots",
+        lambda: [(tmp_path / "svc", tmp_path, True), (tmp_path / "v1", tmp_path, False)],
+    )
+    assert sss.cgroup_cpu_quota() == 2.0
 
 
 @pytest.mark.parametrize(

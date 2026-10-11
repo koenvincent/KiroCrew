@@ -350,7 +350,7 @@ and the durable write, so neither files an assistant row the other skipped.
 | `error:*`, after a tool call or reasoning | `EMPTY_TURN_NOTICE_ERROR_AFTER_WORK` — the same label, and the continue remedy: `tool stall` in particular is synthesised only after a tool ran, so its notice can never ask for a resend |
 | stream ended without a terminal | the same flush trio the terminal branch runs (compaction filter, steering filter, stream redactor — the redactor withholds a whole trailing letter run, so a last chunk of `Done` is still in its buffer) runs first, so the verdict reads the real text and a reply that ended in an exhausted stream is delivered and recorded as a reply; only a genuinely textless exhaustion takes `EMPTY_TURN_NOTICE_UNCLOSED`, or `EMPTY_TURN_NOTICE_UNCLOSED_AFTER_WORK` when the turn did work — no `DONE` reached the renderer, so the dispatcher hands it one (`stop_reason="error"`, the verdict riding it) BEFORE it judges delivery: the bubble carries the same sentence the row records, and `delivery_failed` reads the fate of that send rather than a turn that had not yet tried to say anything |
 | `cancelled` | `""` — the cancel is the answer; a notice would contradict it |
-| a terminal directive applied (`TurnDriver.terminal_directive_applied`) | `""` — the quiet end IS the reply. The injected `directive_consumer` answers `True` when the applied directive's structured `DirectiveOutcome.ends_turn` is set (`build_directive_consumer` reads it from `apply_session_directive_outcome`); today no directive reaches it on a channel turn: `ask_question` is refused slot-less, and `nothing_to_do` is refused because the channel driver cannot yet tell a human's message from a loop's wake (`producer_is_channel` with no self-wake provenance) — the conservative answer, so a channel patrol gets the pre-existing notice rather than silence until the driver carries that provenance. A consumer that answers anything else (`None` from an older one) leaves the verdict as it was. Only a CLEAN terminal consults the flag: a `refusal` or an `error:`-family terminal after the directive keeps its notice (`_is_fault_terminal`) because that fault is still the user's to hear, and a stream that ended without a terminal still takes the unclosed notice, because that fault is the transport's, not the model's |
+| a terminal directive applied (`TurnDriver.terminal_directive_applied`) | `""` — the quiet end IS the reply. The injected `directive_consumer` answers `True` when the applied directive's structured `DirectiveOutcome.ends_turn` is set (`build_directive_consumer` reads it from `apply_session_directive_outcome`); today no directive reaches it on a channel turn: `nothing_to_do` is refused because the channel driver cannot yet tell a human's message from a loop's wake (`producer_is_channel` with no self-wake provenance) — the conservative answer, so a channel patrol gets the pre-existing notice rather than silence until the driver carries that provenance. A consumer that answers anything else (`None` from an older one) leaves the verdict as it was. Only a CLEAN terminal consults the flag: a `refusal` or an `error:`-family terminal after the directive keeps its notice (`_is_fault_terminal`) because that fault is still the user's to hear, and a stream that ended without a terminal still takes the unclosed notice, because that fault is the transport's, not the model's |
 | any text at all | `""` |
 
 The sentences live in `messaging/empty_turn_copy.py`, and the dashboard runner's
@@ -1571,6 +1571,15 @@ opening the dashboard:
   a stale or ambiguous binding cannot block `/new`, `/unlink`, `/session`, `/help`,
   `/status`, `/ping`, `/cron`, `/yolo`, `/kirocrew dashboard`, `/voice`, or
   `/agent`.
+- **Channel `/agent` (Webex, Discord, Teams, Feishu)** is one handler,
+  `agent_switch_command.handle_channel_agent_command`. A pick lives in a
+  route-keyed `ChannelAgentPicks` (in memory, like Telegram's `_agent_pref`) and
+  feeds the dispatcher's `_resolve_agent(route)`, so it moves the session key. Only
+  Telegram's picker list (`_installed_agent_names`) is accepted; a switch is refused
+  while the current key is busy; the no-op test compares effective agents. On a
+  switch `ConversationState.reseed` re-reads the route's generation from the new
+  agent's bucket, so `/new` is always fresh. Discord passes the pick to the shared
+  pipeline as `Asker.agent`; a resumed dashboard session keeps its own agent.
 - `/new` and `/unlink` call `SessionBinder.release`, which atomically clears the
   inbound link and retires its durable expectation. `/new` then advances the native
   Telegram generation; `/unlink` returns to the existing native conversation. A
@@ -2175,7 +2184,7 @@ reaches the model as literal text instead of executing on drain.
 A `steer` / `queue` directive prefix forces that one message down the
 corresponding path, overriding `queue_mode` for that message only.
 **Discord's text commands are `!`-prefixed** (`!new`, `!compact`, `!model`,
-`!status`, `!link`, `!unlink`, `!stop`, `!help`, `!sessions`, `!queue`,
+`!agent`, `!status`, `!link`, `!unlink`, `!stop`, `!help`, `!sessions`, `!queue`,
 `!steer`) because Discord's client swallows a bare `/`
 message into its own slash-command UI; the `/` forms are also accepted as message
 text for muscle-memory parity with Telegram, which uses `/` only. Since the
@@ -2336,7 +2345,14 @@ message to the dashboard slot instead (`_handle_resumed_busy` →
   arm on a user roster it was never checked against), on the queue entry directly — `queue_for_next_turn`'s singular
   `channel_recipient` parameter writes that one key beside the containment
   stamp, which nothing passed there can reach — and, for a steer, through the
-  admission dict the requeue copies. When the drain's re-validation drops the entry
+  admission dict the requeue copies. A turn that dies and is requeued verbatim by the
+  runner's recovery (`chat_runner._queue_recovery`) keeps both drop-notice addresses
+  (this one and the dashboard sender stamp), read only off the row the drain handed
+  that turn, never off a transcript row found by scanning, and only when the requeued text equals
+  that row's text (runner context prepended to the turn makes it someone else's words).
+  A merged row keeps an address only
+  when every entry it merges carries that same address, since the notice quotes the whole row.
+  When the drain's re-validation drops the entry
   (`chat_runner._drop_stale_admissions`), `notify_channel_recipient_dropped`
   schedules a notice into that conversation — the DM was told "queued" and reads
   neither the target's transcript nor the SEL — through the same cross-surface
@@ -4271,7 +4287,7 @@ default it.
 **Dispatch + rendering.** Turns ride the shared `drive_turn` / `TurnDriver`
 pipeline. `transport_dispatch.py` intercepts the command surface (`/new`,
 `/compact`, `/help`, `/stop` + `/cancel`, `/link`, `/unlink`, `/yolo`,
-`/kirocrew dashboard`, `/model`, `/sessions`, plus the `/queue` and `/steer`
+`/kirocrew dashboard`, `/model`, `/agent`, `/sessions`, plus the `/queue` and `/steer`
 per-message overrides),
 queues or steers mid-turn messages, drains the queue after the turn, runs
 `/compact` under atomic `try_acquire`, and posts soft/hard context-threshold
@@ -5204,7 +5220,7 @@ the operator's production bot and answer real people.
 `messaging/dispatch.py::drive_turn`. The command vocabulary lives in ONE table,
 `teams/commands.py::COMMAND_SPEC`, which drives both the parser and the `/help`
 card so the two cannot drift: `/new` (alias `/start`), `/compact`, `/stop` (alias `/cancel`),
-`/yolo`, `/link`, `/unlink`, `/sessions`, `/dashboard`, `/help`, plus the `/queue` and `/steer` per-message
+`/agent`, `/yolo`, `/link`, `/unlink`, `/sessions`, `/dashboard`, `/help`, plus the `/queue` and `/steer` per-message
 directives. A bare directive answers with usage rather than handing the
 literal `/queue` to the model, which would reply to it as chat text.
 `/dashboard [<N>h|<N>m]` MINTS a presigned dashboard login token for the asking
@@ -5519,8 +5535,21 @@ received a bare `/tmp` path and answered about nothing, silently. Two rules foll
 from the same place: an attachment-bearing message is never STEERED (a steer carries
 text only, so the files would be dropped while the user is told they were folded in)
 and never read as a COMMAND (Teams puts the caption in `text`, so "/stop here is the
-log" would cancel the turn AND discard the file). The queue entry carries the RAW
-descriptors and the drained turn re-ingests them, bounded by
+log" would cancel the turn AND discard the file). Everywhere the dispatcher asks
+whether a message carries a file (the command parse and intercept, the steer-or-queue
+choice, the `has_attachments` flag handed to a busy resumed session, the dropped
+count a spooled message reports, and the descriptors a queue entry carries)
+"attachment-bearing" means FILE-bearing by the ingest's own classification
+(`attachments.file_attachments`, the entries the ingest acts on), not
+`bool(activity.attachments)`: Teams attaches a `text/html` echo of the body to every
+rich-text message, so a gate reading the raw list saw an upload on every typed
+`/help` and no slash command was ever recognized in a 1:1 chat, and every mid-turn
+message was queued rather than steered (#18467). The helper and the ingest's skip
+set are one function, so whatever the ingest ignores in silence (the body echo, a
+card, an entry without a content type) cannot turn a command into a caption or a
+plain message into an upload, while a real upload, an inline image or an attachment
+of an unrecognized type still does. The queue entry
+carries those file descriptors and the drained turn re-ingests them, bounded by
 `IngestLimits().max_attachments` so a burst is answered across turns instead of
 having its surplus refused. Discord and Telegram draw every one of these lines in
 the same place.
@@ -5587,7 +5616,9 @@ that awaits the turn and unlinked in a worker once it returns.
   worker thread.
 - **What is not a file.** Teams echoes rich text as a `text/html` attachment on
   ordinary messages, and a card can ride an activity; both are skipped without a
-  note, because a per-message line would be pure noise. Any other unrecognized
+  note, because a per-message line would be pure noise, and neither counts as a file
+  anywhere the dispatcher asks (`file_attachments` reads the same skip decision).
+  Any other unrecognized
   content type is reported by TYPE — not by file name — and never fetched.
 
 `test/test_teams_attachments.py` pins the policy half (envelope mapping, the auth

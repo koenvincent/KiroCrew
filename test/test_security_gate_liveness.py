@@ -198,7 +198,47 @@ def _url_payload_command(n: int) -> str:
 #: Raised again, from 28,572, for ``StreamRedactor``'s two read-only properties,
 #: ``held`` and ``discarding``, which the Slack stream reads at a ``wait`` instead
 #: of the private fields. No pattern moved.
-_PACKAGE_LINE_BUDGET = 28_582
+#:
+#: Raised again, from 28,582, for ``redaction._ROUTED_COMMIT_RE``: a key-shaped window cut
+#: out of a longer run is declined when twelve of its characters are digits of a
+#: commit right after a code-host route (``blob/``, ``tree/`` and the rest), because
+#: the window of a commit permalink that straddles the repository name and the
+#: commit clears every gate. One regex and one threshold with their measured reason,
+#: a helper that reads only the first commit starting after a window and declines a
+#: window crossing that commit's opening ``/`` with twelve of its digits, one clause
+#: beside the separator ceiling, and the docstring naming them. No pass widened and
+#: no existing threshold moved.
+#:
+#: Raised again, from 28,631, for the ``-d @`` benign-program carve-out in
+#: ``exfil.py``: the bare-substring data-exfil denial false-positives on GNU
+#: ``date`` epoch conversions and ``grep`` searches for the literal ``-d @``.
+#: The denial is unchanged; the carve-out reuses ``denied_rules._exception_eligible``
+#: and allows the hit only for a single plain command whose first word runs no
+#: subcommand. It is a security-deciding predicate, so it cannot leave the package,
+#: and no dead code remains to offset it. Its first word is split on space and tab
+#: only, the way bash splits, so a Unicode space cannot pose as a word break.
+#:
+#: Raised again, from 28,665, for a PlantUML route in ``redaction._DOCUMENT_LINK_RE``:
+#: an encoded diagram is deflate output in a base64 alphabet, so pass 3 masked
+#: nearly every diagram link. The route admits only a ``plantuml`` host and a
+#: ``png|svg|txt|uml`` path, and the span counts only when the diagram inflates,
+#: whole, to printable text that every credential pass leaves unchanged. The
+#: text inflated per link and per call is capped so the extra scan stays that of
+#: a 16 KiB plain text. One route, the decode helpers, their comment. No pass
+#: widened and no threshold moved.
+#:
+#: Raised again, from 28,740, for the one import ``redaction_allow`` needs to publish
+#: its hosts file through ``atomic_write.replace_with_retry``, which retries the
+#: Windows sharing violation a bare ``os.replace`` lost the write on. No pattern moved.
+#:
+#: Raised again, from 28,741, for ``redaction._credential_search``: the credential
+#: scan finds the JWT-branch start with its own linear finder, which skips a failed
+#: segment run whole, so a long ``eyJ`` run costs linear time, not quadratic. It
+#: returns the same match as ``_CREDENTIAL_PATTERNS.search`` at every step. The
+#: other branches' start search guards the Telegram branch so a long digit run is
+#: walked once, not once per digit, and the JWT start keeps its run's end so an
+#: overlapping match does not re-walk that run. No pattern moved and no pass changed.
+_PACKAGE_LINE_BUDGET = 28_827
 
 #: Ceiling on any ONE file in the package. This is what the bound is really for --
 #: a package total says nothing about a single file growing back into a second

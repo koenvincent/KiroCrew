@@ -879,6 +879,10 @@ export interface McpServer {
    *  alongside `authChallenge`; absent is "unknown", which is why the sign-in
    *  wording is gated on an explicit `false`. */
   authGrantPresent?: boolean
+  /** The owner added this remote server from the dashboard, at this url, so the
+   *  table may offer the in-place sign-in on it. Absent or false for a server
+   *  an agent, a session or a hand edit added. */
+  ownerSignIn?: boolean
   /** Spec-declared temp keys the probe refused (path already redacted); the
    *  probe ran with the managed temp instead. Absent when nothing was refused. */
   tempRefusals?: McpTempRefusal[]
@@ -1003,6 +1007,12 @@ export interface McpSessionReport {
   awaiting_auth: string[]
   /** Server name -> its redacted failure reason, when one was reported. */
   failures: Record<string, string>
+  /**
+   * Failed servers whose reason reads as a credential they did not have when
+   * they started: a new session loads them once the credential exists.
+   * Optional because an older gateway sends no such key.
+   */
+  restart_to_load?: string[]
 }
 
 export interface SessionLink {

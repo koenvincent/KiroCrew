@@ -958,6 +958,43 @@ def _session_tools() -> tuple[Tool, ...]:
             routes=("POST /api/session-control/reload",),
         ),
         Tool(
+            name="session_rename",
+            description=(
+                "Rename a live session's sidebar title: your own session, or one you "
+                "may control with session_stop. A conductor uses it to relabel the "
+                "workers it created as their work changes. The new title is final, the "
+                "same as a manual rename: the automatic titler stops refreshing that "
+                "session. Metadata only; the transcript, model and any running turn "
+                "are untouched. A crew member or an agent-created session may rename "
+                "only itself and sessions it created; a scheduled run may rename only "
+                "sessions it created, never its own session. ARCHIVED (history) "
+                "sessions are not addressable."
+            ),
+            schema={
+                "type": "object",
+                "properties": {
+                    "target": {
+                        "type": "string",
+                        "description": (
+                            "Session key from list_sessions, 'dashboard:<slot>' key, or "
+                            "its exact unique title."
+                        ),
+                    },
+                    "title": {
+                        "type": "string",
+                        "description": (
+                            "New title, 1-200 characters after surrounding whitespace is "
+                            "stripped; no control characters."
+                        ),
+                    },
+                },
+                "required": ["target", "title"],
+            },
+            run=_run_session_rename,
+            identity="strict",
+            routes=("POST /api/session-control/rename",),
+        ),
+        Tool(
             name="session_close",
             description=(
                 "Close another session — the same thing as pressing the ✕ on that tab. "
@@ -2817,6 +2854,21 @@ def _run_session_set_model(args: dict[str, Any], ctx: ToolContext) -> str:
     else:
         change = effort_text
     return redact(f"\U0001f501 `{target}` will switch to {change} when its next turn starts.")
+
+
+def _run_session_rename(args: dict[str, Any], ctx: ToolContext) -> str:
+    try:
+        resp = ctx.client.post(
+            "/api/session-control/rename",
+            {"target": args["target"], "title": args["title"]},
+            session_key=ctx.caller_key,
+        )
+    except DashboardError as refused:
+        resp = refused.body
+    if resp.get("error"):
+        return redact(f"Error: could not rename that session: {resp['error']}")
+    target = resp.get("target", args["target"])
+    return redact(f"Renamed `{target}` to {resp.get('title', args['title'])!r}.")
 
 
 def _run_session_reload(args: dict[str, Any], ctx: ToolContext) -> str:

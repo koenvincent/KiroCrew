@@ -29,6 +29,7 @@ if TYPE_CHECKING:
         ToolHookResult,
         _bounded_pattern_search,
         logger,
+        policy_aliases,
     )
 
 
@@ -147,6 +148,20 @@ class ToolCall:
     #: provenance. Gates the identity-keyed operator grant and the host-known
     #: read-only built-in proof.
     identity_trusted: bool = False
+    #: ``AcpEvent.mcp_identity_unreadable``: the frame PRESENTED an MCP server or
+    #: tool name longer than Crew's own tool surface admits, so ``mcp_tool`` is
+    #: empty because the name could not be retained, not because there was none.
+    #: The exact ``@server/tool`` deny it may be under cannot be checked, so the
+    #: gate denies the call outright rather than judging it by title.
+    identity_unreadable: bool = False
+    #: ``AcpEvent.kas_builtin_ids``: the permission event came from a harness in
+    #: ``ACP_BACKENDS_PERMISSION_KIND_FROM_TOOL_CALL`` (KAS), whose built-in ids
+    #: (``read_file``, ``run_command``) are the ones ``platform.tool_names``
+    #: maps to kiro-cli policy names. Only then does the gate read a bare
+    #: built-in id under its kiro-cli name (``GateFacts.policy_alias_names``,
+    #: the read-only proof): another harness that stamps the same bare id is
+    #: judged under that id alone, exactly as on main.
+    kas_builtin_ids: bool = False
     #: The ``spawn_run`` target the governance spawn policy judges.
     spawn_target: str = ""
     #: The agent that ACTUALLY ran (``read_effective_agent``), never the slot's
@@ -192,6 +207,8 @@ class ToolCall:
             "mcp_server": getattr(event, "mcp_server_name", "") or "",
             "mcp_tool": getattr(event, "tool_name", "") or "",
             "identity_trusted": bool(getattr(event, "mcp_identity_trusted", False)),
+            "identity_unreadable": bool(getattr(event, "mcp_identity_unreadable", False)),
+            "kas_builtin_ids": bool(getattr(event, "kas_builtin_ids", False)),
             "spawn_target": getattr(event, "spawn_target", "") or "",
         }
         values.update(overrides)
@@ -213,6 +230,8 @@ class ToolCall:
             "mcp_server_name": self.mcp_server,
             "mcp_tool_name": self.mcp_tool,
             "mcp_identity_trusted": self.identity_trusted,
+            "mcp_identity_unreadable": self.identity_unreadable,
+            "kas_builtin_ids": self.kas_builtin_ids,
             "spawn_target": self.spawn_target,
         }
 
@@ -248,7 +267,11 @@ def hook_gate_kwargs(event: object, **overrides: Any) -> dict[str, Any]:
 
 
 def _is_host_read_only_builtin(
-    mcp_tool_name: str, mcp_server_name: str, *, mcp_identity_trusted: bool
+    mcp_tool_name: str,
+    mcp_server_name: str,
+    *,
+    mcp_identity_trusted: bool,
+    kas_builtin_ids: bool = False,
 ) -> bool:
     """True when the host-trusted identity names a known read-only BUILT-IN.
 
@@ -290,8 +313,24 @@ def _is_host_read_only_builtin(
         return False
     if mcp_server_name or not mcp_tool_name:
         return False
+    # A kiro-cli alias (``read``) reads under the name a rule is written in.
     name = _HOST_READ_ONLY_BUILTIN_ALIASES.get(mcp_tool_name, mcp_tool_name)
-    return name in _HOST_READ_ONLY_BUILTIN_TOOLS
+    if name in _HOST_READ_ONLY_BUILTIN_TOOLS:
+        return True
+    # A KAS built-in arrives under its own id (``read_file``, ``grep_search``;
+    # ``platform.tool_names``), and this allowlist is spelled in kiro-cli's.
+    # Read the id under its kiro-cli policy name, the same fold the deny tier
+    # applies -- but only for a name the table knows to be the SAME work: the
+    # aliases are the read/search family of a kiro-cli read tool, so a KAS
+    # ``read_file`` is proven read-only exactly where ``fs_read`` is, and a
+    # write alias (``str_replace`` -> ``fs_write``) resolves to a name this
+    # allowlist does not carry. Without this a ``--approval reads`` gateway
+    # prompted for every KAS read it would have auto-approved on kiro-cli.
+    # Only on the KAS harness (``kas_builtin_ids``): the table speaks about KAS's
+    # ids, and another harness stamping a bare ``read_file`` is not proven by it.
+    if not kas_builtin_ids:
+        return False
+    return any(alias in _HOST_READ_ONLY_BUILTIN_TOOLS for alias in policy_aliases(mcp_tool_name))
 
 
 def _app_owns_mcp_server(mcp_server_name: str, app: str) -> bool:
@@ -447,6 +486,45 @@ def mcp_identity_ref(mcp_server_name: str, mcp_tool_name: str) -> str:
     if not mcp_tool_name:
         return f"@{mcp_server_name}"
     return f"@{mcp_server_name}/{mcp_tool_name}"
+
+
+def title_is_trusted_mcp_identity(
+    title: str,
+    mcp_server_name: str,
+    mcp_tool_name: str,
+    *,
+    mcp_identity_trusted: bool,
+) -> bool:
+    """*title* is exactly the call's own verified MCP identity, not a path.
+
+    The sensitive-path tier reads a string as a filename. A permission title
+    that is the exact ``@server/tool`` reference of the call's OWN verified
+    identity (:func:`mcp_identity_ref`) names a tool, not a file: the
+    identity comes from the client's provenance-verified ``_meta.kiro`` parse,
+    and the title must equal it byte for byte, so a title that carries anything
+    else -- a path, a path-shaped description -- stays gated. The tool's
+    arguments are judged on their own tiers either way; only this one string,
+    which can name nothing but the tool, is spared the resolver round trip that
+    refused it as a "path" under resolver load.
+
+    The exemption is the one exact ``@server/tool`` reference
+    :func:`mcp_identity_ref` builds for this call's PROVEN identity, nothing
+    wider. The tool must be proven (``mcp_tool_name`` non-empty): a bare
+    ``@server`` title -- whether the tool is known (where it names a broader
+    thing than the specific tool that ran) or genuinely unproven (where the
+    identity itself is incomplete) -- is NOT this call's own exact identity and
+    stays path-gated. Over-refusing an unverified or incomplete title is the
+    safe failure; the arguments are judged on their own tiers regardless.
+
+    Fail-closed: an unverified identity, an empty server, an empty tool, or a
+    segment holding a separator (which :func:`mcp_identity_ref` documents cannot
+    occur, and would make the reference path-shaped) never matches.
+    """
+    if not (mcp_identity_trusted and mcp_server_name and mcp_tool_name and title):
+        return False
+    if any(sep in seg for seg in (mcp_server_name, mcp_tool_name) for sep in ("/", "\\")):
+        return False
+    return title == mcp_identity_ref(mcp_server_name, mcp_tool_name)
 
 
 def _note_title_only_grant_pattern(pattern: str, identity_ref: str) -> None:

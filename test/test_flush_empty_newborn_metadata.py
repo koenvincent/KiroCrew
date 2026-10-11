@@ -169,3 +169,125 @@ def test_a_newer_queue_committed_after_the_merge_keeps_its_witness(tmp_path, mon
 
     assert log.get_metadata(key).get("color_index") == 4
     assert child._queue_persisted_sig == queue_persist_signature(newer)
+
+
+def test_a_route_forced_save_still_commits_as_on_main(tmp_path, monkeypatch):
+    # The tag, folder, pin and transfer routes save with force=True and roll
+    # back on False. They do not opt in to the flush's refusals, so the same
+    # race that refuses the flush still commits the route's edit.
+    from kiro_crew.dashboard import chat_persistence as cp
+    from kiro_crew.dashboard.slot_queue_repository import queue_persist_signature
+
+    monkeypatch.setattr(sc, "session_control_enabled", lambda: True)
+    state = _make_state(tmp_path)
+    child = _newborn(state)
+    key = slot_history_key(child)
+    child.pinned = True
+    newer = [{"text": "follow-up", "id": "q-1"}]
+
+    def _another_writer_commits_the_queue():
+        state.conversation_log.update_metadata(key, {"queued_prompts": newer})
+        child._queue_persisted_sig = queue_persist_signature(newer)
+
+    _commit_before_the_lock(state, monkeypatch, _another_writer_commits_the_queue)
+
+    assert cp._save_slot_to_history(state, child, force=True, expected_slot_name=child.key) is True
+    meta = state.conversation_log.get_metadata(key)
+    assert meta.get("pinned") is True
+    # The route's older, empty queue snapshot does not overwrite the queue the
+    # other writer committed, and the witness still names that newer queue.
+    assert meta.get("queued_prompts") == newer
+    assert child._queue_persisted_sig == queue_persist_signature(newer)
+
+
+def test_queue_drift_alone_on_a_line_less_tab_is_saved_once(tmp_path, monkeypatch):
+    # A line-less tab has nothing on disk to carry the queue. The merge credits
+    # the witness, so a second pass does not re-run the save for the same drift,
+    # and the tab still gets no file.
+    from kiro_crew.dashboard import chat
+    from kiro_crew.dashboard.chat_utils import slot_history_key
+
+    state = _make_state(tmp_path)
+    slot = state.get_or_create_slot("chat-queued")
+    slot._dirty = False
+    slot._queue_persisted_sig = "not-the-current-queue"
+    assert slot.queue_persist_pending
+    original = chat._save_slot_to_history
+    calls: list[dict] = []
+
+    def _counting(*a, **k):
+        calls.append(k)
+        return original(*a, **k)
+
+    monkeypatch.setattr(chat, "_save_slot_to_history", _counting)
+
+    state.flush_slot_now(slot)
+    state.flush_slot_now(slot)
+
+    assert len(calls) == 1
+    assert not slot.queue_persist_pending
+    assert not state.conversation_log.has_log(slot_history_key(slot))
+
+
+def test_a_dirty_line_less_tab_is_saved_once(tmp_path, monkeypatch):
+    from kiro_crew.dashboard import chat
+
+    state = _make_state(tmp_path)
+    plain = state.get_or_create_slot("chat-plain")
+    plain._dirty = True
+    original = chat._save_slot_to_history
+    calls: list[dict] = []
+
+    def _counting(*a, **k):
+        calls.append(k)
+        return original(*a, **k)
+
+    monkeypatch.setattr(chat, "_save_slot_to_history", _counting)
+
+    state.flush_slot_now(plain)
+    state.flush_slot_now(plain)
+
+    assert len(calls) == 1
+    assert plain._dirty is False
+
+
+def test_a_queue_cancel_on_a_clean_message_less_session_reaches_disk(tmp_path, monkeypatch):
+    # A restored message-less session with a line: cancelling its persisted
+    # queued prompt changes the queue without marking the slot dirty. The flush
+    # must still write the cancel, or a restart restores the cancelled prompt.
+    from kiro_crew.dashboard.slot_queue_repository import queue_persist_signature
+
+    monkeypatch.setattr(sc, "session_control_enabled", lambda: True)
+    state = _make_state(tmp_path)
+    child = _newborn(state)
+    key = slot_history_key(child)
+    cancelled = [{"text": "follow-up", "id": "q-1"}]
+    state.conversation_log.update_metadata(key, {"queued_prompts": cancelled})
+    child._queue_persisted_sig = queue_persist_signature(cancelled)
+    child._dirty = False
+    assert child.queue_persist_pending
+
+    state.flush_slot_now(child)
+
+    assert not state.conversation_log.get_metadata(key).get("queued_prompts")
+    assert not child.queue_persist_pending
+
+
+def test_an_unreadable_transcript_on_queue_drift_does_not_escape_the_flush(tmp_path, monkeypatch):
+    # The merge reads the transcript under its lock. An OSError there stays
+    # contained like any failed write, or it would end the periodic flush loop
+    # for every slot.
+    state = _make_state(tmp_path)
+    slot = state.get_or_create_slot("chat-denied")
+    slot._dirty = False
+    slot._queue_persisted_sig = "not-the-current-queue"
+    assert slot.queue_persist_pending
+
+    def _denied(*_a, **_k):
+        raise PermissionError("denied")
+
+    monkeypatch.setattr(state.conversation_log, "update_metadata_if", _denied)
+
+    state.flush_slot_now(slot)
+
+    assert slot.queue_persist_pending, "the drift stays owed to the next pass"

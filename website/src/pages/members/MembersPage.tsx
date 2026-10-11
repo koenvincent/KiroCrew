@@ -32,19 +32,28 @@
  * no one lands on the crewmate the user last CHATTED with (`last_chat_ts`, a
  * server record, so it survives a gateway restart), else on the one last
  * opened in this browser if it is still on the roster, else on the most
- * recently USED chat (greatest `last_active_ts`). That is the conversation the user
+ * recently USED chat (greatest `last_active_ts`), else on the first crewmate
+ * (key `mate`, see lib/assistantMember), which is a crewmate like any other: a
+ * first visit with no usage lands on its welcome. The reserved `default` member
+ * is never landed on or remembered. That is the conversation the user
  * most plausibly came back for, and it is a property of the user's own
  * history, not of the list order: #11763 rejected priming the user on
  * whichever row the SORT floated to the top, and that still holds — the
- * default follows use, never the sort. Only an EMPTY roster opens nothing;
+ * default follows use, never the sort. Only a roster with no crewmate beyond
+ * `default` opens nothing;
  * it shows the New crewmate hero instead. Below md nothing auto-opens (the
- * phone's two-level list rule).
+ * phone's two-level list rule) -- except Mate's first-visit landing (see
+ * `resolveMateLanding`), which applies at every width.
+ *
+ * Creating a crewmate happens in place of the chat: the guided flow (the
+ * embedded Meet CrewMates flow) or the full form (Advanced), one at a time,
+ * with the chat and side panel hidden but still MOUNTED. See `openGuided`.
  */
 import { Fragment, lazy, Suspense, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import { useLocation, useNavigate, useSearchParams } from 'react-router-dom'
-import { ArrowLeft, Check, ChevronRight, Circle, Goal, LayoutDashboard, Loader2, MessageCircleQuestionMark, Plus, RotateCw, Sparkles, Square, Star, X, Zap } from 'lucide-react'
+import { ArrowLeft, Check, ChevronRight, Circle, Goal, LayoutDashboard, Loader2, MessageCircleQuestionMark, Plus, RotateCw, Square, Star, X, Zap } from 'lucide-react'
 import { usePreviewFlag } from '../../hooks/usePreviewFlag'
-import { PREVIEW_DASHBOARD } from '../../utils/previewFlags'
+import { PREVIEW_CREW, PREVIEW_DASHBOARD } from '../../utils/previewFlags'
 import { PanelRightSolid } from '../../components/icons/panels'
 import { Btn } from '../../components/ui'
 import { CrewMemberMark } from '../../components/CrewMemberMark'
@@ -52,7 +61,10 @@ import NewCrewmateDialog, { type CreatedCrewmate } from './NewCrewmateDialog'
 import { sendTurn } from '../../chat-core/transport/sendTurn'
 import { useTranslation } from 'react-i18next'
 import { api, type CrewTeam, type MemberRosterRow } from '../../api/client'
+import { ApiError } from '../../api/apiError'
 import { crewDisplayName, type KiroCrewAgent } from '../../components/AgentSelector'
+import { isAssistantMember, pendingMate } from '../../lib/assistantMember'
+import { useFirstGreeting } from './useFirstGreeting'
 import {
   MEMBERS_ROSTER_QUERY_KEY,
   memberThreadQueryKey,
@@ -99,7 +111,7 @@ import { usePersistedBool } from '../../hooks/usePersistedBool'
 import { usePersistedString } from '../../hooks/usePersistedString'
 import { findReport, reportForError, type ErrorReport } from '../../utils/errorReport'
 import { useAppDispatch, useAppSelector } from '../../store'
-import { selectSidebarAutomationRunningKeys, selectSlotStreamState } from '../../store/chatSlice'
+import { selectSidebarAutomationRunningKeys, selectSlotMessages, selectSlotStreamState, selectSlotTurnFromWake } from '../../store/chatSlice'
 import { useLanguage } from '../../i18n/LanguageProvider'
 import { markSlotRead } from '../../store/dashboardSlice'
 import { emitSlotRead, flushSlotRead } from '../../lib/slotReadRelay'
@@ -129,9 +141,12 @@ import { mergePaneDraft } from '../../utils/chatPaneDrafts'
 import ErrorBoundary from '../../components/ErrorBoundary'
 import ErrorNotice from '../../components/ErrorNotice'
 import { useConfirm } from '../../components/ConfirmDialog'
-import { CREWMATES_PAGE_ENTERED_EVENT, START_MEET_CREWMATES_EVENT } from '../../components/MeetCrewmatesFlow'
-import { hasNoCrewmates } from '../../hooks/useMeetCrewmatesGate'
-import { useGuardedLeave, usePublishNavigationStake, useRegisterNavigationLeaveGuard } from '../../components/NavigationLeaveGuard'
+import MeetCrewmatesFlow, { CREWMATES_PAGE_ENTERED_EVENT, START_MEET_CREWMATES_EVENT, type CrewmateCreatedReceipt, type MeetCrewmatesDraft } from '../../components/MeetCrewmatesFlow'
+import { hasNoCrewmates, useMeetCrewmatesGate } from '../../hooks/useMeetCrewmatesGate'
+import { useGuideOpenedSurface } from '../../guide/useGuideOpenedSurface'
+import { useGuideRevealScope } from '../../guide/GuideRevealScope'
+import { useGuidePredicate, useGuideSelection } from '../../guide/guidePredicates'
+import { useGuardedLeave, useMayLeaveForNavigation, usePublishNavigationStake, useRegisterNavigationLeaveGuard } from '../../components/NavigationLeaveGuard'
 import CrewNotesTab from './CrewNotesTab'
 import { useIsMobile } from '../../hooks/useIsMobile'
 import { useConnected } from '../../hooks/useConnected'
@@ -169,15 +184,20 @@ import TeamGroupHeader from './TeamGroupHeader'
 import TeamView, { type TeamMemberInput } from './TeamView'
 import TeamDialog from './TeamDialog'
 import { TEAM_COLLAPSED_KEY, TEAM_PARAM, groupRosterByTeam, parseCollapsedTeams, serializeCollapsedTeams } from './teamGroups'
-import { safeGetItem, safeSetItem } from '../../utils/safeStorage'
+import { safeGetItem, safeGetSessionItem, safeSetItem, safeSetSessionItem } from '../../utils/safeStorage'
 import { useMemberProjection, useMemberRosterViews } from '../../state/useMemberProjection'
 import type { RosterView } from '../../state/memberProjectionTypes'
 import type { CrewmateIdentity } from '../chat/CrewmateMessage'
 import { SidePanelDockHost } from '../../components/SidePanelGlyph'
+import { uiLocation } from '../../uiLocations/uiLocation'
+import { guidePick } from '../../uiLocations/targetRegistry'
 
-/** Creating a crewmate happens IN this page: the header "+" and the empty-state
- *  hero open `NewCrewmateDialog`, which performs the same `POST /api/agents`
- *  write as the crew manager's create form (one write path, two front doors).
+/** Creating a crewmate happens IN this page, in place of the chat: the header
+ *  "+" New crewmate and the empty-state hero open the
+ *  guided flow (`MeetCrewmatesFlow`, embedded); the "+" menu's Advanced row and
+ *  the hero's Advanced link open the full form (`NewCrewmateDialog`, embedded).
+ *  Both perform the same `POST /api/agents` write as the crew manager's create
+ *  form (one write path, several front doors).
  *  Editing an existing crewmate also happens IN this page now (CREW-18688): the
  *  Profile card's edit controls open `CrewEditorDialog` as a modal, driven by the
  *  shared `useCrewEditor` state machine — the SAME editor the crew manager
@@ -191,6 +211,18 @@ import { SidePanelDockHost } from '../../components/SidePanelGlyph'
  *  comment), and a link that resolved `Oncall` to `oncall`'s thread would be
  *  the silent misroute this page exists to prevent. */
 const MEMBER_PARAM = 'member'
+
+/** The notice for a refused Fresh start, by the route's refusal code: queued
+ *  work says to wait, a turn that would not stop says to stop it first. */
+function freshStartFailureKey(err: unknown): string {
+  let code = ''
+  if (err instanceof ApiError) {
+    try { code = String((JSON.parse(err.body) as { code?: unknown }).code ?? '') } catch { /* not JSON */ }
+  }
+  if (code === 'slot_queue_pending') return 'pages.membersPage.fresh_start_failed_queued'
+  if (code === 'turn_in_flight') return 'pages.membersPage.fresh_start_failed_busy'
+  return 'pages.membersPage.fresh_start_failed'
+}
 /** The last member opened, so returning to the page (or reloading) lands on
  *  the conversation the user left rather than the empty column. Stored by
  *  exact name for the same reason as the URL param. One key per origin is
@@ -220,7 +252,8 @@ const LAST_MEMBER_CHAT_MARK_KEY = 'mc-members-last-member-chat-mark'
  *  a roster holding only `default` resolves to `undefined` and shows the
  *  empty-state hero. A remembered `default` is the restore effect's own case
  *  (`rememberedDefaultPick`, ranked above this). Pure, so the cases —
- *  restore, most-recently-used, tie, stale, empty — are tested directly. */
+ *  restore, most-recently-used, tie, stale, empty — are tested directly.
+ *  Mate's first visit is decided before this, by {@link resolveMateLanding}. */
 export function resolveDefaultMember(
   remembered: string | null,
   ordered: readonly MemberRosterRow[],
@@ -282,6 +315,16 @@ export function rememberedDefaultPick(
   return chatMarkOf(rows) > chatMark ? undefined : hit
 }
 
+/** Mate (`isAssistantMember`) while no message has been exchanged with it:
+ *  the Crewmates page lands there first, ahead of a remembered or more recently
+ *  used crewmate, so its welcome is the user's first look at the page. Once
+ *  its thread holds anything this answers `undefined` and the page's usual
+ *  landing rules apply unchanged. A separate, early rule on purpose, so the
+ *  usual rules ({@link resolveDefaultMember}) carry no Mate special case. */
+export function resolveMateLanding(rows: readonly MemberRosterRow[]): MemberRosterRow | undefined {
+  return pendingMate(rows)
+}
+
 type MemberMemoryDisplay = 'global' | 'legacy' | 'private' | 'ownership_mismatch' | 'unavailable'
 
 /** Full catalog keys for the Profile Memory tile, one per `memberMemoryDisplay` answer. */
@@ -295,6 +338,7 @@ const PROFILE_MEMORY_KEYS: Record<MemberMemoryDisplay, string> = {
 
 export function memberMemoryDisplay(row: MemberRosterRow): MemberMemoryDisplay {
   if (row.name === 'default') return row.memory_store === 'default' ? 'global' : 'unavailable'
+  if (isAssistantMember(row) && row.memory_store === 'default' && !row.memory_owner) return 'global'
   if (row.memory_owner && row.memory_owner !== row.name) return 'ownership_mismatch'
   if (row.memory_version === 2) return row.memory_owner === row.name ? 'private' : 'unavailable'
   if (row.memory_version === 1 && !row.memory_owner) return 'legacy'
@@ -321,24 +365,25 @@ export const CREW_PANEL_TAB_IDS: readonly string[] = [CREW_DASHBOARD_TAB_ID]
  *  generic chat session summary would be a third, unrelated summary. Exported so the test pins the set. */
 export const MEMBERS_UNFED_VIEWS: readonly ViewKind[] = [...CHAT_TRANSCRIPT_VIEWS, 'summary']
 /** Everything this page withholds once the thread is confirmed. The rule: the
- *  STANDING tabs here are Dashboard (the host-owned leading tab), Files and
- *  Artifacts (the chat panel's two pinned views, both slot-fed); everything
- *  the chat page reaches through the + menu stays reachable through the + menu
- *  here too (Side Chat, Terminal, Browser, Git, Subagents, Workflows, the
- *  Developer-Mode views and any app-contributed tab), bound to the member's
- *  own slot. Withheld, then: the unfed views above and the chat page's Command
- *  Center (the task dashboard lives in the permanent Dashboard tab, not a
- *  second chat view). Artifacts was withheld by #16317 to keep the standing
- *  set at Dashboard + Files; that also withheld every artifact DOCUMENT tab
- *  (`SidePanel.isWithheld` folds a document into its parent view), so a
- *  crewmate's artifacts could not be opened on this page at all — not from a
- *  reply link, not from a list (#18320). A crewmate's output IS largely
- *  artifacts, so the view stands again. Side chat IS offered — its composer draft lives in the chat-core store
+ *  STANDING tabs here are Dashboard (the host-owned leading tab) and Files (the
+ *  one pinned view this page keeps); everything the chat page reaches through
+ *  the + menu stays reachable through the + menu here too (Side Chat, Terminal,
+ *  Browser, Git, Subagents, Workflows, the Developer-Mode views and any
+ *  app-contributed tab), bound to the member's own slot. Withheld, then: the
+ *  unfed views above, the chat page's Command Center (the task dashboard lives
+ *  in the permanent Dashboard tab, not a second chat view) and Artifacts — a
+ *  PINNED standing tab on the chat page, and this page's standing set is
+ *  Dashboard + Files, so it is the one withdrawal versus the plain chat panel.
+ *  Withdrawing the Artifacts LIST does not withdraw an artifact DOCUMENT: a
+ *  `/artifacts/<slug>` link in a crewmate's reply opens its own tab here
+ *  (`onArtifactOpen` → `openArtifactGuarded`), and `SidePanel.isWithheld`
+ *  ties document tabs to `'files'`, which this page withholds only while the
+ *  thread is unconfirmed (#18320). Side chat IS offered — its composer draft lives in the chat-core store
  *  (`sideChatDrafts`, per slot, persisted), so `SidePanel` unmounting the body
  *  on a tab or member switch loses nothing, and the selection toolbar's "Ask
  *  about this" needs the tab as its landing (`openMemberSideChat`); it stays
  *  dynamic, never standing. Exported so the test pins the set. */
-export const MEMBERS_WITHHELD_VIEWS: readonly SidePanelWithholdable[] = [...MEMBERS_UNFED_VIEWS, 'command-center']
+export const MEMBERS_WITHHELD_VIEWS: readonly SidePanelWithholdable[] = [...MEMBERS_UNFED_VIEWS, 'command-center', 'artifacts']
 /** Everything the panel withholds while the thread is UNCONFIRMED: every
  *  classified view, plus Terminal and app tabs. Derived from
  *  `VIEW_DATA_SOURCE` (the exhaustive `Record<ViewKind, …>`) rather than
@@ -478,6 +523,12 @@ function CrewFaceFlight({ flight, onDone }: { flight: FaceFlight; onDone: () => 
     document.body,
   )
 }
+
+/** The Assistant's docked panel choice, hidden until the user opens it. The
+ *  Assistant is the landing chat for a first-time user, so its page opens on
+ *  the conversation alone; opening the panel there is remembered here without
+ *  moving the choice every other crewmate reads from `PANEL_OPEN_KEY`. */
+const ASSISTANT_PANEL_OPEN_KEY = 'mc-members-assistant-panel-open'
 /** Static key per menu row — a map, not a template, so `check-i18n-keys` can
  *  resolve every reference (assembled keys are a counted blind spot there). */
 const SOURCE_LABEL_KEY: Record<Exclude<MemberSourceFilter, 'all'>, string> = {
@@ -660,6 +711,7 @@ function MemberRow({
   return (
       <motion.li
         key={view.name}
+        {...guidePick(view.name)}
         layout={reduceMotion ? false : 'position'}
         transition={{ type: 'spring', stiffness: 520, damping: 42 }}
         className="group/row relative"
@@ -682,8 +734,8 @@ function MemberRow({
           className={cn(
             'w-full flex items-center gap-2.5 text-sm text-left transition-all select-none',
             ROW_BOX_CLS, 'pr-8',
-            // Grouped-row indent = ROW_BOX_CLS left pad (10) + 14: `pl-6` 24.
-            indented && 'pl-6',
+            // Grouped-row indent = ROW_BOX_CLS left pad (14) + 14: `pl-7` 28.
+            indented && 'pl-7',
             view.name === activeName ? ROW_ACTIVE_CLS : ROW_IDLE_CLS,
           )}
           aria-current={view.name === activeName ? 'true' : undefined}
@@ -829,8 +881,10 @@ function MemberRow({
  *  tokens follow `EmptyState` in components/ui.tsx; the face is the real ghost at
  *  full strength rather than EmptyState's 12%-opacity icon, because here the
  *  avatar IS the subject (what a crewmate looks like), not decoration. */
-function CrewmateEmptyHero({ onCreate, held }: {
+function CrewmateEmptyHero({ onCreate, onAdvanced, held }: {
   onCreate: () => void
+  /** Opens the full New crewmate form (the header menu's Advanced row). */
+  onAdvanced: () => void
   /**
    * Why the CTA is held, or `null` when it is live. Set while a just-created
    * crewmate's follow-up is still in flight: the roster re-read has not yet
@@ -854,12 +908,86 @@ function CrewmateEmptyHero({ onCreate, held }: {
         aria-label={held ?? undefined}
         className="mt-2 h-9 px-4 text-[13.5px]"
         data-testid="crewmate-empty-cta"
+        {...uiLocation('members.new')}
       >
         <Plus size={15} className="lucide-inline" aria-hidden="true" />
         {t('pages.membersPage.add_member')}
       </Btn>
+      {/* The full form stays reachable on an empty roster, where the header
+          "+" menu (and its Advanced row) is hidden behind this hero. */}
+      <button
+        type="button"
+        onClick={onAdvanced}
+        disabled={held !== null}
+        className="text-[12.5px] text-muted underline-offset-2 hover:underline bg-transparent border-none cursor-pointer disabled:cursor-default disabled:opacity-60"
+        data-testid="crewmate-empty-advanced"
+        {...uiLocation('members.new-advanced')}
+      >
+        {t('pages.membersPage.create_advanced')}
+      </button>
     </div>
   )
+}
+
+/** Browser-session record of the crewmate-created receipts, keyed by the
+ *  member whose chat the creation was started from. sessionStorage: it
+ *  survives a reload or a page change in this tab, never another tab or a
+ *  new browser session. It is NOT a server record -- no backend holds it. */
+export const CREATED_RECEIPTS_KEY = 'mc-members-created-receipts'
+const RECEIPT_SCHEDULES = new Set<CrewmateCreatedReceipt['schedule']>(['saved', 'refused', 'unknown', 'none'])
+/** At most this many origins are kept; one receipt per origin (the latest). */
+const MAX_RECEIPTS = 20
+
+function isReceipt(v: unknown): v is CrewmateCreatedReceipt {
+  if (!v || typeof v !== 'object') return false
+  const r = v as Record<string, unknown>
+  return typeof r.name === 'string' && r.name !== '' && typeof r.goal === 'string'
+    && (r.key === undefined || (typeof r.key === 'string' && r.key !== ''))
+    && RECEIPT_SCHEDULES.has(r.schedule as CrewmateCreatedReceipt['schedule'])
+}
+
+export function readCreatedReceipts(): Record<string, CrewmateCreatedReceipt> {
+  try {
+    const raw = safeGetSessionItem(CREATED_RECEIPTS_KEY)
+    if (!raw) return {}
+    const parsed: unknown = JSON.parse(raw)
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return {}
+    const out: Record<string, CrewmateCreatedReceipt> = Object.create(null)
+    for (const [origin, receipt] of Object.entries(parsed as Record<string, unknown>).slice(-MAX_RECEIPTS)) {
+      if (origin && isReceipt(receipt)) {
+        out[origin] = { name: receipt.name, goal: receipt.goal, schedule: receipt.schedule, ...(receipt.key ? { key: receipt.key } : {}) }
+      }
+    }
+    return out
+  } catch {
+    return {}
+  }
+}
+
+function writeCreatedReceipts(receipts: Record<string, CrewmateCreatedReceipt>) {
+  // Storage full or blocked: the receipt still shows for this page's life.
+  const entries = Object.entries(receipts).slice(-MAX_RECEIPTS)
+  safeSetSessionItem(CREATED_RECEIPTS_KEY, JSON.stringify(Object.fromEntries(entries)))
+}
+
+/** A same-origin `/members?create=1` link's draft, or null for anything else
+ *  -- including an href the URL parser refuses, which must never throw. */
+export function createDraftFromHref(href: string | null, base: string): MeetCrewmatesDraft | null {
+  if (!href) return null
+  let url: URL
+  try {
+    url = new URL(href, base)
+  } catch {
+    return null
+  }
+  let origin: string
+  try {
+    origin = new URL(base).origin
+  } catch {
+    return null
+  }
+  if (url.origin !== origin || url.pathname !== '/members' || url.searchParams.get('create') !== '1') return null
+  return { name: url.searchParams.get('name') ?? '', goal: url.searchParams.get('goal') ?? '' }
 }
 
 export default function MembersPage() {
@@ -887,13 +1015,6 @@ export default function MembersPage() {
   )
   const loaded = rosterQuery.data !== undefined || rosterQuery.isError
   const loadError = rosterQuery.data === undefined && rosterQuery.isError
-  // Ask the host to show Meet CrewMates on the first visit. The host decides
-  // whether it is still due (whether this workspace has seen it, nothing
-  // else), so announcing on every mount is safe; the empty-state button stays
-  // the on-demand entry.
-  useEffect(() => {
-    window.dispatchEvent(new Event(CREWMATES_PAGE_ENTERED_EVENT))
-  }, [])
   // ONE source of truth for the roster fields the page derives from (starred
   // count, the Starred filter, search, sort, source chips): the react-query
   // rows merged with each member's pushed `roster` projection, projection
@@ -1178,6 +1299,12 @@ export default function MembersPage() {
   const teamsQ = useQuery(teamsQuery)
   const teams = teamsQ.data ?? EMPTY_TEAMS
   const teamsFailed = teamsQ.isError
+  // A dismiss holds for this outage: a failed read keeps re-reading every 30s
+  // (`refetchWhileFailed`), so the notice stays away until a read succeeds
+  // (`dataUpdatedAt` passes the dismiss) and only a failure after that shows it.
+  const [teamsDismissedAt, setTeamsDismissedAt] = useState(0)
+  const teamsNoticeShown = teamsFailed && teamsDismissedAt <= teamsQ.dataUpdatedAt
+  const dismissTeamsNotice = useCallback(() => setTeamsDismissedAt(teamsQ.errorUpdatedAt), [teamsQ.errorUpdatedAt])
   const urlTeam = searchParams.get(TEAM_PARAM) ?? ''
   const activeTeam = useMemo(() => teams.find((tm) => tm.id === urlTeam), [teams, urlTeam])
   // Collapsed groups persist per browser, keyed by team id (the "No team" group
@@ -1205,8 +1332,115 @@ export default function MembersPage() {
   // '' — no thread opened). The remembered-member fallback never sets it —
   // there the user named nobody. Cleared once a different member opens.
   const [gone, setGone] = useState<{ name: string; shown: string } | null>(null)
-  // New crewmate dialog (header "+" and the empty-state hero open it).
+  // The full New crewmate form (Advanced: the "+" menu row and the hero's
+  // link), shown in place of the chat. Only one creation surface at a time.
   const [createOpen, setCreateOpen] = useState(false)
+  const guided = useMeetCrewmatesGate({ automatic: false })
+  const [creationDraft, setCreationDraft] = useState<MeetCrewmatesDraft>()
+  // Receipts, keyed by the member the creation started from; see
+  // CREATED_RECEIPTS_KEY. Seeded from this tab's session record.
+  const [createdReceipts, setCreatedReceipts] = useState<Record<string, CrewmateCreatedReceipt>>(readCreatedReceipts)
+  const creationOrigin = useRef('')
+  const mayLeave = useMayLeaveForNavigation()
+  // Only one creation surface is ever on screen, and only one holds a draft:
+  // the guided flow stays MOUNTED (its draft survives while hidden), the full
+  // form (Advanced) is opened only while the guided draft is untouched.
+  const guidedEditedRef = useRef(false)
+  const guidedBusyRef = useRef(false)
+  const onDraftStateChange = useCallback(({ edited, busy }: { edited: boolean; busy: boolean }) => {
+    guidedEditedRef.current = edited
+    guidedBusyRef.current = busy
+  }, [])
+  // The flow kept the user's edited draft over a new proposal: say so.
+  const [draftKept, setDraftKept] = useState(false)
+  const createOpenRef = useRef(false)
+  createOpenRef.current = createOpen
+  const openGuided = useCallback((draft?: MeetCrewmatesDraft, leaveGranted = false) => {
+    if (guidedBusyRef.current) return
+    // The full form is up: leaving it is the form's own guard's question
+    // (it asks only when that form holds a draft). Refused, it stays. A guide
+    // that brought us here has already asked it (`leaveGranted`).
+    if (createOpenRef.current) {
+      if (!leaveGranted && !mayLeave()) return
+      setCreateOpen(false)
+    }
+    creationOrigin.current = activeNameRef.current
+    setDraftKept(false)
+    // Handed to the flow as a proposal. The flow, not the page, decides
+    // whether it applies: a draft the user has edited is kept and the new
+    // proposal is not written over it (MeetCrewmatesFlow `onDraftKept`).
+    if (draft) setCreationDraft(draft)
+    window.dispatchEvent(new Event(START_MEET_CREWMATES_EVENT))
+  }, [mayLeave])
+  const draftRequest = searchParams.get('create') === '1'
+  // Set below, once `closeGuided` exists: records the guide that opened the flow.
+  const markGuideOpenedRef = useRef<() => void>(() => {})
+  useEffect(() => {
+    if (!draftRequest) return
+    const granted = (location.state as { leaveGranted?: boolean } | null)?.leaveGranted === true
+    markGuideOpenedRef.current()
+    openGuided({ name: searchParams.get('name') ?? '', goal: searchParams.get('goal') ?? '' }, granted)
+    const next = new URLSearchParams(searchParams)
+    next.delete('create'); next.delete('name'); next.delete('goal')
+    setSearchParams(next, { replace: true })
+  }, [draftRequest, searchParams, setSearchParams, openGuided, location.state])
+  const recordCreated = (receipt: CrewmateCreatedReceipt) => {
+    guidedEditedRef.current = false
+    const origin = creationOrigin.current || activeNameRef.current
+    if (origin) {
+      setCreatedReceipts((prev) => {
+        const next = { ...prev }
+        delete next[origin]
+        next[origin] = receipt
+        writeCreatedReceipts(next)
+        return next
+      })
+    }
+    guided.onCreated()
+  }
+  const guidedOpen = guided.open
+  const guidedDone = guided.onDone
+  /** Hiding the guided flow preserves its form-owned draft state. */
+  const closeGuided = useCallback((outcome: 'completed' | 'dismissed') => {
+    if (guidedBusyRef.current) return
+    setDraftKept(false)
+    guidedDone(outcome)
+  }, [guidedDone])
+  // A guide that opened the flow and was then called off steps it aside so the
+  // chat (with the guide's result line) shows again -- only while the user has
+  // not touched the draft. An edited draft is theirs and stays open.
+  markGuideOpenedRef.current = useGuideOpenedSurface('crewmate.create', {
+    open: guidedOpen,
+    isPristine: () => !guidedEditedRef.current && !guidedBusyRef.current,
+    close: () => closeGuided('dismissed'),
+  })
+  // Choosing a chat or a team while a creation surface is up means "show me
+  // that": the guided flow steps aside (its draft stays mounted and resumes
+  // on the next open); the full form is left only if its own guard agrees.
+  const leaveGuided = useCallback((): boolean => {
+    if (guidedBusyRef.current) return false
+    if (createOpenRef.current) {
+      if (!mayLeave()) return false
+      setCreateOpen(false)
+    }
+    if (guidedOpen) closeGuided('dismissed')
+    return true
+  }, [guidedOpen, closeGuided, mayLeave])
+  /** The Advanced door. Never abandons a guided draft the user worked on:
+   *  that draft is shown again instead of a second, competing one. */
+  const openAdvanced = useCallback(() => {
+    if (guidedBusyRef.current) return
+    if (guidedEditedRef.current) {
+      if (!guidedOpen) {
+        creationOrigin.current = activeNameRef.current
+        window.dispatchEvent(new Event(START_MEET_CREWMATES_EVENT))
+      }
+      return
+    }
+    if (guidedOpen) guidedDone('dismissed')
+    setDraftKept(false)
+    setCreateOpen(true)
+  }, [guidedOpen, guidedDone])
   /** The DM column, the containing block of the modal profile card. */
   const threadColumnRef = useRef<HTMLElement>(null)
   // The crewmate just created here, until its chat has opened and its greeting has
@@ -1255,9 +1489,8 @@ export default function MembersPage() {
   // trade against a page with no way back. Over an EMPTY cached roster it
   // stays undismissable: "No crewmates yet" under "Radar was created" would
   // be two contradicting statements in one column. "Empty" is the hero's own
-  // predicate (`hasNoCrewmates`), not `length > 0`: a roster holding only the
-  // built-in `default` row still renders the hero, so a dismiss over it would
-  // put that same contradiction on screen.
+  // predicate (`hasNoCrewmates`), so the two can never disagree about what
+  // counts as empty.
   const postCreateDismissable =
     postCreateError !== null && (postCreateError.kind !== 'roster' || !hasNoCrewmates(members))
   // The crewmate whose follow-up (roster re-read, chat open, greeting send)
@@ -1369,6 +1602,24 @@ export default function MembersPage() {
   // stays beside the pane there, pinned or not.
   const [rosterPinned, setRosterPinned] = useState(false)
   const rosterShown = !activeName || rosterPinned
+  // The switcher chip fades out while the pin holds (the column IS its list),
+  // so each of the two controls that flip the pin goes away under the press:
+  // the chip's footer action, and the column's own X. Each asks for focus to
+  // move to what replaced it -- the column's search, then the chip again --
+  // so a keyboard user is not dropped on the page body.
+  const rosterAsideRef = useRef<HTMLElement>(null)
+  const switcherSlotRef = useRef<HTMLDivElement>(null)
+  const pinFocusRef = useRef<'roster' | 'chip' | null>(null)
+  const setRosterPin = useCallback((pinned: boolean) => {
+    pinFocusRef.current = pinned ? 'roster' : 'chip'
+    setRosterPinned(pinned)
+  }, [])
+  useEffect(() => {
+    const target = pinFocusRef.current
+    pinFocusRef.current = null
+    if (target === 'roster' && rosterPinned) rosterAsideRef.current?.querySelector('input')?.focus()
+    if (target === 'chip' && !rosterPinned) switcherSlotRef.current?.querySelector('button')?.focus()
+  }, [rosterPinned])
   const beside = panelSitsBeside({ winW, rosterW: rosterShown ? roster.width : 0, isMobile })
   // On a phone the overlay must FILL its scrim. SidePanel's own mobile
   // fallback is `width: 100%`, which cannot resolve here: the overlay's inner
@@ -1391,7 +1642,14 @@ export default function MembersPage() {
   // permanent column is wanted at all, and whether the drawer is up right now
   // — so dismissing the drawer must not also hide the column the next time the
   // window widens.
-  const [dockedOpen, setDockedOpen] = usePersistedBool(PANEL_OPEN_KEY, true)
+  const [memberDockedOpen, setMemberDockedOpen] = usePersistedBool(PANEL_OPEN_KEY, true)
+  const [assistantDockedOpen, setAssistantDockedOpen] = usePersistedBool(ASSISTANT_PANEL_OPEN_KEY, false)
+  const onAssistant = useMemo(() => {
+    const open = members.find((m) => m.name === activeName)
+    return !!open && isAssistantMember(open)
+  }, [members, activeName])
+  const dockedOpen = onAssistant ? assistantDockedOpen : memberDockedOpen
+  const setDockedOpen = onAssistant ? setAssistantDockedOpen : setMemberDockedOpen
   const { panelVisible, showOpener } = panelChrome({ beside, dockedOpen, overlayOpen })
   // The two real faces the flight copy departs from and lands on (#18236), and
   // the pill face's box taken HERE, on open: by the time the dock commits the
@@ -1549,6 +1807,18 @@ export default function MembersPage() {
   // What the panel gesture reads: the panel and its opener are both drawn only
   // while a member is open, so the toggle is inert otherwise.
   useEffect(() => { openMemberRef.current = !!active }, [active])
+  // Guide facts: the roster picker's selection (whether a crewmate is open and
+  // whether any exists, never which), and whether the roster is shown, per
+  // layout: folded into the switcher on a wide screen (`members.roster`),
+  // behind the open chat on a phone (`members.roster-phone`).
+  useGuideSelection('crewmate_selected', { selected: !!active, available: loaded && !hasNoCrewmates(members), name: active?.name })
+  // The header "Add…" menu is drawn once the roster has a crewmate.
+  useGuidePredicate('has_crewmates', loaded ? !hasNoCrewmates(members) : null)
+  useGuideRevealScope(isMobile ? undefined : 'members.roster', rosterShown)
+  useGuideRevealScope(isMobile ? 'members.roster-phone' : undefined, !activeName)
+  // The profile card (opened from the header pill) holds the Permissions row a
+  // "crewmate tools" guide points at (`members.permissions`).
+  useGuideRevealScope('members.profile', !!profile)
   // The active member's projected roster view over its server row: the drawer
   // Configuration and header read config fields (kiro_agent/model/workspace/
   // memory_store) and last_active_ts from the projection when present, the row
@@ -1791,6 +2061,10 @@ export default function MembersPage() {
   // through ErrorNotice below.
   const defaultAgentRead = useQuery(defaultAgentQuery)
   const defaultAgentFailed = defaultAgentRead.isError
+  // Dismissed per failure, like the teams notice above.
+  const [defaultAgentDismissedAt, setDefaultAgentDismissedAt] = useState(0)
+  const defaultAgentNoticeShown = defaultAgentFailed && defaultAgentDismissedAt <= defaultAgentRead.dataUpdatedAt
+  const dismissDefaultAgentNotice = useCallback(() => setDefaultAgentDismissedAt(defaultAgentRead.errorUpdatedAt), [defaultAgentRead.errorUpdatedAt])
   // Settled = an answer or a terminal failure (retries keep it pending).
   const defaultAgentSettled = defaultAgentRead.data !== undefined || defaultAgentRead.isError
   const defaultAgent: string | null = defaultAgentFailed ? null : defaultAgentRead.data ?? ''
@@ -1814,6 +2088,69 @@ export default function MembersPage() {
     [orderedMembers, defaultAgent],
   )
   const activeSlot = active ? threadOutcome?.slot_key ?? '' : ''
+  // Fresh start: the server stops any turn and drops the conversation; the
+  // slot key and its transcript stay. Each slot's reset time folds the rows
+  // before it in the pane. Page state only: the rows are still on disk.
+  const [freshStarts, setFreshStarts] = useState<Record<string, string>>({})
+  const [freshStartError, setFreshStartError] = useState<{ slot: string; message: string; report?: ErrorReport } | null>(null)
+  const freshStart = useMutation({
+    mutationFn: ({ slug }: { slug: string; slot: string }) => api.memberFreshStart(slug),
+    onMutate: () => setFreshStartError(null),
+    // Fold only once the conversation is gone. A queued clear (the session was
+    // still busy) says so in the transcript line the clear path writes.
+    onSuccess: (res, { slot }) => { if (res.outcome === 'cleared') setFreshStarts((prev) => ({ ...prev, [slot]: res.reset_at })) },
+    onError: (err: unknown, { slot }) => setFreshStartError({
+      slot,
+      message: t(freshStartFailureKey(err)),
+      report: findReport(err instanceof Error ? err.message : undefined),
+    }),
+  })
+  // The page's themed confirm, as the Schedules guard uses: one ask, naming
+  // what stops and what stays.
+  const { confirm: confirmFreshStart, confirmDialog: freshStartConfirmDialog } = useConfirm()
+  // Fresh start lives in the Profile card. One ask; the card closes on a yes,
+  // so the fold in the chat is what the user sees next.
+  const freshStartMutate = freshStart.mutate
+  const askFreshStart = useCallback(() => {
+    if (!active || !activeSlot) return
+    const slug = active.slug
+    const slot = activeSlot
+    void confirmFreshStart({
+      title: t('pages.membersPage.fresh_start_confirm_title'),
+      body: t('pages.membersPage.fresh_start_confirm_body'),
+      confirmLabel: t('pages.membersPage.fresh_start_confirm_action'),
+    }).then((ok) => {
+      if (!ok) return
+      requestCloseProfile()
+      freshStartMutate({ slug, slot })
+    })
+  }, [active, activeSlot, confirmFreshStart, t, requestCloseProfile, freshStartMutate])
+  // The Crewmates preview. Mate is created in the background whatever it says,
+  // but nothing about Mate is put in front of the user -- no landing, no
+  // welcome -- until the preview is on and the page is opened.
+  const crewPreview = usePreviewFlag(PREVIEW_CREW)
+  // Mate's first-visit landing happens at most once per page mount, so a phone
+  // Back to the roster is never bounced into Mate's chat again.
+  const mateLandedRef = useRef(false)
+  // Mate speaks first: once its confirmed thread is open, ask the gateway for
+  // its first welcome. The server greets only an empty, never-greeted thread
+  // that still owes one, so this is a no-op on every later open. A crewmate
+  // created on this page greets through the create flow's own seeded turn.
+  useFirstGreeting(active?.slug, activeSlot, crewPreview && isAssistantMember(active))
+  // Ask the host to show Meet CrewMates on the first visit, once the roster
+  // says whether Mate's first-visit landing applies: that landing is the first
+  // visit then, so the flow is not also announced over it. The host decides
+  // whether the flow is still due (whether this workspace has seen it), so a
+  // later visit, once Mate has history, still announces; the empty-state
+  // button stays the on-demand entry.
+  const entryAnnouncedRef = useRef(false)
+  useEffect(() => {
+    if (entryAnnouncedRef.current || !loaded) return
+    entryAnnouncedRef.current = true
+    const mate = crewPreview && !loadError ? resolveMateLanding(members) : undefined
+    if (mate && (!urlMember || urlMember === mate.name)) return
+    window.dispatchEvent(new Event(CREWMATES_PAGE_ENTERED_EVENT))
+  }, [loaded, loadError, crewPreview, members, urlMember])
   // Two distinct verdicts with two different sentences: a collision is a
   // fact about the roster (the slug's thread belongs to another crew), a
   // failed POST is a transport error. Both render through ErrorNotice so
@@ -2051,8 +2388,9 @@ export default function MembersPage() {
   // extraction, the pins query) — this page has none of those, and an empty
   // Changes chip on the monitoring page would assert "nothing changed" while a
   // member is editing. `summary` is withheld too: Profile Sessions and the generated
-  // Dashboard already own the member-level views. Files and Artifacts stand, and
-  // every + menu view stays offered (see MEMBERS_WITHHELD_VIEWS). Until the thread is confirmed, EVERY slot-bound view is
+  // Dashboard already own the member-level views. So is the pinned Artifacts tab:
+  // this page's standing tabs are Dashboard + Files only, while every + menu view
+  // stays offered (see MEMBERS_WITHHELD_VIEWS). Until the thread is confirmed, EVERY slot-bound view is
   // withheld as well, per the binding rule above — and so is Terminal: while
   // unconfirmed the strip sits in the shared no-slot bucket, so a PTY opened
   // then would be orphaned (live shell, unreachable tab) the moment the
@@ -2242,7 +2580,7 @@ export default function MembersPage() {
     if (besideRef.current) setDockedOpen(true)
     else setOverlayOpen(true)
   }, [setDockedOpen])
-  const { openFile, openArtifact, saveFile } = usePanelDocumentActions({
+  const { openFile, openWorkingTreeDiff, openArtifact, saveFile } = usePanelDocumentActions({
     tabsCtl,
     slotRef: activeSlotRef,
     queryClient,
@@ -2510,7 +2848,7 @@ export default function MembersPage() {
   // pill is a Glass chip, so the conversation scrolls under it the way it
   // scrolls under the composer dock. Two measurements, never constants: the
   // header's own height is what the content under it pays, and the block of
-  // notices / greeting cards that can sit between header and pane reports
+  // notices that can sit between header and pane reports
   // its VISIBLE height (its own content, never the padding above it) so the
   // pane knows whether IT is the thing under the header (nothing between: the
   // pane's rows pad below the header) or something else is (a card between:
@@ -2533,10 +2871,18 @@ export default function MembersPage() {
   // The greeting the open chat starts on (cold welcome or warm resume), read
   // once per open of a confirmed thread. Mid-turn means the crewmate's OWN
   // turn: workers it runs do not count, since a goal in flight is the very case
-  // the resume speaks to.
+  // the resume speaks to. Nor does a background wake (a monitor loop's cycle,
+  // a worker's completion): a conductor is woken every few minutes, so
+  // counting those turns took the card down within a minute and skipped every
+  // open that met one.
+  // Who opened a running turn is read off the transcript, so a busy slot's
+  // open waits for it: the thread confirms before the transcript lands.
+  const pillLoopTurn = useAppSelector((s) => (pillSlotKey ? selectSlotTurnFromWake(s, pillSlotKey) : false))
+  const pillTranscriptKnown = useAppSelector((s) => (pillSlotKey ? selectSlotMessages(s, pillSlotKey).length > 0 : false))
+  const greetingIdle = pillLoopTurn || (pillStreamState === 'idle' && !pillLiveSlot?.running)
   const { greeting: mateGreeting, failure: mateGreetingFailure, dismiss: dismissMateGreeting } = useMateGreeting(
-    confirmedSlot,
-    pillStreamState === 'idle' && !pillLiveSlot?.running,
+    greetingIdle || pillTranscriptKnown ? confirmedSlot : '',
+    greetingIdle,
     activeView ? { slug: activeView.slug, member: activeView.name, lastActiveTs: activeView.last_active_ts ?? 0 } : null,
   )
   const pillLastActive = (activeView ?? active)?.last_active_ts
@@ -2576,6 +2922,9 @@ export default function MembersPage() {
       window.removeEventListener('blur', onVis)
     }
   }, [])
+  // A creation surface (guided flow or Advanced form) hides the chat while it
+  // stays mounted: hidden is not viewed, so it neither reads nor suppresses.
+  const threadShown = pageVisible && !guided.open && !createOpen
   useEffect(() => {
     // Viewing the thread is the read — but only a VISIBLE view is a view. A
     // hidden member tab neither clears its own badge nor relays one; on
@@ -2584,18 +2933,18 @@ export default function MembersPage() {
     // thread earlier (locally clean) while another window's badge is still
     // lit, and a visible view here retires that too. Throttled per slot by
     // the relay module; watermarked at the slot's newest known message ts.
-    if (activeSlot && pageVisible) {
+    if (activeSlot && threadShown) {
       if (activeSlotUnread) dispatch(markSlotRead(activeSlot))
       emitSlotRead(activeSlot, activeSlotLastTs)
     }
-  }, [activeSlot, activeSlotUnread, pageVisible, activeSlotLastTs, dispatch])
+  }, [activeSlot, activeSlotUnread, threadShown, activeSlotLastTs, dispatch])
   // Tell the unread-marker which thread is on screen, for exactly as long as
   // it is: registered while the thread is mounted AND this window is visible
   // and focused, retired on switch, hide, blur and unmount. A hidden window's
   // open thread therefore badges like any other slot, and the read effect
   // above drains it on reveal -- same visibility bar for both directions.
   useEffect(() => {
-    if (!activeSlot || !pageVisible) return
+    if (!activeSlot || !threadShown) return
     setViewedThreadSlot(activeSlot)
     return () => {
       // Like switchSlot, flush before retiring the view so its trailing read
@@ -2603,7 +2952,7 @@ export default function MembersPage() {
       flushSlotRead(activeSlot)
       clearViewedThreadSlot(activeSlot)
     }
-  }, [activeSlot, pageVisible])
+  }, [activeSlot, threadShown])
 
   // Per-row unread marker: the rail badge says "1", this says WHICH member.
   // Keyed the same way isRunning resolves a member's slot (thread-endpoint
@@ -2755,23 +3104,21 @@ export default function MembersPage() {
   // The roster badge's mount/unmount tween honours the OS motion preference:
   // the state change still happens, it just cuts instead of fading.
   const reduceMotion = useReducedMotion()
-  // Whether Profile holds its in-flow column right now — the state whose two
-  // flips the face flies on. Floating opens and closes fly nothing: the pill
-  // stays, so the face never changes place.
+  // Whether Profile holds its in-flow column right now.
   const profileDocked = !!activeView && !!profile && profile.placement === 'column'
+  // Whether the card is up at all — the state whose two flips the face flies
+  // on, whichever placement the card takes. Floating, the pill stays beside the
+  // card with its face slot held empty: the face is IN the card.
+  const profileOpen = !!activeView && !!profile
   const [faceFlight, setFaceFlight] = useState<FaceFlight | null>(null)
   const flightKeyRef = useRef(0)
-  const wasDockedRef = useRef(profileDocked)
+  const wasOpenRef = useRef(profileOpen)
   useLayoutEffect(() => {
-    const was = wasDockedRef.current
-    wasDockedRef.current = profileDocked
-    if (was === profileDocked) return
-    // A column re-placed as the floating card (the window crossed below md) is
-    // still the open card, not a close: the pill comes back beside it and the
-    // face does not move. Measuring here would read the floating card's face,
-    // which took over `cardFaceRef`, and hide it.
-    if (!profileDocked && profile) { flightFromRef.current = null; return }
-    const from = profileDocked ? flightFromRef.current : cardFaceRef.current?.getBoundingClientRect() ?? null
+    const was = wasOpenRef.current
+    wasOpenRef.current = profileOpen
+    // A re-placement (column <-> floating) keeps the card open: no flip, no flight.
+    if (was === profileOpen) return
+    const from = profileOpen ? flightFromRef.current : cardFaceRef.current?.getBoundingClientRect() ?? null
     flightFromRef.current = null
     // No box to depart from (reduced motion, a never-laid-out face, a dock that
     // came from somewhere other than the pill) means a plain swap, not a flight.
@@ -2779,8 +3126,8 @@ export default function MembersPage() {
     // The folding card is AnimatePresence's exiting child, re-rendered with the
     // props it left with — `faceHidden` can no longer reach it — so its face is
     // unpainted here, on the element, for the rest of its exit.
-    if (!profileDocked && cardFaceRef.current) cardFaceRef.current.style.visibility = 'hidden'
-    const target = profileDocked ? cardFaceRef : pillFaceRef
+    if (!profileOpen && cardFaceRef.current) cardFaceRef.current.style.visibility = 'hidden'
+    const target = profileOpen ? cardFaceRef : pillFaceRef
     setFaceFlight({
       key: ++flightKeyRef.current,
       seed: active.name,
@@ -2790,7 +3137,7 @@ export default function MembersPage() {
       from,
       to: () => target.current?.getBoundingClientRect() ?? null,
     })
-  }, [profileDocked, profile, reduceMotion, active, activeSlot, isRunning])
+  }, [profileOpen, reduceMotion, active, activeSlot, isRunning])
   const endFaceFlight = useCallback(() => setFaceFlight(null), [])
   // A flight belongs to the crewmate it was measured on. Leaving that crewmate
   // mid-flight (Back, a bare /members, a team open) unmounts the copy before its
@@ -2838,6 +3185,7 @@ export default function MembersPage() {
    *  lands in one tick. */
   const openMember = useCallback(
     async (m: MemberRosterRow): Promise<boolean> => {
+      if (!leaveGuided()) return false
       // Re-clicking the open member is the repair gesture (re-POST); the URL
       // is unchanged so the sync effect would not fire — call through. It is
       // also an explicit choice of that member, so a swap notice still
@@ -2878,7 +3226,7 @@ export default function MembersPage() {
       if (ok) go()
       return ok
     },
-    [activeName, urlMember, isMobile, activate, setSearchParams],
+    [activeName, urlMember, isMobile, activate, setSearchParams, leaveGuided],
   )
 
   // The seeded first turn of a just-created crewmate's chat. The receipt is
@@ -2967,7 +3315,19 @@ export default function MembersPage() {
     setSearchParams({ [MEMBER_PARAM]: created.name }, { replace: true })
   }, [rosterQuery, openMember, setSearchParams, queryClient])
 
+  /** Opens a crewmate created here by its member KEY (never the display
+   *  name), through the same guards as any switch. Not on the roster yet (its
+   *  re-read is in flight): the URL names it once the page's guards agree,
+   *  and the URL sync opens it when the roster lands. */
+  const openCreatedMember = useCallback((key: string) => {
+    const target = members.find((m) => m.name === key)
+    if (target) void openMember(target)
+    else leave(() => setSearchParams({ [MEMBER_PARAM]: key }, { replace: true }))
+  }, [members, openMember, leave, setSearchParams])
+
   const handleCreated = useCallback((created: CreatedCrewmate) => {
+    // The form's work is done: the open that follows must not ask to leave it.
+    createOpenRef.current = false
     setCreateOpen(false)
     void openCreated(created)
   }, [openCreated])
@@ -2984,8 +3344,9 @@ export default function MembersPage() {
   // opens it; a URL that names none (a fresh visit, the sidebar entry, a
   // reload) is REPLACED with the remembered crewmate if one is still on the
   // roster, so returning users land back on the conversation they left, else
-  // with the most recently USED one (`resolveDefaultMember`) — the default
-  // follows the user's own history, never the sort order (#11763). "Nothing
+  // with the most recently USED one, else the built-in Assistant
+  // (`resolveDefaultMember`) — the default follows the user's own history,
+  // never the sort order (#11763). "Nothing
   // to open" therefore means an EMPTY roster, and only that. A URL naming a
   // crewmate that is gone (deleted or renamed) falls back the same way, with
   // a one-line notice above the chat naming the swap — the user asked for
@@ -2994,7 +3355,8 @@ export default function MembersPage() {
   // navigation: no `?member=` IS the roster, so no auto-open there (same rule
   // as SidePanelLayout's remembered tab), and a gone crewmate in the URL
   // returns to the roster instead of bouncing the phone user into a different
-  // crewmate's chat.
+  // crewmate's chat. Mate's first-visit landing is the one exception, once
+  // per page mount, so the phone's Back to the roster stays on the roster.
   useEffect(() => {
     if (!loaded || loadError) return
     if (urlMember) {
@@ -3037,6 +3399,17 @@ export default function MembersPage() {
         setActiveName('')
       }
       return
+    }
+    // Mate's first visit wins first: never chatted with, Mate opens ahead of a
+    // remembered or more recently used crewmate. Every rule below is the
+    // page's ordinary landing, untouched by Mate.
+    if (!urlMember && crewPreview && !mateLandedRef.current) {
+      const mate = resolveMateLanding(members)
+      if (mate) {
+        mateLandedRef.current = true
+        setSearchParams({ [MEMBER_PARAM]: mate.name }, { replace: true })
+        return
+      }
     }
     if (isMobile) {
       if (urlMember) {
@@ -3118,13 +3491,14 @@ export default function MembersPage() {
     }
     restoredRef.current = target.name
     setSearchParams({ [MEMBER_PARAM]: target.name }, { replace: true })
-  }, [loaded, loadError, urlMember, urlTeam, teamsQ.data, members, listedMembers, activeName, isMobile, activate, setSearchParams, rosterQuery.isFetching, defaultAgentSettled, orderedMembers])
+  }, [loaded, loadError, urlMember, urlTeam, teamsQ.data, members, listedMembers, activeName, isMobile, activate, setSearchParams, rosterQuery.isFetching, defaultAgentSettled, orderedMembers, crewPreview])
 
   // Team open: the header row's click. Same history rule as openMember -- one
   // entry above md or while something is already open, a PUSHED step from the
   // bare roster below md so the back button pops.
   const openTeam = useCallback(
     (id: string) => {
+      if (!leaveGuided()) return
       const go = () => {
         if (urlMember || urlTeam || !isMobile) {
           // The replace keeps the entry's own state: below md this branch is
@@ -3143,7 +3517,7 @@ export default function MembersPage() {
       if (!schedAtStakeRef.current()) { go(); return }
       void schedGuardRef.current().then((ok) => { if (ok) go() })
     },
-    [urlMember, urlTeam, isMobile, setSearchParams, location.state],
+    [urlMember, urlTeam, isMobile, setSearchParams, location.state, leaveGuided],
   )
   const closeTeamView = useCallback(() => {
     if ((location.state as { fromRoster?: boolean } | null)?.fromRoster) navigate(-1)
@@ -3294,7 +3668,7 @@ export default function MembersPage() {
         className={`${
           activeName && !activeTeam && !rosterPinned
             ? 'hidden'
-            : activeName || activeTeam || postCreateError?.kind === 'roster'
+            : activeName || activeTeam || guided.open || createOpen || postCreateError?.kind === 'roster'
               ? 'hidden md:flex'
               : 'flex'
         } ${LIST_SHELL_CLS} relative w-full md:w-[var(--roster-w)] shrink-0 flex-col min-h-0`}
@@ -3302,6 +3676,7 @@ export default function MembersPage() {
         // md: class consumes it, so resizing the window across 768px reacts
         // without any JS media-query snapshot going stale.
         style={{ '--roster-w': `${roster.width}px` } as React.CSSProperties}
+        ref={rosterAsideRef}
         data-testid="member-roster"
       >
         <div className={LIST_HEADER_CLS}>
@@ -3349,20 +3724,21 @@ export default function MembersPage() {
               Also hidden until the first read has answered: the names the
               dialog checks a new one against are unknown until then. */}
           {loaded && !(!loadError && hasNoCrewmates(members)) && (
-          <DropdownMenu>
+          <DropdownMenu guideScope="menu:members.add-menu">
             <DropdownMenuTrigger asChild>
               <button
                 className="flex items-center justify-center w-7 h-7 rounded-md transition-colors bg-transparent border-none shrink-0 text-muted hover:text-text hover:bg-bg-hover cursor-pointer data-[state=open]:bg-bg-hover data-[state=open]:text-text"
                 aria-label={t('pages.membersPage.add_menu')}
                 title={t('pages.membersPage.add_menu')}
                 data-testid="member-add"
+                {...uiLocation('members.add-menu')}
               >
                 <Plus size={15} />
               </button>
             </DropdownMenuTrigger>
             <DropdownMenuContent align="end" data-testid="member-add-menu">
               <DropdownMenuItem
-                onSelect={() => setCreateOpen(true)}
+                onSelect={() => openGuided()}
                 disabled={createHeld !== null}
                 // A disabled Radix item takes no pointer events, so a `title`
                 // would never show; the hold reason is written under the label
@@ -3372,13 +3748,16 @@ export default function MembersPage() {
               >
                 <Plus size={13} className="lucide-inline text-muted shrink-0" aria-hidden="true" />
                 <span className="flex-1 min-w-0 flex flex-col">
-                  <span>{t('pages.membersPage.add_member')}</span>
+                  <span {...uiLocation('members.add-menu.new')}>{t('pages.membersPage.add_member')}</span>
                   {createHeld !== null && (
                     <span className="text-[11.5px] text-muted whitespace-normal" data-testid="member-add-crewmate-held">
                       {createHeld}
                     </span>
                   )}
                 </span>
+              </DropdownMenuItem>
+              <DropdownMenuItem onSelect={openAdvanced} disabled={createHeld !== null} data-testid="member-add-advanced" {...uiLocation('members.add-menu.advanced')}>
+                {t('pages.membersPage.create_advanced')}
               </DropdownMenuItem>
             </DropdownMenuContent>
           </DropdownMenu>
@@ -3391,7 +3770,7 @@ export default function MembersPage() {
           {rosterPinned && activeName && (
             <button
               type="button"
-              onClick={() => setRosterPinned(false)}
+              onClick={() => setRosterPin(false)}
               className="hidden md:flex items-center justify-center w-7 h-7 rounded-md transition-colors bg-transparent border-none shrink-0 text-muted hover:text-text hover:bg-bg-hover cursor-pointer"
               aria-label={t('pages.membersPage.roster_hide')}
               title={t('pages.membersPage.roster_hide')}
@@ -3443,12 +3822,13 @@ export default function MembersPage() {
         {/* A failed team read renders the roster FLAT, which is not "no teams"
             -- it is unknown, and said here on the roster the grouping lives
             on. No draft on this page, so the hand-off is safe. */}
-        {teamsFailed && (
+        {teamsNoticeShown && (
           <div className="px-4 pb-2">
             <ErrorNotice
               message={t('pages.membersPage.teams_load_failed')}
               variant="inline"
               askAgent
+              onDismiss={dismissTeamsNotice}
               testId="member-roster-teams-error"
             />
           </div>
@@ -3590,13 +3970,14 @@ export default function MembersPage() {
         {/* Default-crew lookup failed: the hide rule is off (every row listed),
             and this says why in localized copy, never the raw server text.
             Mounted only while failing, like the star error. */}
-        {defaultAgentFailed && (
+        {defaultAgentNoticeShown && (
           <div className="px-2">
             <ErrorNotice
               message={t('pages.membersPage.default_agent_failed_title')}
               report={findReport(defaultAgentRead.error instanceof Error ? defaultAgentRead.error.message : undefined)}
               askAgent
               actionPlacement="below"
+              onDismiss={dismissDefaultAgentNotice}
               testId="member-default-agent-error"
             />
           </div>
@@ -3631,33 +4012,14 @@ export default function MembersPage() {
           className={`${LIST_BODY_CLS} list-none m-0`}
           style={{ scrollbarWidth: 'none' }}
           aria-label={t('pages.membersPage.title')}
+          {...uiLocation('members.roster-list')}
         >
           {loaded && !loadError && hasNoCrewmates(members) && (
             // Below md only: above md the thread column carries the hero
             // instead (see the DM thread section), so the two panes never
             // show the same hero twice on a wide viewport.
             <li className="md:hidden">
-              <CrewmateEmptyHero onCreate={() => setCreateOpen(true)} held={createHeld} />
-            </li>
-          )}
-          {loaded && !loadError && hasNoCrewmates(members) && (
-            /* The on-demand Meet CrewMates entry, beside the empty state
-               (the built-in `default` row is the main assistant, not a
-               crewmate). Re-opens the first-run flow (App hosts it) — the user
-               asked, so no check applies. */
-            <li className="px-4 py-2">
-              <button
-                onClick={() => window.dispatchEvent(new Event(START_MEET_CREWMATES_EVENT))}
-                className="inline-flex items-center gap-1 text-[11.5px] px-2 py-1 rounded border border-border hover:bg-accent/40"
-                data-testid="member-meet-crewmates"
-              >
-                <Sparkles className="lucide-inline" />
-                {t('pages.membersPage.meet_crewmates')}
-              </button>
-              {/* A block line under the button, never an inline tail: beside the
-                  button the gloss wrapped mid-phrase in the narrow sidebar and
-                  read as part of the control. */}
-              <p className="mt-1 text-[11px] text-muted">{t('pages.membersPage.meet_crewmates_hint')}</p>
+              <CrewmateEmptyHero onCreate={() => openGuided()} onAdvanced={openAdvanced} held={createHeld} />
             </li>
           )}
           {loadError && (
@@ -3785,6 +4147,17 @@ export default function MembersPage() {
         // panel's own copy — the two surfaces share several sentences, "Opening
         // the conversation…" among them, and each says it about itself.
         data-testid="member-main-column"
+        style={guided.open || createOpen ? { display: 'none' } : undefined}
+        onClickCapture={(event) => {
+          if (!isAssistantMember(active) || event.button !== 0 || event.metaKey || event.ctrlKey || event.altKey || event.shiftKey) return
+          const anchor = event.target instanceof Element ? event.target.closest('a[href]') : null
+          if (!anchor) return
+          const draft = createDraftFromHref(anchor.getAttribute('href'), window.location.href)
+          if (!draft) return
+          event.preventDefault()
+          event.stopPropagation()
+          openGuided(draft)
+        }}
       >
         {!greetingNoticeInRoster && postCreateNotice}
         {/* The hero yields to a post-create notice: after the FIRST create a
@@ -3794,7 +4167,7 @@ export default function MembersPage() {
             team view too: a team can exist before its first crewmate does,
             and the pane is the team's then. */}
         {!active && !activeTeam && !postCreateError && loaded && !loadError && hasNoCrewmates(members) && (
-          <CrewmateEmptyHero onCreate={() => setCreateOpen(true)} held={createHeld} />
+          <CrewmateEmptyHero onCreate={() => openGuided()} onAdvanced={openAdvanced} held={createHeld} />
         )}
         {/* A failed roster read at md and up: the roster column shows its own
             notice, but this column would otherwise be blank — no chat can
@@ -3841,12 +4214,13 @@ export default function MembersPage() {
                 />
               </div>
             )}
-            {teamsFailed && (
+            {teamsNoticeShown && (
               <div className="px-4 pt-3 md:hidden">
                 <ErrorNotice
                   message={t('pages.membersPage.teams_load_failed')}
                   variant="inline"
                   askAgent
+                  onDismiss={dismissTeamsNotice}
                   testId="team-view-teams-error"
                 />
               </div>
@@ -3899,9 +4273,19 @@ export default function MembersPage() {
                     returns to the full-width roster instead. It carries the
                     same per-row signals the roster's status filters read
                     (`signalsOf`), so a crewmate parked on a question stays
-                    visible while the roster column is folded away. */}
+                    visible while the roster column is folded away. With the
+                    column pinned open beside the thread the chip only repeats
+                    that list, so it fades out in place (`invisible` keeps its
+                    box, so the identity pill does not move) until the column
+                    closes; reduced motion cuts instead of fading. Only the
+                    hide transitions `visibility`: on show it flips at once, or
+                    the chip would still be hidden on the frame focus moves to it. */}
+                <div
+                  ref={switcherSlotRef}
+                  className={`hidden md:flex duration-200 motion-reduce:transition-none ${rosterPinned ? 'opacity-0 invisible transition-[opacity,visibility]' : 'opacity-100 visible transition-opacity'}`}
+                  data-testid="crewmate-switcher-slot"
+                >
                 <CrewmateSwitcher
-                  className="hidden md:flex"
                   members={orderedMembers}
                   defaultAgent={defaultAgent}
                   activeName={active.name}
@@ -3910,10 +4294,10 @@ export default function MembersPage() {
                     const m = orderedMembers.find((row) => row.name === name)
                     if (m) void openMember(m)
                   }}
-                  onCreate={createHeld ? undefined : () => setCreateOpen(true)}
-                  rosterShown={rosterPinned}
-                  onToggleRoster={() => setRosterPinned((v) => !v)}
+                  onCreate={createHeld ? undefined : () => openGuided()}
+                  onShowRoster={() => setRosterPin(true)}
                 />
+                </div>
                 <Glass
                   as="button"
                   variant="chip"
@@ -3938,8 +4322,9 @@ export default function MembersPage() {
                     void schedGuardRef.current().then((ok) => { if (ok) go() })
                   }}
                   className="md:hidden glass-hover inline-flex items-center justify-center w-8 h-8 rounded-full text-text cursor-pointer"
-                  aria-label={t('pages.membersPage.title')}
+                  aria-label={t('pages.membersPage.back_to_roster')}
                   data-testid="member-back"
+                  {...uiLocation('members.back')}
                 >
                   <ArrowLeft size={16} className="lucide-inline" />
                 </Glass>
@@ -3967,10 +4352,11 @@ export default function MembersPage() {
                 // press closes it (through the draft guard — see requestCloseProfile)
                 // instead of re-opening on the default tab, which remounted the card.
                 onClick={() => { if (profile) requestCloseProfile(); else openProfile() }}
-                className="glass-shadow flex items-center gap-2.5 pl-2.5 pr-3 py-1.5 min-w-0 max-w-full justify-self-center cursor-pointer text-left focus-ring pointer-events-auto"
+                className="glass-shadow group flex items-center gap-1 p-1.5 pr-2 min-w-0 max-w-full justify-self-center cursor-pointer text-left focus-ring pointer-events-auto"
                 title={t('pages.membersPage.profile_card')}
                 aria-expanded={!!profile}
                 data-testid="member-identity-pill"
+                {...uiLocation('members.edit')}
               >
                 {/* The same reactive CrewStateAvatar as before — a plain face,
                     no scrim, no badge (issue #9425). */}
@@ -3980,7 +4366,7 @@ export default function MembersPage() {
                 <span
                   ref={pillFaceRef}
                   className="relative flex shrink-0 rounded-full"
-                  style={faceFlight ? { visibility: 'hidden' } : undefined}
+                  style={faceFlight || (profile && profile.placement === 'floating') ? { visibility: 'hidden' } : undefined}
                   data-testid="member-pill-face"
                 >
                   <CrewStateAvatar
@@ -3993,31 +4379,25 @@ export default function MembersPage() {
                   />
                   <CrewLoopIndicator on={isLoopOn(active)} testId="member-pill-loop-indicator" />
                 </span>
-                <div className="min-w-0 leading-tight">
-                  {/* Title row = name (+ the ID when a label covers it). */}
+                {/* Compact at rest: the face (with its loop mark) and the
+                    chevron. The words fold to zero width and slide open on
+                    hover or keyboard focus (a 0fr -> 1fr column, so the width
+                    animates; cut under reduced motion). Folded, they stay in
+                    the DOM, so the name is still the button's accessible name.
+                    A screen with no hover (touch) keeps them open: a tap opens
+                    Profile and never sets `:focus-visible`. */}
+                <div
+                  className="grid grid-cols-[0fr] group-hover:grid-cols-[1fr] group-focus-visible:grid-cols-[1fr] [@media(hover:none)]:grid-cols-[1fr] transition-[grid-template-columns] duration-200 ease-out motion-reduce:transition-none min-w-0"
+                  data-testid="member-pill-text"
+                >
+                <div className="overflow-hidden min-w-0">
+                <div className="min-w-0 leading-tight pl-1.5">
+                  {/* Title row = the crewmate's display name; the ID is not shown. */}
                   <div className="min-w-0 flex items-center gap-1.5" data-testid="member-title-row">
-                    {/* The ID stays visible when a label covers it — routes, crons
-                        and spawn params address the ID, never the label. A label
-                        that differs from the ID only in case ("Kiro" over "kiro")
-                        covers nothing, so the line is withheld and the ID rides
-                        the name's tooltip instead. */}
-                    {(() => {
-                      const label = crewDisplayName(active)
-                      const idShown = label.toLowerCase() !== active.name.toLowerCase()
-                      const idTip = t('components.agentSelector.agent_id_tooltip', { name: active.name })
-                      return (
-                        <>
-                          <div
-                            className="text-[13.5px] font-semibold truncate max-w-[24rem]"
-                            title={!idShown && label !== active.name ? idTip : undefined}
-                            data-testid="member-pill-name"
-                          >{label}</div>
-                          {idShown && (
-                            <div className="text-[11px] font-mono text-muted truncate max-w-[11rem]" title={idTip} data-testid="member-pill-id">{active.name}</div>
-                          )}
-                        </>
-                      )
-                    })()}
+                    <div
+                      className="text-[13.5px] font-semibold truncate max-w-[24rem]"
+                      data-testid="member-pill-name"
+                    >{crewDisplayName(active)}</div>
                   </div>
                   {/* Activity line — what the crewmate is doing right now, text
                       only (the face above already carries presence, so no dot
@@ -4035,6 +4415,8 @@ export default function MembersPage() {
                     data-activity={pillActivity.kind}
                     aria-hidden="true"
                   >{pillActivity.label}{isLoopOn(active) ? ` · ${t('pages.membersPage.loop_on')}` : ''}</div>
+                </div>
+                </div>
                 </div>
                 {/* The one visible sign that this chip OPENS something. Without
                     it the pill and the switcher beside it are two controls
@@ -4077,6 +4459,7 @@ export default function MembersPage() {
                     aria-label={t('pages.membersPage.panel_toggle')}
                     title={t('pages.membersPage.panel_toggle')}
                     data-testid="member-panel-toggle"
+                    {...uiLocation('members.details')}
                   >
                     <PanelRightSolid size={15} />
                   </Glass>
@@ -4103,7 +4486,7 @@ export default function MembersPage() {
                 is visible and this wrapper steps aside; below md the roster is
                 hidden regardless of the pin. No hand-off: the Profile card may
                 hold an unsaved schedule draft, and Ask the agent navigates away. */}
-            {(patrol.failed || teamsFailed || defaultAgentFailed || starError) && (
+            {(patrol.failed || teamsNoticeShown || defaultAgentNoticeShown || starError) && (
               <div
                 className={`${rosterPinned ? 'md:hidden' : ''} flex flex-col gap-2 px-4 pb-2`}
                 data-testid="member-main-roster-errors"
@@ -4116,20 +4499,22 @@ export default function MembersPage() {
                     testId="member-main-patrol-error"
                   />
                 )}
-                {teamsFailed && (
+                {teamsNoticeShown && (
                   <ErrorNotice
                     message={t('pages.membersPage.teams_load_failed')}
                     variant="inline"
                     askAgent={false}
+                    onDismiss={dismissTeamsNotice}
                     testId="member-main-teams-error"
                   />
                 )}
-                {defaultAgentFailed && (
+                {defaultAgentNoticeShown && (
                   <ErrorNotice
                     message={t('pages.membersPage.default_agent_failed_title')}
                     report={findReport(defaultAgentRead.error instanceof Error ? defaultAgentRead.error.message : undefined)}
                     askAgent={false}
                     actionPlacement="below"
+                    onDismiss={dismissDefaultAgentNotice}
                     testId="member-main-default-agent-error"
                   />
                 )}
@@ -4152,6 +4537,18 @@ export default function MembersPage() {
                 hand-off: the ChatPane below holds the DM composer draft as
                 unsaved local state (its own notices say the same), and the
                 agent hand-off navigates away, which would unmount it. */}
+            {/* No hand-off: the ChatPane below holds the DM composer draft. */}
+            {freshStartError && freshStartError.slot === activeSlot && (
+              <ErrorNotice
+                message={freshStartError.message}
+                report={freshStartError.report}
+                onDismiss={() => setFreshStartError(null)}
+                askAgent={false}
+                variant="inline"
+                className="mx-4 mb-2"
+                testId="member-fresh-start-error"
+              />
+            )}
             {actionError && (
               <ErrorNotice
                 message={actionError}
@@ -4290,10 +4687,6 @@ export default function MembersPage() {
                 )}
               </div>
             )}
-            {mateGreeting && crewmateIdentity && (mateGreeting.kind === 'warm'
-              ? <MateResumeCard resume={mateGreeting.resume} crewmate={crewmateIdentity} onDismiss={dismissMateGreeting} />
-              : <MateWelcomeCard recap={mateGreeting.recap} crewmate={crewmateIdentity} onDismiss={dismissMateGreeting} />
-            )}
             {mateGreetingFailure && crewmateIdentity && (
               /* The status read failed (not "no ledger", which is no greeting).
                  No hand-off, for the reason the notices above give: the DM
@@ -4330,15 +4723,53 @@ export default function MembersPage() {
                     composerInput={CrewComposer}
                     frameless
                     followContentWidth
+                    crewmateCreated={Object.prototype.hasOwnProperty.call(createdReceipts, active.name) ? (() => {
+                      const receipt = createdReceipts[active.name]
+                      return (
+                        <section className="mx-4 mb-4 rounded-xl border border-border bg-card text-text p-4" role="status" data-testid="member-created-receipt">
+                          <h2 className="text-sm font-semibold">{t('components.meetCrewmatesFlow.step4_title', { name: receipt.name })}</h2>
+                          <p className="mt-2 text-sm whitespace-pre-wrap break-words">{receipt.goal}</p>
+                          {receipt.schedule === 'none' && (
+                            <p className="mt-2 text-[13px] text-muted">
+                              <span className="font-medium text-text">{t('components.meetCrewmatesFlow.when_label')}</span>{' '}
+                              <span>{t('components.meetCrewmatesFlow.when_ask')}</span>
+                            </p>
+                          )}
+                          {/* No hand-off: the receipt sits above the crewmate's composer, whose unsent draft the hand-off navigation would discard. */}
+                          {(receipt.schedule === 'refused' || receipt.schedule === 'unknown') && (
+                            <ErrorNotice message={t(receipt.schedule === 'refused' ? 'components.meetCrewmatesFlow.ready_no_schedule' : 'components.meetCrewmatesFlow.ready_schedule_unknown', { name: receipt.name })} />
+                          )}
+                          <Btn
+                            className="mt-3"
+                            onClick={() => {
+                              // Through the page's own exit guards (an open
+                              // Profile's Schedules draft asks first), like
+                              // every other member switch.
+                              openCreatedMember(receipt.key ?? receipt.name)
+                            }}
+                            data-testid="member-created-receipt-open"
+                          >
+                            {t('components.meetCrewmatesFlow.open_chat', { name: receipt.name })}
+                          </Btn>
+                        </section>
+                      )
+                    })() : undefined}
                     // The failure notice above owns the verdict on this thread
                     // while a repair has failed; the pane's own "Session
                     // ready" would contradict it one line down.
-                    // A greeting card above already speaks for the empty chat.
-                    hideEmptyHint={activeThreadFailed || mateGreeting?.kind === 'cold'}
+                    // The crewmate's greeting already speaks for the empty chat.
+                    hideEmptyHint={activeThreadFailed || !!mateGreeting}
+                    foldBefore={freshStarts[activeSlot]}
                     // Under the floating header only when nothing sits between
                     // them (see the block above); a card between already paid.
                     topInset={betweenHeaderH > 0 ? 0 : threadHeaderH}
                     crewmate={crewmateIdentity}
+                    // The greeting (cold welcome or warm resume) is a message
+                    // from the crewmate at the end of its chat, drawn here and
+                    // never sent: no model call, nothing in the transcript.
+                    crewmateGreeting={mateGreeting && crewmateIdentity && (mateGreeting.kind === 'warm'
+                      ? <MateResumeCard resume={mateGreeting.resume} crewmate={crewmateIdentity} onDismiss={dismissMateGreeting} />
+                      : <MateWelcomeCard recap={mateGreeting.recap} crewmate={crewmateIdentity} onDismiss={dismissMateGreeting} />)}
                     onOpenCrewWorkLog={openCrewWorkLog}
                     openSideChat={openMemberSideChat}
                     threads={threadHooks}
@@ -4360,6 +4791,44 @@ export default function MembersPage() {
           </>
         )}
       </section>
+      <div className={guided.open || createOpen ? 'flex flex-1 min-w-0 min-h-0 flex-col overflow-y-auto' : 'hidden'} data-testid="member-create-pane">
+        {guided.open && draftKept && (
+          <p role="status" className="mx-4 mt-3 mb-0 rounded-lg border border-border bg-card px-3 py-2 text-[13px] text-text" data-testid="member-draft-kept">
+            {t('components.meetCrewmatesFlow.draft_kept')}
+          </p>
+        )}
+        {/* Always mounted: an unfinished guided draft survives while hidden.
+            Below sm the chapter stacks and must GROW past the pane so the pane
+            scrolls (sticky footer); clamping it with min-h-0 there clipped the
+            goal examples with nothing able to scroll. From sm up the chapter's
+            own section scrolls inside the clamped height. */}
+        <div className={guided.open ? 'flex flex-1 min-w-0 sm:min-h-0' : 'hidden'} data-testid="member-create-guided">
+          <MeetCrewmatesFlow
+            embedded
+            open={guided.open}
+            initialDraft={creationDraft}
+            onCreated={recordCreated}
+            persistFailed={guided.persistFailed}
+            onDone={closeGuided}
+            onDraftKept={() => setDraftKept(true)}
+            onDraftStateChange={onDraftStateChange}
+            // The shell's leave registry is synchronous, so this page's own
+            // `window.confirm` asks, as its other guards here do.
+            confirmLeave={(message) => window.confirm(message)}
+            onOpenMember={(key) => {
+              closeGuided('completed')
+              openCreatedMember(key)
+            }}
+            onReturnToChat={() => {
+              if (creationOrigin.current) setSearchParams({ [MEMBER_PARAM]: creationOrigin.current }, { replace: true })
+            }}
+          />
+        </div>
+        {/* The full form (Advanced), in place of the chat like the flow. */}
+        <div className={createOpen ? 'flex flex-1 min-w-0 min-h-0 justify-center p-4' : 'hidden'} data-testid="member-create-advanced">
+          <NewCrewmateDialog embedded open={createOpen} onClose={() => setCreateOpen(false)} onCreated={handleCreated} existingNames={existingNames} />
+        </div>
+      </div>
       </div>
 
       {/* Side panel — the chat page's tabbed SidePanel, docked to this page.
@@ -4372,6 +4841,7 @@ export default function MembersPage() {
           taking the gesture back while it is hidden; narrow ones make it an
           overlay the header button opens, with the same close control, on the
           chat page's dock motion. */}
+      <div className={guided.open || createOpen ? 'hidden' : 'contents'}>
       {active && (() => {
           // Notes — the crewmate's own standing notes, read-only (no editor:
           // see CrewNotesTab). Its briefing read is gated on the tab being on
@@ -4380,6 +4850,7 @@ export default function MembersPage() {
             <CrewNotesTab
               slug={activeSlug}
               member={activeMemberName}
+              displayName={crewDisplayName(active)}
               header={null}
               visible
             />
@@ -4422,7 +4893,16 @@ export default function MembersPage() {
                     onAct={activeSlot ? (text: string) => mergePaneDraft(activeSlot, text, []) : undefined}
                   />
                 ) : (
-                  <CrewDashboardFrame slug={activeSlug} member={activeMemberName} displayName={crewDisplayName(activeView ?? active)} />
+                  <CrewDashboardFrame
+                    slug={activeSlug}
+                    member={activeMemberName}
+                    displayName={crewDisplayName(activeView ?? active)}
+                    avatar={(activeView ?? active).avatar}
+                    // A suggested prompt lands in this crewmate's chat box; the person sends it.
+                    onAct={activeSlot ? (text: string) => mergePaneDraft(activeSlot, text, []) : undefined}
+                    // Through the leave guard, like every other exit from this page.
+                    onOpenPreviews={() => { const destination = '/settings/developer?highlight=developer.dynamic-dashboard'; leave(() => navigate(destination), destination) }}
+                  />
                 )
               )}
             </div>
@@ -4560,6 +5040,11 @@ export default function MembersPage() {
               description={profileRegistryQuery.data?.agents.find((a) => a.name === active.name)?.description ?? ''}
               descriptionError={profileRegistryQuery.isError}
               memoryLabel={t(PROFILE_MEMORY_KEYS[memberMemoryDisplay(activeView)])}
+              // Only a crewmate's OWN (V2) store has a page to manage; the shared
+              // global store is not this crewmate's, so that tile stays a readout.
+              onOpenMemory={memberMemoryDisplay(activeView) === 'private' && activeView.memory_store
+                ? () => { const destination = `/settings/overview?view=memory&store=${encodeURIComponent(activeView.memory_store ?? '')}`; leave(() => navigate(destination), destination) }
+                : undefined}
               initialTab={profile.tab}
               schedules={schedulesForActive}
               schedulesLoading={schedulesCountQuery.isPending}
@@ -4577,6 +5062,7 @@ export default function MembersPage() {
               onRequestBack={requestProfileBack}
               onEdit={() => setEditingCrew(active.name)}
               onOpenFiles={() => openCrewView('files')}
+              onFreshStart={activeSlot && !freshStart.isPending ? askFreshStart : undefined}
             />
           ) : null
           // The card is a hover card either way — rounded on every corner, a third
@@ -4612,21 +5098,36 @@ export default function MembersPage() {
               )}
             </AnimatePresence>
           )
-          const profileSurface = profileDocked ? dockedSurface : profilePanel && threadColumnRef.current ? createPortal(
-            <div
-              className="absolute inset-0 z-30 flex justify-center px-2 py-2"
-              role="presentation"
-              onClick={(e) => { if (e.target === e.currentTarget) requestCloseProfile() }}
-              data-testid="crew-profile-modal"
-            >
-              <div
-                className="h-full rounded-2xl border border-border-strong bg-bg-elevated shadow-[var(--shadow-float,var(--shadow-lg)),inset_0_1px_0_var(--card-hl)] overflow-hidden flex flex-col animate-in zoom-in-95 fade-in-0 duration-200"
-                style={{ width: `min(${profileCardW}px, calc(100% - 16px))` }}
-                data-testid="crew-profile-card"
-              >{profilePanel}</div>
-            </div>,
+          // The floating card fades in and out on the face flight's clock while the
+          // face itself flies from the pill into the card head (and back): the one
+          // moving thing is the face, the card is the surface it lands on. Mounted
+          // through AnimatePresence so the close plays too; a plain portal unmounted
+          // it in one frame.
+          const floatingSurface = threadColumnRef.current ? createPortal(
+            <AnimatePresence initial={false}>
+              {profilePanel && !profileDocked && (
+                <motion.div
+                  key="crew-profile-floating"
+                  className="absolute inset-0 z-30 flex justify-center px-2 py-2"
+                  role="presentation"
+                  onClick={(e) => { if (e.target === e.currentTarget) requestCloseProfile() }}
+                  data-testid="crew-profile-modal"
+                >
+                  <motion.div
+                    className="h-full rounded-2xl border border-border-strong bg-bg-elevated shadow-[var(--shadow-float,var(--shadow-lg)),inset_0_1px_0_var(--card-hl)] overflow-hidden flex flex-col"
+                    style={{ width: `min(${profileCardW}px, calc(100% - 16px))` }}
+                    initial={reduceMotion ? false : { opacity: 0 }}
+                    animate={{ opacity: 1 }}
+                    exit={reduceMotion ? undefined : { opacity: 0 }}
+                    transition={{ duration: FACE_FLIGHT_SECS, ease: FACE_FLIGHT_EASE }}
+                    data-testid="crew-profile-card"
+                  >{profilePanel}</motion.div>
+                </motion.div>
+              )}
+            </AnimatePresence>,
             threadColumnRef.current,
           ) : null
+          const profileSurface = profileDocked ? dockedSurface : floatingSurface
           // The side panel's host tabs: the dynamic Dashboard only. The Workspace
           // file browser is the one chat view left unwithheld (see
           // MEMBERS_WITHHELD_VIEWS); together they are the whole strip.
@@ -4670,6 +5171,7 @@ export default function MembersPage() {
             onActiveTabChange: setShownTabId,
             projectDir,
             onFileOpen: openFile,
+            onOpenWorkingTreeDiff: openWorkingTreeDiff,
             onArtifactOpen: openArtifact,
             onFileSave: saveFile,
             leadingTabs,
@@ -4801,6 +5303,7 @@ export default function MembersPage() {
             </AnimatePresence>
           </>)
         })()}
+      </div>
       {/* Edit team (create is hidden for the phase). A saved team opens its
           team view; a deleted one that was open drops `?team=` and the bare
           URL falls to the page's default (the remembered or most recently used
@@ -4822,11 +5325,11 @@ export default function MembersPage() {
           }}
         />
       )}
-      <NewCrewmateDialog open={createOpen} onClose={() => setCreateOpen(false)} onCreated={handleCreated} existingNames={existingNames} />
       {/* The Schedules tab's discard prompt. Raised from the strip's own guard and from
           the section's collapse toggle, so it must sit outside the panel subtree the
           answer may unmount. */}
       {schedConfirmDialog}
+      {freshStartConfirmDialog}
       {/* CREW-18688: the bot-edit modal, opened in place by the thread header's
           identity pill (member-identity-pill). Renders nothing until editingCrew is
           set; the hook returns open=false until its roster read resolves the

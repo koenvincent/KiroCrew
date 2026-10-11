@@ -68,7 +68,12 @@ from kiro_crew.acp.types import (
     TurnUsage,
     classify_stop_reason,
 )
-from kiro_crew.acp_backends import ACP_BACKENDS_COMPACT
+from kiro_crew.acp_backends import (
+    ACP_BACKEND_KAS,
+    ACP_BACKEND_KIRO,
+    ACP_BACKENDS_COMPACT,
+    ACP_BACKENDS_LOCAL_CLEAR,
+)
 from kiro_crew.agent_capabilities import CapabilityError
 from kiro_crew.agent_discovery import (
     agent_welcome_message,
@@ -367,20 +372,21 @@ from kiro_crew.dashboard.recovery_replays import (
     replays_of,
 )
 
-# ``QUESTION_CARD_SHOWN_PREFIX`` and ``apply_session_directive`` are part of the
+# ``apply_session_directive`` is part of the
 # runner's base-names surface (``_BASE_NAMES`` in
 # test_chat_runner_composition_contract.py), which callers and tests read off
-# ``chat_runner`` directly; the ratchet keeps them bound here even though the
+# ``chat_runner`` directly; the ratchet keeps it bound here even though the
 # turn loop itself consumes the structured outcome.
 from kiro_crew.dashboard.session_directive_apply import (  # noqa: F401
-    QUESTION_CARD_SHOWN_PREFIX,
     DirectiveOutcome,
+    _reset_conversation,
     apply_session_directive,
     apply_session_directive_outcome,
 )
 from kiro_crew.dashboard.slot_queue_repository import RESTORED_QUEUE_KEY
 from kiro_crew.dashboard.state import (  # noqa: F401
     _MAX_SLOT_MESSAGES,
+    _TURN_CONTINUING_INJECT_KINDS,
     CRON_NOTIFY_PREFIX,
     CRON_NOTIFY_RE,
     DENY_CAUSE_APPROVAL_NO_BUDGET,
@@ -474,10 +480,13 @@ from kiro_crew.llm_helpers import (  # noqa: F401
     FallbackState,
     PromptBusyExhaustedError,
     _billing_stats,
+    acp_error_is_connection_failure,
     acp_error_is_session_not_found,
     acp_error_is_transient,
     advance_fallback_candidate,
     configured_fallback_chain,
+    connection_recovery_open,
+    connection_retry_delay,
     fallback_rewound_transient_budget,
     first_advertised_fallback,
     pick_epoch_host,
@@ -599,6 +608,7 @@ from kiro_crew.session_capabilities import CapabilityStartupError
 from kiro_crew.slack.handler import post_linked_approval, resolve_linked_approval
 from kiro_crew.slack.outbound import PostedOptions
 from kiro_crew.start_priority import StartPriority, person_priority
+from kiro_crew.tool_gate_busy import hook_gate_busy
 from kiro_crew.trust_patterns import (  # noqa: F401 -- compatibility re-export
     _mask_quoted_separators,
     approval_command,
@@ -3088,7 +3098,7 @@ _RECIPIENT_LOGGED_CAP = 512
 _name_grant_refusal_off_loop = refusal_for_command_off_loop
 
 
-async def _retire_sessions_on_identity_change(state: Any) -> None:
+async def _retire_sessions_on_identity_change(state: Any, *, unattended: bool = False) -> None:
     """Recycle kiro-backed children when the signed-in account has changed.
 
     The counterpart to :func:`_mark_kiro_signed_out`, for the case that function
@@ -3103,6 +3113,24 @@ async def _retire_sessions_on_identity_change(state: Any) -> None:
     invalidated child and lets the send proceed on a fresh one, which is a
     process recycle rather than a readiness verdict. It stays off the spawn path
     too -- the trigger is a local database read, briefly cached, not a ``whoami``.
+
+    ``unattended`` marks a caller with no person behind it, an agent cron. An
+    EMPTY live fingerprint is never reconciled, so every call under it sweeps, and
+    that sweep spares nothing: it retires every idle kiro-backed session,
+    cancelling an idle parent's ``spawn_run`` children and dropping each one's
+    native conversation. After a real sign-out that is the point: every child
+    still holding the old credential has to go. But the same
+    empty fingerprint comes from a store the reader cannot identify (a social
+    login, an unreadable or relocated store), where it never goes away; a cron
+    would then repeat the sweep on every fire. Its own session survives from one
+    fire to the next mostly while its sub-agents are still running, so even
+    retiring just that one would usually end them. So an unattended caller sweeps
+    under an empty fingerprint only when the read proved nobody is signed in
+    (``identity_absence_is_definitive``), and only until one sweep under that
+    sign-out completes (``identity_absence_already_swept``): a session started after
+    it holds no account or brings its own ``KIRO_API_KEY`` (a cron job's ``env``
+    block), which no sweep spares, so sweeping again would only cancel its
+    sub-agents. Otherwise it does nothing.
 
     Best-effort: a failure here must not fail the turn, which would be a worse
     outcome than the staleness it exists to correct.
@@ -3121,6 +3149,19 @@ async def _retire_sessions_on_identity_change(state: Any) -> None:
         # keep the latch armed -- see note_sessions_reconciled. Looked up
         # defensively like the other optional surfaces in this gate.
         observed_gen = getattr(service, "identity_observation_generation", None)
+        # Captured with the read for the same reason: the sweep below awaits, and a
+        # read that lands meanwhile must not speak for the one that started it.
+        absence_proven = getattr(service, "identity_absence_is_definitive", False)
+        absence_run = getattr(service, "identity_absence_run", None)
+        if (
+            unattended
+            and not live
+            and (not absence_proven or getattr(service, "identity_absence_already_swept", False))
+        ):
+            # See the docstring: an account the reader cannot identify, or a
+            # sign-out a sweep already finished, is no reason for an unattended
+            # caller to recycle anything.
+            return
         # BEFORE the unchanged early-return: the stamp check exists precisely
         # for the case where the baseline (and the interim latch) compare
         # equal -- an A->B->A round trip no read ever observed -- while a
@@ -3169,6 +3210,12 @@ async def _retire_sessions_on_identity_change(state: Any) -> None:
         # whatever the store now holds even when we cannot fingerprint it.
         if complete and live:
             service.note_sessions_reconciled(live, observations_before=observed_gen)
+        elif complete and absence_proven and absence_run is not None:
+            # A sign-out is never reconciled, so record that a sweep finished this
+            # one: unattended callers then leave it alone (identity_absence_already_swept).
+            note_absence_swept = getattr(service, "note_absence_swept", None)
+            if note_absence_swept is not None:
+                note_absence_swept(absence_run)
         # Narrow the latch ONLY on an actual sign-out (no identity on disk). On a
         # switch to another valid account, narrowing would strand readiness: if a
         # status poll observed the switch first it has already stamped the new
@@ -4883,6 +4930,79 @@ def _arm_pending_reset_retry(state: "DashboardState", slot: "_ChatSlot") -> None
     _pending_reset_retries[slot.key] = (slot, asyncio.create_task(_retry()))
 
 
+async def _slash_command_backend(state: DashboardState, session_key: str) -> str:
+    """The backend a slash command on *session_key* would reach.
+
+    A positively live provider answers for itself (peeked, never created);
+    otherwise the factory's member-aware selection does, so a dead row cannot
+    answer for its successor.
+    """
+    provider = state.sessions.get_provider(session_key)
+    if provider is not None and await state.sessions.is_provider_alive(session_key) is True:
+        return capabilities_of(provider).backend
+    agent_cfg = KiroCrewConfig.load().agent
+    backend = select_provider_backend(
+        session_key,
+        getattr(agent_cfg, "member_acp_backend", ""),
+        getattr(agent_cfg, "acp_backend", ""),
+    )
+    return backend if isinstance(backend, str) else ACP_BACKEND_KIRO
+
+
+async def _answer_slash_without_channel(
+    state: DashboardState, slot: _ChatSlot, session_key: str, command: str
+) -> str:
+    """Answer a harness command the backend cannot run, as a local command.
+
+    ``/clear`` queues the discard ``reset_conversation`` queues and applies it
+    through the same consumer, so the next turn starts with no memory of this
+    conversation. The transcript stays, as it does for that tool. A session that
+    refuses the discard (busy, sub-agents attached) keeps it queued for a later
+    turn boundary.
+
+    Returns the outcome it records: ``discarded``, ``queued`` or
+    ``unsupported_backend``.
+    """
+    if command.lower() == "/clear":
+        await _reset_conversation(slot, session_key, {})
+        torn_down = await _consume_pending_reset(state, slot, allow_discard=True)
+        # The consumer's True also covers a queued project reset; only a spent
+        # discard flag means THIS conversation was dropped.
+        cleared = torn_down and not slot._pending_discard_conversation_key
+        outcome = "discarded" if cleared else "queued"
+        if torn_down:
+            schedule_eager_spawn(state, slot)
+        if cleared:
+            # The plan goes with the conversation, as on kiro's native /clear:
+            # a kept pill would be rebuilt into the fresh one at its cold start.
+            if slot.set_todo(None):
+                state.broadcast_ws("todo_update", {"slot": slot.key, "todo": None})
+            text = (
+                "🗑 Conversation cleared. Earlier messages stay visible, but the agent "
+                "no longer remembers them."
+            )
+        else:
+            text = (
+                "🗑 Clear queued. The agent is busy right now, so your next reply "
+                "may still remember this conversation."
+            )
+    else:
+        outcome = "unsupported_backend"
+        text = f"⚠ `{command}` doesn't work with KAS. It was not sent to the agent."
+    sel().log_tool_invocation(
+        session_key=session_key,
+        agent=slot.agent or "kirocrew",
+        source="dashboard",
+        tool_name=command,
+        tool_kind="slash_command",
+        outcome=outcome,
+        metadata={"slot": slot.key},
+    )
+    slot.append("assistant", text, "msg msg-a")
+    state.push_slots_update()
+    return outcome
+
+
 async def _consume_pending_reset(
     state: DashboardState, slot: _ChatSlot, *, allow_discard: bool = False
 ) -> bool:
@@ -4904,7 +5024,10 @@ async def _consume_pending_reset(
     would hand the next turn a reconstruction of the conversation the caller
     discarded.
 
-    ``allow_discard`` IS THE BOUNDARY, and only the end-of-turn caller sets it.
+    ``allow_discard`` IS THE BOUNDARY. Two callers set it: the end-of-turn one,
+    and a no-channel ``/clear`` (``_answer_slash_without_channel``), which runs
+    before any session work and relies on ``skip_if_busy`` to refuse under a
+    streaming channel turn.
     The project reset is consumed at three points including the one just before
     ``get_or_create``, and that pre-acquire point is safe for it only in the
     narrow sense its own comment claims: no lock is held by THIS turn, so
@@ -7093,7 +7216,9 @@ async def _start_next_queued_turn(
     _drained_send_ids: list[str] = []
     # circular import: session_control imports this package's modules at module level.
     from kiro_crew.dashboard.session_control import (
+        CHANNEL_RECIPIENT_META_KEY,
         QUEUED_CONTAINMENT_META_KEY,
+        SEND_ORIGIN_META_KEY,
         audit_queued_allow,
     )
 
@@ -7128,6 +7253,21 @@ async def _start_next_queued_turn(
             _drained_meta.update(
                 (k, v) for k, v in _item_meta.items() if k != QUEUED_CONTAINMENT_META_KEY
             )
+    # A drop-notice address names the one sender whose text the notice quotes.
+    # A merged row's text is every entry's, so the row keeps an address only
+    # when every consumed entry carries that same address; otherwise the union's
+    # last writer would be quoted another sender's words.
+    for _address_key in (CHANNEL_RECIPIENT_META_KEY, SEND_ORIGIN_META_KEY):
+        _addresses = [
+            (
+                (item.get("meta") or {}).get(_address_key)
+                if isinstance(item.get("meta"), dict)
+                else None
+            )
+            for item in consumed
+        ]
+        if any(_address != _addresses[0] for _address in _addresses):
+            _drained_meta.pop(_address_key, None)
     # Model input only: the row keeps the user's text as typed.
     _possibly_delivered_steer = bool(_drained_meta.pop(STEER_POSSIBLY_DELIVERED_META, False))
     # Queue plumbing like the steer mark above, read the way the channel origin is:
@@ -7827,10 +7967,11 @@ async def _end_turn_tail(
     if outcome is not None:
         # End-of-turn fallback: catches set_project and reset_conversation calls
         # that fired mid-turn, after the start-of-turn consume already ran. This
-        # is the ONLY caller that may consume a queued conversation discard --
-        # the earlier consume points run just before a turn acquires the
-        # session, where a teardown can land under a channel turn already
-        # streaming on it. Guarded because a raise here would skip the queue
+        # is the only TURN-PATH caller that may consume a queued conversation
+        # discard -- the earlier consume points run just before a turn acquires
+        # the session, where a teardown can land under a channel turn already
+        # streaming on it. A no-channel /clear also consumes one, relying on
+        # skip_if_busy for that case. Guarded because a raise here would skip the queue
         # hand-off below, silently stranding queued work at the end of an
         # otherwise successful turn.
         try:
@@ -7856,6 +7997,8 @@ async def _end_turn_tail(
         # with the turn; the next turn's provenance is its own opener's.
         # Outermost frame only: the depth-1 re-entry's exit is not the turn's end.
         slot._turn_channel_narrowed = False
+        slot._turn_channel_origin = False
+        slot._turn_user_sent = False
     # A healthy `wait` clears its own state with a final keepalive ping, but
     # that ping is best-effort and cannot run at all if the MCP subprocess died
     # mid-sleep (hard stop, crash, gateway abort). Clearing at turn end is the
@@ -8336,6 +8479,8 @@ async def _run_chat(
         # the depth-1 re-entry runs inside the same turn and must keep a narrowing
         # the turn already took.
         slot._turn_channel_narrowed = False
+        slot._turn_channel_origin = bool(_directive_channel_origin)
+        slot._turn_user_sent = bool(_directive_user_origin) and not _directive_channel_origin
     # Dispatch appends the triggering row before entering this runner. Freeze
     # that row now, before await points, prompt expansion or new deliveries.
     _current_replay_message = _current_message
@@ -9058,14 +9203,38 @@ async def _run_chat(
         channel-born session (fail-closed). The requeue is the moment its
         admission is re-affirmed, and the turn's directive provenance rides
         along so the audience exemption follows the original author.
+
+        A requeue of the sender's own text, unchanged, also keeps the sender's
+        drop-notice addresses (the channel conversation or the sending session),
+        so a retry the drain drops is reported to the same sender the first
+        queueing would have told. The text is compared with the row the drain
+        handed this turn, never with ``message``: the runner prepends context
+        and failure notes to ``message`` before streaming, and a notice quoting
+        that text would show the sender words that are not theirs. The
+        addresses are read only off that handed row, which this process
+        admitted; a row found by scanning the transcript may have been restored
+        from disk, and a write target is never taken from there.
         """
         # circular import: session_control imports this package's modules at module level.
-        from kiro_crew.dashboard.session_control import containment_meta
+        from kiro_crew.dashboard.session_control import (
+            CHANNEL_RECIPIENT_META_KEY,
+            SEND_ORIGIN_META_KEY,
+            containment_meta,
+        )
 
-        _recovery_meta = {
-            **containment_meta(state, slot),
-            **(extra_meta or {}),
-        }
+        _address_keys = (CHANNEL_RECIPIENT_META_KEY, SEND_ORIGIN_META_KEY)
+        _recovery_meta = containment_meta(state, slot)
+        # A caller's extra meta can be the handed row's whole meta, so its
+        # addresses are dropped here: the comparison below is their one writer.
+        _recovery_meta.update(
+            (k, v) for k, v in (extra_meta or {}).items() if k not in _address_keys
+        )
+        if isinstance(_current_message, dict) and content == _current_message.get("content"):
+            _row_meta = _current_message.get("meta")
+            if isinstance(_row_meta, dict):
+                for _key in _address_keys:
+                    if _key in _row_meta:
+                        _recovery_meta[_key] = _row_meta[_key]
         if _commands_off:
             # A recovery is a second turn of the SAME message: a channel entry that
             # arrived as turn content stays turn content when its retry drains, or
@@ -9296,8 +9465,8 @@ async def _run_chat(
     # text and overwrite the applied outcome in the transcript. Replaying the
     # stored output keeps every frame consistent and marker-free.
     _dir_consumed_out: dict[str, str] = {}
-    # A terminal directive APPLIED this turn (a shown question card, a recorded
-    # quiet end — ``session_directive_apply.TERMINAL_DIRECTIVES``) is the turn's
+    # A terminal directive APPLIED this turn (a recorded quiet end —
+    # ``session_directive_apply.TERMINAL_DIRECTIVES``) is the turn's
     # intended output. The tool tells the model to end without assistant text,
     # so empty-response recovery must not inject a closing continuation. The
     # signal is the applier's structured ``DirectiveOutcome.ends_turn``, never a
@@ -9755,23 +9924,8 @@ async def _run_chat(
     # member-aware successor selection. Acquisition still confirms support,
     # because the provider can be replaced between this probe and the claim.
     if first_word in _KIRO_ONLY_BLOCKED_SLASH_COMMANDS:
-        _todos_provider = state.sessions.get_provider(session_key)
-        _todos_provider_alive = (
-            await state.sessions.is_provider_alive(session_key)
-            if _todos_provider is not None
-            else None
-        )
-        if _todos_provider is not None and _todos_provider_alive is True:
-            _todos_supported = capabilities_of(_todos_provider).supports_native_todos
-        else:
-            _todos_agent_cfg = KiroCrewConfig.load().agent
-            _todos_backend = select_provider_backend(
-                session_key,
-                getattr(_todos_agent_cfg, "member_acp_backend", ""),
-                getattr(_todos_agent_cfg, "acp_backend", ""),
-            )
-            _todos_supported = capabilities_for(_todos_backend).supports_native_todos
-        if not _todos_supported:
+        _todos_backend = await _slash_command_backend(state, session_key)
+        if not capabilities_for(_todos_backend).supports_native_todos:
             _refuse_blocked_slash()
             return
 
@@ -9842,6 +9996,33 @@ async def _run_chat(
                 "msg msg-a",
             )
             state.push_slots_update()
+            return
+
+    # ── Harness commands on KAS, which has no command channel ──
+    # The session handle runs a command natively only on kiro-cli; KAS gets it
+    # as session/prompt text, and KAS has no built-in /clear there, so the
+    # model reads "/clear" as a request and the conversation stays. KAS also
+    # refuses _kiro.dev/commands/execute itself, so that verb is no way out.
+    # Answer here instead, before any session work: /clear takes the same discard
+    # reset_conversation queues, and every other command gets a notice rather
+    # than reaching the model. /compact passes through: on KAS the session handle
+    # sends it as the engine's own compaction verb, not as prompt text. A /todos
+    # that got past its own gate is on a harness that runs it natively.
+    # The other harnesses in ACP_BACKENDS_LOCAL_CLEAR have no /clear of their own
+    # either, so /clear alone is answered here for them too; their other commands
+    # keep the prompt path, where those harnesses serve the ones they know.
+    if (
+        is_slash
+        and not _is_cc_provider
+        and first_word != "/compact"
+        and first_word not in _KIRO_ONLY_BLOCKED_SLASH_COMMANDS
+    ):
+        _command_backend = await _slash_command_backend(state, session_key)
+        if _command_backend == ACP_BACKEND_KAS or (
+            _this_turn_is_clear and _command_backend in ACP_BACKENDS_LOCAL_CLEAR
+        ):
+            turn_exit.local_command = first_word
+            await _answer_slash_without_channel(state, slot, session_key, first_word)
             return
 
     _is_monitor_wake = message.startswith(MONITOR_WAKE_PREFIX)
@@ -10946,6 +11127,24 @@ async def _run_chat(
                     metadata={"count": str(_n_skills), "slot": slot.key},
                 )
 
+        # Change-card outcomes since this slot's last turn (a card proposed here
+        # was applied, cancelled, undone...). Read and marked heard in one step,
+        # so the next turn does not repeat them. Reference data only: it never
+        # starts a turn of its own, and a card never carries a secret value.
+        if not is_slash and _prompt_depth < 1:
+            try:
+                from kiro_crew.context_blocks import render_change_card_results
+                from kiro_crew.dashboard.change_cards import card_store_for
+
+                _card_store = card_store_for(state)
+                await _card_store.warm()
+                _card_outcomes = _card_store.take_unreported(slot.key)
+                if _card_outcomes:
+                    _request_prefix_context += render_change_card_results(_card_outcomes)
+                    await _card_store.flush()
+            except Exception:
+                logger.debug("change-card results block skipped", exc_info=True)
+
         # Ensure the mirror-source message is always bound before both the Slack
         # and channel-neutral user-message mirror legs run. The assignment that
         # refines it below only executes for non-slash turns that have a
@@ -11585,6 +11784,21 @@ async def _run_chat(
         # refusal card below, which renders the same shape for every harness.
         _turn_refusal: RefusalInfo | None = None
 
+        def _record_refused_cycle() -> None:
+            """Mark this slot's last turn as a refused cycle of the loop that fired it.
+
+            Only a loop's own delivered cycle counts (``_directive_self_wake``
+            with the fired loop's id), so a refusal on a person's turn never stops
+            a loop sharing the slot. The fire guard reads the pair before the next
+            cycle and stops that loop with ``model_refused``: the refusal card is
+            terminal for an unattended cycle, and the next one would send the same
+            prompt to the same model.
+            """
+            if not (_directive_self_wake and _directive_loop_id):
+                return
+            slot._last_turn_model_refused_loop_id = _directive_loop_id
+            slot._last_turn_model_refused_loop_gen = _directive_loop_gen
+
         async def _refusal_fallback_retry() -> bool:
             """One single-message retry on the configured refusal fallback.
 
@@ -12069,7 +12283,10 @@ async def _run_chat(
                                     "tool_result",
                                     {"slot": slot.key, "tool_call_id": tcid, "output": ""},
                                 )
-                        elif m.get("role") not in ("tool", "permission", "chunk"):
+                        # A `card` row is a change card / guide offer the
+                        # tool group's own call put into the conversation, so
+                        # the scan reads past it like the tool rows around it.
+                        elif m.get("role") not in ("tool", "permission", "chunk", "card"):
                             break
                     # The same inference for the log. A tool that produced no
                     # output sent no result frame, so its call is still open here;
@@ -13490,6 +13707,7 @@ async def _run_chat(
                     tool_result = await run_in_tool_gate_pool(
                         state.context_builder.hooks.on_tool_call,
                         event.title,
+                        on_queue_timeout=hook_gate_busy,
                         session_key=session_key,
                         agent=slot.agent or "",
                         app=slot._app or "",
@@ -16226,6 +16444,7 @@ async def _run_chat(
                 if await _refusal_fallback_retry():
                     pass
                 else:
+                    _record_refused_cycle()
                     logger.warning(
                         "Model refusal for slot %s (category=%s) after "
                         "streamed explanation — not retrying",
@@ -16275,6 +16494,7 @@ async def _run_chat(
             if await _refusal_fallback_retry():
                 pass
             else:
+                _record_refused_cycle()
                 logger.warning(
                     "Model refusal for slot %s (category=%s) — not retrying "
                     "[is_new=%s resumed=%s tool_calls=%d visible_output=%s "
@@ -17711,7 +17931,10 @@ async def _run_chat(
                 slot.key,
                 _death_attempts,
             )
-        if _should_suppress_requeue(slot):
+        # A Stop that already resolved to idle is invisible to the suppress
+        # check, and `_queue_recovery` takes no Stop snapshot of its own, so
+        # only this gate can see it (the same pairing as the lost-session arm).
+        if _should_suppress_requeue(slot) or _stop_pressed():
             pass
         elif _prompt_depth == 0 and _death_attempts <= SESSION_RECOVERY_MAX_ATTEMPTS:
             # Persisted card: reliably visible at turn-teardown (an ephemeral
@@ -17768,6 +17991,7 @@ async def _run_chat(
             _turn_emitted=_turn_emitted,
             _is_synthetic=_is_synthetic,
             _queue_recovery=_queue_recovery,
+            _stop_pressed=_stop_pressed,
         )
     except AcpError as exc:
         # The exception CLASS is logged alongside the message because the
@@ -17847,7 +18071,8 @@ async def _run_chat(
                 slot._prompt_busy_retries += 1
                 _exhausted = slot._prompt_busy_retries > 3
                 _status = "⟳ Session busy — retrying…"
-            if _should_suppress_requeue(slot):
+            # Resolved Stop: see the AcpProcessDied arm above.
+            if _should_suppress_requeue(slot) or _stop_pressed():
                 pass
             elif _exhausted:
                 logger.info(
@@ -17970,6 +18195,10 @@ async def _run_chat(
                 (_image_replay_owed := not _turn_emitted and _replay_owes_delivery())
                 or (
                     not _should_suppress_requeue(slot)
+                    # Resolved Stop: the `_image_stop_gen` snapshot below is
+                    # taken after the Stop moved the counter, so only this read
+                    # sees it (see the AcpProcessDied arm).
+                    and not _stop_pressed()
                     and not _has_user_queued_followup(slot)
                     and not getattr(slot, "_pending_steers", None)
                 )
@@ -18049,7 +18278,10 @@ async def _run_chat(
         elif (
             not _turn_emitted
             and acp_error_is_transient(exc)
-            and slot._transient_5xx_retries < TRANSIENT_RETRIES
+            and (
+                slot._transient_5xx_retries < TRANSIENT_RETRIES
+                or connection_recovery_open(exc, slot._transient_ladder_started)
+            )
         ):
             # Transient backend 5xx (InternalServerError / DispatchFailure /
             # ConnectionReset, JSON-RPC -32603): the kiro-cli process is ALIVE —
@@ -18066,19 +18298,33 @@ async def _run_chat(
             # session — unless CONSECUTIVE cycles exhaust this way, in which
             # case the else escalates to a session destroy (poisoned
             # persisted conversation; see the escalation block there).
+            #
+            # A connection failure (the network path dropped, no provider
+            # answer) may run past TRANSIENT_RETRIES while the recovery window
+            # opened at the ladder's first retry is still open, on a backoff
+            # capped at CONNECTION_RETRY_MAX_DELAY, so a short outage resumes
+            # the turn instead of ending it. Past the window it falls through to
+            # the same branches as an exhausted provider-error ladder.
+            if slot._transient_5xx_retries == 0:
+                slot._transient_ladder_started = time.monotonic()
             slot._transient_5xx_retries += 1
+            _in_recovery_window = slot._transient_5xx_retries > TRANSIENT_RETRIES
+            _base_delay = (
+                connection_retry_delay(slot._transient_5xx_retries)
+                if acp_error_is_connection_failure(exc)
+                else transient_retry_delay(slot._transient_5xx_retries)
+            )
             # Local curve, floored by the dependency coordinator's shared
             # cooldown for this provider scope (one schedule per scope, RFC
             # §4.4); a typed throttle is reported to the adaptive controller.
-            _delay = _shared_dependency_delay(
-                exc, transient_retry_delay(slot._transient_5xx_retries), slot_key=slot.key
-            )
+            _delay = _shared_dependency_delay(exc, _base_delay, slot_key=slot.key)
             logger.info(
-                "Transient backend 5xx in slot %s (attempt %d/%d) — re-prompting "
+                "Transient backend error in slot %s (attempt %d/%d%s) — re-prompting "
                 "live session in %.1fs: %s",
                 slot.key,
                 slot._transient_5xx_retries,
                 TRANSIENT_RETRIES,
+                ", connection recovery window" if _in_recovery_window else "",
                 _delay,
                 _msg[:80],
             )
@@ -18087,6 +18333,16 @@ async def _run_chat(
             slot.purge_chunks()
             if _should_suppress_requeue(slot):
                 pass
+            elif _stop_pressed():
+                # Resolved Stop: skip the "retrying" card the post-backoff re-read
+                # would only withdraw (see the AcpProcessDied arm). This ends the
+                # turn with no requeue, so it owes the same per-turn budget refresh
+                # as the post-backoff drop arm below: the attempt counted above
+                # would otherwise shorten the next turn's ladder.
+                slot._transient_5xx_retries = 0
+                slot._infra_retries = 0
+                slot._fallback_candidate_idx = 0
+                slot._fallback_walked = []
             elif _prompt_depth == 0:
                 # Single emit (see AcpProcessDied note): slot.append persists +
                 # broadcasts one chat_message; no explicit broadcast_ws. Back off,
@@ -18096,15 +18352,34 @@ async def _run_chat(
                 # re-offering a choice that re-runs itself); the post-backoff
                 # re-read below is the one path that can leave it standing for a
                 # retry that never happened, and it corrects the row in place.
-                slot.append(
-                    "error",
-                    TRANSIENT_RETRYING_TEXT,
-                    "msg msg-err",
-                    meta={
-                        "kind": TRANSIENT_RETRY_KIND,
-                        TRANSIENT_NOTICE_META_KEY: TRANSIENT_NOTICE_RETRYING,
-                    },
-                )
+                # Inside the recovery window one standing notice covers the
+                # outage: a retrying row is not repeated when only the replays
+                # of this same turn have been appended since it.
+                _tail: dict = {}
+                for _row in reversed(slot.messages):
+                    if (
+                        _row.get("role") == "inject"
+                        and (_row.get("meta") or {}).get("injectKind")
+                        in _TURN_CONTINUING_INJECT_KINDS
+                    ):
+                        continue
+                    _tail = _row
+                    break
+                if not (
+                    _in_recovery_window
+                    and _tail.get("role") == "error"
+                    and (_tail.get("meta") or {}).get(TRANSIENT_NOTICE_META_KEY)
+                    == TRANSIENT_NOTICE_RETRYING
+                ):
+                    slot.append(
+                        "error",
+                        TRANSIENT_RETRYING_TEXT,
+                        "msg msg-err",
+                        meta={
+                            "kind": TRANSIENT_RETRY_KIND,
+                            TRANSIENT_NOTICE_META_KEY: TRANSIENT_NOTICE_RETRYING,
+                        },
+                    )
                 await _recovery_delay(_delay)
                 # Re-read the STOP signals after the multi-second backoff: the
                 # guard above ran before the wait, and a Stop pressed during it
@@ -18729,6 +19004,9 @@ async def _run_chat(
                 and not slot._poisoned_reset_used
                 and _prompt_depth == 0
                 and not _should_suppress_requeue(slot)
+                # Resolved Stop: the canary snapshot below is taken after the
+                # Stop moved the counter (see the AcpProcessDied arm).
+                and not _stop_pressed()
             ):
                 # ── Canary probe: conversation-specific evidence, or bust ──
                 # Two exhausted ladders alone cannot distinguish a poisoned

@@ -183,7 +183,6 @@ from kiro_crew.config.section_builders import (  # noqa: F401
 )
 from kiro_crew.config.sections import (  # noqa: F401
     _BOT_NAME_MAX,
-    _BOT_NAME_RE,
     _COLOR_HEX_RE,
     _CONNECT_TIMEOUT_CEILING,
     _DEFAULT_BEACON_ENDPOINT,
@@ -691,7 +690,9 @@ def warn_undecodable_env(ep: Path, exc: UnicodeDecodeError) -> None:
     logger.warning("%s", undecodable_env_message(ep, exc))
 
 
-def read_env_file_credential(key: str, env_file: Path | None = None) -> str:
+def read_env_file_credential(
+    key: str, env_file: Path | None = None, *, definitive: list[bool] | None = None
+) -> str:
     """Best-effort read of one ``KEY=VALUE`` entry from the data home's ``.env``.
 
     Same line format :meth:`KiroCrewConfig.load_credentials` parses (one pair
@@ -699,15 +700,29 @@ def read_env_file_credential(key: str, env_file: Path | None = None) -> str:
     Returns ``""`` when the file is absent, unreadable or UTF-16/UTF-32 encoded —
     callers treat the credential as unset rather than failing.
 
+    ``definitive``, when given, receives ONE bool from this same read: True when
+    the file was decoded or does not exist, so an empty answer means the key is
+    not there; False when it could not be read or is UTF-16/UTF-32, so an empty
+    answer proves nothing. Any other decode error propagates, as before, and
+    records nothing.
+
     Blocking file IO: call via ``asyncio.to_thread`` from async paths.
     """
     ep = env_file if env_file is not None else env_path()
     try:
         text = read_env_text(ep)
+    except FileNotFoundError:
+        if definitive is not None:
+            definitive.append(True)
+        return ""
     except OSError:
+        if definitive is not None:
+            definitive.append(False)
         return ""
     except EnvFileWideEncodingError as exc:
         warn_undecodable_env(ep, exc)
+        if definitive is not None:
+            definitive.append(False)
         return ""
     value = ""
     for line in text.splitlines():
@@ -718,6 +733,8 @@ def read_env_file_credential(key: str, env_file: Path | None = None) -> str:
             k, v = line.split("=", 1)
             if k.strip() == key:
                 value = v.strip()
+    if definitive is not None:
+        definitive.append(True)
     return value
 
 
@@ -3447,6 +3464,7 @@ def _build_dashboard_config(_degraded: set[str], dashboard_data: dict) -> Dashbo
             "qr_session_persist_across_restart", _safe_bool
         ),
         restore_window_minutes=section.get("restore_window_minutes"),
+        idle_slot_sweep_days=section.read("idle_slot_sweep_days", _safe_int, 0, 3650),
         surface_channel_sessions=section.get("surface_channel_sessions"),
         bot_name=section.get("bot_name"),
         avatar=section.get("avatar"),
@@ -3506,6 +3524,9 @@ def _build_dashboard_config(_degraded: set[str], dashboard_data: dict) -> Dashbo
         default_memory_mode=_default_memory_mode_from(section.get("default_memory_mode")),
         widget_density=section.get("widget_density"),
         use_builtin_browser=section.read("use_builtin_browser", _safe_bool),
+        browser_local_origins=_sections.coerce_browser_local_origins(
+            section.get("browser_local_origins")
+        ),
         browser_view_port=_port_or_unset(section.get("browser_view_port")),
         verbosity=_sections.normalize_verbosity(section.get("verbosity")),
         link_previews=section.read("link_previews", _safe_bool),
@@ -3548,6 +3569,7 @@ def _build_dashboard_config(_degraded: set[str], dashboard_data: dict) -> Dashbo
             "feature_videos_cache_max_mb", _safe_float, lo=0.0
         ),
         folder_suggestions_enabled=bool(section.get("folder_suggestions_enabled")),
+        topic_tags_enabled=section.read("topic_tags_enabled", _safe_bool),
         tips_cadence_hours=section.read("tips_cadence_hours", _safe_float, lo=0.0),
         tips_snooze_hours=section.read("tips_snooze_hours", _safe_float, lo=0.0),
         tips_recency_decay=section.read("tips_recency_decay", _safe_float, lo=0.0, hi=1.0),
@@ -4698,6 +4720,10 @@ class KiroCrewConfig:
             extra_env: dict[str, str] | None = None,
             reasoning_effort_override: str | None = None,
             crew_agent: str | None = None,
+            # The backend a caller asked for explicitly (``spawn_run(backend=...)``).
+            # NAMED so it is never swallowed by the catch-all: the session would
+            # silently start on the configured default. ``None`` = no override.
+            backend_override: str | None = None,
             # Per-session opt-in for the claude backend's own permission
             # classifier. NAMED rather than left to ``**_kwargs`` on purpose: a
             # caller passing it into the catch-all would be swallowed here and
@@ -4742,8 +4768,9 @@ class KiroCrewConfig:
             # backend, and why to_acp_id is the non-claude choice, is documented
             # on that method.)
             # Per-session backend selection -- ONE call to the selection gate's
-            # per-session half (members.select_provider_backend: member-DM
-            # auto-route > configured default). The factory body carries no
+            # per-session half (members.select_provider_backend: the caller's
+            # explicit backend > member-DM auto-route > configured default). The
+            # factory body carries no
             # branching of its own, so the kiro construction path gains no
             # second check (harness-parity H3/H13); resolve_selected_backend
             # inside the helper applies the same governance/selectability gate
@@ -4757,6 +4784,7 @@ class KiroCrewConfig:
                 session_key,
                 self.agent.member_acp_backend,
                 self.agent.acp_backend,
+                backend_override=backend_override,
             )
             # Resolved BEFORE the model, and threaded into the resolution: the
             # model's namespace translation and its pin-scope check both have to
@@ -5441,6 +5469,7 @@ def build_config(
                     watchdog_tool_stall_hard_cap_secs=crew.read(
                         "watchdog_tool_stall_hard_cap_secs", _safe_float, lo=0.0
                     ),
+                    autocompact_pct=_crew_autocompact_pct(crew),
                     telegram_account=crew.get("telegram_account"),
                     session_color=_safe_color(crew.get("session_color")),
                     # Module-qualified on purpose: the facade's `from
@@ -7056,6 +7085,36 @@ def _project_declares_agent(agent_name: str, project_dir: str) -> bool:
     except Exception:  # noqa: BLE001 — a probe failure only costs a fallback
         logger.debug("Project agent probe failed for %r", agent_name, exc_info=True)
         return False
+
+
+def _crew_autocompact_pct(crew: "_sections.SectionReader") -> float:
+    """Read one crew record's ``autocompact_pct``: 0 (inherit) or a value in range.
+
+    config.json is hand-editable, so junk and a negative value collapse to 0
+    (inherit the global) rather than crash the load. Any positive value is
+    held to the global knob's documented range, so a per-agent default can
+    neither thrash compaction (below the minimum) nor never fire (above the
+    maximum).
+    """
+    value = crew.read("autocompact_pct", _safe_float, lo=0.0, hi=AUTOCOMPACT_PCT_MAX)
+    if 0.0 < value < AUTOCOMPACT_PCT_MIN:
+        return AUTOCOMPACT_PCT_MIN
+    return value
+
+
+def crew_autocompact_pct(config: "KiroCrewConfig", crew_name: str) -> float | None:
+    """The compaction threshold crew *crew_name* declares, or ``None`` to inherit.
+
+    *crew_name* is a canonical ``config.agents`` key, the identity a session's
+    allocation resolved (:func:`resolve_crew_identity`). A name that is not a
+    crew, or a crew that leaves the field at 0, inherits the global
+    ``session.autocompact_pct``. The value is the one :func:`_crew_autocompact_pct`
+    validated at load, so this is a lookup and nothing more.
+    """
+    crew = config.agents.get(crew_name) if crew_name else None
+    if crew is None or not crew.autocompact_pct:
+        return None
+    return crew.autocompact_pct
 
 
 def resolve_crew_identity(

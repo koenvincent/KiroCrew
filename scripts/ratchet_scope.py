@@ -161,6 +161,21 @@ def changed_paths() -> tuple[set[str] | None, str]:
     return None, "undeterminable (judging the whole tree)"
 
 
+def base_ref(scope_label: str, *, cwd: Path | None = None) -> str | None:
+    """The commit a ``changed_paths`` label diffs this change against, or None.
+
+    Both merge labels diff from ``HEAD^1``; ``<base>...HEAD`` diffs from
+    ``merge-base(<base>, HEAD)``. An unknown label or a failing git is None, so
+    a caller that needs the base cannot silently read a different one.
+    """
+    if scope_label in ("merge HEAD^1..HEAD", "merge parents"):
+        return "HEAD^1"
+    if scope_label.endswith("...HEAD"):
+        code, out = _git_result("merge-base", scope_label[: -len("...HEAD")], "HEAD", cwd=cwd)
+        return out.strip() if code == 0 and out.strip() else None
+    return None
+
+
 def added_lines(scope_label: str) -> dict[str, set[int]] | None:
     """Repo-relative path -> line numbers this change ADDED, or None.
 
@@ -189,11 +204,10 @@ def added_lines(scope_label: str) -> dict[str, set[int]] | None:
     elif scope_label == "merge parents":
         args = ["diff", "--unified=0", "HEAD^1", "HEAD^2"]
     elif scope_label.endswith("...HEAD"):
-        base = scope_label[: -len("...HEAD")]
-        code, out = _git("merge-base", base, "HEAD")
-        if code != 0 or not out.strip():
+        base = base_ref(scope_label)
+        if base is None:
             return None
-        args = ["diff", "--unified=0", out.strip()]
+        args = ["diff", "--unified=0", base]
     else:
         return None
     proc = subprocess.run(

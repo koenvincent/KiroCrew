@@ -118,12 +118,16 @@ class PublishedSpec:
     so a changed base needs a cold start to take effect. ``base_spec`` is the
     exact spec the derivation read (project scope first), so a caller that must
     still enforce the base's own hooks reads them from that source and never
-    re-resolves the name to a different file.
+    re-resolves the name to a different file. ``source_id`` is ``None`` when that
+    spec is the user-level one and the project's real path when the checkout
+    supplied it, so such a caller can apply the project-agent trust verdict
+    before running any command the spec names.
     """
 
     name: str
     digest: str
     base_spec: dict[str, Any] | None = field(default=None, compare=False, repr=False)
+    source_id: str | None = field(default=None, compare=False)
 
 
 def readonly_agent_name(base_name: str, source_id: str | None = None) -> str:
@@ -486,7 +490,9 @@ def publish_readonly_spec(base_name: str, project_dir: str | None = None) -> Pub
             _refresh_materialized_snapshot()
     except OSError as exc:
         raise ReadOnlySpecError("spec_write_failed", f"could not write {target}: {exc}") from exc
-    return PublishedSpec(name=derived_name, digest=digest, base_spec=base_spec)
+    return PublishedSpec(
+        name=derived_name, digest=digest, base_spec=base_spec, source_id=source_id
+    )
 
 
 def _read_current(target: Path) -> dict[str, Any] | None:

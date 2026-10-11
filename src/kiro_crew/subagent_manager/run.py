@@ -813,21 +813,31 @@ class RunEventCoordinator(ManagerComponent):
                     # this returns) before it builds its payload, so the
                     # completion the parent receives, the ``subagent_done``
                     # event and the tombstone all carry the same failure -- and
-                    # a completed run whose process the kill left standing is
-                    # NOT marked delivered (``_report_terminal`` gates that on
-                    # an empty error), so its folder stays in orphan
-                    # reconciliation, which is what kills the survivor at the
-                    # next start. Published first, the parent received a clean
-                    # completion whose ``delivered`` tombstone hid the process
-                    # from reconciliation for good (the cron reaper's
+                    # the survivor is recorded as a LEAKED PROCESS, separate
+                    # from the delivery. Published first, the parent received a
+                    # clean completion whose ``delivered`` tombstone hid the
+                    # process from reconciliation for good (the cron reaper's
                     # ``last_error`` takes the same suffix, the one spelling).
+                    # A completed run has no tombstone yet and gets none here:
+                    # until the parent acknowledges the completion its folder
+                    # must stay in orphan reconciliation, which re-delivers a
+                    # completion a restart dropped from the parent's queue.
+                    # ``_leaked_process`` is read by the report instead: an
+                    # acknowledged delivery writes the ``delivered`` tombstone
+                    # with ``leaked_process``, so the next start ends the
+                    # process without announcing the run a second time
+                    # (``_end_leaked_processes_impl``).
                     info.error = with_kill_failure(info.error or "", kill_failed)
                     tombstone = read_tombstone(info.id)
-                    if tombstone is not None and tombstone.get("cause") != "delivered":
+                    if tombstone is None:
+                        info._leaked_process = True
+                    elif tombstone.get("cause") != "delivered":
                         # The run's own arm wrote it already (an error, a
                         # timeout, a cancel): re-written under the same cause so
                         # the record on disk names the failure too.
-                        self._manager._write_tombstone(info, str(tombstone.get("cause") or "error"))
+                        self._manager._write_tombstone(
+                            info, str(tombstone.get("cause") or "error"), leaked_process=True
+                        )
                 if fallback_ran:
                     try:
                         sel().log_tool_invocation(
@@ -2018,7 +2028,7 @@ class RunEventCoordinator(ManagerComponent):
 
     async def _floored_agent(
         self, info: SubagentInfo, agent: str, cwd: str
-    ) -> tuple[str, dict[str, Any] | None]:
+    ) -> tuple[str, dict[str, Any] | None, str | None]:
         """The agent a floored run launches as: its spec with backend grants emptied.
 
         The permission ladder only sees the requests kiro-cli raises. A tool on
@@ -2029,8 +2039,10 @@ class RunEventCoordinator(ManagerComponent):
         and keeps everything else, so every tool call becomes a request the
         ladder sends to a person. The shared template is not changed. A spec that
         cannot be derived refuses the run instead of launching the base agent.
-        Returns the derived name and the base spec it was derived from, whose
-        PreToolUse hooks the run is then gated on.
+        Returns the derived name, the base spec it was derived from, whose
+        PreToolUse hooks the run is then gated on, and that spec's project
+        source (``None`` for a user-level spec), which decides whether those
+        hooks may run at all.
         """
         from kiro_crew.dashboard.side_readonly_spec import ReadOnlySpecError, publish_readonly_spec
         from kiro_crew.subagent_manager.hub_approvals import floor_enforceable
@@ -2052,7 +2064,7 @@ class RunEventCoordinator(ManagerComponent):
                 f"spawn refused: the approval floor requires agent {base!r} without its "
                 f"backend tool grants, and that spec could not be prepared ({exc.code})"
             ) from exc
-        return published.name, published.base_spec
+        return published.name, published.base_spec, published.source_id
 
     async def _run_inner_impl(
         self,
@@ -2284,9 +2296,12 @@ class RunEventCoordinator(ManagerComponent):
         turn_execution = replace(execution, template_id=agent)
         floor_base = ""
         floor_source: dict[str, Any] | None = None
+        floor_project: str | None = None
         if info.approval_floor == "interactive":
             floor_base = agent or "kirocrew"
-            agent, floor_source = await self._floored_agent(info, agent, effective_cwd)
+            agent, floor_source, floor_project = await self._floored_agent(
+                info, agent, effective_cwd
+            )
             turn_execution = replace(execution, template_id=agent)
         extra_kwargs: dict[str, Any] = {
             "crew_agent": execution.selection_name if kind == "member" else "",
@@ -2316,6 +2331,10 @@ class RunEventCoordinator(ManagerComponent):
         eff_effort = plan.eff_effort
         if eff_effort:
             extra_kwargs["reasoning_effort_override"] = eff_effort
+        # The per-spawn backend (spawn_run ``backend``). ``is not None``: ``""``
+        # is a Kiro request and must reach the factory under a non-Kiro default.
+        if info.backend is not None:
+            extra_kwargs["backend_override"] = info.backend
         if info.bare:
             extra_kwargs["bare"] = True
         if info.allowed_tools:
@@ -2800,7 +2819,9 @@ class RunEventCoordinator(ManagerComponent):
         if floor_base:
             # The derived spec carries no hooks, so the template's PreToolUse
             # denies are fired here, before the hub's person is asked.
-            _spec = await floored_spec_hooks(floor_base, effective_cwd, floor_source)
+            _spec = await floored_spec_hooks(
+                floor_base, effective_cwd, floor_source, project_source=floor_project
+            )
         # The run's permission ladder. Imported here because this body runs on
         # the facade's globals (bind_component_globals), not this module's.
         from kiro_crew import tool_permission
@@ -4134,7 +4155,8 @@ class RunEventCoordinator(ManagerComponent):
         """Decide whether a subagent should use the shared-runtime path.
 
         All must hold: session_sharing config True; parent session exists and
-        is ACP/kiro-backed (not CC); not a CC-specific spawn (model/allowed_tools/bare).
+        is ACP/kiro-backed (not CC); not a CC-specific spawn (model/allowed_tools/bare);
+        no per-spawn backend.
         """
         # Member capability and native prompt documents are prepared at launch.
         if info._force_dedicated:
@@ -4148,6 +4170,10 @@ class RunEventCoordinator(ManagerComponent):
         except Exception:
             return False
         if info.model or info.allowed_tools or info.bare:
+            return False
+        # The shared runtime is the parent's own process, on the parent's backend:
+        # a run asked onto a backend of its own needs a process of its own.
+        if info.backend is not None:
             return False
         if not info.parent_session_key:
             return False

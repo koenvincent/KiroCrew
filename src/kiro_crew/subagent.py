@@ -225,8 +225,10 @@ from kiro_crew.subagent_persistence import (  # noqa: F401 - read_tombstone reso
     _cleanup_session_files_sync,
     _subagents_dir,
     agent_dir_for_display,
+    clear_leaked_process,
     clear_tombstone,
     create_agent_folder,
+    list_leaked_processes,
     list_orphans,
     mark_delivered,
     prune_stale_tombstones,
@@ -1407,7 +1409,9 @@ def _subagent_default_effort(cfg: Any = None) -> str:
         return ""
 
 
-def _spawn_effective_model(model: str, agent: str, *, crew_agent: str | None = None) -> str | None:
+def _spawn_effective_model(
+    model: str, agent: str, *, crew_agent: str | None = None, backend: str | None = None
+) -> str | None:
     """Resolve the factory's model; ``""`` means auto, ``None`` means unavailable.
 
     Not a re-encoding of the factory's precedence — the selection itself is
@@ -1446,13 +1450,63 @@ def _spawn_effective_model(model: str, agent: str, *, crew_agent: str | None = N
             # No kwarg: get_or_create resolves the session chain and passes
             # its result (possibly None) as model_override.
             override = _session_model(cfg, agent or None, crew_agent=claim)
-        return cfg.acp_effective_model(agent or None, override) or ""
+        # A per-spawn backend is translated into ITS namespace, as the factory
+        # does once the override wins the selection gate.
+        namespace = None
+        if backend is not None:
+            from kiro_crew.agent_sdk.capabilities import capabilities_for
+
+            namespace = capabilities_for(backend).model_id_namespace
+        return cfg.acp_effective_model(agent or None, override, namespace=namespace) or ""
     except Exception:
         return None
 
 
+def _effort_channel(backend: str | None) -> str | None:
+    """How *backend* receives a reasoning-effort level, or ``None`` if it takes none.
+
+    ``"cli_json"`` for the Kiro family (kiro-cli reads the level from its
+    workspace ``cli.json`` at spawn), ``"config_option"`` for a harness that takes
+    it as a live ``set_config_option`` push. Both answers are opt-in MEMBERSHIP in
+    the sets the provider itself gates on, never "not one of the others": a
+    harness in neither set never receives the level. ``None`` (no per-spawn
+    backend) is the gateway default, which the verdict has always described as
+    the Kiro family.
+    """
+    from kiro_crew.acp_backends import (
+        ACP_BACKENDS_EFFORT_VIA_CONFIG_OPTION,
+        ACP_BACKENDS_KIRO_SLASH_COMMANDS,
+    )
+
+    if backend is None or backend in ACP_BACKENDS_KIRO_SLASH_COMMANDS:
+        return "cli_json"
+    if backend in ACP_BACKENDS_EFFORT_VIA_CONFIG_OPTION:
+        return "config_option"
+    return None
+
+
+def _effort_judged_at_session_start(backend: str | None) -> bool:
+    """Whether *backend* advertises its own effort levels, so no verdict is possible here.
+
+    Such a harness reports its model ids and effort levels with ``session/new``,
+    and the provider validates the level then (``AcpProvider._resolve_effort``);
+    the registry the verdict reads has none of them. Only a per-spawn backend is
+    asked: without one the verdict keeps describing the default, as before.
+    """
+    if backend is None:
+        return False
+    from kiro_crew.acp_backends import ACP_BACKENDS_EFFORT_FROM_ADVERTISED_OPTION
+
+    return backend in ACP_BACKENDS_EFFORT_FROM_ADVERTISED_OPTION
+
+
 def effort_drop_reason(
-    model: str, reasoning_effort: str, agent: str = "", *, crew_agent: str | None = None
+    model: str,
+    reasoning_effort: str,
+    agent: str = "",
+    *,
+    crew_agent: str | None = None,
+    backend: str | None = None,
 ) -> str:
     """Why a requested per-spawn effort will not take effect, or ``""``.
 
@@ -1466,9 +1520,11 @@ def effort_drop_reason(
     Reporting-only: never raises and never influences whether or how a spawn
     proceeds. ``crew_agent`` has the same namespace semantics as allocation.
     """
-    if not reasoning_effort:
+    if not reasoning_effort or _effort_judged_at_session_start(backend):
         return ""
-    resolved = _spawn_effective_model(model, agent, crew_agent=crew_agent)
+    if _effort_channel(backend) is None:
+        return f"backend '{backend}' takes no reasoning-effort level, so it is not applied"
+    resolved = _spawn_effective_model(model, agent, crew_agent=crew_agent, backend=backend)
     if resolved is None:
         return ""
     if not resolved:
@@ -1483,7 +1539,12 @@ def effort_drop_reason(
 
 
 def effort_applied_note(
-    model: str, reasoning_effort: str, agent: str = "", *, crew_agent: str | None = None
+    model: str,
+    reasoning_effort: str,
+    agent: str = "",
+    *,
+    crew_agent: str | None = None,
+    backend: str | None = None,
 ) -> str:
     """The delivery mirror of :func:`effort_drop_reason`, or ``""``.
 
@@ -1494,12 +1555,20 @@ def effort_applied_note(
     key, so a bare "applied" would leave that failure mode unobservable.
     Complementary with the drop reason when the selection can be resolved:
     exactly one is non-empty for a requested effort. An unavailable selection
-    leaves both empty. Reporting-only, same totality contract.
+    leaves both empty, and so does a per-spawn *backend* that advertises its own
+    effort levels. Reporting-only, same totality contract.
     """
-    if not reasoning_effort:
+    if not reasoning_effort or _effort_judged_at_session_start(backend):
         return ""
-    resolved = _spawn_effective_model(model, agent, crew_agent=crew_agent)
+    resolved = _spawn_effective_model(model, agent, crew_agent=crew_agent, backend=backend)
     if not resolved or not model_supports_effort(resolved):
+        return ""
+    channel = _effort_channel(backend)
+    if channel == "config_option":
+        from kiro_crew.acp_backends import effort_config_option_id
+
+        return f"{resolved} → config option {effort_config_option_id(str(backend))}"
+    if channel != "cli_json":
         return ""
     return f"{resolved} → {effort_settings_key(resolved)}.effort"
 
@@ -2928,6 +2997,11 @@ class SubagentInfo:
     # Wins over the ``role_efforts['subagent']`` pin; ``""`` defers to it.
     # Like ``model``, a non-empty value forces the dedicated-process path.
     reasoning_effort: str = ""
+    # Per-call backend (spawn_run ``backend``): the harness this run starts on
+    # instead of the gateway default. ``None`` = the default; ``""`` is Kiro's
+    # own id. Like ``model``, a value forces the dedicated-process path -- the
+    # shared runtime is the PARENT's process, on the parent's backend.
+    backend: str | None = None
     allowed_tools: list[str] = field(default_factory=list)
     bare: bool = False
     # Continuable conversations (spawn_run keep=True / spawn_continue):
@@ -3168,6 +3242,11 @@ class SubagentInfo:
     # a report cancelled BEFORE delivery — which must be made recoverable on the
     # next start — from one cancelled AFTER it, which must not be re-delivered.
     _reported_to_parent: bool = False
+    # Set by the run's teardown when its kill left the process standing and no
+    # tombstone exists yet (a completed run). The terminal report reads it: a
+    # delivery the parent acknowledged writes the ``delivered`` tombstone with
+    # ``leaked_process`` so the next start ends the process without a notice.
+    _leaked_process: bool = False
     # The run's final ACP ``stop_reason`` and its ``classify_stop_reason``
     # class (a ``STOP_CLASS_*`` value), recorded by ``_run_inner`` on the
     # completion that ended the run
@@ -3183,6 +3262,19 @@ class SubagentInfo:
     # completion in place (``STOP_RECOVERY_MAX_RETRIES`` budget, shared with
     # the main chat's ``slot._tool_stall_retries``).
     _stop_recovery_used: int = 0
+
+    @property
+    def made_no_tool_calls(self) -> bool:
+        """Did this run neither emit a ``tool_call`` frame nor raise a permission request?
+
+        The pair the replay gates already read as "no side effect happened":
+        ``tool_count`` counts ``tool_call`` frames (and approved child
+        escalations) and ``turns`` counts the run's own permission requests, so a
+        backend that surfaces a gated tool only as a permission request still
+        counts as having called a tool. Such a run wrote no file, ran no command
+        and made no commit, whatever its text reports.
+        """
+        return self.tool_count == 0 and self.turns == 0
 
     @property
     def outcome(self) -> str:
@@ -4353,6 +4445,12 @@ class SubagentManager:
     async def _reconcile_orphans(self) -> None:
         return await self._monitor._reconcile_orphans_impl()
 
+    async def _end_leaked_processes(self) -> None:
+        return await self._monitor._end_leaked_processes_impl()
+
+    async def _end_orphan_process(self, agent_id: str, state: dict, *, reason: str) -> str | None:
+        return await self._monitor._end_orphan_process_impl(agent_id, state, reason=reason)
+
     @staticmethod
     def _is_pid_alive(pid: int) -> bool:
         """Check if a PID is still running."""
@@ -5140,6 +5238,7 @@ class SubagentManager:
         crew: str = "",
         target_member: str | None = None,
         delegation: dict[str, str] | None = None,
+        backend: str | None = None,
         _execution_context: dict | None = None,
         _parent_spawn_policy: "ParentSpawnPolicy | None" = None,
         _agent_check: "AgentCheck | None" = None,
@@ -5182,6 +5281,7 @@ class SubagentManager:
             crew=crew,
             target_member=target_member,
             delegation=delegation,
+            backend=backend,
             _execution_context=_execution_context,
             _parent_spawn_policy=_parent_spawn_policy,
             _agent_check=_agent_check,
@@ -6208,7 +6308,7 @@ class SubagentManager:
         return self._run_events._emit_queue_depth_impl(parent_session_key, batch_id, wait=wait)
 
     @staticmethod
-    def _write_tombstone(info: SubagentInfo, cause: str) -> None:
+    def _write_tombstone(info: SubagentInfo, cause: str, *, leaked_process: bool = False) -> None:
         """Best-effort tombstone write for abnormal exits.
 
         A run that is not persistent gets no tombstone. ``write_tombstone``
@@ -6216,6 +6316,11 @@ class SubagentManager:
         that ended before its folder was seeded -- a declined spawn prompt, a
         stop or a reap while it waited for admission into startup -- has
         neither, so the run's own mode decides here.
+
+        ``leaked_process`` records that the kill left the run's process
+        standing. The tombstone still ends the run (orphan reconciliation will
+        not report it again); the flag is what the next start reads to end the
+        survivor without a second notice (``list_leaked_processes``).
         """
         if info.memory_mode != "persistent":
             return
@@ -6248,6 +6353,7 @@ class SubagentManager:
                 # dies with the gateway, so without this the specific reason is
                 # recoverable from nothing but the log.
                 detail=(_redact(info.error)[:MAX_ERROR_DETAIL_LEN] if info.error else ""),
+                **({"leaked_process": True} if leaked_process else {}),
             )
         except Exception:
             logger.debug("Failed to write tombstone for %s", info.id, exc_info=True)

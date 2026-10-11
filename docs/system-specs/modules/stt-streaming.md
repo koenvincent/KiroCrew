@@ -184,7 +184,7 @@ Client to server:
 
 Server to client, JSON. `stt.session.SttEvent.kind` supplies the local provider's `partial` and `final` frame types; `dashboard.stt_stream` owns the complete wire contract:
 
-- `{"type":"ready"}`: the session is live and the client may send audio. Capture begins before this arrives, so `useStreamingStt` buffers PCM locally and flushes it in order after readiness. Reaching 60 seconds of buffered PCM stops capture and drains the retained audio after readiness instead of discarding the recording's beginning; the worklet's short flushed tail is retained too. Local sessions additionally advertise `final_timeout_ms`, the browser's stop-to-close allowance: `stt.timeout_secs` plus the native abort grace and a wire grace. Readiness keeps its own client timeout, and which one it is depends on whether anything has announced work: a socket that has said nothing gets 60 seconds, while a `downloading` or `preparing` frame switches the wait to the preparation budget that frame carries in `prepare_timeout_ms`, and every later announcing frame restarts it, so the wait is bounded by SILENCE rather than by the total length of a cold load. A frame without a usable figure leaves a local 300-second fallback in place. For older servers without a valid stop-to-close allowance, the client uses 315 seconds.
+- `{"type":"ready"}`: the session is live and the client may send audio. Capture begins before this arrives, so `useStreamingStt` buffers PCM locally and flushes it in order after readiness. Reaching 60 seconds of buffered PCM stops capture and drains the retained audio after readiness instead of discarding the recording's beginning; the worklet's short flushed tail is retained too. Local sessions additionally advertise `final_timeout_ms`, the browser's stop-to-close allowance: `stt.timeout_secs` plus the native abort grace and a wire grace. Readiness keeps its own client timeout, and which one it is depends on whether anything has announced work: a socket that has said nothing gets 60 seconds, while a `downloading` or `preparing` frame switches the wait to the preparation budget that frame carries in `prepare_timeout_ms`, and every later announcing frame restarts it, so the wait is bounded by SILENCE rather than by the total length of a cold load. A frame without a usable figure leaves a local 300-second fallback in place. For older servers without a valid stop-to-close allowance, the client uses 315 seconds. Every provider also advertises `max_duration_ms`, the wall-clock life of this connection (`_MAX_STREAM_DURATION_SECS`, derived at send time so a changed cap cannot leave a stale figure), so a client that outlives one connection -- the Meetings app -- can rotate to a fresh socket before the cap instead of discovering it by being ended.
 - `{"type":"status","stage":...,"downloaded_bytes":N,"total_bytes":N,"code":...,"prepare_timeout_ms":N}`
   where `stage` is `downloading`, `preparing` or `ready`, and `prepare_timeout_ms` is the preparation budget the readiness wait switches to. A first-ever local session has to
   fetch weights before it can recognise anything, and a silent transfer is
@@ -210,7 +210,28 @@ Server to client, JSON. `stt.session.SttEvent.kind` supplies the local provider'
   utterance a finished request, so the composer may submit without a keypress.
   Only when `stt.endpointing` is on.
 - `{"type":"error","message":"...","code":"..."}`: a setup failure, a refusal or
-  a cap. The English `message` is advisory and the `code` is the contract, because
+  the cap. The cap is a server-initiated `stop` on all three providers: the
+  deadline ends the read loop without closing, the session finishes the
+  utterance in flight and relays its `final` to the still-open socket, then this
+  frame goes out with `_CODE_MAX_DURATION`, then the socket closes. How the read
+  loop ends differs: on `local` the deadline cancels the reader outright, which
+  is safe because that reader only queues frames and never awaits a write to the
+  recogniser; on `apple` and `transcribe` the reader runs over `_receive_until`,
+  which observes the cap only between frames, so a frame being forwarded to the
+  helper or the event stream is never cut half-way, and the grace below bounds a
+  reader stuck inside one. On `local` the cap frame is the promise that nothing the server
+  accepted was discarded: a drain that fails under the cap (its deadline, a
+  failed decode, a raise) sends that failure's own code in its place. On `apple`
+  and `transcribe` a failure during the cap's drain is reported by the relay or
+  logged, and the cap frame may still follow. A session with no pending audio
+  sends the cap frame straight away. A cap that lands after the client's `stop`
+  was read changes nothing, because that stop already owns the teardown. A reader
+  stuck inside the frame it is forwarding (a helper that stopped reading its
+  stdin) is cancelled after `_CAP_READER_GRACE_SECS`, so a wedged recogniser
+  cannot hold the session, and its slot, past the cap. (Before this, the deadline task closed the socket first and the
+  pending utterance was cancelled or drained into a closed socket: up to the
+  utterance backstop of accepted speech per cap.) The
+  English `message` is advisory and the `code` is the contract, because
   the dashboard renders localised text and cannot key off a sentence. Codes the
   `stt` package already owns travel through unchanged rather than being remapped;
   the transport adds its own for the conditions only it can see:
@@ -697,6 +718,47 @@ matter for anyone tuning this path:
   measured from the END of a decode, which bounds the queue but not the share of the
   machine cosmetic work takes.
 
+**Display-only decodes encode a sized window.** The floor is the encoder working
+through all 1500 frames (30 s) of its window whatever the audio's length.
+`WhisperEngine.decode(sized_window=True)` sets whisper.cpp's `audio_ctx` to
+`engine.preview_audio_ctx()` frames for that one call, and restores the shared params
+before the next. That is the clip plus a 2 s margin at 50 frames per second, rounded
+up to 64, and never under `PREVIEW_AUDIO_CTX_FLOOR` (512).
+- The session asks for it on its partials and phrase commits, and never on a final.
+  A sized window can change punctuation or an unsettled word, which a preview the
+  final replaces can afford and the text the user keeps cannot. One path keeps a
+  preview: when the socket closes before the final arrives, `useStreamingStt`
+  delivers the last partial as recovered text, so that text was decoded with a
+  sized window. It was an approximate preview at the full window too.
+- The floor is measured, not assumed. With `base`, a window under 448 frames sent
+  some 1 s clips into whisper.cpp's temperature fallback: 2.5 s against 0.36 s at the
+  full window. A window shorter than the clip truncates it. At the floor, across
+  four voices and every phrase length from 1 s to 8 s on a 16-thread x86-64 CPU
+  build, the sized decodes spent 2.5x less CPU and wall time than the full window.
+- Per second of speech the saving is smaller, because the partial interval starts
+  when a decode ends: a faster decode buys more previews, not only idle time. A
+  54 s talk streamed through `LocalSession` in real time on that build ran 81
+  decodes at a 242 ms median and 6.8 cores on average, against 64 decodes at
+  507 ms and 9.4 cores at the full window.
+- Because `MAX_PHRASE_SECS` is 8 s, every partial lands on the floor in practice.
+- The first sized decode after a full one costs about a full decode, because
+  whisper.cpp re-reserves the encoder graph for the new width.
+- `WhisperEngine._note_window_cost` keeps the most recent full-window decode as a
+  reference. It stops sizing for the rest of the loaded model's life after
+  `PREVIEW_WINDOW_MAX_STRIKES` (3) sized decodes IN A ROW took more than
+  `PREVIEW_WINDOW_SLOWDOWN` (2x) that reference, and logs it. The threshold is
+  the failure, not noise: a looping sized decode took 7-21x the full window,
+  while load moves a preview by tens of percent. The prewarm, a second of
+  silence, can be the first reference, so a session with no final yet still has
+  one. An aborted decode records nothing, because its early
+  unwind would understate the reference. It identifies the loaded model by a
+  WEAK reference: a context is freed when its last strong reference goes, so a
+  strong one would keep evicted or replaced weights resident.
+- The `Model.transcribe` fallback path always decodes at the full window, because
+  pywhispercpp stores any parameter passed there on the params object for good. So
+  does a binding whose params carry no `audio_ctx`: setting it there would fail
+  every preview, and the breaker only reacts to slow decodes.
+
 **The Voice panel's shape follows from that.** Two duration pickers were retired from
 Settings -> Voice as a consequence of the paragraph above, not as a matter of taste:
 `stt.partial_interval_ms` asked a user to choose a cadence the recogniser cannot
@@ -1051,6 +1113,7 @@ restated here, because a copied constant goes stale silently.
 | `_MAX_TEXT_FRAME_BYTES` | `dashboard/stt_stream.py` | One inbound control frame |
 | `_MAX_LOCAL_BUFFER_BYTES`, `_MAX_LOCAL_BUFFER_FRAMES` | `dashboard/stt_stream.py` | PCM awaiting local inference, by bytes and frame count |
 | `_MAX_MODEL_PREPARE_SECS` | `dashboard/stt_stream.py` | The one-time model fetch a first-ever `local` session waits on |
+| `_CAP_READER_GRACE_SECS` | `dashboard/stt_stream.py` | After the cap, how long an `apple` or `transcribe` reader may stay inside the frame it is forwarding before it is cancelled |
 | `heartbeat` on `WebSocketResponse` | `dashboard/stt_stream.py` | Idle liveness ping interval |
 | `MAX_SESSION_SECS` | `stt/session.py` | Audio one local session buffers |
 | `MAX_PHRASE_SECS` | `stt/session.py` | Phrase length before a commit is forced |
@@ -1066,6 +1129,11 @@ audio-second and counts against the account's concurrent-stream quota; on `apple
 it holds a helper process and an OS recognition session; on `local` it accumulates
 buffered audio and keeps queueing decodes onto the one shared model. The
 concurrency cap is shared by the free providers because all still consume bounded local capacity.
+The duration cap bounds the CONNECTION, not the speech: at the cap each branch
+drains what it already accepted and delivers the trailing final before the cap's
+frame and the close, which is what lets a long-running client rotate to a fresh
+socket without loss. `ready` advertises the cap as `max_duration_ms` so that
+client can plan the rotation.
 
 The model fetch gets its own ceiling rather than borrowing the session's because it transfers a catalog entry rather than a dictation. `stt.models` uses a request timeout, while `_prepare_local_with_progress` also bounds how long a WebSocket waits. On the WebSocket timeout the transfer is shielded and left running:
 cancelling it would release the model store's transfer lock while its worker thread
@@ -1094,8 +1162,9 @@ needs. The close still runs, is still awaited immediately after, and still
 tolerates a broken transport (logged, not raised).
 
 A claimed fatal cause outranks the read loop's own outcome: the loop can exit
-cleanly because the cap or the relay closed the socket under it, and recording
-that as `ok` would report a session that died as a session that finished.
+cleanly because the cap ended it (between frames, or by cancelling a reader stuck
+past its grace) or the relay closed the socket under it, and recording that as
+`ok` would report a session that died as a session that finished.
 
 Tests asserting on the audit pair must **wait** for the end event: neither
 receiving the error frame nor exiting the `TestClient` context orders the

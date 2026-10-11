@@ -191,7 +191,10 @@ _NEW_OWNER_DEFS: dict[str, tuple[str, ...]] = {
 #: captured from the one-module file before the split: each keeps the kind and the
 #: signature it had there. ``safe_read_file_bytes_nolink``'s keyword-only
 #: ``admit_hardlinked`` and ``ScriptHookStore``'s callers all read these shapes.
-_BASE_SHAPE_DIGEST = "87cd6c619f0192c4acc0c630754c810d5d25c5dbdc6f433aab885428f78bc563"
+#: Re-pinned once since: ``_governance_denial`` gained ``alias_groups`` and
+#: ``deny_aliases`` (the KAS tool-id spellings ``gate_decision`` reads as one
+#: identity), both keyword defaults, so every pre-split caller still fits.
+_BASE_SHAPE_DIGEST = "929fdbd29a36ecad562006ef00c3e12aa5e75886bc79d2c874e6d5ab50a3758a"
 
 #: Definitions that stay in the facade file, each because a guard, a contract or the
 #: ``compose`` ordering reads it there. The reason per entry is in

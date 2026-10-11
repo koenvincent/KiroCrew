@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react'
+import { guideConfirm } from '../uiLocations/targetRegistry'
 
 import Modal from './Modal'
 import { Btn } from './ui'
@@ -28,6 +29,9 @@ export interface ConfirmOptions {
   /** Every earlier caller confirms a destructive act, so danger styling is the
    *  default. Pass `false` for a weighty but non-destructive confirm (a grant). */
   danger?: boolean
+  /** Paints the confirm button as the page's primary action, for a confirm whose
+   *  yes is the next step rather than a risk (an export the user asked for). */
+  primary?: boolean
   /** `top` paints the prompt above a full-screen overlay (`z-[9999]`) the
    *  caller may be raising it from; see `Modal`'s `layer`. */
   layer?: 'dialog' | 'top'
@@ -101,7 +105,8 @@ export function useConfirm(): {
           <Btn onClick={() => settle(false)}>
             {i18nT('components.confirmDialog.cancel')}
           </Btn>
-          <Btn danger={opts.danger !== false} onClick={() => settle(true)}>
+          {/* What a guide's destructive step waits for: this press, never a cancel. */}
+          <Btn danger={!opts.primary && opts.danger !== false} primary={opts.primary} onClick={() => settle(true)} {...guideConfirm()}>
             {opts.confirmLabel}
           </Btn>
         </>

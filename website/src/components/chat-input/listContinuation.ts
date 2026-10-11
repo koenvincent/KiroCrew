@@ -1,5 +1,5 @@
 import { useCallback, useRef } from 'react'
-import { listLineBreakEdit, listMarkerBackspaceEdit } from '../composerListContinuation'
+import { applyListEdit, listLineBreakEdit, listMarkerBackspaceEdit } from '../composerListContinuation'
 import { findTokenRanges, type PasteBlock } from '../../utils/pasteTokens'
 import type { useImeGuard } from '../../hooks/useImeGuard'
 
@@ -33,7 +33,8 @@ export function applyTextareaListBreak(
   // The prototype setter, not `textarea.value =`: React tracks the instance
   // setter, and a value written through it would make the `input` event below
   // look like no change, so onChange would never run.
-  setNativeValue(textarea, value.slice(0, edit.start) + edit.insert + value.slice(edit.end))
+  // Renumbering only rewrites digits after the caret, so the caret offset holds.
+  setNativeValue(textarea, applyListEdit(value, edit))
   const caret = edit.start + edit.insert.length
   textarea.setSelectionRange(caret, caret)
   textarea.dispatchEvent(new Event('input', { bubbles: true }))
@@ -54,7 +55,9 @@ export function applyTextareaListBackspace(
   const edit = listMarkerBackspaceEdit(value, selectionStart, chips)
   if (!edit) return false
   endUndoBurst?.()
-  setNativeValue(textarea, value.slice(0, edit.start) + edit.insert + value.slice(edit.end))
+  // Clearing an empty numbered item also moves the items below it back up;
+  // those writes are all after the caret, so its offset holds.
+  setNativeValue(textarea, applyListEdit(value, edit))
   textarea.setSelectionRange(edit.start, edit.start)
   textarea.dispatchEvent(new Event('input', { bubbles: true }))
   return true

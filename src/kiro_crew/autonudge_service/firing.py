@@ -23,7 +23,12 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Callable
 
 from kiro_crew import shutdown_event
-from kiro_crew.autonudge_service.gate import _WAKE_FOLLOWUP_TICKS, _record_delivered_revision
+from kiro_crew.autonudge_service.gate import (
+    _WAKE_FOLLOWUP_TICKS,
+    _delivery_basis,
+    _record_delivered_reading,
+    _record_delivered_revision,
+)
 from kiro_crew.autonudge_service.maintenance import _release_mutation_lock
 from kiro_crew.autonudge_service.model import (
     _CONSECUTIVE_FAILURE_STANDDOWN_AFTER,
@@ -413,6 +418,9 @@ async def _run_fire_cycle(self: AutoNudgeService, loop: NudgeLoop) -> None:
     # on _persist_locked(), so the delivered cycle was never written and the
     # loop could run extra cycles after a restart. _run_fire_cycle owns the
     # window; this method is the body.
+    # Read before the dispatch, which is a long await an owner can re-aim the loop
+    # inside; see ``_record_delivered_reading``.
+    delivery_basis = _delivery_basis(loop)
     try:
         delivered = await self._on_fire(loop)
     except Exception:
@@ -429,7 +437,9 @@ async def _run_fire_cycle(self: AutoNudgeService, loop: NudgeLoop) -> None:
                 self._rearm_fail_count.get(loop.id, 0) + 1,
             )
     claimed_wake = loop.id in self._pending_monitor_wake
-    self._pending_monitor_wake.discard(loop.id)
+    # Taken, not merely tested: the claim carries the wake's own text, and the
+    # re-owe below has to put the same text back rather than an empty one.
+    claimed_briefs = self._pending_monitor_wake.pop(loop.id, "")
     claimed_floor = loop.id in self._pending_floor_tick
     self._pending_floor_tick.discard(loop.id)
     if claimed_wake and loop.monitor is not None:
@@ -470,7 +480,12 @@ async def _run_fire_cycle(self: AutoNudgeService, loop: NudgeLoop) -> None:
             # single point delivery is confirmed, and the claim is discarded
             # there. A retry that is refused again re-owes it, which is correct
             # and bounded by the same backoff that bounds the retry itself.
-            self._pending_monitor_wake.add(loop.id)
+            #
+            # Re-owed WITH ITS TEXT. The retry takes the observation-free bypass, so
+            # it never re-reads the probe and the briefs cannot be rebuilt: an empty
+            # re-owe here would deliver the news as a bare cycle header, which is the
+            # whole defect the text was added to close.
+            self._pending_monitor_wake[loop.id] = claimed_briefs
         if claimed_floor:
             # Same reasoning: a refused floor delivery spent nothing, so the charge
             # stays owed rather than being recorded or dropped.
@@ -652,6 +667,9 @@ async def _run_fire_cycle(self: AutoNudgeService, loop: NudgeLoop) -> None:
         # a later quiet floor can tell whether the ledger moved since. Rides the
         # delivered path's own write, like the counters above.
         _record_delivered_revision(loop.monitor)
+        # And a pull-request watch remembers the short reading this turn carried, if
+        # any, so a repeat of it can be held instead of delivering again.
+        _record_delivered_reading(loop, delivery_basis)
     if not delivered:
         # If the fire path already removed the loop (e.g. slot missing →
         # remove()), do NOT resurrect it with a fresh timer — that would

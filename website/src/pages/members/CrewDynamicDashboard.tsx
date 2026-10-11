@@ -6,8 +6,10 @@ import { Btn } from '../../components/ui'
 import ErrorNotice from '../../components/ErrorNotice'
 import { useTheme } from '../../hooks/useTheme'
 import { useSandboxDoc } from '../../hooks/useSandboxDoc'
+import { useFrameOpenLink } from '../../hooks/useFrameOpenLink'
 import { buildSrcdoc, readThemeVars } from '../../lib/widgetSrcdoc'
 import { i18nT } from '../../i18n/t'
+import { apiErrorCode } from '../../api/apiError'
 import { useLanguage } from '../../i18n/LanguageProvider'
 
 /**
@@ -21,7 +23,9 @@ import { useLanguage } from '../../i18n/LanguageProvider'
  *   cannot read the dashboard's cookies or localStorage, or touch the parent DOM.
  * - No `allow-popups`. A template is loaded at run time, including one a user
  *   imported from a shared file, and a window it could open is a capability
- *   nothing about a status page needs.
+ *   nothing about a status page needs. The one way out is the host's own
+ *   `kirocrew-dashboard:open` bridge (`useFrameOpenLink`): a GitHub pull-request
+ *   URL, from this frame, right after a user gesture, opened by the host.
  * - No `allow-top-navigation`, `allow-forms`, or `allow-modals`.
  *
  * Egress is closed by the document CSP (`connect-src 'none'`), which the gateway
@@ -119,12 +123,18 @@ interface Loaded {
  *    can see that, so the held `Loaded` is re-mounted and the new html is dropped
  *    until the next read brings a different one.
  */
-export default function CrewDynamicDashboard({ slug, member, displayName, onAct }: {
+export default function CrewDynamicDashboard({ slug, member, displayName, onAct, preview = false, onPreviewGone }: {
   slug: string
   member: string
   displayName: string
   /** Put a reply the page offered into the chat box. Absent: the page's options do nothing. */
   onAct?: (text: string) => void
+  /** Render the STAGED page instead of the adopted one. Its own cache entry, so the
+   *  live tab never shows a page nobody applied; still under the `member-dashboard`
+   *  prefix, so the frame that says the page changed refetches it too. */
+  preview?: boolean
+  /** Told whether the staged page is gone (applied or expired), so a host can drop its "not applied" label. */
+  onPreviewGone?: (gone: boolean) => void
 }) {
   const frameRef = useRef<HTMLIFrameElement | null>(null)
   const onActRef = useRef(onAct)
@@ -141,6 +151,8 @@ export default function CrewDynamicDashboard({ slug, member, displayName, onAct 
     window.addEventListener('message', onMessage)
     return () => window.removeEventListener('message', onMessage)
   }, [])
+  // A pull request the page links to: this frame only, GitHub PR URLs only.
+  useFrameOpenLink([frameRef])
   const { theme, colorTheme, themeVersion } = useTheme()
   // eslint-disable-next-line react-hooks/exhaustive-deps
   const themeVars = useMemo(() => readThemeVars(), [theme, colorTheme, themeVersion])
@@ -149,9 +161,9 @@ export default function CrewDynamicDashboard({ slug, member, displayName, onAct 
   // UI language re-reads the page in the new one.
   const { resolved: locale } = useLanguage()
 
-  const { data, isLoading, isError, refetch } = useQuery({
-    queryKey: ['member-dashboard', slug, member, locale],
-    queryFn: () => api.memberDashboard(slug, member, locale),
+  const { data, isLoading, isError, error, refetch } = useQuery({
+    queryKey: ['member-dashboard', slug, member, locale, preview ? 'preview' : 'live'],
+    queryFn: () => (preview ? api.memberDashboard(slug, member, locale, true) : api.memberDashboard(slug, member, locale)),
     enabled: Boolean(slug) && Boolean(member),
     // THE FALLBACK, not the mechanism. Liveness comes from the two WS frames
     // `handleDashboardMoved` listens for; this is what covers the gap when one is
@@ -166,6 +178,8 @@ export default function CrewDynamicDashboard({ slug, member, displayName, onAct 
     refetchInterval: DASHBOARD_FALLBACK_REFETCH_MS,
     refetchIntervalInBackground: false,
   })
+  const previewGone = preview && isError && apiErrorCode(error) === 'no_preview'
+  useEffect(() => { onPreviewGone?.(previewGone) }, [onPreviewGone, previewGone])
 
   /**
    * The page currently believed to work, and the candidate waiting to prove it.
@@ -343,6 +357,16 @@ export default function CrewDynamicDashboard({ slug, member, displayName, onAct 
       <div className="p-4 space-y-1.5" data-testid="crew-dashboard-loading" aria-hidden>
         <div className="h-3 rounded bg-bg-hover animate-pulse" />
         <div className="h-3 w-2/3 rounded bg-bg-hover animate-pulse" />
+      </div>
+    )
+  }
+
+  // 404 `no_preview`: the staged page was applied or expired. Nothing is broken
+  // and a retry reads the same answer, so no error styling and no Retry.
+  if (previewGone) {
+    return (
+      <div className="p-4 text-sm text-muted" data-testid="crew-dashboard-preview-gone">
+        {i18nT('pages.chat.dashboardPreviewPanel.gone')}
       </div>
     )
   }

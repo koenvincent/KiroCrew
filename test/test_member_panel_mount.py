@@ -31,6 +31,7 @@ from kiro_crew.acp.kas_agents import to_client_custom_agent
 from kiro_crew.acp.types import (
     ACP_BACKEND_CLAUDE,
     ACP_BACKEND_CODEX,
+    ACP_BACKEND_DEEPSEEK,
     ACP_BACKEND_GOOSE,
     ACP_BACKEND_KAS,
     ACP_BACKEND_KIRO,
@@ -476,7 +477,13 @@ class TestPanelBackendSetIsItsOwnDecision:
 
     @pytest.mark.parametrize(
         "backend",
-        [ACP_BACKEND_CLAUDE, ACP_BACKEND_KAS, ACP_BACKEND_CODEX, ACP_BACKEND_OPENCODE],
+        [
+            ACP_BACKEND_CLAUDE,
+            ACP_BACKEND_KAS,
+            ACP_BACKEND_CODEX,
+            ACP_BACKEND_OPENCODE,
+            ACP_BACKEND_DEEPSEEK,
+        ],
     )
     def test_the_argued_members_are_present(self, backend):
         from kiro_crew.acp.types import ACP_BACKENDS_MEMBER_PANEL

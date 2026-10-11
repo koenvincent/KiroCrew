@@ -315,11 +315,12 @@ via `monitor_update`, see "Live steering"):
 
 ## Your panel: publish JUDGMENTS, never numbers
 
-The panel is STORED and read back through the panel route; the Dashboard tab beside
-your chat draws the crewmate's own dashboard instead. So an item under `you` reaches
-a reader only if you also write it to an agentic dashboard field with
-`dashboard_write`, where it appears under "Needs you" with the act it needs. Publish
-the panel for a reader who asks for it; write the dashboard for one who has not.
+The Dashboard tab beside your chat draws this panel while the "Dynamic Dashboard"
+Feature Preview is off, which is the default. With the preview on, it draws the
+crewmate's own dashboard instead, where an item reaches the reader only through an
+agentic field written with `dashboard_write` (it appears under "Needs you" with the
+act it needs). So publish every item under `you` here, and also write it to the
+dashboard field for readers who turned the preview on.
 
 `panel_publish` with template `kirocrew-pipeline-conductor` takes exactly four keys,
 and nothing else — an unknown key is refused and the refusal names it:
@@ -1528,6 +1529,13 @@ honors it, and record the mode in the ledger. Canonical example — "stop taking
 new work": edit the instruction to `DRAIN MODE: no backfill, no new
 dispatches; patrol until in-flight items resolve; then final tally +
 autonudge_stop.`
+
+When that mode change invalidates what an in-flight worker is doing right now,
+forward it with `session_send` and `steer: true` so it lands in the worker's
+running turn rather than after it; a plain send waits out the whole turn. Keep
+`steer` off for rulings, nudges and anything that can wait for the turn
+boundary. A steer does not withdraw messages already queued (`queue_depth` from
+`session_read_message`), so name the instruction it supersedes.
 
 ## Merge, cleanup, reconcile
 

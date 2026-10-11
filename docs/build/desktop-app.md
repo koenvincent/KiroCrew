@@ -501,6 +501,7 @@ The script honors these environment flags:
 | `BUNDLE_KIRO_CLI=0` | Ship without the bundled kiro-cli (default `1` stages it; see [Bundled kiro-cli](#bundled-kiro-cli--the-app-carries-its-own-agent-runtime)) |
 | `KIRO_CLI_VERSION=<version>` / `latest` | Override the `packaging/kiro-cli-version` pin; `latest` resolves the upstream manifest instead (still sha256-verified) |
 | `KIROCREW_MANAGED_INSTALL_MARKER=<file>` | Bake that JSON file into the app as the externally-managed marker; a missing or malformed file fails the build (see [Baking the marker into the app](#baking-the-marker-into-the-app-editions)) |
+| `KIROCREW_AUTH_SERVER_ALLOWLIST=<list>` | Bake a comma-separated host list (`*.example.com,intranet.example.org`) into the app so its web contents, the Browser panel included, answer Kerberos/Negotiate challenges from those hosts; Electron gets it as its integrated-auth server switch before app ready. The switch is process-wide, so a page the agent drives in the Browser panel also signs in to those hosts as the user; list only hosts the agent may read as the user. Credential delegation is never enabled. A malformed list fails the build; unset, the app enables integrated auth for no host |
 
 ## The bundled backend (python-build-standalone)
 
@@ -600,6 +601,19 @@ With no gateway to reuse, the shell locates the backend binary via
 [`find-bin.js`](../../website/electron/find-bin.js), spawns it as `kirocrew
 gateway --no-open`, polls `/api/status`, and loads the dashboard once it is
 healthy.
+
+For a bundled backend, the shell removes inherited `PYTHONPATH` and `PYTHONHOME`
+before spawning Python. Windows cleanup also removes mixed-case spellings of
+these keys. This keeps a desktop app launched from a development shell from
+importing a checkout instead of its packaged backend. Source-tree gateway
+launches retain those environment variables for development. The bundled
+launcher already uses `-s` to disable user-site imports for the gateway itself;
+the shell does not set `PYTHONNOUSERSITE`, which would also disable user-site
+dependencies in operator Python, ACP, and MCP child processes. Because the
+bundled gateway's environment is what it hands to the operator Python, MCP
+server, and cron child processes it spawns, those descendants no longer inherit
+a shell-exported `PYTHONPATH` or `PYTHONHOME` either; a child that relied on one
+to resolve its imports under the desktop app must set it for itself.
 
 Host-runtime discovery stays behind the same main-process ownership boundaries.
 The `wsl:detect` handler in

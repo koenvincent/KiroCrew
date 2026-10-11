@@ -17,6 +17,7 @@ from __future__ import annotations
 import logging
 import math
 import re as _re
+import unicodedata as _unicodedata
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -121,6 +122,10 @@ from kiro_crew.stt.limits import DEFAULT_SILENCE_MS as _STT_DEFAULT_SILENCE_MS
 from kiro_crew.stt.models import CATALOG as _STT_CATALOG
 from kiro_crew.stt.models import DEFAULT_MODEL as _STT_DEFAULT_MODEL
 from kiro_crew.stt.models import resolve as _resolve_stt_model
+
+# Stdlib-only leaf: the one table of code points that render as nothing, shared
+# with the terminal and scanner paths so the bot-name filter does not keep a copy.
+from kiro_crew.terminal_safe import _is_invisible
 
 logger = logging.getLogger("kiro_crew.config.loader")
 
@@ -838,7 +843,40 @@ def _safe_avatar(value: object) -> dict:
 
 
 _BOT_NAME_MAX = 50
-_BOT_NAME_RE = _re.compile(r"[^a-zA-Z0-9 _\-.]")
+
+#: Unicode general categories a bot name is made of: letters, the marks that
+#: attach to them, and digits, in any script. This is the character policy of
+#: the artifact tag rule (``artifact_store.rules.normalize_tag``), applied as a
+#: filter that drops instead of a validator that refuses: a name is a display
+#: label, never a file name or a key. Nonspacing and spacing marks (``Mn``,
+#: ``Mc``) are the combining characters NFC leaves standing beside their base
+#: (Devanagari vowel signs, Thai tone marks, Arabic harakat); without them whole
+#: scripts could not be written. Letter numbers (``Nl``: IDEOGRAPHIC NUMBER
+#: ZERO, the Roman numerals) are admitted with the decimal digits, as the tag
+#: rule admits them. Enclosing marks (``Me``: the keycap that turns ``1`` into an
+#: emoji, the enclosing circle) are not admitted, as the tag rule refuses them:
+#: they are symbols by another route. Neither are other numbers (``No``: VULGAR
+#: FRACTION ONE HALF, SUPERSCRIPT TWO, CIRCLED DIGIT ONE), which are symbols
+#: drawn from a digit. Everything else is dropped: punctuation other than the
+#: separators below, symbols and emoji (which the tag rule refuses too), and
+#: every control (``Cc``), format (``Cf``: the zero-width characters and the
+#: bidi controls), line and paragraph separator, surrogate, private-use and
+#: unassigned code point, plus the letters and marks that render as nothing
+#: (``terminal_safe._is_invisible``: the variation selectors, the Hangul
+#: fillers), which the category test alone would keep as an invisible residue.
+#: The tag rule's helper is not imported: it lives in ``artifact_store.rules``,
+#: which reaches ``kiro_crew.deploy`` and through it this package, so the
+#: category test is written here against the stdlib. Three tag rules are not
+#: applied, each for the reason a filter differs from a validator or a chip
+#: differs from a prompt: a compatibility form (full-width letters) is kept as
+#: typed because a drop cannot name the plain spelling the rule asks for; a name
+#: may open with a separator; and a run of combining marks is not bounded, since
+#: the bound guards a chip's drawn width and nothing draws this name, which is
+#: only substituted into the prompt.
+_BOT_NAME_CATEGORIES = frozenset({"Lu", "Ll", "Lt", "Lm", "Lo", "Mn", "Mc", "Nd", "Nl"})
+
+#: The ASCII separators a name may carry.
+_BOT_NAME_SEPARATORS = frozenset(" _-.")
 
 # Default endpoint for the anonymous usage beacon (see kiro_crew/beacon.py).
 # Lives here with the other config defaults so beacon.py adds no import edge
@@ -846,13 +884,63 @@ _BOT_NAME_RE = _re.compile(r"[^a-zA-Z0-9 _\-.]")
 _DEFAULT_BEACON_ENDPOINT = "https://d175o3ylxqum0e.cloudfront.net"
 
 
+def _bot_name_char(ch: str) -> str:
+    """The character ``ch`` contributes to a bot name: itself, a space, or nothing.
+
+    A brace is nothing: the ``{bot_name}`` placeholder must not recurse. The
+    category test already drops it as punctuation; naming it here keeps that
+    rule visible beside the one it protects.
+    """
+    if ch in _BOT_NAME_SEPARATORS:
+        return ch
+    if ch in "{}" or _is_invisible(ch):
+        return ""
+    category = _unicodedata.category(ch)
+    if category in _BOT_NAME_CATEGORIES:
+        return ch
+    # A space separator that is not the ASCII space (NO-BREAK SPACE, the
+    # IDEOGRAPHIC SPACE a Japanese keyboard types between words) keeps the words
+    # it separated apart instead of joining them. NFKC maps these to the plain
+    # space; the name is NFC-normalized, so the one mapping is made here.
+    if category == "Zs":
+        return " "
+    return ""
+
+
 def _sanitize_bot_name(raw: str) -> str:
-    """Sanitize bot_name: strip markdown, braces, limit length."""
+    """Sanitize bot_name: NFC-normalize, cap the length, drop braces and non-name characters.
+
+    A name keeps the letters, combining marks and digits of any script
+    (``_BOT_NAME_CATEGORIES``) plus the ASCII space, ``_``, ``-`` and ``.``, and
+    is stored in its NFC spelling so ``Jos\u00e9`` typed with a precomposed or a
+    combining accent loads as one string. Everything else is dropped: braces
+    (the ``{bot_name}`` placeholder must not recurse), markdown and other
+    punctuation, symbols and emoji, and every control, format, invisible,
+    surrogate and private-use character. A space run that a removal leaves
+    behind folds to one space and a leading or trailing one is stripped; a double
+    space the user typed is kept. The cap is :data:`_BOT_NAME_MAX` code points of
+    the NFC form, applied before the filter.
+    """
     if not isinstance(raw, str):
         return ""
-    name = raw.strip()[:_BOT_NAME_MAX]
-    name = name.replace("{", "").replace("}", "")
-    return _BOT_NAME_RE.sub("", name)
+    name = _unicodedata.normalize("NFC", raw).strip()[:_BOT_NAME_MAX]
+    kept: list[str] = []
+    removed_since_last_kept = False
+    for ch in name:
+        out = _bot_name_char(ch)
+        if not out:
+            removed_since_last_kept = True
+            continue
+        if out == " " and removed_since_last_kept and kept and kept[-1] == " ":
+            # The removal left two spaces touching: the name keeps one.
+            continue
+        kept.append(out)
+        removed_since_last_kept = False
+    # A removal can leave a base letter and a combining mark adjacent that the
+    # input kept apart (``e`` + ZERO WIDTH SPACE + COMBINING ACUTE ACCENT), and
+    # NFC composes such a pair, so the stored spelling is normalized again on
+    # the way out. Composition only shortens, so the cap still holds.
+    return _unicodedata.normalize("NFC", "".join(kept).strip())
 
 
 def _archive_retention_days(session_data: dict) -> int:
@@ -2049,9 +2137,15 @@ class SessionConfig:
             "Closing a dashboard or cron tab still ends its process; a channel thread's "
             "session belongs to the channel, so closing its viewer does not. The Watchdog "
             "RSS Limit, when set, still applies. A listed session with no tab, such as a "
-            "cron job that runs without one, is reaped only by that limit or a gateway "
-            "restart, even after its job is deleted, so take a deleted job's key off the "
-            "list. At most 10 keys are kept.",
+            "cron job that runs without one, keeps running even after its job is deleted, "
+            "so take a deleted job's key off the list. The RSS limit or a gateway restart "
+            "still ends it. On the kiro-cli or KAS backend, a Kiro sign-out from the dashboard "
+            "ends it at once, whatever account it signed in with. After any other switch or "
+            "sign-out of the Kiro account it signed in with, the next dashboard chat turn ends "
+            "it, and so does the next agent cron run unless Kiro Crew then cannot tell which "
+            "account is signed in, as with a social login. A session that "
+            "is mid-turn then ends later instead, when its next turn starts or at a later "
+            "dashboard chat turn or agent cron run. At most 10 keys are kept.",
         ),
     )
     empty_response_auto_continue: bool = field(
@@ -2173,7 +2267,8 @@ class SlackConfig:
         default_factory=list,
         metadata=_meta(
             "Allowed Users",
-            "List of Slack users allowed to interact. Each entry: {slack_id, name}.",
+            "Ignored for access: Slack is owner-only, so only the owner can interact. "
+            "A name here is only a display-name fallback. Each entry: {slack_id, name}.",
         ),
     )
     tracking_channels: list[dict] = field(
@@ -2187,7 +2282,7 @@ class SlackConfig:
         default_factory=list,
         metadata=_meta(
             "Open Channels",
-            "Channel IDs where all users are authorized without allowlist.",
+            "Ignored for access: open channels are disabled (Slack is owner-only).",
         ),
     )
     command: str = field(
@@ -2831,6 +2926,18 @@ class DashboardConfig:
             restart=True,
         ),
     )
+    idle_slot_sweep_days: int = field(
+        default=7,
+        metadata=_meta(
+            "Archive Idle Sessions After Days",
+            "When 450 or more sessions are open, archive sessions idle for this many "
+            "days to history, hourly, and post a notification. Pinned sessions, app "
+            "sessions, the open session, sessions with a running turn, a pending "
+            "approval or sub-agents, crew worker sessions and sessions an auto-nudge "
+            "loop drives are kept. 0 = never.",
+            restart=True,
+        ),
+    )
     surface_channel_sessions: bool = field(
         default=True,
         metadata=_meta(
@@ -2986,6 +3093,21 @@ class DashboardConfig:
             "Use Built-in Browser",
             "When on, the browser tool opens pages in Kiro Crew's built-in panel "
             "(desktop app only). When off, the agent browses via playwright-cli.",
+        ),
+    )
+    browser_local_origins: list[str] = field(
+        default_factory=list,
+        metadata=_meta(
+            "Built-in Browser Local Origins",
+            "Loopback origins the browser tool may open in the built-in panel, "
+            "each written host:port with host localhost, 127.0.0.1 or [::1] "
+            "(e.g. localhost:5173 for a Vite dev server). Empty (the default) "
+            "keeps every loopback, private and link-local address refused. The "
+            "port is required and matched exactly, so one entry opens one dev "
+            "server and never the rest of the machine; the gateway's own port is "
+            "refused even when listed. Entries in any other shape are dropped. "
+            "The agent cannot set this while its sandbox is on: config.json is "
+            "read-only inside the sandbox.",
         ),
     )
     browser_view_port: int = field(
@@ -3427,6 +3549,15 @@ class DashboardConfig:
             "Offer to file a newly-titled, unfiled chat session into a matching folder.",
         ),
     )
+    topic_tags_enabled: bool = field(
+        default=False,
+        metadata=_meta(
+            "Topic Tags Enabled",
+            "Ask the background model for up to two topic tags from a new chat "
+            "session's first message. A session never gets more than three tags "
+            "this way. Off by default because each new session costs one model call.",
+        ),
+    )
     tips_cadence_hours: float = field(
         default=6.0,
         metadata=_meta(
@@ -3629,6 +3760,22 @@ class KiroCrewAgentConfig:
             "to UNKNOWN verdicts and to an opaque MCP tool whose only WORKING "
             "evidence is movement in the runtime's process tree; every other "
             "WORKING session is never acted on.",
+        ),
+    )
+    # Per-agent compaction threshold. Same empty-inherits convention as the
+    # watchdog windows above: 0 means "use session.autocompact_pct". A
+    # session's own slider override still wins over this.
+    autocompact_pct: float = field(
+        default=0.0,
+        metadata=_meta(
+            "Auto-compact threshold override (%)",
+            "Default context-usage percentage at which sessions running this "
+            "agent compact. 0 inherits session.autocompact_pct, and so does a "
+            "negative value. A positive value is held to the same 5-90 range as "
+            "the global. Set low (e.g. 45) for "
+            "an orchestrator that should stay sharp, high (e.g. 85) for a worker "
+            "that should keep its long context. A session's own threshold "
+            "override (the context popover slider) still takes precedence.",
         ),
     )
     session_color: str = field(
@@ -5641,6 +5788,44 @@ def _parse_telegram_accounts(raw: object) -> dict[str, "TelegramAccountConfig"]:
             allowed_forum_chat_ids=_coerce_int_ids(account.get("allowed_forum_chat_ids")),
             soft_threshold_pct=account.read("soft_threshold_pct", _threshold_pct),
         )
+    return out
+
+
+_BROWSER_LOCAL_HOSTS = frozenset({"localhost", "127.0.0.1", "[::1]"})
+
+
+def coerce_browser_local_origins(raw: object) -> list[str]:
+    """Coerce ``dashboard.browser_local_origins`` to canonical ``host:port`` entries.
+
+    Fails closed: a non-list yields ``[]`` and an entry is dropped unless it is
+    exactly one of the three loopback host spellings in
+    :data:`_BROWSER_LOCAL_HOSTS` followed by a plain ASCII port in 1-65535. A
+    scheme, path, userinfo, wildcard, a private/LAN address or a missing port is
+    rejected rather than sanitized: a bare host would open every port on the
+    machine (the gateway included), and widening past loopback is not what the
+    setting is for. The port is rebuilt canonically (``08080`` -> ``8080``) so
+    it compares equal to what ``urlsplit`` reports for the navigated URL.
+    """
+    if not isinstance(raw, list):
+        return []
+    out: list[str] = []
+    for entry in raw:
+        if not isinstance(entry, str):
+            continue
+        text = entry.strip().lower()
+        host, sep, port_text = text.rpartition(":")
+        if not sep or host not in _BROWSER_LOCAL_HOSTS:
+            continue
+        # The length cap runs before int(): a port of thousands of digits would
+        # otherwise raise past Python's int-string limit and abort config load.
+        if not (port_text.isascii() and port_text.isdigit() and len(port_text) <= 5):
+            continue
+        port = int(port_text)
+        if not 0 < port < 65536:
+            continue
+        canonical = f"{host}:{port}"
+        if canonical not in out:
+            out.append(canonical)
     return out
 
 

@@ -149,6 +149,29 @@ describe('LexicalComposerInput list continuation', () => {
     await waitFor(() => expect(value()).toBe(`${initial}\n- `))
   })
 
+  it('renumbers the items below a new one and keeps the caret on it', async () => {
+    const { enter, value, controlRef } = await setup('1. foo\n2. bar\n3. baz', { caret: 3 })
+    enter({ shiftKey: true })
+    await waitFor(() => expect(value()).toBe('1. \n2. foo\n3. bar\n4. baz'))
+    expect(controlRef.current!.getSelection()).toEqual({ start: 7, end: 7 })
+  })
+
+  it('undoes a renumbering continuation in one step', async () => {
+    const { enter, value, editor } = await setup('1. foo\n2. bar', { caret: 6 })
+    enter({ shiftKey: true })
+    await waitFor(() => expect(value()).toBe('1. foo\n2. \n3. bar'))
+    act(() => { editor.dispatchCommand(UNDO_COMMAND, undefined) })
+    await waitFor(() => expect(value()).toBe('1. foo\n2. bar'))
+  })
+
+  it('renumbers past a paste chip on a later item', async () => {
+    const block: PasteBlock = { id: 'paste-1', seq: 1, lines: 4, content: 'a\nb\nc\nd' }
+    const initial = `1. a\n2. ${formatToken(block)}\n3. c`
+    const { enter, value } = await setup(initial, { blocks: [block], caret: 4 })
+    enter({ shiftKey: true })
+    await waitFor(() => expect(value()).toBe(`1. a\n2. \n3. ${formatToken(block)}\n4. c`))
+  })
+
   it('undoes the continuation in one step', async () => {
     const { enter, value, editor } = await setup('- item')
     enter({ shiftKey: true })
@@ -196,6 +219,17 @@ describe('LexicalComposerInput list marker Backspace', () => {
     backspace(editor)
     await waitFor(() => expect(value()).toBe('1. test\n'))
     expect(controlRef.current!.getSelection()).toEqual({ start: 8, end: 8 })
+  })
+
+  it('moves the items below back up when it clears a mid-list item, in one undo step', async () => {
+    const { enter, value, editor, controlRef } = await setup('1. foo\n2. bar', { caret: 6 })
+    enter({ shiftKey: true })
+    await waitFor(() => expect(value()).toBe('1. foo\n2. \n3. bar'))
+    backspace(editor)
+    await waitFor(() => expect(value()).toBe('1. foo\n\n2. bar'))
+    expect(controlRef.current!.getSelection()).toEqual({ start: 7, end: 7 })
+    act(() => { editor.dispatchCommand(UNDO_COMMAND, undefined) })
+    await waitFor(() => expect(value()).toBe('1. foo\n2. \n3. bar'))
   })
 
   it('removes only the marker in front of item text', async () => {

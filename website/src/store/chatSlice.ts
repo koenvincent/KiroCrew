@@ -285,6 +285,13 @@ function applyNonActiveFrame(
     bumpRunEpoch(state, slot)
     if (run.state === 'idle') run.lastChunkSeq = undefined
   }
+  // A change card / guide offer: placed like the tool row that proposed it.
+  if (role === 'card') {
+    let insertIdx = msgs.length
+    if (insertIdx > 0 && msgs[insertIdx - 1]?.role === 'streaming') insertIdx--
+    msgs.splice(insertIdx, 0, ensureMsgId({ role, content, cls: cls || '', ts, meta }))
+    return
+  }
   if (role === 'tool') {
     if (run.state === 'idle') bumpRunEpoch(state, slot)
     setRunState(run, 'tool_running')
@@ -489,6 +496,16 @@ function applyActiveFrame(state: ChatState, p: ChatFrame): void {
   if (role === 'inject' && !isNoteRow({ cls, meta })) {
     bumpRunEpoch(state, slot)
     if (state.slotState === 'idle') state.lastChunkSeq = undefined
+  }
+  // A change card / guide offer lands mid-turn, right after the tool call that
+  // proposed it, so it is placed exactly like that tool row: ahead of the open
+  // streaming message (the gateway's own order, which the turn-end refresh
+  // restores anyway).
+  if (role === 'card') {
+    let insertIdx = state.messages.length
+    if (insertIdx > 0 && state.messages[insertIdx - 1]?.role === 'streaming') insertIdx--
+    state.messages.splice(insertIdx, 0, ensureMsgId({ role, content, cls: cls || '', ts, meta }))
+    return
   }
   // Tool call — update state, insert before streaming message
   if (role === 'tool') {
@@ -850,6 +867,7 @@ const chatSlice = createSlice({
       state.agentSwitchNotice = action.payload === null ? null : { message: action.payload }
     },
     setVoicePlaying(state, action: PayloadAction<boolean>) { state.voicePlaying = action.payload },
+    setVoicePreparing(state, action: PayloadAction<boolean>) { state.voicePreparing = action.payload },
     setVoiceAudio(state, action: PayloadAction<string | null>) { state.voiceAudio = action.payload },
     /** Ask the sidebar to reveal a session row (expand collapsed ancestor
      *  folders, scroll it into view, flash it). Consumed and cleared by
@@ -958,9 +976,9 @@ const chatSlice = createSlice({
 
 export const {
   setCloseRefused,
-  setActiveSlot, clearSlotState, setPendingInput, stageToMainComposer, setAgentSwitchNotice, clearUnresumableResume, clearUndeletableHistory, setQuestionCard, clearQuestionCard, setQuestionDraft, resolveQuestionCard, setFollowupCard, clearFollowupCard, dismissFollowupItem, setFolderSuggestion, clearFolderSuggestion, ageFolderSuggestion, appendMessage, appendSlotMessage, updateStreamingMessage, finalizeAssistant,
-  removeThinking, confirmOptimisticSend, markSendUnconfirmed, resolveOptimisticSteer, removeByApprovalId, resolveByApprovalId, clearPendingPermissions, setSlotRunning, setSlotStopping, settleStopNotRunning, startLocalTurn, endLocalTurn, syncSlotRunningFromServer, setSlotState, setSlotStatusDetail, setStopPressedAt, clearMessages, clearSlotCache, truncateAfterIndex, replaceMessages, hydrateSlotMessages, sseChatMessage, sseChatMessageUpdate, sseChatMessagePatchByTs, sseThinkingChunk, removeQueuedMessage, appendQueuedMessage, cancelQueuedMessage, editQueuedMessage, reorderQueuedMessages,
-  sseContextUsage, setVoicePlaying, setVoiceAudio,
+  setActiveSlot, clearSlotState, setPendingInput, stageToMainComposer, setAgentSwitchNotice, clearUnresumableResume, clearUndeletableHistory, setQuestionCard, clearQuestionCard, setQuestionDraft, setQuestionNotice, setQuestionRequestInFlight, markQuestionSettled, resolveQuestionCard, setFollowupCard, clearFollowupCard, dismissFollowupItem, setFolderSuggestion, clearFolderSuggestion, ageFolderSuggestion, appendMessage, appendSlotMessage, updateStreamingMessage, finalizeAssistant,
+  removeThinking, confirmOptimisticSend, markSendUnconfirmed, resolveOptimisticSteer, removeByApprovalId, resolveByApprovalId, clearPendingPermissions, setSlotRunning, setSlotStopping, settleStopNotRunning, startLocalTurn, startServerTurn, endLocalTurn, syncSlotRunningFromServer, setSlotState, setSlotStatusDetail, setStopPressedAt, clearMessages, clearSlotCache, truncateAfterIndex, replaceMessages, hydrateSlotMessages, sseChatMessage, sseChatMessageUpdate, sseChatMessagePatchByTs, sseThinkingChunk, removeQueuedMessage, appendQueuedMessage, cancelQueuedMessage, editQueuedMessage, reorderQueuedMessages,
+  sseContextUsage, setVoicePlaying, setVoicePreparing, setVoiceAudio,
   toggleActivity, openActivityToTab, openActivityPanel, openActivityToTool, clearFocusToolCallId, requestSlotReveal, clearSlotReveal, requestFolderReveal, clearSubagentsForSnapshot, sseSubagentPending, markSubagentApproving, sseSubagentSpawn, sseSubagentTool, sseSubagentStalled, sseSubagentRetrying, sseSubagentDone, sseSubagentQueued, reconcileSubagentQueuedFromSlots,
   sseSubagentBatchUpdate, sseSubagentBatchChunks, selectSubagent, clearTerminalSubagents,
   setAutomations, sseAutomation, removeAutomation,
@@ -977,8 +995,8 @@ export {
   slotSwitchFetchLimit, slotCoverageShortfall, countMatchedFetchLimit, isSupersededPagingRejection,
   abortActiveOlderFetch, type CoverageRow,
 } from './chat/paging'
-export type { FollowupItem, SideMessage, SideQueueEntry, SideState, SlotState, SlotStatusDetail, WorkflowRunProgress } from './chat/state'
-export { FOLDER_SUGGESTION_MAX_TURNS, capturePendingAskId, pendingQuestionFor, shouldResolveAskOnSend } from './chat/composerCards'
+export type { ChatState, FollowupItem, SideMessage, SideQueueEntry, SideState, SlotState, SlotStatusDetail, WorkflowRunProgress } from './chat/state'
+export { FOLDER_SUGGESTION_MAX_TURNS, capturePendingAskId, isAnsweredQuestionEnding, pendingQuestionFor, shouldResolveAskOnSend } from './chat/composerCards'
 export { mcpAppKey } from './chat/mcpApps'
 export {
   isAwaitingSpawnApproval, selectSidebarApprovalCounts, selectSidebarStartedSubagentCounts, selectSidebarSubagentCounts, selectSlotPendingSpawnApprovals,
@@ -990,7 +1008,7 @@ export { queueEditBroadcastAt } from './chat/side'
 export {
   selectActiveSlotProject, selectComposerBusy, selectContinuable, selectSendConfirmed, selectSlotMessages,
   selectSlotPendingApproval, selectSlotRunEpoch, selectSlotStreamState, selectSlotToolLog, selectTrailingSendUnconfirmed,
-  selectTurnInterrupted,
+  selectSlotTurnFromWake, selectTurnInterrupted,
   QUIET_END_SERVER, QUIET_END_TOOL,
 } from './chat/selectors'
 export { clearSwitchSlotGone, switchSlot, switchSlotNoticeCopy, type SwitchSlotArg } from './chat/slotSwitch'

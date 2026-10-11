@@ -27,7 +27,7 @@ from urllib.parse import urlencode
 from kiro_crew import mcp_core
 from kiro_crew import resource_status as host_status
 from kiro_crew.config.loader import KiroCrewConfig
-from kiro_crew.constants import DEFAULT_SUBAGENT_MAX_TURNS
+from kiro_crew.constants import DEFAULT_SUBAGENT_MAX_TURNS, NO_TOOL_CALLS_NOTE
 from kiro_crew.context_management import COMPLETION_KEEP_DEFAULT_CHARS
 from kiro_crew.execution_context import read_session_execution
 from kiro_crew.mcp_shared import ToolCancelled, is_tool_cancelled
@@ -325,6 +325,7 @@ def schemas(*, names_only: bool = False) -> list[dict[str, Any]]:
                                 "task": {"type": "string"},
                                 "model": {"type": "string"},
                                 "reasoning_effort": {"type": "string"},
+                                "backend": {"type": "string"},
                             },
                             "required": ["task"],
                             "additionalProperties": False,
@@ -332,9 +333,9 @@ def schemas(*, names_only: bool = False) -> list[dict[str, Any]]:
                         "description": (
                             "Multiple tasks to run in parallel as one wave. Each entry is a "
                             "prompt string, or an object {task, model?, "
-                            "reasoning_effort?} whose fields override the call's batch-wide "
-                            "value for that task only, e.g. the same review prompt on two "
-                            "models, delivered together."
+                            "reasoning_effort?, backend?} whose fields override the call's "
+                            "batch-wide value for that task only, e.g. the same review prompt "
+                            "on two models or two backends, delivered together."
                         ),
                     },
                     "agent": {
@@ -417,6 +418,21 @@ def schemas(*, names_only: bool = False) -> list[dict[str, Any]]:
                             "`kiro-cli chat --list-models --format json`; another backend "
                             "(e.g. codex) accepts only ids from its own model list and "
                             "refuses ids from kiro's catalog."
+                        ),
+                    },
+                    "backend": {
+                        "type": "string",
+                        "description": (
+                            "Optional backend (agent harness) for the subagent(s), e.g. "
+                            "'kiro', 'claude', 'codex': the run starts on that harness "
+                            "instead of the gateway default, so one orchestrator can hand "
+                            "each task to the harness that suits it. A backend that is "
+                            "unavailable AT SPAWN TIME is REFUSED with the list of "
+                            "available ones (and its install command when it is only "
+                            "missing), never replaced by the default. Pass 'model' as an "
+                            "id from THAT backend's list. Batch-wide; a tasks[] object can "
+                            "override it per task. A spawn_continue follow-up asks for the "
+                            "run's backend."
                         ),
                     },
                     "reasoning_effort": {
@@ -794,6 +810,7 @@ def spawn_run(name: str, args: dict[str, Any]) -> str:
     instance_id = args.get("instance_id") or ""
     model = args.get("model") or ""
     reasoning_effort = args.get("reasoning_effort") or ""
+    backend = args.get("backend") or ""
     keep = bool(args.get("keep"))
     # Context scope: absent ⇒ true, so a parent that passes nothing gets the
     # same context a normal session would.
@@ -873,6 +890,7 @@ def spawn_run(name: str, args: dict[str, Any]) -> str:
         a = agents_list[i] if agents_list else agent
         t_model = over.get("model") or model
         t_effort = over.get("reasoning_effort") or reasoning_effort
+        t_backend = over.get("backend") or backend
         if a in refused_agents:
             # Short line on purpose: the full roster is already on the first
             # refusal above, and repeating it once per remaining member would
@@ -900,6 +918,8 @@ def spawn_run(name: str, args: dict[str, Any]) -> str:
             body["model"] = t_model
         if t_effort:
             body["reasoning_effort"] = t_effort
+        if t_backend:
+            body["backend"] = t_backend
         if keep:
             body["keep"] = True
         if not inc_memory:
@@ -914,6 +934,8 @@ def spawn_run(name: str, args: dict[str, Any]) -> str:
         can_work = can_work and d.get("parent_work_supported") is True
         if d.get("error"):
             error_line = f"{t[:60]}: {d['error']}"
+            if d.get("install_command"):
+                error_line += f" (install: {d['install_command']})"
             if d.get("transport_error"):
                 # The gateway may have accepted the spawn before the
                 # response failed. Treat it as unknown, not rejected, and
@@ -1286,7 +1308,15 @@ def spawn_status(name: str, args: dict[str, Any]) -> str:
         path += "?" + urlencode(spawn_params)
     d = mcp_core._get(path)
     usage = format_subagent_usage(d.get("credits"), d.get("elapsed"))
-    if d.get("error"):
+    # ``error`` means two different things here. On a payload that is not a
+    # finished run (a failed lookup or a transport error, such as
+    # ``{"error": "HTTP 404"}``) it is the whole answer. On a finished run
+    # (``done`` is True) it is the reason the run ended badly, sent next to the
+    # transcript the run retained; a timed-out or reaped run keeps its partial
+    # output on purpose. That transcript must stay readable, so the reason
+    # becomes a header instead of replacing the output.
+    ended_with_error = d.get("done") is True and bool(d.get("error"))
+    if d.get("error") and not ended_with_error:
         error = f"Error: {d['error']}"
         return f"[usage: {usage}]\n{error}" if usage else error
 
@@ -1373,8 +1403,14 @@ def spawn_status(name: str, args: dict[str, Any]) -> str:
         header, _ = redact_credentials(header)
         return f"{header}\n{result}"
     if isinstance(meta, dict) and meta:
-        return result
-    return f"[usage: {usage}]\n{result}" if usage else result
+        out = result
+    else:
+        out = f"[usage: {usage}]\n{result}" if usage else result
+    if ended_with_error:
+        reason, _ = redact_exfiltration_urls(str(d["error"]))
+        reason, _ = redact_credentials(reason)
+        out = f"[ENDED WITH ERROR · {reason}]\n{out}"
+    return out
 
 
 #: Server-side hold per resume-poll request (seconds); under the client GET
@@ -1445,6 +1481,24 @@ def spawn_sub_agents(name: str, args: dict[str, Any]) -> str:
 
     def _redact_sa(text: str) -> str:
         return redact(text)
+
+    def _inline_result(aid: str, raw: str) -> str:
+        """A finished child's retained output as this reply carries it.
+
+        Redacted, and past ``COMPLETION_KEEP_DEFAULT_CHARS`` replaced by the same
+        summary plus disk path that ``spawn_run`` gives, so a large transcript
+        does not fill the caller's context window. One rule for a child that
+        completed and one that ended in error.
+        """
+        result_text = _redact_sa(raw)
+        if len(result_text) > COMPLETION_KEEP_DEFAULT_CHARS:
+            try:
+                result_path = str(agent_dir_for_display(aid) / "result.txt")
+            except (ValueError, OSError):
+                result_path = ""
+            if result_path:
+                result_text = mcp_core.summarize_result(result_text, result_path)
+        return result_text
 
     # Validate individual agent entries (schema guarantees dict entries)
     for entry in agents_input:
@@ -1610,6 +1664,13 @@ def spawn_sub_agents(name: str, args: dict[str, Any]) -> str:
                 "status": "error",
                 "error": _redact_sa(sa_st["error"]),
             }
+            if sa_st.get("done"):
+                # On a finished run ``error`` is why it ended badly, sent next to
+                # the output the run retained (a timed-out run keeps its partial
+                # work). This call marks the child collected, so its completion
+                # event is not injected either: the reply is where that output
+                # reaches the caller.
+                failure["text"] = _inline_result(aid, sa_st.get("result", ""))
             if aid in sa_deferred and not sa_st.get("done"):
                 failure["hint"] = (
                     "accepted at spawn time; its state couldn't be read now; "
@@ -1625,28 +1686,17 @@ def spawn_sub_agents(name: str, args: dict[str, Any]) -> str:
         else:
             completed += 1
             _settled_ids.add(aid)
-            result_text = _redact_sa(sa_st.get("result", ""))
-            # Apply the same summarize_result treatment as spawn_run:
-            # when results exceed completion_keep threshold, return a
-            # summary + disk path instead of the full transcript. This
-            # prevents massive tool_results from filling the model's
-            # context window and causing attention degradation.
-            if len(result_text) > COMPLETION_KEEP_DEFAULT_CHARS:
-                try:
-                    result_path = str(agent_dir_for_display(aid) / "result.txt")
-                except (ValueError, OSError):
-                    result_path = ""
-                if result_path:
-                    result_text = mcp_core.summarize_result(result_text, result_path)
-            sa_results.append(
-                json.dumps(
-                    {
-                        "agent": label,
-                        "status": "completed",
-                        "text": result_text,
-                    }
-                )
-            )
+            result_text = _inline_result(aid, sa_st.get("result", ""))
+            record: dict[str, Any] = {
+                "agent": label,
+                "status": "completed",
+                "text": result_text,
+            }
+            # Exactly True: a status read that does not say (a run recovered
+            # from disk, a stopped or failed run) attaches nothing.
+            if sa_st.get("made_no_tool_calls") is True:
+                record["unverified"] = f"This agent {NO_TOOL_CALLS_NOTE}"
+            sa_results.append(json.dumps(record))
     if _unsettled:
         sa_results.append(
             json.dumps(

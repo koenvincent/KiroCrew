@@ -75,7 +75,13 @@ are the ones dropped.
 Verify with `kirocrew doctor`, which grows an `MCP Governance (enterprise)`
 section when the local identity is one an administrator's registry can govern
 (an IAM Identity Center or API-key sign-in), when `agent.mcp_registry_mode` is
-set, or when registry-marked entries are present.
+set, or when registry-marked entries are present. The identity comes from the
+`auth.idc.*` rows in kiro-cli's local store or a `KIRO_API_KEY`. Some kiro-cli
+builds sign an Identity Center user in without writing those rows, so before
+telling you to turn registry mode off, doctor asks `kiro-cli whoami` for the
+account type. If whoami cannot answer either, the section says the identity is
+unknown and asks you to check with `kiro-cli whoami`, rather than assuming a
+personal account.
 
 ### 2. Have the administrator allow-list the servers
 
@@ -283,10 +289,11 @@ the authority narrowed by it: allow-lists intersect, deny-lists union, a strictn
 level takes the stricter value. A subordinate cannot repeal by omission either — a
 scope it simply leaves out keeps the authority's value.
 
-Two values a subordinate sets are kept only when the authority left them empty:
+One value a subordinate sets is kept only when the authority left it empty:
 `updates.source` (where both name one, the authority's glob stands — two globs have no
-expressible intersection) and `channels.posture` (the authority's posture wins; a
-subordinate posture is not yet folded). A `min_version`
+expressible intersection). `channels.posture` folds leaf by leaf: where both tiers
+set the same leaf, an id must be allowed by both; a leaf only the subordinate sets
+is added as a further restriction. A `min_version`
 floor does fold: the higher of the two wins. A
 `~/.kiro/crew/security_policy.json` that cannot be used (unreadable, not JSON, or
 a document the schema rejects) beneath a central document is skipped with one

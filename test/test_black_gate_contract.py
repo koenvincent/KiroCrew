@@ -516,3 +516,105 @@ def test_a_black_pin_change_measures_the_whole_tree_and_catches_graduation(
     assert gate.main(argv) == 1
     assert calls == [gate.DEFAULT_TARGETS]
     assert "src/old.py" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize(
+    ("dirty", "expected"),
+    [(set(), 0), ({"src/old.py"}, 1)],
+    ids=["removed-entry-now-clean", "removed-entry-still-dirty"],
+)
+def test_a_deletion_only_baseline_edit_checks_just_the_removed_paths(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    dirty: set[str],
+    expected: int,
+) -> None:
+    # A PR that graduates a file must delete its entry; forcing the whole tree for
+    # that made backend-lint run ~15 min of black on hosted runners and time out.
+    calls, argv = _scoped_gate(
+        monkeypatch,
+        tmp_path,
+        changed={"src/a.py", gate.BASELINE_REL},
+        unformatted=dirty,
+        baseline=["src/kept.py"],
+        files=["src/a.py", "src/old.py", "src/kept.py"],
+    )
+    monkeypatch.setattr(
+        gate, "_base_baseline", lambda label: {"src/kept.py", "src/old.py"}, raising=False
+    )
+    assert gate.main(argv) == expected
+    assert calls == [("src/a.py", "src/old.py")]
+    if expected:
+        assert "file=src/old.py" in capsys.readouterr().out
+
+
+def test_a_removed_entry_whose_file_was_deleted_is_dropped_from_the_scope(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # Black errors on a missing path, so the deleted file must not reach it.
+    calls, argv = _scoped_gate(
+        monkeypatch,
+        tmp_path,
+        changed={"src/a.py", gate.BASELINE_REL},
+        unformatted=set(),
+        baseline=["src/kept.py"],
+        files=["src/a.py", "src/kept.py"],
+    )
+    monkeypatch.setattr(
+        gate, "_base_baseline", lambda label: {"src/kept.py", "src/gone.py"}, raising=False
+    )
+    assert gate.main(argv) == 0
+    assert calls == [("src/a.py",)]
+
+
+@pytest.mark.parametrize(
+    ("base", "reason"),
+    [
+        ({"src/kept.py"}, "the baseline edit adds an entry"),
+        (None, "the baseline at the base could not be read"),
+    ],
+    ids=["entry-added", "base-unreadable"],
+)
+def test_a_baseline_edit_that_adds_an_entry_still_measures_the_whole_tree(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    base: set[str] | None,
+    reason: str,
+) -> None:
+    calls, argv = _scoped_gate(
+        monkeypatch,
+        tmp_path,
+        changed={"src/a.py", gate.BASELINE_REL},
+        unformatted={"src/new.py"},
+        baseline=["src/kept.py", "src/new.py"],
+        files=["src/a.py", "src/new.py", "src/kept.py"],
+    )
+    monkeypatch.setattr(gate, "_base_baseline", lambda label: base, raising=False)
+    gate.main(argv)
+    assert calls == [gate.DEFAULT_TARGETS]
+    # The log must say why the tree ran, or a fallback looks like any other edit.
+    assert f"whole tree, {reason}" in capsys.readouterr().out
+
+
+def test_the_base_baseline_is_read_at_the_scope_base(monkeypatch: pytest.MonkeyPatch) -> None:
+    # No real git here: `base_ref` is pinned against an isolated repo in
+    # test_ratchet_scope.py, so this test only checks how the gate uses it.
+    asked: list[tuple[str, str]] = []
+
+    class _Scope:
+        @staticmethod
+        def base_ref(label: str, *, cwd: Path | None = None) -> str | None:
+            return "BASE" if label == "main...HEAD" else None
+
+        @staticmethod
+        def show_at(base: str, path: str, *, cwd: Path | None = None) -> str | None:
+            asked.append((base, path))
+            return "# header\nsrc/a.py\n\nsrc/b.py\n"
+
+    monkeypatch.setattr(gate, "_load_scope", lambda: _Scope)
+    assert gate._base_baseline("main...HEAD") == {"src/a.py", "src/b.py"}
+    assert asked == [("BASE", gate.BASELINE_REL)]
+    assert gate._base_baseline("fake scope") is None
+    assert len(asked) == 1

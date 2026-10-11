@@ -67,6 +67,18 @@ describe('AgentDropdownList', () => {
 })
 
 describe('AgentDropdownList namespaces (member vs template)', () => {
+  it('names a crewmate by its label alone; a template by its name', () => {
+    const rows: AgentItem[] = [
+      { name: 'mate', source: 'builtin', selection_kind: 'member', display_name: 'Pebble' },
+      { name: 'mate', source: 'kirocrew', selection_kind: 'template', display_name: 'Ignored' },
+    ]
+    render(<AgentDropdownList agents={rows} activeAgent="" defaultAgent="" onSelect={() => {}} />)
+    expect(screen.getByText('Pebble')).toBeInTheDocument()
+    expect(screen.queryByText('Ignored')).toBeNull()
+    // Only the template row reads `mate`: the crewmate's ID is not shown.
+    expect(screen.getAllByText('mate')).toHaveLength(1)
+  })
+
   const both: AgentItem[] = [
     { name: 'reviewer', source: 'kirocrew', selection_kind: 'member', description: 'My reviewer' },
     { name: 'reviewer', source: 'builtin', selection_kind: 'template', description: 'Shared template' },

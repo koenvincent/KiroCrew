@@ -2951,6 +2951,7 @@ class _ChatSlot:
         "_tool_stall_retries",
         "_tool_stall_exhausted_emitted",
         "_transient_5xx_retries",
+        "_transient_ladder_started",
         "_infra_retries",
         "_fallback_candidate_idx",
         "_fallback_walked",
@@ -2972,6 +2973,8 @@ class _ChatSlot:
         "_last_turn_structural_terminal",
         "_last_turn_structural_terminal_loop_id",
         "_last_turn_structural_terminal_loop_gen",
+        "_last_turn_model_refused_loop_id",
+        "_last_turn_model_refused_loop_gen",
         "_prestream_exhausted_cycles",
         "_poisoned_reset_used",
         "_session_not_found_retry_used",
@@ -3008,6 +3011,7 @@ class _ChatSlot:
         "_channel_window_mtime",
         "_disk_older_count",
         "_disk_older_durable_count",
+        "_unknown_row_fields_bytes",
         "_disk_window_len",
         "_disk_meta_created_at",
         "_disk_meta_observed",
@@ -3040,6 +3044,8 @@ class _ChatSlot:
         "_steer_user_origin",
         "_steer_channel_origin",
         "_turn_channel_narrowed",
+        "_turn_channel_origin",
+        "_turn_user_sent",
         "_steer_admissions",
         "_steer_decision_strips",
         "_steer_possibly_delivered",
@@ -3706,6 +3712,10 @@ class _ChatSlot:
         # ConnectionReset) retries on the interactive stream path. Distinct
         # budget from prompt-busy / pipe-death; reset on a completed turn.
         self._transient_5xx_retries: int = 0
+        # time.monotonic() at the current transient ladder's first retry, the
+        # start of the network-drop recovery window. Re-stamped whenever the
+        # ladder starts from zero, so it needs no reset of its own.
+        self._transient_ladder_started: float = 0.0
         # L1 gateway-capacity retries: how many times THIS cycle waited out an
         # infrastructure refusal of a tool call (the ladder owns the budget; this
         # is the slot-visible count the health panel classifies as recovering).
@@ -3816,6 +3826,15 @@ class _ChatSlot:
         # guard passes it to AutoNudgeService.update(expected_generation=...) so
         # the stop is applied under an atomic (id, generation) fence.
         self._last_turn_structural_terminal_loop_gen: int = 0
+        # The loop whose own delivered cycle ended on a content refusal that
+        # nothing retried, and the config generation it fired under. Empty when
+        # the last turn was not such a cycle. The auto-nudge fire guard reads the
+        # pair and stops that loop with ``model_refused`` instead of firing the
+        # same prompt into the same model again; cleared at the start of every
+        # genuine new turn, like the structural verdict above. Not persisted, for
+        # the same reason as that verdict.
+        self._last_turn_model_refused_loop_id: str = ""
+        self._last_turn_model_refused_loop_gen: int = 0
         # Poisoned-conversation escalation (cross-cycle). A cycle that EXHAUSTS
         # the transient-5xx ladder with ZERO output counts one pre-stream
         # exhaustion; consecutive exhausted cycles indicate the backend is
@@ -3951,6 +3970,9 @@ class _ChatSlot:
         self._disk_older_count: int = (
             0  # count of disk messages OLDER than in-memory window (stable, set at restore/resume)
         )
+        # Bytes of newer-build row fields the messages keep (an upper bound; see
+        # slot_persistence.message_entries.MAX_UNKNOWN_ROW_FIELDS_SLOT_BYTES).
+        self._unknown_row_fields_bytes: int = 0
         # Durable-only frozen-prefix counter: how many durable rows (role not
         # in ``_TRANSIENT_ROLES``) have LEFT the in-memory window off the front.
         # Absolute message positions (``session_control.read_messages``) are
@@ -4149,6 +4171,21 @@ class _ChatSlot:
         # the turn, a declined or requeued steer included (narrowing is the direction
         # that cannot be wrong); the turn resets it at its end and at the next start.
         self._turn_channel_narrowed: bool = False
+        # The running turn's OPENER provenance: True while a turn a channel message
+        # opened (`_run_chat(_directive_channel_origin=True)`) is in flight. Set at
+        # the turn's outermost start and cleared at its end, beside
+        # `_turn_channel_narrowed`; read by gateway routes a tool call reaches
+        # mid-turn (the guide routes refuse a channel turn), which have
+        # no other way to learn where the turn came from.
+        self._turn_channel_origin: bool = False
+        # Whether the running turn is one the person sent from the dashboard
+        # (`_run_chat(_directive_user_origin=True)` and not a channel's): set at
+        # the turn's outermost start and cleared at its end beside
+        # `_turn_channel_origin`. A loop wake, a cron or app injection, a
+        # `session_send` and a sub-agent completion never set it, and a steer
+        # that is not the user's clears it (`chat_delivery`), so the guide routes
+        # that act for the user refuse them.
+        self._turn_user_sent: bool = False
         # The containment that held when an in-flight steer was AUTHORIZED, keyed by
         # the same message text and kept in the same LOCKSTEP. The requeue stamps it
         # on the queue entry instead of reading the slot again: its own moment is the
@@ -6212,6 +6249,10 @@ class DashboardState:
         # ``len(_slots)`` alone undercounts by however many imports are in flight,
         # and each concurrent import would then be waved past a full-slot cap.
         self._slots_under_construction: set[str] = set()
+        # The slot each connected owner dashboard reports in the foreground, by
+        # connection (``slot_retention.note_foreground``). The idle sweep never
+        # archives a slot someone is looking at.
+        self._foreground_slots: dict[int, str] = {}
         self._slack_to_slot: dict[str, str] = {}  # Slack session_key → slot name
         # Live OPTIONS controls, keyed by the SESSION KEY that owns them.
         #
@@ -6389,6 +6430,12 @@ class DashboardState:
         # question card is addressed to one slot rather than the whole gateway.
         self._pending_questions: dict[str, dict] = {}
         self._question_futures: dict[str, asyncio.Future] = {}  # type: ignore[type-arg]
+        # Recent endings let reconnecting owner windows distinguish submitted answers.
+        self._recent_question_resolutions: dict[str, tuple[str, float]] = {}
+        # Blocking MCP ``ask_question`` calls, keyed by ask_id: which session owns
+        # each (a wait from any other session is refused), its redacted
+        # questions, deadline and why it ended. See QuestionCoordinator.
+        self._agent_asks: dict[str, dict] = {}
         self._flush_task: asyncio.Task | None = None  # type: ignore[type-arg]
         self._persistence_coordinator = _new_dashboard_persistence()
         # Update progress tracking (shared across all connected clients)
@@ -7171,6 +7218,14 @@ class DashboardState:
     # margin below the watchdog. `wait` can afford 1800s because it is a
     # different mechanism; copying that number here was the bug.
     _QUESTION_TIMEOUT_MAX = 540  # 9 minutes — 60s under the 600s tool-stall watchdog
+    # The blocking MCP ``ask_question`` is not bound by the cap above: its tool
+    # call waits in short slices and pings /api/session-keepalive between them,
+    # which resets the stall watchdog the same way the ``wait`` tool does. So
+    # the window is sized for a person, not for a transport. A tool call that
+    # stops polling for _AGENT_ASK_STALE_SECS is presumed dead and its card is
+    # withdrawn, so a crashed subprocess cannot leave a card collecting answers.
+    _AGENT_ASK_WINDOW_DEFAULT = 1800  # 30 minutes
+    _AGENT_ASK_STALE_SECS = 120
     _FLUSH_INTERVAL = 5  # seconds between dirty-slot flushes
 
     # ── FIX 2: bounded concurrency for unattended, app-owned turns ──────────
@@ -7325,7 +7380,13 @@ class DashboardState:
         if self._knowledge_store is None:
             db_dir = os.path.join(str(config_dir()), "workspace", "knowledge")
             mkdirs_owner_only(db_dir)
-            self._knowledge_store = KnowledgeStore(os.path.join(db_dir, "knowledge.db"))
+            self._knowledge_store = KnowledgeStore.open_recovering(
+                os.path.join(db_dir, "knowledge.db")
+            )
+            # The log alone is not enough: an empty library with no word on
+            # screen reads as data loss. The bell feed is where the user looks.
+            for warning in self._knowledge_store.warnings:
+                self.notify("agent", "Knowledge library was reset", warning, url="/knowledge")
         return self._knowledge_store
 
     def enable_yolo(self, *, from_config: bool = False) -> None:
@@ -7516,6 +7577,7 @@ class DashboardState:
         *,
         blocking: bool | None = None,
         card_id: str | None = None,
+        reason: str | None = None,
     ) -> bool:
         """Retire only question records matching both supplied filters."""
         return _questions_for(self).clear_pending(
@@ -7523,15 +7585,27 @@ class DashboardState:
             slot_key,
             blocking=blocking,
             card_id=card_id,
+            reason=reason,
         )
 
-    def _broadcast_question_retired(self, slot_key: str, card_ids: list[str]) -> None:
+    def _broadcast_question_retired(
+        self,
+        slot_key: str,
+        cards: list[str] | list[tuple[str, bool]],
+        *,
+        reason: str | None = None,
+    ) -> None:
         """Tell owner clients that question cards are no longer actionable."""
-        _questions_for(self).broadcast_retired(self, slot_key, card_ids)
+        normalized = [(card, False) if isinstance(card, str) else card for card in cards]
+        _questions_for(self).broadcast_retired(self, slot_key, normalized, reason=reason)
 
     def _push_slots(self) -> None:
         """Push question status without failing the question lifecycle."""
         _questions_for(self).push_slots(self)
+
+    def recent_question_resolutions(self) -> dict[str, str]:
+        """Return bounded recent blocking ask endings for reconnect repair."""
+        return _questions_for(self).recent_resolutions(self)
 
     async def request_question(
         self,
@@ -7549,9 +7623,31 @@ class DashboardState:
             timeout,
         )
 
-    def resolve_question(self, ask_id: str, answers: dict[str, str] | None) -> bool:
-        """Resolve one blocking question future if it is still pending."""
-        return _questions_for(self).resolve(self, ask_id, answers)
+    def resolve_question(
+        self, ask_id: str, answers: dict[str, str] | None, *, reason: str | None = None
+    ) -> bool:
+        """Resolve one blocking question future if it is still pending.
+
+        ``reason`` says why a ``None`` answer ended the wait (``dismissed``,
+        ``composer``, ...); only a blocking MCP ask reports it back to the agent.
+        """
+        return _questions_for(self).resolve(self, ask_id, answers, reason=reason)
+
+    async def open_agent_ask(
+        self, ask_id: str, slot_key: str, session_key: str, questions: list[dict]
+    ) -> int | None:
+        """Open a blocking MCP ask, or return ``None`` when live asks fill the cap."""
+        return await _questions_for(self).open_agent_ask(
+            self, ask_id, slot_key, session_key, questions
+        )
+
+    async def wait_agent_ask(self, ask_id: str, session_key: str, slice_secs: float) -> dict | None:
+        """Wait one slice for an agent ask; ``None`` when the caller does not own it."""
+        return await _questions_for(self).wait_agent_ask(self, ask_id, session_key, slice_secs)
+
+    def withdraw_agent_ask(self, ask_id: str, session_key: str) -> bool:
+        """Withdraw an agent ask whose tool call was cancelled."""
+        return _questions_for(self).withdraw_agent_ask(self, ask_id, session_key)
 
     def cancel_questions_for_slot(self, slot_key: str) -> int:
         """Unblock every blocking question owned by one slot."""

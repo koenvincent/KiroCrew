@@ -44,7 +44,7 @@ Follow these rules for every `gh` invocation below:
   conversation and pass them as a double-quoted literal. Do not paste raw user
   text (with its punctuation/metacharacters) into the search string.
 - If you cannot safely pass a value, fall back to the copy/paste option
-  (Option 2) instead of shelling out.
+  (Option 1) instead of shelling out.
 
 ## Workflow
 
@@ -83,6 +83,22 @@ gh issue list --repo "$REPO" \
 
 If you find related issues, show them to the user and ask if any cover their
 need. They may want to comment on an existing issue instead.
+
+**This search is also your up-front capability check.** It is the first `gh`
+call in the flow, so its outcome tells you — *before* you draft anything —
+whether direct submission (Option 3) will work on this host:
+
+- If it succeeds, `gh` is installed and authenticated, so Option 3 is available.
+- If it fails with `command not found`, `gh` is not installed on this host.
+- If it fails with an auth error, `gh` is installed but not authenticated.
+
+In either failure case **say so now, before drafting**, so the user is not
+surprised after approving a draft. Nothing is lost: the flow still drafts the
+issue and hands it back as copy/paste text (Option 1), which needs neither `gh`
+nor Browser — only that the user is signed in to GitHub in their own browser to
+submit it. Do not silently proceed as if submission will work and only reveal
+the gap at the submit step. The duplicate search can still be skipped on failure;
+losing it does not block filing.
 
 ### 4. Draft the Issue
 
@@ -147,34 +163,67 @@ enhancement for feature requests, the two that have always existed — and skip
 the grouping dimensions, which are the part that grows. Do not guess a grouping
 value you could not read.
 
-### 6. Submit — Offer Three Options
+### 6. Submit — Offer the Options
 
-Present all three and let the user choose:
+What you can offer depends on the capability check in step 3. If `gh` worked,
+all three options below may apply. If it did not, Option 3 is unavailable on this
+host; offer Option 1, and Option 2 only when its query string is short (see
+below).
 
-**Option 1: Pre-filled URL** (if body ≤ 2000 chars)
+Lead with the routes that reliably reach the user. Crew's chat redacts any
+model-written URL whose query string is 200 characters or longer, with no
+exception for issue links (this is intentional — injected content could hide
+private context in a prefilled `body=`, and the issue it creates is public). A
+prefilled link carrying a drafted title and body almost always crosses that
+length and would render as `[REDACTED: suspicious URL]` rather than a clickable
+link, so Option 1 is the primary route and Option 2 is offered only in the rare
+short-query case where it survives redaction.
+
+**Option 1: Copy/paste** (always works, nothing to install)
+
+Show the formatted title and body in a code block the user can copy, and give
+them the plain new-issue form link — it has no query string, so it is never
+redacted:
+
+```
+https://github.com/kirodotdev/KiroCrew/issues/new
+```
+
+The user pastes the title and body into that form and submits. This needs only
+that they are signed in to GitHub in their own browser. You can also point them
+at the feature-request template form, whose only query parameter is short enough
+to survive redaction:
+
+```
+https://github.com/kirodotdev/KiroCrew/issues/new?template=feature_request.yml
+```
+
+**Option 2: Pre-filled URL** (only when its query string is short)
 
 Build a GitHub new-issue URL with query params:
 
 ```
-https://github.com/kirodotdev/KiroCrew/issues/new?title=URL_ENCODED_TITLE&body=URL_ENCODED_BODY&labels=URL_ENCODED_LABELS
+https://github.com/kirodotdev/KiroCrew/issues/new?title=URL_ENCODED_TITLE&body=URL_ENCODED_BODY
 ```
 
-`labels=` takes the comma-separated names chosen in step 5. **Percent-encode each
-label name in full**, not just its spaces: an unencoded `&` starts a new query
-param and an unencoded `#` pushes the remainder into the URL fragment, either of
-which silently drops the drafted body from the pre-filled issue. Encode the
-separating comma as `%2C`.
+Do **not** add a `labels=` parameter: GitHub answers 404 to a `labels` query
+from anyone without permission to label issues in this repo, which is most
+users (chosen labels apply only through Option 3, and triage labels the rest).
+**Percent-encode the title and body in full**, not just their spaces: an
+unencoded `&` starts a new query param and an unencoded `#` pushes the remainder
+into the URL fragment, either of which silently drops the drafted body from the
+pre-filled issue.
 
-Note: URL-encode the title and body. If the total URL exceeds ~4000 chars,
-warn the user it may be truncated and recommend Option 2.
+You build this URL, so you know its length: offer it **only when its query
+string is under 200 characters** (a short title and little or no body). At or
+above 200, Crew redacts it in chat as a suspicious URL (intentional, no
+exception for issue links), so do not offer it — leave it out silently and use
+Option 1 rather than handing the user a link that renders as a
+`[REDACTED: suspicious URL]` placeholder. (A URL over ~4000 chars may also be
+truncated by GitHub, another reason the short-query case is the only one worth
+offering here.)
 
-**Option 2: Copy/paste**
-
-Show the formatted title and body in a code block the user can copy into
-the GitHub new issue form at:
-`https://github.com/kirodotdev/KiroCrew/issues/new`
-
-**Option 3: Direct creation via `gh` CLI**
+**Option 3: Direct creation via `gh` CLI** (only if the step 3 check succeeded)
 
 On the user's choice, allocate files, then use the file-writing tool to write
 `BODY_FILE` with the confirmed body and `TITLE_FILE` with the confirmed title,
@@ -202,7 +251,7 @@ literal — double quotes would let the shell expand it. Omit the extra flags wh
 no grouping label applies.
 
 This requires `gh auth` on the user's machine. If it fails with auth errors,
-fall back to Option 2.
+fall back to Option 1 (copy/paste).
 
 ## Guidelines
 

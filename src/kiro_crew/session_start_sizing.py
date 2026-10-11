@@ -45,7 +45,6 @@ CPUS_PER_START = 4
 #: GB of available memory one started session tree holds.
 GB_PER_START = 3
 
-_CGROUP_V2_ROOT = Path("/sys/fs/cgroup")
 _READ_CAP = 4096
 
 
@@ -67,38 +66,47 @@ def parse_cpu_max(text: str) -> float | None:
     return quota / period
 
 
+def _cgroup_v2_roots() -> list[tuple[PurePosixPath, PurePosixPath]]:
+    """(process directory, mount boundary) for each visible cgroup v2 mount.
+
+    Reuses the subagent memory probe's walk, which already resolves the
+    process's membership against mountinfo; cgroup v2 is one unified
+    hierarchy, so the same directories hold ``cpu.max``.
+    """
+    from kiro_crew.subagent import _cgroup_memory_roots
+
+    return [(leaf, mount) for leaf, mount, v2 in _cgroup_memory_roots() if v2]
+
+
 def cgroup_cpu_quota(
-    proc_self_cgroup: str | None = None, root: Path = _CGROUP_V2_ROOT
+    roots: list[tuple[PurePosixPath, PurePosixPath]] | None = None,
 ) -> float | None:
     """Tightest cgroup v2 ``cpu.max`` quota over this process's cgroup ancestry.
 
     ``affinity_cpu_count`` cannot see a CFS quota (``docker run --cpus``,
     systemd ``CPUQuota=``): it sets no affinity mask. Any ancestor's quota
-    bounds the process, so the smallest along the path to *root* binds. Inside
-    a cgroup namespace the membership path is ``/`` and the walk reads only
-    *root*, which is where the container's own limit is mounted.
+    bounds the process, so the smallest on the path from the process's
+    directory up to the mount boundary binds. Inside a cgroup namespace the
+    process directory is the mount itself, where the container's own limit is.
     ``None`` when there is no quota, no cgroup v2, or nothing is readable.
     """
-    if proc_self_cgroup is None:
+    if roots is None:
         try:
-            with open("/proc/self/cgroup", encoding="utf-8") as fh:
-                proc_self_cgroup = fh.read(_READ_CAP)
-        except (OSError, UnicodeDecodeError):
+            roots = _cgroup_v2_roots()
+        except Exception:
+            logger.debug("cgroup root probe failed", exc_info=True)
             return None
-    membership: PurePosixPath | None = None
-    for line in proc_self_cgroup.splitlines():
-        hierarchy, _, rest = line.partition(":")
-        controllers, _, path = rest.partition(":")
-        if hierarchy == "0" and not controllers:
-            candidate = PurePosixPath(path.strip())
-            # Never let a crafted path walk outside *root*.
-            if candidate.is_absolute() and ".." not in candidate.parts:
-                membership = candidate
-            break
-    if membership is None:
-        return None
     best: float | None = None
-    directory = root.joinpath(*membership.parts[1:])
+    for leaf, mount in roots:
+        quota = _tightest_cpu_max(Path(leaf), Path(mount))
+        if quota is not None and (best is None or quota < best):
+            best = quota
+    return best
+
+
+def _tightest_cpu_max(directory: Path, mount: Path) -> float | None:
+    """Smallest ``cpu.max`` from *directory* up to and including *mount*."""
+    best: float | None = None
     while True:
         try:
             with open(directory / "cpu.max", encoding="utf-8") as fh:
@@ -107,7 +115,7 @@ def cgroup_cpu_quota(
             quota = None
         if quota is not None and (best is None or quota < best):
             best = quota
-        if directory == root or directory.parent == directory:
+        if directory == mount or directory.parent == directory:
             break
         directory = directory.parent
     return best

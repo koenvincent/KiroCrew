@@ -25,12 +25,17 @@ import type { ReactElement } from 'react'
 import type { ChatMessage } from '../types'
 import { mergeRenderers, resolveRenderer, type MessageRenderContext } from '../app-sdk/messageRenderers'
 import { createTranscriptRenderers, featureRequestRefusalIsNewest, sessionStartRepeatIsNewest } from '../pages/chat/transcriptRenderers'
+import { ErrorCard } from '../pages/chat/ErrorCard'
+import NoticeCard from '../pages/chat/NoticeCard'
+import { i18nT } from '../i18n/t'
 import { FEATURE_REQUEST_FORM_URL, FEATURE_REQUEST_ROW_META_KEY } from '../prompts/featureRequest'
 import { isWorkflowRunTool } from '../pages/chat/WorkflowRunCard'
 import { isSpawnRunTool } from '../pages/chat/SubagentRunCard'
 import { isWorkflowCompletionMessage } from '../pages/chat/WorkflowCompletionCard'
 import { isSubagentCompletionMessage } from '../pages/chat/subagentCompletion'
 import { parseRecoveryMessage } from '../pages/chat/RecoveryCard'
+import CrewmateMessage from '../pages/chat/CrewmateMessage'
+import { CARD_ROLE } from '../cards/ConversationCard'
 
 const msg = (role: string, over: Partial<ChatMessage> = {}): ChatMessage =>
   ({ role, content: '', cls: '', ...over }) as ChatMessage
@@ -198,6 +203,19 @@ describe('shape still beats role after the defaults are replaced', () => {
 describe('the error row offers Continue only where the single-chat surface does', () => {
   const errs = [msg('error', { content: 'first' }), msg('assistant', { content: 'x' }), msg('error', { content: 'last' })]
   const recoverable = { slot: 's1', continuable: true, interrupted: true, onContinue: () => undefined }
+
+  it('renders a restored-answer notice as a warn NoticeCard, not a red error', () => {
+    // The row the restore sites append: role 'notice' with NoticeCard's warn glyph.
+    const notice = msg('notice', {
+      content: '\u26A0\uFE0F ' + i18nT('components.pendingQuestionCard.answer_restored'),
+      cls: '',
+    })
+    expect(idFor(notice)).toBe('notice')
+    const el = render(notice, { slot: 's1' }, { messages: [notice] }) as ReactElement
+    expect(el.type).toBe(NoticeCard)
+    expect(el.type).not.toBe(ErrorCard)
+    expect(el.props.content).toContain(i18nT('components.pendingQuestionCard.answer_restored'))
+  })
 
   it('offers it on the last error only', () => {
     const last = render(errs[2], recoverable, { index: 2, messages: errs }) as ReactElement
@@ -537,5 +555,55 @@ describe('the single-chat surface renders from THIS row set', () => {
     expect(chatPageSrc).toMatch(/i18nT\('components\.mcpApp\.from_app', \{ app: appLabel\.split\('\/'\)\[0\] \}\)/)
     expect(chatPageSrc).not.toMatch(/noteSource/)
     expect(chatPageSrc).not.toMatch(/from_note/)
+  })
+})
+
+describe("a change card in a crewmate's chat", () => {
+  const mate = { name: 'mate', label: 'Mate' }
+  const card = msg(CARD_ROLE, { meta: { card_id: 'c1' } })
+
+  it("is the crewmate's own message, opening the run when it comes first", () => {
+    const messages = [msg('user', { content: 'hi' }), card, msg('assistant', { content: 'Press Apply change.' })]
+    const el = render(card, { slot: 's1', crewmate: mate }, { index: 1, messages }) as ReactElement<{ pos: string }>
+    expect(el.type).toBe(CrewmateMessage)
+    // The author line belongs to the card: it is the first bubble of the run.
+    expect(el.props.pos).toBe('start')
+  })
+
+  it("continues the run its acknowledgement opened, so there is one author line", () => {
+    const messages = [msg('user', { content: 'hi' }), msg('assistant', { content: 'Checking.' }), card, msg('assistant', { content: 'Ready.' })]
+    const el = render(card, { slot: 's1', crewmate: mate }, { index: 2, messages }) as ReactElement<{ pos: string }>
+    expect(el.type).toBe(CrewmateMessage)
+    expect(el.props.pos).toBe('cont')
+  })
+
+  it('stays a plain card outside a crewmate chat', () => {
+    const el = render(card, { slot: 's1' }, { index: 0, messages: [card] }) as ReactElement
+    expect(el.type).not.toBe(CrewmateMessage)
+  })
+})
+
+describe('a turn that hit its time limit links to the setting', () => {
+  const onOpenTurnLimit = () => undefined
+  const opts = { slot: 's1', continuable: true, interrupted: true, onContinue: () => undefined, onOpenTurnLimit }
+
+  it('hands the settings link to a turn_timeout row, and keeps Resume', () => {
+    const live = msg('error', { content: '⏱️ This turn hit the 4-hour limit.', kind: 'turn_timeout' } as Partial<ChatMessage>)
+    const el = render(live, opts, { index: 0, messages: [live] }) as ReactElement
+    expect(el.type).toBe(ErrorCard)
+    expect(el.props.onOpenTurnLimit).toBe(onOpenTurnLimit)
+    expect(el.props.onContinue).toBeTypeOf('function')
+  })
+
+  it('reads the kind from a rebuilt transcript row too', () => {
+    const restored = msg('error', { content: '⏱️ limit', meta: { kind: 'turn_timeout' } })
+    const el = render(restored, opts, { index: 0, messages: [restored] }) as ReactElement
+    expect(el.props.onOpenTurnLimit).toBe(onOpenTurnLimit)
+  })
+
+  it('withholds the link from every other error row', () => {
+    const other = msg('error', { content: '⏱️ This turn hit the 4-hour limit.' })
+    const el = render(other, opts, { index: 0, messages: [other] }) as ReactElement
+    expect(el.props.onOpenTurnLimit).toBeUndefined()
   })
 })

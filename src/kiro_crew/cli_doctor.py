@@ -35,6 +35,7 @@ module).
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import importlib
 import json
 import logging
@@ -60,15 +61,18 @@ from kiro_crew import (  # noqa: F401
     diagnostics,
     platform_compat,
     sandbox,
+    session_pid,
     stdlib_shadow,
     stt,
     user_json,
 )
 from kiro_crew._bootstrap import _source_checkout_root
+from kiro_crew._llama_lib_path import (  # noqa: F401
+    dropped_inherited_lib_path,
+)
 from kiro_crew.acp.client import KIRO_CLI_BIN
 from kiro_crew.acp.kas_transport import (
     KAS_RELAY_ENGINE,
-    KAS_RELAY_ENGINE_FLAG,
     build_kas_argv,
 )
 
@@ -85,6 +89,7 @@ from kiro_crew.agent_discovery import (
     project_agent_files,
     project_agent_name,
 )
+from kiro_crew.agent_sdk import kas_engine_gap
 from kiro_crew.agent_sdk.provider_identity import is_claude_code
 from kiro_crew.agent_spec_format import (  # noqa: F401
     NATIVE_SKILL_ALIAS_PREFIX,
@@ -147,6 +152,7 @@ from kiro_crew.embeddings import (  # noqa: F401
     _resolve_model_url,
     default_model_path,
     model_file_present,
+    operator_lib_path_override,
     resolve_custom_model,
     verify_vendored_libs,
 )
@@ -159,6 +165,7 @@ from kiro_crew.kiro_cli import (
     PATH_ONLY_INSTALL_NOTE,
     SPEC_PERMISSIONS_MIN_VERSION,
     installed_kiro_cli_version,
+    kas_relay_help,
     mcp_governance_may_apply,
     resolve_kiro_cli,
     spec_permissions_supported,
@@ -181,6 +188,10 @@ from kiro_crew.platform import (
 from kiro_crew.platform.capability_bound import bind_capability_manager
 from kiro_crew.platform.defaults import DefaultCapabilityManager
 from kiro_crew.platform.governance import CU_MCP_SERVER, may_skip_gate_now
+from kiro_crew.platform.tool_names import (
+    kas_verified_releases,
+    kas_vocabulary_drift,
+)
 from kiro_crew.sandbox import _MOUNT_SOURCE_PREFIX, warm_backend  # noqa: F401
 from kiro_crew.security import is_sensitive_path
 from kiro_crew.sel import sel
@@ -560,7 +571,10 @@ def _doctor_effective_model(cfg: KiroCrewConfig, project_dir: str, issues: list[
 # already-authenticated application must stay behind a prompt), and a diagnostic
 # command must not silently undo that.  Doctor still repairs the ``tools`` entry,
 # which only makes the server's tools *reachable*, never pre-approved.
-_NO_BLANKET_ALLOW_MCPS = frozenset({CU_MCP_SERVER}) | frozenset(_OPT_IN_MCPS)
+# ``kirocrew-guide`` is always on but is granted per tool
+# (``agent._GUIDE_AUTO_GRANTS``); a whole-server grant would also pre-approve any
+# tool added to it later, before anyone reviewed it.
+_NO_BLANKET_ALLOW_MCPS = frozenset({CU_MCP_SERVER, "kirocrew-guide"}) | frozenset(_OPT_IN_MCPS)
 
 
 def _strict_agent_json_specs(directory: Path) -> list[Path]:
@@ -936,25 +950,51 @@ def _doctor_mcp_tools(
         )
 
     if config_changed:
-        try:  # both verdicts on the shared spec are audited; the audit must not break doctor
-            sel().log_api_access(
-                caller="system",
-                operation="agent_home_write",
-                outcome="denied" if declined else "allowed",
-                source="cli_doctor",
-                resources=str(agent_path),
-            )
-        except Exception:  # noqa: BLE001
-            logger.debug("SEL audit unavailable for doctor spec write", exc_info=True)
-    if config_changed and declined:
-        print("  → Auto-fix skipped: shared home")
-        issues.append("agent config (auto-fix skipped: shared home)")
-    elif config_changed:
-        agent_data["tools"] = tools
-        agent_data["allowedTools"] = allowed
-        agent_data["mcpServers"] = mcps
-        atomic_write(agent_path, json.dumps(agent_data, indent=2) + "\n")
-        print("  → Auto-fixed agent config")
+        # The verdict that decides the write is the one taken under the agent-spec
+        # lock every spec writer of that directory holds, so a gateway that took
+        # ownership since the probe above is not overwritten by this auto-fix, and
+        # that final verdict is the one audited.
+        lock_error = ""
+        with contextlib.ExitStack() as spec_lock:
+            if not declined:
+                try:
+                    spec_lock.enter_context(_agent.agents_spec_lock(agent_path.parent))
+                except OSError as exc:
+                    lock_error = f"agent-spec lock unavailable ({exc})"
+                else:
+                    declined = _agent._decline_shared_agent_home(audit=False) is not None
+            try:  # both verdicts on the shared spec are audited; the audit must not break doctor
+                if lock_error:
+                    sel().log_api_access(
+                        caller="system",
+                        operation="agent_home_write",
+                        outcome="denied",
+                        source="cli_doctor",
+                        resources=str(agent_path),
+                        error=lock_error,
+                    )
+                else:
+                    sel().log_api_access(
+                        caller="system",
+                        operation="agent_home_write",
+                        outcome="denied" if declined else "allowed",
+                        source="cli_doctor",
+                        resources=str(agent_path),
+                    )
+            except Exception:  # noqa: BLE001
+                logger.debug("SEL audit unavailable for doctor spec write", exc_info=True)
+            if lock_error:
+                print(f"  → Auto-fix skipped: {lock_error}")
+                issues.append("agent config (auto-fix skipped: agent-spec lock unavailable)")
+            elif declined:
+                print("  → Auto-fix skipped: shared home")
+                issues.append("agent config (auto-fix skipped: shared home)")
+            else:
+                agent_data["tools"] = tools
+                agent_data["allowedTools"] = allowed
+                agent_data["mcpServers"] = mcps
+                atomic_write(agent_path, json.dumps(agent_data, indent=2) + "\n")
+                print("  → Auto-fixed agent config")
 
     if not probe_targets:
         return
@@ -1012,9 +1052,38 @@ def _doctor_mcp_tools(
         issues.append(f"{ref} probe")
 
 
-# Non-secret rows kiro-cli writes when the signed-in identity came from IAM
-# Identity Center. Presence is the signal; the values (a start URL and a region)
-# are never read into a message, and no token key is touched.
+def _doctor_whoami_governance() -> bool | None:
+    """Ask kiro-cli itself whether governance can reach the signed-in identity.
+
+    The store probe behind ``mcp_governance_may_apply`` counts the
+    ``auth.idc.*`` rows in ``state``, and some kiro-cli builds sign an Identity
+    Center user in without writing them: the sign-in then lives only in
+    ``auth_kv``, under the same ``kirocli:odic:`` key names a Builder ID sign-in
+    uses, so no key-name check can tell the two apart. ``kiro-cli whoami``
+    names the account type directly and no store value is read here.
+
+    ``True`` for Identity Center or an API key, ``False`` for Builder ID, a
+    social sign-in or no sign-in at all, and ``None`` when nothing is known
+    (whoami would not run or answer, or named a type this code does not know).
+    """
+    from kiro_crew.cloud.login_target import (
+        ACCOUNT_TYPE_API_KEY,
+        ACCOUNT_TYPE_IDENTITY_CENTER,
+        discover_local_identity,
+        is_personal_account_type,
+    )
+
+    identity = discover_local_identity()
+    if identity is None:
+        return None
+    account_type = str(identity.get("account_type") or "")
+    if account_type in (ACCOUNT_TYPE_IDENTITY_CENTER, ACCOUNT_TYPE_API_KEY):
+        return True
+    if not account_type or is_personal_account_type(account_type):
+        return False
+    return None
+
+
 def _doctor_mcp_governance(
     agent_path: Path, issues: list[str], *, gated_off: "frozenset[str] | None" = None
 ) -> None:
@@ -1084,6 +1153,31 @@ def _doctor_mcp_governance(
     # declaration and no leftover markers, is the ordinary case.
     if not governed_capable and not declared and not marked:
         return
+
+    if not governed_capable:
+        # The store probe found no Identity Center rows and no API key is set.
+        # That is not proof of a personal account, so confirm with kiro-cli
+        # before advising the declaration off: only reached when a declaration
+        # or markers exist, so an ordinary personal install never pays for it.
+        via_whoami = _doctor_whoami_governance()
+        if via_whoami is None:
+            print("\nMCP Governance (enterprise):")
+            print(
+                "  identity: unknown — no Identity Center rows in kiro-cli's store, "
+                "and `kiro-cli whoami` did not say which account this is"
+            )
+            if declared:
+                print("  ⚠️  registry mode is declared")
+            else:
+                print("  ⚠️  registry markers are present on the spec without the declaration")
+            print(
+                "      run `kiro-cli whoami`. On a Builder ID or social sign-in kiro-cli "
+                "drops these servers; fix:  kirocrew config set agent.mcp_registry_mode false"
+            )
+            print(f"      affected: {', '.join(marked) if marked else names}")
+            issues.append("MCP governance identity unknown")
+            return
+        governed_capable = via_whoami
 
     print("\nMCP Governance (enterprise):")
 
@@ -1445,39 +1539,15 @@ def _credential_vendor_line() -> str:
         return ""
 
 
-#: Bare flag name (no leading dashes) used to tell "this kiro-cli predates engine
-#: selection" apart from "it offers engines but not ours". Derived from the
-#: transport constant so the two can never drift.
-_KAS_ENGINE_FLAG_NAME = KAS_RELAY_ENGINE_FLAG.lstrip("-")
-
-
 def _kas_relay_help(binary: str) -> str | None:
     """``acp --help`` text for this kiro-cli, or ``None`` when the probe FAILED.
 
-    Read from help output because there is no machine-readable capability surface
-    for the engine selector. ``None`` means only one thing — the probe could not
-    run (spawn error, timeout) — so the caller reports genuinely-unknown as
-    unknown. Help text that RAN and simply lacks the engine selector is returned
-    as-is, not as ``None``: a kiro-cli too old to offer ``--agent-engine`` cannot
-    serve KAS at all, and reporting that as "unknown" would let a broken
-    configuration pass the readiness check and fail later at spawn instead.
-
-    Local binary, argv list, no shell, no credential involved.
+    The probe is :func:`kiro_cli.kas_relay_help` and the reading is
+    :func:`agent_sdk.kas_engine_gap`, both shared with the runtime floor
+    (``agent_sdk.kas_engine_unsupported_reason``), so the doctor and the gate
+    cannot read the help text differently.
     """
-    try:
-        proc = subprocess.run(  # noqa: S603 - argv list, no shell, local binary
-            [binary, "acp", "--help"],
-            capture_output=True,
-            timeout=15,
-            check=False,
-            # Pinned UTF-8 rather than bare text=True: help output is decoded
-            # here, and a platform-locale decode could mangle the flag name this
-            # probe searches for and report a supported kiro-cli as unreadable.
-            **UTF8_TEXT,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return None
-    return f"{proc.stdout}\n{proc.stderr}"
+    return kas_relay_help(binary)
 
 
 def _doctor_kas(issues: list[str]) -> None:
@@ -1551,26 +1621,21 @@ def _report_kas_backend(issues: list[str]) -> None:
     # letting it swallow this row would hide a withheld auto-approve on exactly
     # the host where kiro-cli is misbehaving.
     _report_kas_spec_permissions(issues)
+    _report_kas_tool_vocabulary(issues)
     help_text = _kas_relay_help(binary)
     if help_text is None:
         # The probe itself failed, so nothing is known either way. Advisory: a
         # diagnostic must not invent a verdict it could not establish.
         print("  engine:      ⚠️  could not read `acp --help`; engine support unknown")
         return
-    # Two distinct failures, both definite: the flag is absent entirely (a
-    # kiro-cli predating engine selection) or it is present without this engine.
-    if f"--{_KAS_ENGINE_FLAG_NAME}" not in help_text:
-        print(f"  engine:      ❌ this kiro-cli has no --{_KAS_ENGINE_FLAG_NAME} flag")
-        print("               Fix: update kiro-cli, or switch agent.acp_backend to kiro.")
-        issues.append(
-            f"kiro-cli is too old to select the KAS engine (no --{_KAS_ENGINE_FLAG_NAME})"
-        )
-    elif KAS_RELAY_ENGINE in help_text:
+    # The same reading the gateway's boot floor acts on: a gap is definite.
+    gap = kas_engine_gap(help_text)
+    if gap is None:
         print(f"  engine:      ✅ {KAS_RELAY_ENGINE} supported")
     else:
-        print(f"  engine:      ❌ this kiro-cli does not offer engine {KAS_RELAY_ENGINE}")
+        print(f"  engine:      ❌ {gap}")
         print("               Fix: update kiro-cli, or switch agent.acp_backend to kiro.")
-        issues.append(f"kiro-cli does not support the KAS engine ({KAS_RELAY_ENGINE})")
+        issues.append(f"kiro-cli cannot serve the KAS engine: {gap}")
     # Reported from the SAME decision as the ``auth owner:`` line above, so the
     # two cannot disagree: the relay resolves every access token from whichever
     # store owns the spawn -- Crew's vault when it holds a usable identity,
@@ -1621,6 +1686,52 @@ def _report_kas_spec_permissions(issues: list[str]) -> None:
     print("               already carries the block, `kirocrew setup --agent-only --clean`")
     print("               rebuilds it without the key.")
     issues.append("kiro-cli is too old to carry the KAS `permissions` block")
+
+
+def _report_kas_tool_vocabulary(issues: list[str]) -> None:
+    """Whether the installed engine is one the KAS tool-vocabulary tables were read from.
+
+    Crew mounts a spec's kiro-cli tool names on KAS by translating them to KAS's
+    built-in ids and governs KAS ids under their kiro-cli names
+    (``platform.tool_names``). Both directions were measured on ONE engine
+    release; any other kiro-cli ships a different KAS, which may rename a
+    built-in, add one, or (older) lack one. The mount direction fails silent
+    (an id the engine does not recognise is dropped from the spec's tool set
+    without an error, so a read tool is simply absent from the agent), the
+    policy direction fails permissive (an id the table does not know is
+    governed only under its own name), so a mismatch in either direction is
+    worth one line here. Advisory: another release is not known to have
+    drifted, only not known not to have.
+    """
+    version = installed_kiro_cli_version()
+    verified = kas_verified_releases()
+    drift = kas_vocabulary_drift(version)
+    if drift == "unknown" or version is None:
+        print(
+            f"  tool names:  ➖ vocabulary verified on kiro-cli {verified}; installed version unknown"
+        )
+        return
+    if not drift:
+        shown = ".".join(str(part) for part in version)
+        print(f"  tool names:  ✅ vocabulary verified on kiro-cli {verified} (installed {shown})")
+        return
+    shown = ".".join(str(part) for part in version)
+    if drift == "older":
+        # Unverified, not compatible: the tables were read from the verified
+        # releases and an older KAS may lack an id or spell it differently. Same
+        # standing as a newer one -- only the direction of the drift risk differs.
+        print(
+            f"  tool names:  ⚠️  installed kiro-cli {shown} is older than every release ({verified})"
+        )
+        print("               the KAS tool-name tables were verified on; not verified against it.")
+        print("               A built-in the tables name may be absent or spelled differently.")
+        return
+    relation = "newer than every release" if drift == "newer" else "not among the releases"
+    print(f"  tool names:  ⚠️  installed kiro-cli {shown} is {relation} ({verified}) the KAS")
+    print("               tool-name tables were verified on. A renamed or added built-in")
+    print("               would mount or be governed under a name Crew does not know.")
+    print("               Re-measure: test/fixtures/kas_builtin_tool_ids.json (its note says how),")
+    print("               then append the release to its verified_kiro_cli_versions.")
 
 
 def _discord_intent_grants(token: str) -> intent_probe.IntentGrants:
@@ -1762,6 +1873,7 @@ def _doctor(platform_boot_error: "Exception | None" = None, bundle: bool = False
         features,
         install,
         mcp,
+        render,
         resources,
         services,
         workload,
@@ -1956,6 +2068,9 @@ def _doctor(platform_boot_error: "Exception | None" = None, bundle: bool = False
     # ── Memory pressure preparedness (swap / userspace OOM killer) ──
     resources._doctor_memory_pressure(issues)
 
+    # ── ACP runtimes: live count, owner and backend CPU (advisory; Linux) ──
+    resources._doctor_acp_runtimes(issues)
+
     # ── Runtime tmpfs headroom (sandbox mount-source roots; Linux only) ──
     resources._doctor_runtime_tmpfs(issues)
 
@@ -1968,7 +2083,10 @@ def _doctor(platform_boot_error: "Exception | None" = None, bundle: bool = False
     workload._doctor_cron_health(issues)
 
     # ── Durable task queue (silent when no tasks.db exists yet) ──
-    workload._doctor_task_store(issues)
+    with render._unreadable_skips_section(
+        issues, "task store", confined=confinement._doctor_vantage_confined
+    ):
+        workload._doctor_task_store(issues)
 
     # ── Overload resilience: configured bounds + platform liveness evidence ──
     workload._doctor_overload_resilience(cfg)

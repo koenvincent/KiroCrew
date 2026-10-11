@@ -238,6 +238,55 @@ class TestApiSpawn:
         assert resp.status == 200
         assert mgr.spawn.call_args.kwargs["approval_floor"] == "interactive"
 
+    @pytest.fixture
+    def run_dirs(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+        monkeypatch.setattr(
+            "kiro_crew.subagent_persistence._agent_dir", lambda run_id: tmp_path / run_id
+        )
+        return tmp_path
+
+    def test_a_hub_chosen_run_id_names_the_run(self, run_dirs: Path) -> None:
+        """A remote hub records the name before it asks, so the run must start
+        under exactly that name for the hub's restart to find it."""
+        mgr = _mgr()
+        mgr.is_queued.return_value = False
+        mgr.spawn.return_value = _info()
+        body = {"task": "x", "run_id": "0123456789abcdef"}
+        resp = _run(mod.api_spawn, _Req(_state(subagents=mgr), body))
+        assert resp.status == 200
+        assert mgr.spawn.call_args.kwargs["_preassigned_id"] == "0123456789abcdef"
+
+    @pytest.mark.parametrize(
+        "run_id", ["../etc", "ABCDEF0123456789", "0123", 1234, "0123456789abcdef0"]
+    )
+    def test_a_malformed_run_id_is_refused(self, run_dirs: Path, run_id: object) -> None:
+        mgr = _mgr()
+        resp = _run(mod.api_spawn, _Req(_state(subagents=mgr), {"task": "x", "run_id": run_id}))
+        assert resp.status == 400
+        assert _payload(resp)["code"] == "invalid_run_id"
+        mgr.spawn.assert_not_called()
+
+    @pytest.mark.parametrize("where", ["live", "queued", "on-disk"])
+    def test_a_run_id_in_use_is_refused_not_reused(self, run_dirs: Path, where: str) -> None:
+        mgr = _mgr()
+        mgr.is_queued.return_value = where == "queued"
+        if where == "live":
+            mgr.get.return_value = _info()
+        if where == "on-disk":
+            (run_dirs / "0123456789abcdef").mkdir()
+        body = {"task": "x", "run_id": "0123456789abcdef"}
+        resp = _run(mod.api_spawn, _Req(_state(subagents=mgr), body))
+        assert resp.status == 409
+        assert _payload(resp)["code"] == "run_id_taken"
+        mgr.spawn.assert_not_called()
+
+    def test_without_a_run_id_the_gateway_names_the_run(self) -> None:
+        mgr = _mgr()
+        mgr.spawn.return_value = _info()
+        resp = _run(mod.api_spawn, _Req(_state(subagents=mgr), {"task": "x"}))
+        assert resp.status == 200
+        assert "_preassigned_id" not in mgr.spawn.call_args.kwargs
+
     @staticmethod
     def _floored_run(**kw: Any) -> Any:
         fields = {"id": "f1", "approval_floor": "interactive", "conversation_key": ""}

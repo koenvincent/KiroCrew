@@ -64,6 +64,13 @@ describe('textarea composer continues markdown lists on a new line', () => {
     expect(onSend).not.toHaveBeenCalled()
   })
 
+  it('Return before an item\'s text renumbers the items below it', () => {
+    const { ta, value } = mount('1. foo\n2. bar', 'ctrl-enter', '1. '.length)
+    expect(newLine(ta)).toBe(true)
+    expect(value()).toBe('1. \n2. foo\n3. bar')
+    expect(ta.selectionStart).toBe('1. \n2. '.length)
+  })
+
   it('insertParagraph (some Android keyboards) continues the list too', () => {
     const { ta, value } = mount('9) item')
     expect(newLine(ta, 'insertParagraph')).toBe(true)
@@ -267,6 +274,15 @@ describe('textarea composer clears a list marker in one Backspace', () => {
     expect(backspace(ta)).toBe(true)
     expect(value()).toBe('1. test\n')
     expect(ta.selectionStart).toBe('1. test\n'.length)
+  })
+
+  it('moves the items below back up when it clears a mid-list item', () => {
+    const { ta, value } = mount('1. foo\n2. bar', 'ctrl-enter', '1. foo'.length)
+    expect(newLine(ta)).toBe(true)
+    expect(value()).toBe('1. foo\n2. \n3. bar')
+    expect(backspace(ta)).toBe(true)
+    expect(value()).toBe('1. foo\n\n2. bar')
+    expect(ta.selectionStart).toBe('1. foo\n'.length)
   })
 
   it('clears an indented task marker in one press', () => {

@@ -52,6 +52,9 @@ window.addEventListener('capture:frame', (e) => {
     seq?: number
   }>).detail
   if (d.kind === 'busy') store.dispatch(busyFrame(d.slot))
+  // radar's turn has ended (the slots frame a stop delivers): the crewmate
+  // reads idle, for a frame whose action follows a stop.
+  if (d.kind === 'idle') store.dispatch(sseSlots([{ key: d.slot, title: 'Radar', messages: 4, running: false, mode: 'member', agent: 'radar' }]))
   // A pushed `member_projection` roster frame, the way the WebSocket delivers
   // one: this is how a crewmate's recency advances on the user's own send
   // without a roster refetch, so a recording of the Recent sort reordering has
@@ -87,6 +90,9 @@ const nav = params.get('nav') === '1'
 // member slot's stream state, which is what the pane's composer reads to
 // decide its busy affordance. Documents the steer-only composer.
 const busy = params.get('busy') === '1'
+// ?subagents=1 — radar's turn runs on the server with sub-agents out, but no
+// live frame has reached this tab yet: the stream state still reads idle.
+const subagents = params.get('subagents') === '1'
 document.documentElement.setAttribute('data-theme', theme === 'light' ? 'kiro-light' : 'kiro-dark')
 // ThemeProvider reads its cache from storage; without these it would resolve
 // its own default and repaint over the ?theme= the frame asked for.
@@ -109,6 +115,7 @@ store.dispatch(
       title: 'Radar',
       messages: 4,
       running: true,
+      ...(subagents ? { subagents_running: true } : {}),
       mode: 'member',
       agent: 'radar',
     },

@@ -54,13 +54,19 @@ import { errMessage } from '../utils/thunkError'
 import NewCrewmateDialog, { type CreatedCrewmate } from './members/NewCrewmateDialog'
 import { EFFORT_LEVELS, effortLabel, modelSupportsEffort } from '../lib/effort'
 import { templateSourceLabel, type TemplateProvenance } from '../lib/templateSource'
+import { hideMateWithoutPreview, isAssistantMember } from '../lib/assistantMember'
+import { usePreviewFlag } from '../hooks/usePreviewFlag'
+import { PREVIEW_CREW } from '../utils/previewFlags'
 import { DEFAULT_CREWMATE_PATH } from './overview/defaultCrewmateLink'
 
 import { i18nT } from '../i18n/t'
+import { uiLocation } from '../uiLocations/uiLocation'
+import { useGuidePredicate, useGuideSelection } from '../guide/guidePredicates'
 
 // An example input value, independent of the display language.
 const HEX_COLOR_EXAMPLE = '#4f8ef7'
 import ErrorNotice from '../components/ErrorNotice'
+import { guidePick } from '../uiLocations/targetRegistry'
 /** Common shape returned by the agent/workspace mutation endpoints. */
 interface AgentMutationResult {
   error?: string
@@ -456,7 +462,7 @@ export function MemoryStoreField({ value = '', member, memoryState = 'unavailabl
       {member && <span className="break-all font-mono text-[12px] text-muted">{isGlobal ? 'default' : value}</span>}
       <div className="flex flex-wrap gap-2">
         {(isGlobal || memoryState === 'private') && onManage && (
-          <Btn onClick={onManage} disabled={busy || manageDisabled}>
+          <Btn onClick={onManage} disabled={busy || manageDisabled} {...uiLocation('agents.manage-memory')}>
             {i18nT('pages.kiroCrewAgentsPage.manage_private_memory')}
           </Btn>
         )}
@@ -484,6 +490,7 @@ export function ModelField({ options, value, onChange, hint }: {
         value={value}
         onChange={onChange}
         aria-label={i18nT('pages.kiroCrewAgentsPage.edit_model')}
+        {...uiLocation('agents.model')}
       />
     </Field>
   )
@@ -534,6 +541,13 @@ export function DisplayNameField({ value, onChange, fallback }: { value: string;
       />
     </Field>
   )
+}
+
+/** What an empty display name falls back to: the crew's key, except for the
+ *  built-in Mate, whose empty label reads as its default name everywhere
+ *  else in the dashboard -- so its editor must not offer the internal key. */
+export function displayNameFallback(agent: KiroCrewAgent | null | undefined, key: string): string {
+  return isAssistantMember(agent) ? i18nT('components.assistantWelcome.default_name') : key
 }
 
 /** The routing-keyword input. Rendered by the create form and by the editor's
@@ -726,6 +740,7 @@ function CrewCard({ agent, isDefault, shared, onOpen }: {
       onClick={onOpen}
       aria-label={i18nT('pages.kiroCrewAgentsPage.edit_crew_named', { name: crewDisplayName(agent) })}
       data-testid="crew-card"
+      {...guidePick(crewDisplayName(agent))}
       className={`group flex flex-col gap-3 rounded-lg border bg-card p-3.5 transition-all
                   hover:border-border-strong hover:shadow-md focus-ring
                   ${isDefault ? 'border-accent-subtle' : 'border-border'}`}
@@ -746,11 +761,6 @@ function CrewCard({ agent, isDefault, shared, onOpen }: {
               badges hold their size, so the row can never wrap. */}
           <div className="flex items-center gap-2 min-w-0">
             <span className="min-w-[3rem] flex-1 truncate font-mono text-[14px] font-semibold text-text-strong">{crewDisplayName(agent)}</span>
-            {/* The ID stays discoverable when a label covers it — crons, spawn
-                params and the CLI address the ID, never the label. */}
-            {crewDisplayName(agent) !== agent.name && (
-              <span className="truncate font-mono text-[11px] text-muted max-w-[14rem]" title={i18nT('components.agentSelector.agent_id_tooltip', { name: agent.name })}>{agent.name}</span>
-            )}
             {isDefault && <DefaultBadge />}
             {showsCrewSourceBadge(agent.source) && <CrewSourceBadge source={agent.source} />}
           </div>
@@ -819,6 +829,7 @@ function CrewRow({ agent, isDefault, shared, onOpen }: {
   return (
     <TableRow
       data-testid="crew-row"
+      {...guidePick(crewDisplayName(agent))}
       className={`cursor-pointer ${isDefault ? 'bg-accent-subtle/30' : ''}`}
       // Convenience only: the whole row is a click target, but a click that
       // landed on the name control must not fire this too or the editor would be
@@ -914,7 +925,8 @@ export default function KiroCrewAgentsPage({ embedded }: { embedded?: boolean } 
   // (`sharedTargets`). React Query's structural sharing keeps `agentsData`
   // identical until the roster actually changes, so this is stable between
   // fetches that return the same rows.
-  const agents = useMemo<KiroCrewAgent[]>(() => agentsData?.agents || [], [agentsData])
+  const crewPreview = usePreviewFlag(PREVIEW_CREW)
+  const agents = useMemo<KiroCrewAgent[]>(() => hideMateWithoutPreview(agentsData?.agents || [], crewPreview), [agentsData, crewPreview])
   const defaultAgent = agentsData?.default_agent || ''
 
   const { data: installedAgents, error: installedError } = useQuery({
@@ -1922,6 +1934,20 @@ export default function KiroCrewAgentsPage({ embedded }: { embedded?: boolean } 
   // built-in ✕ still closes it, and the pane surfaces its own errors.
   const templatePaneActive = pane === 'template'
 
+  // Guide facts (whether, never which): a crewmate's editor is open (the
+  // "choose the crewmate" step of a guide to an editor control), and, while
+  // it is, which section shows and whether its memory is one to manage. With
+  // the editor closed those read unknown rather than unmet.
+  useGuideSelection('crewmate_editor_open', { selected: !!editing, available: !!agentsData && agents.length > 0, name: editingAgent ? crewDisplayName(editingAgent) : undefined })
+  useGuidePredicate('crewmate_danger_zone_open', editing ? pane === 'danger' : null)
+  useGuidePredicate('crewmate_place_pane_open', editing ? pane === 'place' : null)
+  useGuidePredicate('crewmate_model_pane_open', editing ? pane === 'model' : null)
+  const editingMemory = editing && kirocrewCfg ? memberMemoryState(editing, memoryStore, kirocrewCfg.memory_stores) : null
+  useGuidePredicate(
+    'crewmate_memory_manageable',
+    editingMemory === null ? null : editingMemory === 'private' || (editing === 'default' && editingMemory === 'legacy'),
+  )
+
   return (
     <>
       {!embedded && <PageHeader title={i18nT('pages.kiroCrewAgentsPage.agents')} subtitle={i18nT('pages.kiroCrewAgentsPage.manage_agent_workspace_memory_store_bindings')} />}
@@ -2000,12 +2026,15 @@ export default function KiroCrewAgentsPage({ embedded }: { embedded?: boolean } 
           <div className="flex min-w-0 flex-1 basis-0 items-center">
             {agents.length > 1 && <ChangeDefaultLink />}
           </div>
-          <SendBtn onClick={openCreate} data-testid="new-crew" className="shrink-0">
+          <SendBtn onClick={openCreate} data-testid="new-crew" className="shrink-0" {...uiLocation('agents.add')}>
             <Plus className="lucide-inline" aria-hidden="true" />
             {i18nT('pages.kiroCrewAgentsPage.add_crew_member')}
           </SendBtn>
         </div>
 
+        {/* The crewmate list, in either view: what a guide's "choose the
+            crewmate" step points at (picking one opens its editor). */}
+        <div role="group" aria-label={i18nT('pages.kiroCrewAgentsPage.agents')} {...uiLocation('agents.crew-list')}>
         {agents.length === 0 ? (
           <div className="flex flex-col items-center">
             <EmptyState
@@ -2015,7 +2044,7 @@ export default function KiroCrewAgentsPage({ embedded }: { embedded?: boolean } 
             />
             {/* The call to action belongs where the explanation is, not only in
                 the toolbar above it. */}
-            <SendBtn onClick={openCreate}>{i18nT('pages.kiroCrewAgentsPage.create_your_first_crew')}</SendBtn>
+            <SendBtn onClick={openCreate} {...uiLocation('agents.create-first')}>{i18nT('pages.kiroCrewAgentsPage.create_your_first_crew')}</SendBtn>
           </div>
         ) : filtered.length === 0 ? (
           <EmptyState
@@ -2085,6 +2114,7 @@ export default function KiroCrewAgentsPage({ embedded }: { embedded?: boolean } 
             </Clickable>
           </div>
         )}
+        </div>
       </div>
 
       <Dialog open={!!sheet} onOpenChange={next => { if (!next) requestClose() }}>
@@ -2096,7 +2126,7 @@ export default function KiroCrewAgentsPage({ embedded }: { embedded?: boolean } 
              accessible name on its own — it has to say what you are doing to it.
              An explicit aria-label outranks Radix's aria-labelledby, and the
              DialogTitle still has to EXIST or Radix warns. */
-          aria-label={i18nT('pages.kiroCrewAgentsPage.edit_crew_named', { name: displayName.trim() || editing })}
+          aria-label={i18nT('pages.kiroCrewAgentsPage.edit_crew_named', { name: crewDisplayName({ name: editing, display_name: displayName, kiro_agent: editingAgent?.kiro_agent }) })}
           /* Radix closes on an outside pointerdown and on Escape. Dismissing
              mid-write is DELIBERATELY still allowed: the sheetEpoch/settleFor
              machinery below exists to make the abandoned write land harmlessly,
@@ -2138,12 +2168,12 @@ export default function KiroCrewAgentsPage({ embedded }: { embedded?: boolean } 
               <DialogTitle className="flex-1 font-mono">
                 {/* The draft label, live: retitling the crew is the one edit
                     whose effect IS this text, so it previews before Save. */}
-                {displayName.trim() || editing}
+                {crewDisplayName({ name: editing, display_name: displayName, kiro_agent: editingAgent?.kiro_agent })}
               </DialogTitle>
               {showsCrewSourceBadge(editingAgent?.source) && <CrewSourceBadge source={editingAgent.source} />}
             </div>
             <div className="ml-auto flex items-center gap-2" data-testid="crew-editor-actions">
-              <Btn onClick={openAvatarBuilder} disabled={sheetBusy} data-testid="header-edit-avatar" title={i18nT('components.avatarBuilder.edit_avatar')} aria-label={i18nT('components.avatarBuilder.edit_avatar')}>
+              <Btn onClick={openAvatarBuilder} disabled={sheetBusy} data-testid="header-edit-avatar" title={i18nT('components.avatarBuilder.edit_avatar')} aria-label={i18nT('components.avatarBuilder.edit_avatar')} {...uiLocation('agents.edit-avatar')}>
                 <UserPen className="lucide-inline" aria-hidden="true" />
                 {/* Both header labels fold to their icon on a phone-width
                     header so the crew name keeps its room (with two labelled
@@ -2151,7 +2181,7 @@ export default function KiroCrewAgentsPage({ embedded }: { embedded?: boolean } 
                     title truncated to "on…"); aria-label carries the name. */}
                 <span className="hidden sm:inline">{i18nT('components.avatarBuilder.edit_avatar')}</span>
               </Btn>
-              <Btn onClick={requestChat} title={i18nT('memoryV2.chat_member')} aria-label={i18nT('memoryV2.chat_member')}>
+              <Btn onClick={requestChat} title={i18nT('memoryV2.chat_member')} aria-label={i18nT('memoryV2.chat_member')} {...uiLocation('agents.chat')}>
                 <MessageSquare className="lucide-inline" aria-hidden="true" />
                 <span className="hidden sm:inline">{i18nT('memoryV2.chat_member')}</span>
               </Btn>
@@ -2182,6 +2212,13 @@ export default function KiroCrewAgentsPage({ embedded }: { embedded?: boolean } 
                   unsavedLabel={i18nT('components.crewEditor.unsaved_changes')}
                   sharedLabel={i18nT('components.crewEditor.tag_shared')}
                   panelIdPrefix={panelId}
+                  // The sections a guide opens on the way to a control inside
+                  // them (Delete crewmate, the model, the memory).
+                  segments={[
+                    { key: 'model', label: i18nT('pages.kiroCrewAgentsPage.model'), ...uiLocation('agents.section-model') },
+                    { key: 'place', label: i18nT('components.crewEditor.pane_workspace_memory'), ...uiLocation('agents.section-place') },
+                    { key: 'danger', label: i18nT('pages.kiroCrewAgentsPage.danger_zone'), ...uiLocation('agents.section-danger') },
+                  ]}
                 />
                 {/* `tabIndex={-1}` so moving focus here after a rail change is
                     possible without adding a Tab stop. The pane scrolls, not the
@@ -2201,7 +2238,7 @@ export default function KiroCrewAgentsPage({ embedded }: { embedded?: boolean } 
                         user opens to answer "who is this crew" — not under
                         routing (the UX lane's finding on this PR). The create
                         form keeps its copy beside Name for the same reason. */}
-                    <DisplayNameField value={displayName} onChange={setDisplayName} fallback={editing} />
+                    <DisplayNameField value={displayName} onChange={setDisplayName} fallback={displayNameFallback(editingAgent, editing)} />
                     <CrewOverviewPane
                       // The largest face in the editor opens the builder too, so
                       // the hub does not teach the opposite lesson from the
@@ -2455,7 +2492,7 @@ export default function KiroCrewAgentsPage({ embedded }: { embedded?: boolean } 
                             </Btn>
                           </>
                         ) : (
-                          <Btn danger onClick={() => setConfirmDelete(true)} disabled={sheetBusy}>
+                          <Btn danger onClick={() => setConfirmDelete(true)} disabled={sheetBusy} {...uiLocation('agents.delete')}>
                             {i18nT('pages.kiroCrewAgentsPage.delete_crew')}
                           </Btn>
                         )}

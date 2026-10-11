@@ -163,6 +163,7 @@
       "bundle-integrity.js",
       "data-home.js",
       "auto-update.js",
+      "auth-allowlist.js",
       "runtime/update/state-reporter.js",
       "runtime/update/managed-lane.js",
       "runtime/update/feed-lane.js",
@@ -208,6 +209,8 @@
       "perf-metrics.js",
       "host-config.js",
       "open-path.js",
+      "download-handler.js",
+      "download-expectations.js",
       "store-rename.js",
       "upgrade-cache.js",
       "remote-token.js",
@@ -254,7 +257,8 @@
       "icon-nightly.png",
       "trayTemplate.png",
       "trayTemplate@2x.png",
-      "EXTERNALLY-MANAGED"
+      "EXTERNALLY-MANAGED",
+      "AUTH-SERVER-ALLOWLIST"
     ],
     "extraResources": [
       {

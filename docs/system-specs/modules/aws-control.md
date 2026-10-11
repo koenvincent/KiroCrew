@@ -548,9 +548,9 @@ case no other term can see, including the coarse-clock collision reproduced by h
 two sequence type guards cover each other on a record with no sequence, so they are pinned
 as a pair. If the slot is absent or moved while the archive is
 being built, the skip is refused, the refusal leaves the newer record in place, and the
-run logs the reason before uploading the archive. `hooks._run_once` reads `uploaded` and
-reports and audits a skip as `unchanged` rather than as a push; a record without the field
-reads as a push. Neither the label publish nor the retention sweep runs on a successful
+run logs the reason before uploading the archive. The scheduled run's
+`backup.make_job_runner` runner reads `uploaded` and audits a skip as `unchanged`
+rather than as a push; a record without the field reads as a push. Neither the label publish nor the retention sweep runs on a successful
 skip. Labels follow a push, so a local rename reaches the drive on the next real upload
 rather than on a skip. An unchanged night cannot consume a keep slot or prune the archive
 the next skip depends on.
@@ -1391,14 +1391,56 @@ the gateway stopped. The panel copy says exactly that, because "share memory
 between my laptop and my cloud desktop" is the request that leads people here.
 
 The nightly toggle records whether an account is eligible for a scheduled
-snapshot. `aws_control.hooks._run_once` resolves an account and drive, checks
-S3 consent, runs only due backups, and SEL-audits invocation, success, and
-failure. It skips unavailable accounts or absent drives rather than creating
-resources itself. When `hooks._note_shared_drive` sees another install's prefix it
-logs and SEL-audits the observation and then PROCEEDS. It does not take ownership
-of the schedule: with the keys namespaced there is nothing left to collide, and a
+snapshot. `aws_control.hooks._run_once` resolves the account, checks S3 consent, and
+checks for the drive; it skips an unavailable account or an absent drive rather than
+creating resources, so when there is nowhere to push it CLAIMS no run at all (as the
+loop did before it went through the SDK — a claimed-but-empty `done` run would clear
+an owner's last failure on the Backup row). Otherwise, for each due kind it claims a
+Job SDK run through the same `start_async(kind, dedupe_key=account, …)` call the
+owner's manual backup uses — so a scheduled and a manual backup of one account dedupe
+on one key and the run shows on the Backup row. The run's `backup.make_job_runner`
+runner SEL-audits invocation, success, the `unchanged` skip, and failure, and feeds a
+failed scheduled run into the backoff `due_for_nightly` reads (minus a
+`ScheduledUploadWithheld` policy refusal, which is audited `withheld` and recorded
+nowhere — see the adopted-caller rule above). A drive lookup that
+RAISES (not one that returns no drive) is a fault that happens in the loop before any
+run is claimed, so the runner never sees it; `hooks._nightly_setup_failure` records and
+SEL-audits it per due kind there, the same two writes the runner makes after a claim,
+so a setup fault backs off exactly like a push fault. When the runner sees
+another install's prefix (checked once, on the snapshot kind only) it logs and
+SEL-audits the observation and then PROCEEDS. It does not take ownership of the
+schedule: with the keys namespaced there is nothing left to collide, and a
 single-owner schedule would leave one machine silently un-backed-up, which is
 discovered at restore time and is worse than the state it replaced.
+
+Because a scheduled and a manual backup of one account share one `(kind,
+dedupe_key)`, an owner's "Back up now" click DURING a nightly adopts the in-flight
+scheduled run: the SDK returns the first caller's run and `start_async` does not
+merge params, so the adopted run keeps `CALLER_SCHEDULED` and still runs the
+scheduled-only re-checks in `backup_parts/uploads.py`. The caller an adopted run
+keeps is therefore the SCHEDULED one, by construction — and the rule that keeps that
+honest for the owner is the backoff split below: a scheduled-only precondition the
+OWNER controls — the per-kind unattended grant withdrawn, or scheduled transcripts no
+longer allowed because outbound redaction was turned on mid-build — raises
+`uploads.ScheduledUploadWithheld` rather than a bare failure, and the runner audits it
+`withheld` and does NOT call `record_nightly_failure`. Without that split, an owner
+who clicked during a nightly and surfaced one of those gates would see a failure they
+did not cause and watch the backoff grow. The unregistered-kind fail-closed (no grant
+DEFINED for a kind) stays a fault that backs off: it is a configuration error, not an
+owner declining the upload.
+
+The scheduled runner re-resolves the drive per run, but it reads `(profile, region)`
+differently from the owner path. `accounts.resolve_account_profile_cached` serves only
+from the warm snapshot and returns `None` once it is past `accounts._PROBE_TTL_SECS`,
+and `start_async` is fire-and-forget, so the runner thread resolves LATER than the
+loop's live `probe_identity`. A gap longer than the TTL would resolve a nightly the
+loop JUST verified to `None` and audit it as failed. So the loop names the
+`(profile, region)` it freshly probed (`use_cache=False`) under `JOB_PARAM_PROFILE` /
+`JOB_PARAM_REGION`, and a scheduled run falls back to that pair when the cache has
+expired. This cannot operate on the wrong account: `_authorize_upload` still re-checks
+the LIVE account with `sts:GetCallerIdentity` before any byte leaves. The owner path
+carries neither param and keeps the cache-only resolve, because its route pre-flight
+has just warmed the snapshot. The bucket is always re-discovered either way.
 
 ### A failed unattended attempt is recorded, so the loop can back off
 
@@ -1410,10 +1452,13 @@ would take its never-ran branch on every wake, re-stage the whole data home into
 temporary directory, and repeat the same traceback roughly every half hour for as long as
 the fault lasted.
 
-`hooks._failed_attempt` closes that. It is the single place a failed unattended
-attempt is both SEL-audited and recorded, reached from the shared setup's handler
-and from each kind's own push, so the backoff cannot depend on which way the run
-broke.
+A failed unattended attempt is both SEL-audited and recorded in two honest places —
+`backup.make_job_runner`'s post-claim handler for a fault during the push, and
+`hooks._nightly_setup_failure` for a drive lookup that raises before any run is
+claimed — so the backoff cannot depend on which way the run broke. Both make the
+same pair of writes (the `failed` SEL audit under `backup/<subpath>` and
+`record_nightly_failure`), filed under one subject spelling per kind so a setup
+failure and a push failure for one kind never land apart.
 
 It closes that for a fault that leaves the state file writable, which is not every
 fault. A full disk fails the failure-write as well, so nothing is recorded and every
@@ -1424,7 +1469,10 @@ leaves the loop retrying as it does today. So a full disk is still a repeated-tr
 case; what this closes is the larger class where the disk is fine and the backup is not.
 
 Cancellation does not reach it: a cancelled attempt is teardown, and
-counting it would let a clean shutdown push the next night out.
+counting it would let a clean shutdown push the next night out. Neither does a
+`ScheduledUploadWithheld` refusal: the owner withdrawing an unattended grant, or
+turning redaction on, is a policy decision not to upload, not a fault, so counting it
+would let the owner's own setting grow the schedule's backoff.
 
 The record lives under `backup.NIGHTLY_FAILURE_STATE_KEY`, per account then per
 kind, as `{"at": iso8601, "since": iso8601, "consecutive": int, "error": str}`. It is a SEPARATE key

@@ -5079,6 +5079,44 @@ async def test_glab_does_not_forward_ambient_token_to_a_self_managed_host(monkey
 
 
 @pytest.mark.asyncio
+async def test_glab_chip_refresh_hands_the_cli_an_explicit_session_bus_address(monkeypatch) -> None:
+    """The sidebar PR/MR chip refresh runs one ``glab api`` per open MR on a timer.
+
+    glab asks the keyring over D-Bus, and a child left with no ``DBUS_SESSION_BUS_ADDRESS``
+    searches for the bus itself and, where none exists, autolaunches a private
+    ``dbus-daemon`` plus ``gnome-keyring-daemon`` that outlive the call, one pair per
+    probe. The strict allowlist never carries the key, so the runner pins the value the
+    parent resolved once: the user bus by its standard path when it exists, an inert
+    address otherwise, and never the gateway's own ambient value.
+    """
+
+    class FakeProcess:
+        returncode = 0
+
+    sandbox = MagicMock(
+        return_value=(["/usr/bin/sandbox-launcher", "/usr/bin/glab"], {"SAFE": "1"}, None)
+    )
+    monkeypatch.setenv("DBUS_SESSION_BUS_ADDRESS", "unix:path=/ambient/forwarded/bus")
+    monkeypatch.setenv("GITLAB_TOKEN", "glpat-" + "a" * 20)
+    monkeypatch.setattr(source, "_resolve_provider_executable", lambda _name: "/usr/bin/glab")
+    monkeypatch.setattr(source, "sandboxed_spawn_argv", sandbox)
+    monkeypatch.setattr(
+        source.asyncio, "create_subprocess_exec", AsyncMock(return_value=FakeProcess())
+    )
+    monkeypatch.setattr(source, "_collect_process_output", AsyncMock(return_value=(b"{}", b"")))
+
+    for resolved in (github_runner.INERT_SESSION_BUS_ADDRESS, "unix:path=/run/user/4242/bus"):
+        monkeypatch.setattr(
+            github_runner, "session_bus_address", lambda resolved=resolved: resolved
+        )
+        sandbox.reset_mock()
+        await source._run_json("glab", "api", "projects/1", host="gitlab.com")
+        env = sandbox.call_args.kwargs["env"]
+        assert env["DBUS_SESSION_BUS_ADDRESS"] == resolved
+        assert env["DBUS_SESSION_BUS_ADDRESS"] != os.environ["DBUS_SESSION_BUS_ADDRESS"]
+
+
+@pytest.mark.asyncio
 async def test_gitlab_mutations_forward_host_to_the_run_json_guard(monkeypatch) -> None:
     """Regression: the auto-merge and mark-ready mutation call sites must thread
     ``host=ref.host`` into :func:`_run_json`.
@@ -5934,6 +5972,24 @@ def _app(
     return app
 
 
+def _pin_local_owner_gate(monkeypatch) -> None:
+    """Admit the request at the host-provenance gate ``api_token_local`` consults.
+
+    The real gate resolves the caller's PID from the kernel's live loopback
+    connection table (``platform_compat.get_tcp_peer_pid`` reads ``/proc/net/tcp``
+    and every ``/proc/<pid>/fd``) and fails closed with 403 whenever that table is
+    changing or ambiguous. Under xdist, sibling workers churn that table, so the
+    host is an input to the test. The tests below pin the token's subject and
+    claims, not provenance; the gate's own verdicts are pinned in
+    ``test_member_memory_auth.py`` and ``test_dashboard_handlers_core_coverage.py``.
+    Patched on its defining module, which the handler imports at call time.
+    """
+    monkeypatch.setattr(
+        "kiro_crew.member_memory_auth.local_owner_bootstrap_allowed",
+        lambda _request: True,
+    )
+
+
 @pytest.mark.asyncio
 async def test_local_token_uses_configured_owner_subject(monkeypatch) -> None:
     from kiro_crew.dashboard.handlers import core
@@ -5942,6 +5998,7 @@ async def test_local_token_uses_configured_owner_subject(monkeypatch) -> None:
     audit = MagicMock()
     monkeypatch.setattr(core, "generate_token", generate)
     monkeypatch.setattr(core, "_sel", lambda: audit)
+    _pin_local_owner_gate(monkeypatch)
     app = web.Application()
     app["local_secret"] = "local-secret"
     state = MagicMock()
@@ -5969,6 +6026,7 @@ async def test_local_token_carries_embed_parent_port_claim(monkeypatch) -> None:
     generate = MagicMock(return_value="owner-token")
     monkeypatch.setattr(core, "generate_token", generate)
     monkeypatch.setattr(core, "_sel", lambda: MagicMock())
+    _pin_local_owner_gate(monkeypatch)
     app = web.Application()
     app["local_secret"] = "local-secret"
     state = MagicMock()
@@ -5996,6 +6054,7 @@ async def test_local_token_uses_local_owner_subject_without_configured_owner(mon
     audit = MagicMock()
     monkeypatch.setattr(core, "generate_token", generate)
     monkeypatch.setattr(core, "_sel", lambda: audit)
+    _pin_local_owner_gate(monkeypatch)
     app = web.Application()
     app["local_secret"] = "local-secret"
     state = MagicMock()
@@ -9789,16 +9848,16 @@ class TestAdfToMarkdown:
         re-derive the escape set and only then update this test. It is the shared
         contract Design Review asked for, in the one place that can fail.
         """
-        renderer = (
-            pathlib.Path(__file__).resolve().parents[1]
-            / "website"
-            / "src"
-            / "components"
-            / "MarkdownRenderer.tsx"
-        )
+        components = pathlib.Path(__file__).resolve().parents[1] / "website" / "src" / "components"
+        renderer = components / "MarkdownRenderer.tsx"
         if not renderer.is_file():
             pytest.skip("frontend renderer is not part of this checkout")
-        imported = set(re.findall(r"from '((?:remark|rehype)-[a-z0-9-]+)'", renderer.read_text()))
+        # The renderer's leading parse plugins live in a shared list it spreads
+        # in (the rich-text copy uses the same list), so the stack is the union.
+        sources = [renderer, components / "markdown" / "remarkBase.ts"]
+        imported = set()
+        for path in sources:
+            imported |= set(re.findall(r"from '((?:remark|rehype)-[a-z0-9-]+)'", path.read_text()))
         assert imported == {
             "remark-parse",
             "remark-gfm",

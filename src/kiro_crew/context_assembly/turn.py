@@ -18,6 +18,7 @@ New per-turn blocks belong here.
 from __future__ import annotations
 
 import logging
+from collections.abc import Collection
 from typing import TYPE_CHECKING, Any
 
 from kiro_crew.context_assembly import inclusion as _inclusion
@@ -49,8 +50,9 @@ def post_compaction_parts(
     runtime_source: str | None,
     steering_dirs: tuple[str, ...],
     essentials: str,
-    provider_type: str,
+    provider_type: str | None,
     context_provider: Any,
+    native_launch_sources: Collection[str],
 ) -> list[str]:
     """What a turn re-injects after a confirmed compaction dropped session start.
 
@@ -150,15 +152,18 @@ def post_compaction_parts(
     # labels before minting the genuine frame.
     if steering_dirs and not _essentials:
         _caps_fs = ctx._resolve_caps(model_window)
+        _skip_folder_roots, _declared_sources = _inclusion._folder_steering_delivery_snapshot(
+            provider_type=provider_type,
+            native_steering=context_provider is not None and context_provider.native_steering,
+            project=project,
+            native_launch_sources=native_launch_sources,
+        )
         _folder_ctx = _inclusion._render_folder_steering_section(
             steering_dirs,
             project,
             _caps_fs.steering,
-            skip_delivered_roots=ctx._project_steering_delivered(
-                provider_type,
-                context_provider is not None and context_provider.native_steering,
-                project,
-            ),
+            skip_delivered_roots=_skip_folder_roots,
+            delivered_sources=_declared_sources,
         )
         if _folder_ctx:
             # Bodies were scrubbed inside the renderer; the frame it
@@ -452,9 +457,10 @@ def interactive_guidance(
         # wants none of the Crew's dashboard-tool nudges (it drives its own
         # UI through its MCP tools), so honor that here too, not just for
         # _CRITICAL_RULES.
-        # ask_question posts a NON-BLOCKING card and the agent ends its turn:
-        # what blocks is the DECISION, not the tool call. [OPTIONS:] remains
-        # the cheaper choice mechanism on every interactive surface.
+        # ask_question BLOCKS on the dashboard and returns the answers as its
+        # tool result, so the answer never arrives as a user-role message.
+        # [OPTIONS:] remains the cheaper choice mechanism on every
+        # interactive surface.
         if ctx.has_dashboard_surface(session_key or "") and ctx._agent_includes_crew_context(agent):
             if not minimal_context:
                 current_config = ctx.live.snapshot() or ctx.KiroCrewConfig.load()
@@ -467,14 +473,14 @@ def interactive_guidance(
                         "status artifact.)"
                     )
             _interactive_guidance.append(
-                "\n\n(The ask_question tool posts a NON-BLOCKING dashboard card. "
+                "\n\n(The ask_question tool shows a dashboard card and BLOCKS until the "
+                "user responds; the answers are its tool result. "
                 "DEFAULT TO SILENCE: use it only when work cannot continue without a "
                 "human-only decision (permission, irreversible/costly action, or an "
                 "uninferable preference). Decide anything you can read, run, search "
                 "or infer yourself; never ask to reconfirm an authorized plan or "
-                "merely because a choice exists. END YOUR TURN after calling; the "
-                "answer arrives as the next user message, not the tool result. "
-                "When ending anyway, [OPTIONS:] is cheaper.)"
+                "merely because a choice exists. Do not end your turn after calling "
+                "unless the result says so. When ending anyway, [OPTIONS:] is cheaper.)"
             )
             # A follow-up card is distinct from both: it offers concrete NEXT
             # tasks after work is done, optionally handing one to a worktree.

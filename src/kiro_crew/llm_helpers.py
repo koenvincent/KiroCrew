@@ -40,10 +40,12 @@ from kiro_crew.hooks import (
     fire_tool_hooks,
     get_global_hook_store,
     hook_gate_kwargs,
+    title_is_trusted_mcp_identity,
 )
 from kiro_crew.image_refs import strip_image_refs
 from kiro_crew.messaging.link import canonical_key
 from kiro_crew.permission_floor import OUTCOME_REJECTED_TRANSPORT_FLOOR
+from kiro_crew.platform.tool_paths import WRITE_PLANE_KINDS as _WRITE_PLANE_KINDS
 from kiro_crew.platform.tool_paths import (
     command_shaped_strings,
     edit_target_candidates,
@@ -72,6 +74,7 @@ from kiro_crew.security import (
 )
 from kiro_crew.sel import sel as _sel
 from kiro_crew.start_priority import StartPriority
+from kiro_crew.tool_gate_busy import hook_gate_busy
 
 _PROMPT_BUSY_RETRIES = 2
 _PROMPT_BUSY_DELAY = 1.5  # seconds between retries
@@ -182,6 +185,28 @@ _TRANSIENT_MARKERS = (
     "fetch failed",
     "could not reach the model backend",
 )
+
+# The members of _TRANSIENT_MARKERS that name the network path rather than a
+# provider answer. Read only for an error raised without the structured
+# ``connection_failure`` verdict, and only when no other transient marker is
+# present, so a frame that also carries a provider answer keeps the fixed count.
+_CONNECTION_MARKERS = (
+    "connection reset",
+    "connectionreset",
+    "dispatch failure",
+    "dispatchfailure",
+    "econnrefused",
+    "econnreset",
+    "econnaborted",
+    "etimedout",
+    "epipe",
+    "ehostunreach",
+    "eai_again",
+    "socket hang up",
+    "fetch failed",
+    "could not reach the model backend",
+)
+_PROVIDER_ANSWER_MARKERS = tuple(m for m in _TRANSIENT_MARKERS if m not in _CONNECTION_MARKERS)
 
 
 def _is_transient_acp_error(msg: str) -> bool:
@@ -338,6 +363,66 @@ def transient_retry_delay(attempt: int) -> float:
     backs off on the identical curve and co-located peers don't retry in
     lockstep (see ``_JITTER_RNG``)."""
     base = _TRANSIENT_DELAY * (2 ** (attempt - 1))
+    return base + _JITTER_RNG.random() * 0.25 * base
+
+
+# ── Network-drop recovery window (interactive turns) ──
+#
+# A dropped network path (Wi-Fi off and on, a VPN reconnect, a laptop waking up)
+# usually lasts tens of seconds to a couple of minutes, longer than the ~14s the
+# fixed TRANSIENT_RETRIES ladder backs off for. A connection failure therefore
+# keeps re-prompting past that count until CONNECTION_RECOVERY_WINDOW_SECS have
+# passed since the ladder's first retry, with the backoff capped at
+# CONNECTION_RETRY_MAX_DELAY so the turn resumes soon after the network does.
+# Provider answers (5xx, throttle, capacity) keep the fixed count unchanged: a
+# provider that is answering with errors is not helped by waiting longer.
+CONNECTION_RECOVERY_WINDOW_SECS = 300.0
+CONNECTION_RETRY_MAX_DELAY = 30.0
+
+
+def acp_error_is_connection_failure(exc: BaseException) -> bool:
+    """True when *exc* is a transient failure of the network path itself.
+
+    Prefers the structured ``AcpError.connection_failure`` verdict taken from
+    the raw frame at raise time, and falls back to the message text for an
+    exception raised without it. Never true for an error the transient
+    classifier rejects, so a terminal error cannot enter the recovery window.
+    """
+    if not acp_error_is_transient(exc):
+        return False
+    flag = getattr(exc, "connection_failure", None)
+    if isinstance(flag, bool):
+        return flag
+    low = str(exc).lower()
+    return any(m in low for m in _CONNECTION_MARKERS) and not any(
+        m in low for m in _PROVIDER_ANSWER_MARKERS
+    )
+
+
+def connection_recovery_open(
+    exc: BaseException, ladder_started_at: float, *, now: float | None = None
+) -> bool:
+    """True while a connection failure may keep retrying past TRANSIENT_RETRIES.
+
+    *ladder_started_at* is the ``time.monotonic()`` reading taken when the
+    current retry ladder made its first retry; ``0.0`` (no ladder) is never
+    open. The window is measured from that first retry, so one outage gets one
+    window however many attempts it takes.
+    """
+    if ladder_started_at <= 0.0 or not acp_error_is_connection_failure(exc):
+        return False
+    current = time.monotonic() if now is None else now
+    return (current - ladder_started_at) < CONNECTION_RECOVERY_WINDOW_SECS
+
+
+def connection_retry_delay(attempt: int) -> float:
+    """Backoff delay (seconds) for the *attempt*-th retry of a connection failure.
+
+    The same curve as :func:`transient_retry_delay`, capped at
+    :data:`CONNECTION_RETRY_MAX_DELAY` (plus the same proportional jitter) so a
+    long outage is probed every half minute rather than at a doubling interval.
+    """
+    base = min(_TRANSIENT_DELAY * (2 ** (min(attempt, 32) - 1)), CONNECTION_RETRY_MAX_DELAY)
     return base + _JITTER_RNG.random() * 0.25 * base
 
 
@@ -1306,6 +1391,7 @@ def _title_denial(
     denied_regexes: list[str] | None,
     *,
     exempt_command: str | None = None,
+    identity_exempt: bool = False,
 ) -> tuple[str, str] | None:
     """Return the always-enforced denial for the tool *title*, or ``None``.
 
@@ -1325,8 +1411,15 @@ def _title_denial(
     # stall, refused the command as a sensitive path. ``exempt_command`` is
     # :func:`_path_tier_exempt`'s answer -- the one string that is that text; a
     # title that is not the command stays gated.
+    #
+    # ``identity_exempt`` is the same reasoning for a tool NAME: the caller sets
+    # it only when the title is exactly the call's own verified ``@server/tool``
+    # identity (``title_is_trusted_mcp_identity``), which names a tool, not a
+    # file. The bash and regex tiers below still read it.
     path_refusal = (
-        None if _is_exempt_command_text(title, exempt_command) else sensitive_path_refusal(title)
+        None
+        if identity_exempt or _is_exempt_command_text(title, exempt_command)
+        else sensitive_path_refusal(title)
     )
     if path_refusal:
         # A stall is passed through as worded (recognised by its fixed prefix, which
@@ -1344,7 +1437,7 @@ def _title_denial(
 
 
 def _edit_target_denial(
-    raw_params: dict | None, diff_path: str = ""
+    raw_params: dict | None, diff_path: str = "", tool_kind: str = ""
 ) -> tuple[str, str, str] | None:
     """The always-enforced denial for a file-EDIT tool call, or ``None``.
 
@@ -1383,7 +1476,7 @@ def _edit_target_denial(
     a call with neither trusted params nor a diff block never gets here and
     keeps the document scan.
     """
-    candidates = edit_target_candidates(raw_params, diff_path)
+    candidates = edit_target_candidates(raw_params, diff_path, tool_kind=tool_kind)
     if candidates.truncated:
         return (
             "path",
@@ -2995,11 +3088,40 @@ async def _resolve_permission(
     # These run even for AUTO_APPROVE callers (workflows, crons, etc.)
     # to ensure BUILTIN_DENY_PATTERNS and sensitive-path protection cannot
     # be bypassed by callers that skip HookManager wiring.
+    # The empty-title guard, the deny-regex/bash tiers and the reported title
+    # all read the RAW title, exactly as the hook side does: its deny tier runs
+    # over BOTH ``GateFacts.normalized`` AND the raw ``call.title``
+    # (``deny_targets``), and a deny rule such as ``^Running: ...`` is written
+    # against the prefixed title, so stripping it here would stop that rule
+    # matching and let a denied tool through. Only the IDENTITY exemption below
+    # reads the normalized title, matching ``GateFacts.exempt_identity`` (which
+    # uses ``self.normalized``): that is the one check the two sides must agree
+    # on -- ``Running: @server/tool`` and ``@server/tool`` name the same
+    # verified identity, so both must be exempt.
     normalized = event.title or ""
     if not normalized:
         _log("denied", error="Blocked: missing tool title", metadata={"mechanism": "always_deny"})
         await _steer_host_deny(
             provider, event, "the tool call carried no title", cause=DENY_CAUSE_INVALID_NAME
+        )
+        await provider.reject_tool(event.request_id)
+        return False
+    # The frame named an MCP server or tool longer than Crew's own tool surface
+    # admits (``mcp_identity_unreadable``): not a call that names no tool but one
+    # whose exact per-tool deny cannot be checked, so it is refused here on every
+    # surface -- the same as the handle and the client do before this tier -- and
+    # never judged by its title under an empty identity.
+    if getattr(event, "mcp_identity_unreadable", False):
+        _log(
+            "denied",
+            error="Blocked: MCP tool identity is unreadable (name over the tool-surface bound)",
+            metadata={"mechanism": "always_deny"},
+        )
+        await _steer_host_deny(
+            provider,
+            event,
+            "the tool call named an MCP server or tool longer than the tool surface admits",
+            cause=DENY_CAUSE_INVALID_NAME,
         )
         await provider.reject_tool(event.request_id)
         return False
@@ -3074,7 +3196,32 @@ async def _resolve_permission(
     # tightening: that call keeps its document scan below AND gains the
     # target gate). Suppressing the document scan stays keyed on the fully
     # trusted edit reroute (``_edit_params is not None``) alone.
-    _edit_target_gated = _edit_params is not None or bool(event.diff_path and not event.is_shell)
+    #
+    # A DELETE (KAS ``delete_file``, ACP kind ``delete``) is on the write plane
+    # too -- the file is gone -- and carries no document body, so it gains the
+    # target gate under the same trusted-provenance conditions as an edit and
+    # keeps its scan. Same predicate the hook tier and governance route on
+    # (``tool_paths.is_edit_call`` / ``WRITE_PLANE_KINDS``), so the three cannot
+    # disagree on which kinds a config-protecting hard deny applies to.
+    _trusted_delete = (
+        isinstance(event.tool_kind, str)
+        and event.tool_kind in _WRITE_PLANE_KINDS
+        and event.tool_kind != _EDIT_TOOL_KIND
+        and event.shell_classified
+        and not event.is_shell
+        and event.raw_params_trusted
+        and isinstance(event.raw_tool_params, dict)
+    )
+    _edit_target_gated = (
+        _edit_params is not None or _trusted_delete or bool(event.diff_path and not event.is_shell)
+    )
+    # The params the target gate judges: an edit's (rerouted) or a trusted
+    # delete's; a diff-only route passes None and is judged by ``diff_path``.
+    _gated_params = (
+        _edit_params
+        if _edit_params is not None
+        else (event.raw_tool_params if _trusted_delete else None)
+    )
     # Every OTHER non-shell tool with client-established provenance gets a
     # FIELD-SCOPED scan: the same three predicates, over every string in the
     # trusted params except a document body (``platform.tool_paths.
@@ -3168,12 +3315,20 @@ async def _resolve_permission(
         # the strings. Title first, so a request denied on its title
         # reports the title-tier reason and mechanism exactly as before.
         title_hit = _title_denial(
-            normalized, _denied_regexes, exempt_command=_path_tier_exempt(event)
+            normalized,
+            _denied_regexes,
+            exempt_command=_path_tier_exempt(event),
+            identity_exempt=title_is_trusted_mcp_identity(
+                _normalize_tool_name(normalized),
+                getattr(event, "mcp_server_name", "") or "",
+                getattr(event, "tool_name", "") or "",
+                mcp_identity_trusted=bool(getattr(event, "mcp_identity_trusted", False)),
+            ),
         )
         if title_hit is not None:
             return (title_hit[0], title_hit[1], normalized, "always_deny")
         if _edit_target_gated:
-            edit_hit = _edit_target_denial(_edit_params, event.diff_path)
+            edit_hit = _edit_target_denial(_gated_params, event.diff_path, event.tool_kind)
             if edit_hit is not None:
                 return (*edit_hit, "always_deny_input")
         if _scoped_truncated:
@@ -3252,6 +3407,7 @@ async def _resolve_permission(
         tool_result = await run_in_tool_gate_pool(
             hooks.on_tool_call,
             event.title,
+            on_queue_timeout=hook_gate_busy,
             session_key=session_key,
             agent=agent,
             app=app,

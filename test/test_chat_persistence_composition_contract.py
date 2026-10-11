@@ -435,7 +435,7 @@ _SIGNATURES: dict[str, str] = {
     "_restored_mode": "(raw: 'object') -> 'str'",
     "_retain_reasoning_effort_values": "(acp_levels: 'list[str]', *, source: 'str') -> 'list[str]'",
     "_sanitize_open_slot_key": "(raw: 'object') -> 'str | None'",
-    "_save_slot_to_history": "(state: 'DashboardState', slot: '_ChatSlot', messages: 'list[dict] | None' = None, *, closed: 'bool' = False, closed_at: 'float | None' = None, force: 'bool' = False, rewrite: 'bool' = False, expected_history_key: 'str | None' = None, expected_disk_older_count: 'int | None' = None, expected_slot_name: 'str | None' = None, rows_only: 'bool' = False, pending_mode_slot: '_ChatSlot | None' = None, mutes_opened_override: 'bool | None' = None, after_commit_under_lock: 'Callable[[], None] | None' = None) -> 'bool'",
+    "_save_slot_to_history": "(state: 'DashboardState', slot: '_ChatSlot', messages: 'list[dict] | None' = None, *, closed: 'bool' = False, closed_at: 'float | None' = None, force: 'bool' = False, rewrite: 'bool' = False, expected_history_key: 'str | None' = None, expected_disk_older_count: 'int | None' = None, expected_slot_name: 'str | None' = None, rows_only: 'bool' = False, pending_mode_slot: '_ChatSlot | None' = None, mutes_opened_override: 'bool | None' = None, after_commit_under_lock: 'Callable[[], None] | None' = None, refuse_stale_empty_merge: 'bool' = False) -> 'bool'",
     "_stable_durable_queue": "(slot: '_ChatSlot') -> 'tuple[list[dict], int]'",
     "_tighten_carried_execution": "(meta_line: 'dict', mode: 'str') -> 'None'",
     "_validate_autocompact_pct": "(raw: 'object') -> 'float | None'",

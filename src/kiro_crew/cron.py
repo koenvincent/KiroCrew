@@ -2225,6 +2225,46 @@ class CronService:
             self._arm_timer()
         return ok
 
+    async def remove_job_if_async(
+        self,
+        job_id: str,
+        *,
+        expected_revision: str,
+        revision_of: Callable[["CronJob"], str],
+        actor: str,
+        source: str,
+    ) -> str:
+        """Compare-and-delete: remove *job_id* only while ``revision_of(job)`` still
+        equals *expected_revision*, read and deleted under one store lock off the
+        loop. Returns ``"removed"``, ``"not_found"`` or ``"changed"``; raises
+        :class:`CronStoreBusy` on sustained contention.
+        """
+        outcome = await asyncio.to_thread(
+            self._remove_job_if_locked, job_id, expected_revision, revision_of
+        )
+        if outcome == "changed":
+            self._audit_refused_removal(job_id, actor=actor, source=source)
+        else:
+            self._audit_requested_removal(
+                job_id, removed=outcome == "removed", actor=actor, source=source
+            )
+        if outcome == "removed":
+            self._arm_timer()
+        return outcome
+
+    def _audit_refused_removal(self, job_id: str, *, actor: str, source: str) -> None:
+        """Audit a compare-and-delete the live job's fingerprint refused."""
+        try:
+            sel.sel().log_api_access(
+                caller=actor,
+                operation="cron.remove",
+                outcome="denied",
+                source=source,
+                resources=f"job_id={job_id} reason=changed_since_apply",
+            )
+        except Exception:
+            logger.warning("SEL audit for cron removal failed (job %s)", job_id, exc_info=True)
+
     def _audit_requested_removal(
         self,
         job_id: str,
@@ -2486,6 +2526,39 @@ class CronService:
                 logger.info("Removed cron job %s", job_id)
                 return True
         return False
+
+    def _remove_job_if_locked(
+        self,
+        job_id: str,
+        expected_revision: str,
+        revision_of: Callable[["CronJob"], str],
+    ) -> str:
+        """Lock/reload/compare/mutate/save core of :meth:`remove_job_if_async`.
+
+        An exact ``revision_of``/``expected_revision`` match proceeds to the same
+        remove-rows + cascade + save the unconditional path uses; a live job that
+        differs is left untouched (``"changed"``), a missing one ``"not_found"``.
+        """
+        with self._file_lock():
+            self._sync_for_write()
+            job = next((j for j in self._jobs if j.id == job_id), None)
+            if job is None:
+                return "not_found"
+            if revision_of(job) != expected_revision:
+                return "changed"
+            # Same ordering as _remove_job_locked: the grant-epoch bump reads
+            # live rows and must precede the row filter.
+            self._bump_grant_epochs_for({job_id})
+            restore = self._remove_job_rows({job_id})
+            try:
+                self._save()
+            except BaseException:
+                for child, previous_owner in restore:
+                    child.session_key = previous_owner
+                self._reset_fingerprint()
+                raise
+            logger.info("Removed cron job %s", job_id)
+            return "removed"
 
     def _remove_job_rows(self, removed_ids: set[str]) -> list[tuple[CronJob, str]]:
         """Filter ``removed_ids`` out of ``self._jobs`` and cascade the release.
@@ -3949,6 +4022,17 @@ class CronService:
                     # contention is caught below and logged — the merge is
                     # best-effort and the next run / reaper re-persists.
                     await asyncio.to_thread(self._merge_job_result, terminal)
+                except CronStoreBusy as exc:
+                    # The lock was never won, so nothing was merged and the
+                    # one-shot consume did not run. A delete_after_run at-job
+                    # is still enabled (the consume is what stops it), so
+                    # without the deferral it is due again on the next tick.
+                    # Same owed rule as the consume in _merge_job_result.
+                    logger.warning("Result merge for job '%s' skipped: %s", job.name, exc)
+                    if terminal.delete_after_run and not (
+                        terminal.fire_time_denied or terminal.run_never_started
+                    ):
+                        self.defer_removal(terminal.id)
                 except Exception:
                     logger.exception("Failed to merge result for job '%s'", job.name)
                 # Record history
@@ -4067,6 +4151,16 @@ class CronService:
             if not job.failure_recorded and not job.run_never_started:
                 job.record_failure()
             logger.error("Cron job '%s' timed out after %ds", job.name, deadline)
+        finally:
+            # A one-shot whose run FAILED (error or timeout) is auto-paused, not
+            # consumed: the pause is execution-owned, so apply_run_record persists
+            # it under the generation fence and the doctor reports it. In a finally
+            # so a cancel after the failure still parks it. A denied or
+            # never-started run is not a failed run and keeps its own handling.
+            if job.delete_after_run and job.last_status == "error" and not job.auto_paused:
+                if not (job.fire_time_denied or job.run_never_started):
+                    job.enabled, job.auto_paused = False, True
+                    job._audit_pause_change("auto_paused")
 
     async def _execute(self, job: CronJob, claim: _RunClaim | None = None) -> None:
         """Run the job callback and update runtime fields (last_run_ts, last_status).
@@ -4208,9 +4302,12 @@ class CronService:
             # unreadable store to an empty job list WITHOUT raising, so presence
             # is exactly what a corrupt store destroys, and the deferred queue
             # below then never fired for a delete that was still owed on disk.
-            delete_owed = job.delete_after_run and not (
+            # A failed run's auto-pause is only in memory until the save lands, so
+            # a save fault keeps the plain consume rule (as the busy path does).
+            consume_on_fault = job.delete_after_run and not (
                 job.fire_time_denied or job.run_never_started
             )
+            delete_owed = consume_on_fault and job.last_status != "error"
             removed_one_shot = False
             restore: list[tuple[CronJob, str]] = []
             consumed_row = False
@@ -4281,10 +4378,10 @@ class CronService:
                 # reload, and the save never landed, so the disk copy is still
                 # enabled. Without a queue entry the reloaded one-shot comes back
                 # enabled and runs a second time on the next tick. Keyed on
-                # delete_owed, NOT presence: an absent id proves nothing about
+                # consume_on_fault, NOT presence: an absent id proves nothing about
                 # whether the delete is owed, and the drain intersects the queue
                 # with what is present and drops the rest.
-                if delete_owed:
+                if consume_on_fault:
                     self._pending_removals.add(job.id)
                 if isinstance(exc, CronStoreUnreadable):
                     # Return WITHOUT auditing: the emit below records only a SAVED

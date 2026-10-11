@@ -1215,11 +1215,39 @@ Contract:
 **HTTP refusals** of `/api/portability/*` (`dashboard/handlers/portability.py`)
 each carry a machine-readable `code`: `file_field_required` (400),
 `invalid_import_mode` (400), `import_archive_invalid` (400, with the validator's
-detail), `import_archive_too_large` (413), `auth_required` (401), a 409 with the
+detail), `invalid_components` (400, a `?components=` value other than `memory`),
+`memory_only_merge_only` (400, a Replace asked for memory only or given a memory
+bundle), `import_archive_too_large` (413), `auth_required` (401), a 409 with the
 refusal's own code, and `export_failed` / `import_failed` / `preview_failed`
 (500, opaque prose). A 4xx carries an actionable detail; a coded 5xx does not, so
 the dashboard's `PortabilityTab` `refusalText` shows its own localized fallback for
 a coded 5xx and the server's text otherwise.
+
+**Memory only.** `GET /api/portability/export?components=memory` builds an
+archive holding only the snapshot `memory` component (`memory.db`,
+`memory_index.db`, `workspace/memory/`, `workspace/knowledge/`, `memory_stores/`),
+never chats. Its manifest declares `components: ["memory"]` and carries
+`portability.MEMORY_EXPORT_MANIFEST_VERSION`, which lies outside the
+`1..EXPORT_MANIFEST_VERSION` range a whole-install import accepts, so a reader
+that does not know memory bundles refuses one rather than applying it as a whole
+install. `POST /api/portability/import?mode=merge&components=memory` extracts and
+merges only the memory members of any archive; an archive whose manifest declares
+memory only is imported that way without the parameter. The manifest is the one
+member at `<prefix>/MANIFEST.json` (`portability._top_manifest`); both the
+validator and the import read only that one, so a deeper file with that name is
+ordinary content. No top-level manifest, or more than one, is refused. Memory is
+not redacted: the dashboard shows a confirm step listing what the file holds
+before it builds the export.
+
+**Member names.** Because the memory filter reads member NAMES, both
+`validate_import_zip` and `apply_import_zip` refuse a name an extractor could
+place elsewhere (`portability._unsafe_member_name`): `..`, an absolute name, a
+drive prefix (`C:/x`, which Windows `zipfile` strips), and, only on a host where a
+backslash is a path separator, a backslash-spelled form of those. On POSIX a
+backslash is an ordinary filename character and is kept. After each extract the
+import also refuses a member that did not land under its own top directory. The
+manifest is capped at `_MAX_SETTINGS_DOCUMENT_BYTES` (8 MiB, the budget the export
+sizes its own manifest to, session times included) before it is decoded.
 
 The dashboard export (`portability.create_export_zip`) carries every document a
 Settings choice is persisted in: `config.json`, `config.local.json`,
@@ -2547,7 +2575,8 @@ flip could resume a stale session persisted under the other namespace),
 `mcp.extra_path_dirs`, `mcp.honour_auto_approve`, `instances.enabled`,
 `instances.tunnel_base_port`, `slack.command`, `whatsapp.db_path`, `dashboard.url`,
 `dashboard.tailscale.*` except `keep_awake`, `dashboard.restore_sessions`,
-`dashboard.restore_window_minutes`, `dashboard.surface_channel_sessions`,
+`dashboard.restore_window_minutes`, `dashboard.idle_slot_sweep_days`,
+`dashboard.surface_channel_sessions`,
 `dashboard.loop_stall_exit_after_secs` (read once at boot to build the loop-stall
 watchdog), `dashboard.cautious_boot`, `dashboard.auto_open_browser` and `tunnel.*`.
 When the two disagree, the schema wins.
@@ -2645,6 +2674,7 @@ class AgentConfig:
     streaming: bool = True
     model: str = "auto"            # resolved from agent config
     provider: str = "acp"          # fixed to "acp" (kiro-cli) — the only provider
+    bot_name: str = ""             # the name the agent identifies as in conversations (the {bot_name} placeholder in prompts); "" = the provider's default (Kiro). Loaded through _sanitize_bot_name (sections.py): NFC-normalized, capped at 50 code points (_BOT_NAME_MAX), then filtered to Unicode letters (Lu/Ll/Lt/Lm/Lo), the combining marks that attach to them (Mn/Mc), decimal digits (Nd) and letter numbers (Nl, the ideographic zero) in any script, plus the ASCII space, "_", "-" and "." -- the character policy of the artifact tag rule (artifacts.md § Validation & Limits), applied as a filter that drops instead of a validator that refuses. Everything else is dropped: braces (the placeholder must not recurse), other punctuation, symbols and emoji, enclosing marks (the keycap), other numbers (², ½), controls, format characters (zero-width, bidi), the letters and marks that render as nothing (variation selectors, Hangul fillers: terminal_safe._is_invisible, the one shared table), surrogates and private-use. A non-ASCII space (NO-BREAK SPACE, IDEOGRAPHIC SPACE) becomes the plain space; a space run a removal leaves behind folds to one and a leading or trailing one is stripped; a double space the user typed is kept; the result is NFC-normalized again, since a removal can leave a composable pair adjacent. Three tag rules are not applied: compatibility forms (full-width ｋｉｒｏ) are kept as typed because a drop cannot name the plain spelling; a name may open with a separator; and a run of combining marks is not bounded, since the bound guards a chip's width and nothing draws this name. A name that filters to "" takes the default. Nothing is logged when a name changes, and the CLI `config set` echo shows the raw value (#18728 follow-ups). dashboard.bot_name is a separate field and is not filtered.
     sandbox: str = "auto"          # "auto" (default: standard tier -- namespace on Linux, seatbelt on macOS; leaves ~/.aws, ~/.ssh, ~/.kube visible for credential tooling; delegates to kiro-cli's internal sandbox on macOS when enabled) | "strict" (opt-in: also hides ~/.aws incl. sso/cache, ~/.ssh bar known_hosts, ~/.kube, ~/.config/gh and the _CC_FILES credential files; applies to sessions started after the change) | "off" (skips Kiro Crew's sandbox). Any other value falls back to "auto"
     sandbox_allow_no_isolation: bool = False  # SEC-009: acknowledge running un-isolated when no sandbox backend exists; false = loud SECURITY warning, true = info-level
     soft_stop_budget_secs: float = 10.0  # seconds to wait for cooperative cancel before hard kill [0.5, 60.0]
@@ -2688,7 +2718,7 @@ class AgentConfig:
 @dataclass
 class SessionConfig:
     timeout_secs: int = 3600       # 60 min idle timeout (DEFAULT_SESSION_TIMEOUT)
-    idle_exempt_keys: list[str] = []  # session keys the idle sweep never expires on the clock (a dashboard chat is dashboard:<sid>; a tab linked to a cron job or channel thread uses that link's key, e.g. cron:<job>, per chat_utils.session_key_for). Loaded as stripped non-empty strings, at most IDLE_EXEMPT_KEYS_MAX (= POOL_SIZE_MAX, 10: each listed key can keep a whole kiro-cli process tree running, the warm pool's per-entry cost) keys of at most IDLE_EXEMPT_KEY_MAX_CHARS (512) characters each; a longer key is dropped rather than truncated, and one warning is logged per load when any key is dropped; a non-list loads as []. Read at every sweep. A listed dashboard or cron-linked session is still reaped when its tab closes (a channel thread's session is channel-owned, so closing its viewer never reaps it), and the RSS recycle, when enabled, still applies. A listed key that never had a tab, such as a cron job run without one, is reaped on neither axis, so only that recycle or a restart ends it, even after its job is deleted. See session.md "Idle cleanup".
+    idle_exempt_keys: list[str] = []  # session keys the idle sweep never expires on the clock (a dashboard chat is dashboard:<sid>; a tab linked to a cron job or channel thread uses that link's key, e.g. cron:<job>, per chat_utils.session_key_for). Loaded as stripped non-empty strings, at most IDLE_EXEMPT_KEYS_MAX (= POOL_SIZE_MAX, 10: each listed key can keep a whole kiro-cli process tree running, the warm pool's per-entry cost) keys of at most IDLE_EXEMPT_KEY_MAX_CHARS (512) characters each; a longer key is dropped rather than truncated, and one warning is logged per load when any key is dropped; a non-list loads as []. Read at every sweep. A listed dashboard or cron-linked session is still reaped when its tab closes (a channel thread's session is channel-owned, so closing its viewer never reaps it), and the RSS recycle, when enabled, still applies. A listed key that never had a tab, such as a cron job run without one, is reaped on neither axis, even after its job is deleted; that recycle or a restart still ends it, and so does the identity sweep (retire_kiro_identity_sessions, which reads no list). Before each dashboard chat turn and each agent cron run (chat_runner._retire_sessions_on_identity_change) it retires a kiro-backed one once the live Kiro account is no longer the one it was spawned under, except that an agent cron run touches no session when the live fingerprint is empty without proving a sign-out (a social login the reader cannot identify, an unreadable or relocated store); a Kiro sign-out from the dashboard (kas_login._retire_runtimes_after_sign_out) runs it with no live account, which retires every idle kiro-backed session at once, whatever account each signed in with; a busy session is flagged and retired later. See session.md "Idle cleanup".
     empty_response_auto_continue: bool = True  # after TWO consecutive empty model responses, auto-send synthetic "continue" nudges on the same live session (transcript-visible notice; count bounded by empty_response_max_continues; the config gate fails OPEN to the default so a config-load hiccup cannot disable self-healing). See session.md "Empty-response recovery ladder".
     empty_response_max_continues: int = 1  # how many continue nudges may run back to back before the give-up card (EMPTY_RESPONSE_MAX_CONTINUES_MIN/MAX; load-time clamped to [1, 10] so a hand-edited 0 cannot disable recovery and a large value cannot arm an unbounded ladder). Default 1 keeps the pre-knob behavior byte-identical; above 1 the notice numbers each recovery ("recovery 2 of 3").
     autocompact_pct: float = 70.0  # context usage % at which auto-compaction triggers (DEFAULT_AUTOCOMPACT_PCT). Load-time clamped to [5.0, 90.0] (one constant pair shared with the dashboard write gate)
@@ -3164,6 +3194,11 @@ On Windows a fourth mechanism applies: a Job object attached to each agent spawn
 and one warning names the ones that are set
 (`sandbox._WINDOWS_INERT_RESOURCE_LIMIT_KEYS`).
 
+On macOS no mechanism bounds the agent tree's memory: the cgroup path is a no-op,
+and the session host's rlimit profile sets only `RLIMIT_NOFILE`, so `max_memory_mb`
+has no effect there, set or unset (see
+[`docs/decisions/2026-10-09-macos-has-no-agent-tree-memory-ceiling.md`](../../decisions/2026-10-09-macos-has-no-agent-tree-memory-ceiling.md)).
+
 `0` cannot be normalised away in either direction. On the rlimit path it is a
 documented request ("leave the inherited limit unchanged") with existing configs
 behind it; on the cgroup path systemd **rejects** a zero property and the scope
@@ -3575,10 +3610,20 @@ config sections cannot enter configuration through this path.
 
 ### Meet CrewMates first-run state
 
-`DashboardConfig.crewmates_onboarded` records that the four-step "Meet CrewMates"
-flow (`website/src/components/MeetCrewmatesFlow.tsx`) was finished or dismissed.
-The four steps introduce goal ownership, choose a name and starting setup,
-collect the desired outcome and run schedule, and confirm the goal and next run.
+`DashboardConfig.crewmates_onboarded` records completion of the "Meet CrewMates"
+creation flow (`website/src/components/MeetCrewmatesFlow.tsx`). It no longer
+controls automatic presentation: neither completing the tour nor entering
+Crewmates opens a fullscreen chapter. The Crewmates page owns the flow and
+opens it only on an explicit create action.
+The embedded steps collect a goal, choose a name, review the run schedule and
+confirm the result. They reuse the chapter shell without a portal or modal focus
+trap. Technical template selection stays under Advanced. The default is
+on-demand, so completing creation alone never schedules background work.
+Unfinished draft fields, step and errors survive returning to chat and reopening
+the still-mounted flow. Leaving the page warns before discarding an edited draft;
+a later crewmate proposal cannot silently replace it. After completion, the
+next opening starts fresh. The standalone shell retains its existing behavior
+for callers that explicitly request that presentation.
 The shared chapter shell hides floating decorative mascots below `sm` so they
 cannot overlap the headline or body in the stacked mobile header.
 Examples describe outcomes (issue triage, current release notes, passing checks),
@@ -3590,24 +3635,15 @@ The daily schedule accepts a minute-precision `HH:mm` time, defaulting to
 captured once per opening and used for both the cron and confirmation. An
 empty or invalid daily time prevents both button and Enter submissions before
 any create request. Hourly and on-demand choices do not require a time.
-Back preserves the selected time; reopening resets it. The ready screen repeats
+Back preserves the selected time; a fresh creation resets it. The ready screen repeats
 the submitted goal as plain text and formats the chosen time in the UI locale.
 The today/tomorrow label is calculated when creation completes, at minute
 precision; the selected minute itself counts as passed. Failed schedule writes
 show their recovery notice without a next-run claim. This flow creates a crew
 and optional recurring schedule, not a separate goal-completion control loop.
-Whether the workspace has seen the flow is the ONLY condition on showing it:
-existing crewmates and custom agents do not suppress it (`useMeetCrewmatesGate`
-reads neither the roster nor the installed agents). It opens once, at the first
-of: the end of the first-run tour for a new user while the Crew Members preview
-(`PREVIEW_CREW`, Settings → Developer → Feature Previews — the switch that shows
-the Crewmates page) is on, or the first visit to the Crewmates page (the page
-announces `mc-crewmates-page-entered`, and the gate opens unless
-`crewmates_onboarded` is already true on the server). The tour-end path keeps
-its `mc-crewmates-pending` timing so a workspace that finished first run before
-the chapter shipped is not interrupted on its next load; that workspace gets
-the flow on its first Crewmates page visit instead, custom agents included (the
-amended "Existing installs" rule of `docs/request-for-change/rfc-crewmates-launch.md`). The crewmate name is free-form: `POST /api/agents` keeps it as the crew's
+`useMeetCrewmatesGate` listens only for the explicit create event
+(`START_MEET_CREWMATES_EVENT`); it does not inspect the roster, installed
+agents, tour completion or prior completion flag before opening. The crewmate name is free-form: `POST /api/agents` keeps it as the crew's
 label and derives an id-shaped key from it (`members.key_new_crew`), so spaces
 and CJK are accepted. The flow disables Next only on a blank name; the server's
 `validate_member_name` is the gate, and a 400 `invalid_member_name` or
@@ -3652,36 +3688,12 @@ the crewmate is not evidence that this write landed -- so only when nothing matc
 reported as "may not have been saved", with a button to the Schedule page on
 the notice (leaving completes the flow) rather than inviting a duplicate. "Only when I ask" posts no schedule and step 4 then
 says nothing about reports or the Schedule page. An exit never waits for the
-server: `onDone` closes the chapter at once and persists `crewmates_onboarded`
-afterwards, because several exits navigate (`/members`, `/schedule`) and a
-full-screen chapter gated on a round trip would cover the page the user just
-asked for. A refused write is therefore shown where it can be: on the ready
-step when the create-time write failed (the flow is still open), on the NEXT
-entry when the write at exit failed (`persistFailed` carries it until a write
-succeeds). A refusal marks NOTHING locally: `markCrewmatesOnboarded` applies the
-render cache, the pending-mark clear and the in-memory flag only after the
-server accepted the write, so this browser is still due the chapter after a
-reload (which is what the notice says) instead of seeding a completion the
-server never recorded; within the same session the flow does not auto-fire
-again after it closed (the entry still opens it on demand). The flag is written
-through `PUT /api/config/theme` the moment the crewmate exists (the flow stays
-open for its ready step) and again when the user leaves.
-The Crewmates page re-opens the flow on demand; that run sets the flag too.
-`GET /api/theme/boot` exposes it beside the other first-run flags. The frontend
-mirrors it in `localStorage['mc-crewmates-onboarded']` as a render cache only,
-and — like `privacy_acked` — treats a workspace that was already `onboarded`
-before this chapter existed as done locally (never persisted): an existing user
-is not interrupted and reaches the flow from the Crewmates page, while a new
-user, whose tour completes in the same session, flows straight on. A new user
-who reloads or restarts BETWEEN the tour and this chapter is still due it: a
-FIRST tour completion (`markOnboarded` while not yet onboarded -- a replay from
-Settings by an existing user sets nothing) leaves `localStorage['mc-crewmates-pending']`
-on that browser, the seed and the boot rule both exempt a workspace carrying the
-mark from the "already onboarded counts as done" heuristic, and the mark is
-cleared when the chapter is marked done. Only a workspace onboarded with no such
-mark -- before this shipped, or from another machine -- is treated as an existing
-install. The same rule keeps the E2E and capture harnesses, which seed only
-`mc-onboarded`, clear of the chapter.
+server: `onDone` closes the page-owned flow immediately. Creation and completed
+exits persist `crewmates_onboarded` asynchronously; dismissing an unfinished
+draft writes nothing. A refusal remains visible through `persistFailed`, while
+the local completion cache is changed only after the server accepts the write.
+`GET /api/theme/boot` and the existing localStorage mirrors retain the legacy
+completion record for compatibility, but none of those flags auto-opens the flow.
 
 ### `ChannelConfig.from_dict(data: dict) -> ChannelConfig`
 Parses a channel config entry from JSON. Invalid activation values fall back to `"mention"`.

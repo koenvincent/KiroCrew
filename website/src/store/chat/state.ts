@@ -135,6 +135,11 @@ export interface FollowupItem {
  *  resolves any of them into the string a row shows. */
 export type SlotStatusDetail = ((ToolPhaseDetail & { toolCallId?: string }) | PhaseDetail) & { ts: number }
 
+export interface QuestionNotice {
+  message: string
+  kind: 'restored' | 'release_failed'
+}
+
 export interface ChatState {
   recoveryRevision?: number
   lastRecoveryRequestId?: string
@@ -206,6 +211,14 @@ export interface ChatState {
    *  generation replaces the floor instead of being ordered against it. */
   lastChunkGen: string | undefined
   _wsChunkedDuringFetch: boolean
+  /** How many rows `messages` held when the active slot's switch fetch was
+   *  dispatched (the cache `switchSlot.pending` restored, or none). Rows past
+   *  it were appended LIVE while that fetch was in flight -- a send into the
+   *  slot being opened -- and `switchSlot.fulfilled` keeps the user's own
+   *  bubbles among them when the page it replaces the view with predates them.
+   *  Transient like `_wsChunkedDuringFetch`; optional so a preloaded test state
+   *  need not spell it. */
+  _switchLiveFrom?: number
   /** Count of live frames reduced into the ACTIVE view (`applyActiveFrame`),
    *  for the life of this tab. A thunk that awaits across several requests
    *  samples it before and after, and declines to replace `messages` when it
@@ -307,6 +320,8 @@ export interface ChatState {
    *  rather than asserting a precise figure. */
   slotContextTokens: Record<string, { used?: number; window: number }>
   voicePlaying: boolean
+  /** A speech request for the active slot is waiting for its first audio. */
+  voicePreparing: boolean
   voiceAudio: string | null  // base64 stitched MP3 for replay
   subagents: Record<string, SubagentActivity>
   /** Aggregate "waiting to start" count per slot — agents accepted but queued
@@ -481,7 +496,12 @@ export interface ChatState {
   /** Pending ask_question cards keyed by slot. Keyed (rather than a single
    *  card) so concurrent ask_question calls from two slots cannot evict each
    *  other — the losing agent would block until its timeout. */
-  pendingQuestions: Record<string, { slot: string; ask_id?: string; questions: Array<{ question: string; header?: string; options: Array<{ label: string; description?: string }>; multiSelect?: boolean }>; serverCardId?: string; native?: boolean; draftActive?: boolean }>
+  pendingQuestions: Record<string, { slot: string; ask_id?: string; questions: Array<{ question: string; header?: string; options: Array<{ label: string; description?: string }>; multiSelect?: boolean }>; serverCardId?: string; native?: boolean; draftActive?: boolean; draftAnswers?: Record<string, string> }>
+  questionRequestsInFlight: Record<string, true | 'composer' | 'queued'>
+  /** Ask ids whose successful settlement must suppress draft recovery on every surface. */
+  questionsSettled: Record<string, true>
+  /** Restored-answer statuses and card-release failures kept outside transcript hydration. */
+  restoredQuestionNotices: Record<string, QuestionNotice>
   // Agent-authored follow-up suggestions (suggest_followup MCP tool), rendered
   // as a card above the composer. Keyed BY SLOT: a single global card let a
   // suggestion arriving in session B silently evict session A's unacted-on card,
@@ -562,6 +582,7 @@ export const initialState: ChatState = {
   slotContextPct: {},
   slotContextTokens: {},
   voicePlaying: false,
+  voicePreparing: false,
   voiceAudio: null,
   subagents: {},
   subagentQueued: {},
@@ -592,6 +613,9 @@ export const initialState: ChatState = {
   slotHistory: [],
   slotsSnapshotSeen: false,
   pendingQuestions: {},
+  questionRequestsInFlight: {},
+  questionsSettled: {},
+  restoredQuestionNotices: {},
   followups: {},
   folderSuggestions: {},
   stopPressedAt: {},

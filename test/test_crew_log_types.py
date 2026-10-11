@@ -30,6 +30,7 @@ from kiro_crew.crew_log import (
 )
 from kiro_crew.crew_log import entry_types as reg
 from kiro_crew.crew_log import (
+    lease,
     render_markdown,
 )
 from kiro_crew.crew_log import store as store_mod
@@ -273,6 +274,26 @@ CANONICAL: dict[str, dict] = {
         "corrects": [],
         "crew_key": "9f2c" + "0" * 60,
     },
+    "card/proposed": {
+        "slot": "member-helper",
+        "card_id": "cc_0a1b2c3d4e5f",
+        "kind": "setting.change",
+        "title": "Change chat.verbosity to brief",
+        "revision": 1,
+        "risk": "normal",
+        "turn": 3,
+        "mid": "m-7f3a",
+    },
+    "card/finished": {"card_id": "cc_0a1b2c3d4e5f", "status": "applied", "revision": 1},
+    "guide/offered": {
+        "slot": "member-helper",
+        "guide_id": "g_0a1b2c3d4e5f",
+        "actions": ["crewmate.create"],
+        "turn": 4,
+        "mid": "m-7f3b",
+    },
+    "guide/started": {"guide_id": "g_0a1b2c3d4e5f"},
+    "guide/finished": {"guide_id": "g_0a1b2c3d4e5f", "status": "completed"},
 }
 
 
@@ -284,6 +305,14 @@ def _isolated_home(tmp_path, monkeypatch):
     yield
     emit.drain_for_shutdown(timeout=2.0)
     emit.reset_caches()
+    # The holder table is process-global, so a handle a test here keeps reachable
+    # is a lease the next test on this worker reads as held. The v0.9.0-insider.4
+    # release run caught one in ``test_crew_log_writer.py``'s teardown, from this
+    # file. Read here, where it is created, without a ``gc.collect()``: a lease
+    # still held is a retention (typically a ``pytest.raises`` record whose
+    # traceback holds the ``append`` frame, and so the handle), not a frame that
+    # has not finished unwinding.
+    assert not lease._held, f"a lease outlived its test on this worker: {sorted(lease._held)}"
 
 
 # --- what is declared ------------------------------------------------------
@@ -330,7 +359,11 @@ def test_every_type_written_today_is_declared_and_nothing_else_is():
     # there is no file beside it), and a refused write's whole worth is its history --
     # a mistake book is a fold over refusals, and one overwritable document could hold
     # none of it.
-    assert len(SESSION_ENTRY_TYPES) == 38
+    #
+    # The five past that are the change cards and guide offers: each proposal is
+    # a row of the conversation, and ``card/*`` / ``guide/*`` record the proposal and
+    # every outcome in the same session's history.
+    assert len(SESSION_ENTRY_TYPES) == 43
     # Nine types the vocabulary owns that nothing writes. Declaring one would state
     # a shape no writer produces, and the first emitter to land would have to
     # satisfy a contract written without it. They pass through undeclared instead.
@@ -415,6 +448,12 @@ def test_only_a_vocabulary_the_writer_clamps_is_enforced():
         # vocabulary from the declaration beside the type, so the closed enum and the
         # writer's set are one tuple.
         ("dashboard/instance_changed", "action"),
+        # The card and guide stores' own finished statuses: the emitter refuses any
+        # other value before it builds the entry.
+        ("card/finished", "status"),
+        ("guide/finished", "status"),
+        # Dropped by the emitter, not refused, when it is not a known reason.
+        ("guide/finished", "reason"),
     }
     emitted = set(_types_with_a_producing_site())
     assert {spec_type for spec_type, _ in closed} <= emitted
@@ -817,7 +856,11 @@ def test_append_refuses_a_bad_payload_and_leaves_the_file_identical():
     before = crew_log_path("session", SESSION).read_bytes()
     with pytest.raises(CrewLogError) as caught:
         led.append("turn/started", {"turn": 1, "actor": "user"}, src="gateway")
-    assert caught.value.code == CODE_BAD_DATA_FIELD
+    code = caught.value.code
+    # The record's traceback holds this frame, and so ``led``: a cycle that keeps
+    # the write lease held past the test until the collector runs.
+    del caught
+    assert code == CODE_BAD_DATA_FIELD
     assert crew_log_path("session", SESSION).read_bytes() == before
     # The handle is still usable: a refusal happens before any byte is written.
     led.append("turn/started", CANONICAL["turn/started"], src="gateway")
@@ -848,7 +891,10 @@ def test_a_group_refuses_a_citing_entry_the_registry_rejects():
             src="acp",
             cite=lambda seqs: {"type": "message/sent", "data": {"turn": 1, "typo": seqs}},
         )
-    assert caught.value.field == "data.typo"
+    field = caught.value.field
+    # Same cycle as above: the record's traceback would keep ``led`` and its lease.
+    del caught
+    assert field == "data.typo"
     assert crew_log_path("session", SESSION).read_bytes() == before
 
 

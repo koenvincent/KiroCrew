@@ -1,4 +1,5 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest'
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
+import { unregisteredMarkers } from '../../test/guideTargets'
 import { render, screen, fireEvent, within, act, waitFor } from '@testing-library/react'
 import type { MemberRosterRow } from '../../api/client'
 import type { CronJob } from '../../types'
@@ -85,6 +86,9 @@ beforeEach(() => {
   localStorage.clear()
 })
 
+// The forwarding proof: every marker the render drew is registered by its ref.
+afterEach(() => { expect(unregisteredMarkers()).toEqual([]) })
+
 describe('CrewProfilePanel rail (Tablist labels="active")', () => {
   it('has the four tabs in strip order, every one named for assistive tech', () => {
     setup()
@@ -150,12 +154,32 @@ describe('CrewProfilePanel Profile tab', () => {
     expect(h.onEdit).toHaveBeenCalledTimes(1)
   })
 
+  it('the Memory tile is a door, by click and by keyboard, once the host hands it one', () => {
+    const onOpenMemory = vi.fn()
+    setup({ onOpenMemory })
+    const memory = screen.getByTestId('crew-profile-memory')
+    expect(memory.tagName).toBe('BUTTON')
+    expect(memory).toHaveAccessibleName(/Memory/)
+    fireEvent.click(memory)
+    expect(onOpenMemory).toHaveBeenCalledTimes(1)
+    // A native button with no tabindex override: Tab reaches it, Enter/Space press it.
+    expect(memory).toHaveAttribute('type', 'button')
+    expect(memory).not.toHaveAttribute('tabindex')
+    memory.focus()
+    expect(memory).toHaveFocus()
+  })
+
   it('draws the host settings (permission, model, effort) in place of editor doors', () => {
     setup({ settingsBody: <div data-testid="host-settings">host settings</div> })
     expect(within(screen.getByTestId('crew-profile-pane-profile')).getByTestId('host-settings')).toBeInTheDocument()
     // Changed right here now, so the card no longer sends them to the editor.
     expect(screen.queryByTestId('crew-profile-permissions')).toBeNull()
     expect(screen.queryByTestId('crew-profile-model')).toBeNull()
+  })
+
+  it('carries no guide marker: the permission picker it holds is answered in words, not guided', () => {
+    setup()
+    expect(document.querySelectorAll('[data-ui-location]')).toHaveLength(0)
   })
 
   it('says there is no description instead of rendering an empty card', () => {
