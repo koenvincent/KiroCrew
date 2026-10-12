@@ -137,6 +137,11 @@ def register(app: web.Application) -> None:
     app.router.add_post(
         "/api/instances/{id}/send-session", handlers_instances.api_instances_send_session
     )
+    # The pull counterpart: copy one of the crew's sessions to this machine.
+    # Before the catch-all proxy route, like send-session.
+    app.router.add_post(
+        "/api/instances/{id}/fetch-session", handlers_instances.api_instances_fetch_session
+    )
     # Peer capability read — the per-instance counterpart to the local
     # /api/agents, /api/models, /api/effort-levels and /api/workspaces, for a
     # session whose turns run on that peer. Registered BEFORE the catch-all

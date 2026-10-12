@@ -6413,3 +6413,180 @@ async def test_a_reserved_write_releases_when_the_write_finishes(tmp_path, monke
     await write
     await asyncio.sleep(0)
     assert st._disk_inflight == 0
+
+
+# ── fetch-session: the pull counterpart of send-session ──────────────────
+
+
+class _PeerExport:
+    """The live peer response ``proxy_request`` yields: a status and a stream."""
+
+    def __init__(self, status: int, data: bytes = b"") -> None:
+        self.status = status
+        self.content = _make_request(None, None, gz=data).content
+
+
+def _fetch_state(st, monkeypatch, upstream=None, *, error=None):
+    """A stubbed hub state whose manager records each peer request."""
+    from kiro_crew.dashboard import handlers_instances as hi
+
+    monkeypatch.setattr(
+        hi.KiroCrewConfig,
+        "load",
+        staticmethod(lambda: SimpleNamespace(instances=SimpleNamespace(enabled=True))),
+    )
+    state = _stub_state(st, monkeypatch)
+    calls: list = []
+
+    class _Mgr:
+        @contextlib.asynccontextmanager
+        async def proxy_request(self, instance_id, method, path, *, params=None, **_kw):
+            calls.append((instance_id, method, path, dict(params or {})))
+            if error is not None:
+                raise error
+            yield upstream
+
+    state.instances_manager = _Mgr()
+    state.instances_registry = SimpleNamespace(get=lambda _i: SimpleNamespace(id="crew"))
+    state.owner_id = "owner"
+    return state, calls
+
+
+def _fetch_request(state, slot):
+    return _OwnerReq(
+        app={"state": state},
+        match_info={"id": "crew"},
+        headers={},
+        json=_async_value({"slot": slot}),
+    )
+
+
+@pytest.mark.asyncio
+async def test_fetch_session_installs_the_peers_export_as_a_new_local_slot(monkeypatch):
+    """The hub asks the peer's OWN export route, with Layer B requested, and the
+    reply arrives through the one local arrival path as a new slot."""
+    import gzip
+
+    from kiro_crew.dashboard import handlers_instances as hi
+    from kiro_crew.dashboard import session_transfer as st
+
+    export = gzip.compress(json.dumps(_valid(origin="crew-a")).encode())
+    state, calls = _fetch_state(st, monkeypatch, _PeerExport(200, export))
+
+    resp = await hi.api_instances_fetch_session(_fetch_request(state, "chat-1-17"))
+
+    assert resp.status == 200, resp.body
+    assert calls == [
+        ("crew", "GET", "api/chat/slots/chat-1-17/export", {"include_layer_b": "true"})
+    ]
+    assert list(state._slots) == [state._imported_slot.key]
+
+
+@pytest.mark.asyncio
+async def test_fetch_session_refuses_a_slot_key_that_could_leave_the_export_path(monkeypatch):
+    """The key becomes part of a peer path, so a traversal never reaches the peer."""
+    from kiro_crew.dashboard import handlers_instances as hi
+    from kiro_crew.dashboard import session_transfer as st
+
+    state, calls = _fetch_state(st, monkeypatch, _PeerExport(200))
+
+    for bad in ("../status", "chat/1", "", "a" * 201, "%2e%2e"):
+        resp = await hi.api_instances_fetch_session(_fetch_request(state, bad))
+        assert resp.status == 400, bad
+        assert json.loads(resp.body)["code"] == "transfer_missing_slot"
+    assert calls == []
+
+
+@pytest.mark.asyncio
+async def test_fetch_session_maps_a_missing_peer_session_to_404(monkeypatch):
+    from kiro_crew.dashboard import handlers_instances as hi
+    from kiro_crew.dashboard import session_transfer as st
+
+    state, _calls = _fetch_state(st, monkeypatch, _PeerExport(404, b'{"error": "x"}'))
+
+    resp = await hi.api_instances_fetch_session(_fetch_request(state, "chat-1-17"))
+
+    assert resp.status == 404
+    assert json.loads(resp.body)["code"] == "transfer_slot_not_found"
+    assert state._slots == {}
+
+
+@pytest.mark.asyncio
+async def test_fetch_session_blames_the_peer_not_the_caller_for_a_bad_bundle(monkeypatch):
+    """The arrival answers 400 for a body it cannot read; here that body is the
+    PEER's export, so the owner gets a 502 that keeps the arrival's code."""
+    import gzip
+
+    from kiro_crew.dashboard import handlers_instances as hi
+    from kiro_crew.dashboard import session_transfer as st
+
+    cases = {
+        b"\x1f\x8b\x08\x00truncated": "transfer_invalid_gzip",
+        gzip.compress(b"not json"): "transfer_invalid_json",
+    }
+    for data, code in cases.items():
+        state, _calls = _fetch_state(st, monkeypatch, _PeerExport(200, data))
+
+        resp = await hi.api_instances_fetch_session(_fetch_request(state, "chat-1-17"))
+
+        assert resp.status == 502, (code, resp.body)
+        assert json.loads(resp.body)["code"] == code
+        assert state._slots == {}
+
+
+@pytest.mark.asyncio
+async def test_fetch_session_relays_only_the_status_of_a_peer_refusal(monkeypatch):
+    """A peer refusal body is peer text; it is never forwarded."""
+    from kiro_crew.dashboard import handlers_instances as hi
+    from kiro_crew.dashboard import session_transfer as st
+
+    state, _calls = _fetch_state(
+        st, monkeypatch, _PeerExport(400, b'{"error": "AKIAIOSFODNN7EXAMPLE"}')
+    )
+
+    resp = await hi.api_instances_fetch_session(_fetch_request(state, "chat-1-17"))
+
+    assert resp.status == 502
+    body = json.loads(resp.body)
+    assert body["code"] == "transfer_peer_refused"
+    assert "AKIA" not in resp.body.decode()
+    assert state._slots == {}
+
+
+@pytest.mark.asyncio
+async def test_fetch_session_reports_a_peer_that_is_not_connected(monkeypatch):
+    from kiro_crew.dashboard import handlers_instances as hi
+    from kiro_crew.dashboard import session_transfer as st
+    from kiro_crew.instances.ssh_tunnel_manager import ProxyRequestError
+
+    err = ProxyRequestError(
+        "proxy_peer_not_connected", "instance is not connected", http_status=503
+    )
+    state, _calls = _fetch_state(st, monkeypatch, error=err)
+
+    resp = await hi.api_instances_fetch_session(_fetch_request(state, "chat-1-17"))
+
+    assert resp.status == 503
+    assert json.loads(resp.body)["code"] == "proxy_peer_not_connected"
+
+
+@pytest.mark.asyncio
+async def test_fetch_session_is_owner_only(monkeypatch):
+    """The peer request spends the owner's credential, so an app token is refused
+    before anything is asked of the peer."""
+    from kiro_crew.dashboard import handlers_instances as hi
+    from kiro_crew.dashboard import session_transfer as st
+
+    state, calls = _fetch_state(st, monkeypatch, _PeerExport(200))
+    request = _OwnerReq(
+        app={"state": state},
+        match_info={"id": "crew"},
+        headers={},
+        claims={"user": "owner", "app": "some-app"},
+        json=_async_value({"slot": "chat-1-17"}),
+    )
+
+    resp = await hi.api_instances_fetch_session(request)
+
+    assert resp.status == 403
+    assert calls == []
