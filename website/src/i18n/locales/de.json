@@ -11843,6 +11843,12 @@
         "stopping": "Wird gestoppt…",
         "yolo_elsewhere": "YOLO gilt für jede Sitzung auf {{name}}. Ändere es im Dashboard der Crew.",
         "mode_unknown": "Der Genehmigungsmodus auf {{name}} konnte nicht gelesen werden. Neuer Versuch läuft…",
+        "copy_here": "Auf diesen Rechner kopieren",
+        "copy_here_hint": "Diese Sitzung von {{name}} als neue Sitzung auf diesen Rechner kopieren. Die Sitzung auf {{name}} bleibt unverändert.",
+        "copying": "Wird kopiert…",
+        "copied": "Auf diesen Rechner kopiert. Du findest sie unter „Importiert“ in deinen Sitzungen.",
+        "copied_transcript_only": "Auf diesen Rechner kopiert, nur das Transkript: {{name}} hat keinen Kontext mitgeschickt, die Kopie beginnt mit dem Gesprächstext.",
+        "copy_failed": "Kopieren fehlgeschlagen: {{message}}",
         "update_in_remote_crew": "{{name}} unter Remote-Crew aktualisieren"
       },
       "messageContextMenu": {

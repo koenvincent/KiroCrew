@@ -5413,6 +5413,12 @@
         "stopping": "Stopping…",
         "yolo_elsewhere": "YOLO covers every session on {{name}}. Change it on the crew's own dashboard.",
         "mode_unknown": "Couldn't read the approval mode on {{name}}. Trying again…",
+        "copy_here": "Copy to this machine",
+        "copy_here_hint": "Copy this session from {{name}} to this machine as a new session. The session on {{name}} is not changed.",
+        "copying": "Copying…",
+        "copied": "Copied to this machine. Open it from Imported in your sessions.",
+        "copied_transcript_only": "Copied to this machine, transcript only: {{name}} did not send its context, so the copy starts from the conversation text.",
+        "copy_failed": "Copy failed: {{message}}",
         "update_in_remote_crew": "Update {{name}} in Remote Crew"
       }
     },

@@ -269,6 +269,19 @@ export function createInstancesEndpoints({ get, post, del, patch, j, jfetch: fet
         // '' when the peer is too old to report it — treated as unknown.
         resume_mode?: 'session_load' | 'prefix' | ''
       }>,
+    /** Copy one of a connected crew's sessions to THIS machine — the pull
+     *  counterpart of `sendSessionToInstance`. The hub reads the crew's own
+     *  export over the tunnel and installs it like an imported file, so the
+     *  answer is the import's: the new local `key` and its `resume_mode`
+     *  (`prefix` = transcript only, because the crew withheld its context). */
+    fetchSessionFromInstance: (id: string, slot: string) =>
+      post('/api/instances/' + encodeURIComponent(id) + '/fetch-session', { slot }).then(j) as Promise<{
+        ok: boolean
+        key: string
+        title: string
+        messages: number
+        resume_mode: string
+      }>,
   }
 
   const peerReads = {

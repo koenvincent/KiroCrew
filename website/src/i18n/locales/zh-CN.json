@@ -11675,6 +11675,12 @@
         "stopping": "正在停止…",
         "yolo_elsewhere": "YOLO 作用于 {{name}} 上的所有会话。请在该机组自己的仪表板中更改。",
         "mode_unknown": "无法读取 {{name}} 上的审批模式。正在重试…",
+        "copy_here": "复制到这台机器",
+        "copy_here_hint": "将 {{name}} 上的这个会话复制到这台机器，作为一个新会话。{{name}} 上的会话不会改变。",
+        "copying": "正在复制…",
+        "copied": "已复制到这台机器。可在会话列表的“已导入”中打开。",
+        "copied_transcript_only": "已复制到这台机器，仅包含对话记录：{{name}} 没有发送上下文，因此副本从对话文本开始。",
+        "copy_failed": "复制失败：{{message}}",
         "update_in_remote_crew": "在远程 Crew 中更新 {{name}}"
       },
       "messageContextMenu": {

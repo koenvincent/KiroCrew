@@ -11675,6 +11675,12 @@
         "stopping": "중지 중…",
         "yolo_elsewhere": "YOLO는 {{name}}의 모든 세션에 적용됩니다. 크루의 대시보드에서 변경하세요.",
         "mode_unknown": "{{name}}의 승인 모드를 읽을 수 없습니다. 다시 시도하는 중…",
+        "copy_here": "이 컴퓨터로 복사",
+        "copy_here_hint": "{{name}}의 이 세션을 이 컴퓨터에 새 세션으로 복사합니다. {{name}}의 세션은 바뀌지 않습니다.",
+        "copying": "복사 중…",
+        "copied": "이 컴퓨터로 복사했습니다. 세션 목록의 가져옴에서 열 수 있습니다.",
+        "copied_transcript_only": "이 컴퓨터로 복사했습니다(대화 내용만). {{name}}이(가) 컨텍스트를 보내지 않아 복사본은 대화 텍스트부터 시작합니다.",
+        "copy_failed": "복사하지 못했습니다: {{message}}",
         "update_in_remote_crew": "원격 크루에서 {{name}} 업데이트"
       },
       "messageContextMenu": {

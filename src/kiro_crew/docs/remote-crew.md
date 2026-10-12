@@ -168,6 +168,13 @@ Two things follow from the split:
 - **The remote owns the turn.** A turn already in flight keeps running on the
   remote if you close the window or your browser goes away.
 
+**Copy to this machine** in the window's header copies the session here as a new
+local session, filed under **Imported**. The crew's session is not changed, and
+copying twice gives two copies. It is offered only while no turn is running. The
+copy resumes with its full context when the crew allows it (its own
+`dashboard.export_include_layer_b` setting); otherwise the window says the copy
+is transcript only, and it starts from the conversation text.
+
 A chat an older version ran on a crew through the retired turn relay stays in your
 list as a **read-only archive**. You can read it, but every action that would run
 it answers `relay_archive_read_only`; open the crew's own session to keep going.

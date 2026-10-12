@@ -18,6 +18,8 @@ import type { RootState } from '../store'
 
 const mocks = vi.hoisted(() => ({
   crewPeerGet: vi.fn(), crewPeerPost: vi.fn(), listInstances: vi.fn(), instancesCapabilities: vi.fn(),
+  // The hub's own pull of a crew session (copy to this machine).
+  fetchSessionFromInstance: vi.fn(),
   // The LOCAL slot routes. A crew window must never reach them: on a remote
   // slot they are what answered 409.
   continueSlot: vi.fn(), regenerateSlot: vi.fn(), rewind: vi.fn(), approveChatSlot: vi.fn(),
@@ -1104,5 +1106,37 @@ describe('CrewChatWindow', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Close crew chat' }))
     await screen.findByTestId('no-window')
     expect(FakeEventSource.all[0].close).toHaveBeenCalled()
+  })
+})
+
+describe('CrewChatWindow — copy to this machine', () => {
+  it('asks the hub to fetch THIS crew session and says when the copy is transcript-only', async () => {
+    mocks.fetchSessionFromInstance.mockResolvedValue({ ok: true, key: 'local-1', title: 'Build fix', messages: 2, resume_mode: 'prefix' })
+    renderWindow()
+    const btn = await screen.findByTestId('crew-window-copy-here')
+    await waitFor(() => expect(btn).not.toBeDisabled(), PEER_ROW_WAIT)
+    fireEvent.click(btn)
+    await waitFor(() => expect(mocks.fetchSessionFromInstance).toHaveBeenCalledWith('cd-1', 'k1'))
+    expect(await screen.findByTestId('crew-window-copy-result')).toHaveTextContent('transcript only')
+    // The copy is a hub request, never a write to the peer's own routes.
+    expect(mocks.crewPeerPost).not.toHaveBeenCalled()
+  })
+
+  it('reports a refused copy in words', async () => {
+    mocks.fetchSessionFromInstance.mockRejectedValue(new Error('session not found on the crew'))
+    renderWindow()
+    const btn = await screen.findByTestId('crew-window-copy-here')
+    await waitFor(() => expect(btn).not.toBeDisabled(), PEER_ROW_WAIT)
+    fireEvent.click(btn)
+    expect(await screen.findByTestId('crew-window-copy-result')).toHaveTextContent('session not found on the crew')
+  })
+
+  it('is not offered while the crew turn runs', async () => {
+    slotRow = { ...slotRow, running: true }
+    detail = { ...detail, running: true }
+    renderWindow()
+    const btn = await screen.findByTestId('crew-window-copy-here')
+    await waitFor(() => expect(mocks.crewPeerGet).toHaveBeenCalled())
+    expect(btn).toBeDisabled()
   })
 })

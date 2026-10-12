@@ -17,7 +17,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { Link } from 'react-router-dom'
-import { Server, X } from 'lucide-react'
+import { Copy, Server, X } from 'lucide-react'
 import { api, ApiError } from '../../../api/client'
 import { crewPeerUrl } from '../../../api/client/instances'
 import { useAppSelector } from '../../../store'
@@ -302,6 +302,12 @@ export default function CrewChatWindow({ target, onClose = closeCrewWindow }: { 
   const versionMismatch = capsQ.data && !capsQ.data.version_match ? capsQ.data : null
   const actionPending = action.isPending
   const mutate = action.mutate
+  // Copy this crew session to THIS machine as a new local session. A copy, so
+  // the crew's session is untouched and a repeat is simply a second copy. Not
+  // offered mid-turn: the crew withholds its context from a snapshot taken
+  // while a turn runs, so the copy would be transcript-only for no reason.
+  const copyHere = useMutation({ mutationFn: () => api.fetchSessionFromInstance(instanceId, key) })
+  const canCopyHere = connected && !running && !copyHere.isPending
   // Regenerate sits on the newest reply's own hover row, as in the local chat.
   // Read at submit time, not render time: a row's editor can outlive the
   // render whose closure it holds (the list keeps finished rows).
@@ -361,6 +367,16 @@ export default function CrewChatWindow({ target, onClose = closeCrewWindow }: { 
         <span className="truncate font-semibold min-w-0">{title}</span>
         <span className="text-muted truncate">{i18nT('pages.chat.crewWindow.running_on_header', { name })}</span>
         <span className="ml-auto text-muted truncate hidden sm:inline">{i18nT('pages.chat.crewWindow.close_hint', { name })}</span>
+        <Btn
+          className="shrink-0"
+          disabled={!canCopyHere}
+          onClick={() => copyHere.mutate()}
+          title={i18nT('pages.chat.crewWindow.copy_here_hint', { name })}
+          data-testid="crew-window-copy-here"
+        >
+          <Copy size={14} aria-hidden="true" />
+          {copyHere.isPending ? i18nT('pages.chat.crewWindow.copying') : i18nT('pages.chat.crewWindow.copy_here')}
+        </Btn>
         <Btn className="shrink-0" onClick={onClose}><X size={14} aria-hidden="true" />{i18nT('pages.chat.crewWindow.close')}</Btn>
       </div>
       {/* Its own line under the title row, so a long version pair never
@@ -380,6 +396,17 @@ export default function CrewChatWindow({ target, onClose = closeCrewWindow }: { 
           <Link to="/settings/instances" className="text-[12px] text-accent hover:underline">
             {i18nT('pages.chat.crewWindow.update_in_remote_crew', { name })}
           </Link>
+        </div>
+      )}
+      {/* The outcome stays in words beside the header, not a toast: this app has
+          none, and a transcript-only copy must say so rather than read as done. */}
+      {(copyHere.isSuccess || copyHere.isError) && (
+        <div className="px-4 py-1 border-b border-border text-muted" role="status" data-testid="crew-window-copy-result">
+          {copyHere.isError
+            ? i18nT('pages.chat.crewWindow.copy_failed', { message: errMessage(copyHere.error) })
+            : copyHere.data?.resume_mode === 'prefix'
+              ? i18nT('pages.chat.crewWindow.copied_transcript_only')
+              : i18nT('pages.chat.crewWindow.copied')}
         </div>
       )}
       <div className="relative flex-1 min-h-0">

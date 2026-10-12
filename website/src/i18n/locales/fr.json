@@ -12011,6 +12011,12 @@
         "stopping": "En cours d’arrêt…",
         "yolo_elsewhere": "YOLO s'applique à toutes les sessions de {{name}}. Modifie-le dans le tableau de bord de l'équipe.",
         "mode_unknown": "Impossible de lire le mode d'approbation sur {{name}}. Nouvelle tentative…",
+        "copy_here": "Copier sur cette machine",
+        "copy_here_hint": "Copier cette session de {{name}} sur cette machine en tant que nouvelle session. La session sur {{name}} n’est pas modifiée.",
+        "copying": "Copie en cours…",
+        "copied": "Copiée sur cette machine. Ouvrez-la depuis Importées dans vos sessions.",
+        "copied_transcript_only": "Copiée sur cette machine, transcription seulement : {{name}} n’a pas envoyé son contexte, la copie repart du texte de la conversation.",
+        "copy_failed": "Échec de la copie : {{message}}",
         "update_in_remote_crew": "Mettre à jour {{name}} dans Crew distante"
       },
       "messageContextMenu": {

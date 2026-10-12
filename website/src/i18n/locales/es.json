@@ -12011,6 +12011,12 @@
         "stopping": "Deteniendo…",
         "yolo_elsewhere": "YOLO afecta a todas las sesiones de {{name}}. Cámbialo en el panel de la propia tripulación.",
         "mode_unknown": "No se pudo leer el modo de aprobación de {{name}}. Reintentando…",
+        "copy_here": "Copiar a este equipo",
+        "copy_here_hint": "Copia esta sesión de {{name}} a este equipo como una sesión nueva. La sesión en {{name}} no cambia.",
+        "copying": "Copiando…",
+        "copied": "Copiada a este equipo. Ábrela desde Importadas en tus sesiones.",
+        "copied_transcript_only": "Copiada a este equipo, solo la transcripción: {{name}} no envió su contexto, así que la copia empieza desde el texto de la conversación.",
+        "copy_failed": "No se pudo copiar: {{message}}",
         "update_in_remote_crew": "Actualizar {{name}} en Crew remoto"
       },
       "messageContextMenu": {

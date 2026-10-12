@@ -12011,6 +12011,12 @@
         "stopping": "Parando…",
         "yolo_elsewhere": "O YOLO vale para todas as sessões em {{name}}. Altere-o no painel da própria crew.",
         "mode_unknown": "Não foi possível ler o modo de aprovação em {{name}}. Tentando novamente…",
+        "copy_here": "Copiar para esta máquina",
+        "copy_here_hint": "Copia esta sessão de {{name}} para esta máquina como uma nova sessão. A sessão em {{name}} não é alterada.",
+        "copying": "Copiando…",
+        "copied": "Copiada para esta máquina. Abra em Importadas nas suas sessões.",
+        "copied_transcript_only": "Copiada para esta máquina, só a transcrição: {{name}} não enviou o contexto, então a cópia começa pelo texto da conversa.",
+        "copy_failed": "Falha ao copiar: {{message}}",
         "update_in_remote_crew": "Atualizar {{name}} em Crew remota"
       },
       "messageContextMenu": {
